@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{
-    AgentEvent, ApprovalMode, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT,
-    InputRoute, ToolCall, classify_input, resolve_approval,
+    AgentEvent, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute,
+    ToolCall, classify_input,
 };
 
 const MAX_AGENT_STEPS: usize = 8;
@@ -23,6 +23,34 @@ const MAX_AGENT_STEPS: usize = 8;
 enum Provider {
     Ollama,
     Openai,
+}
+
+/// Approval policy for tools that require user confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ApprovalMode {
+    /// Prompt before shell execution.
+    Ask,
+    /// Run all tools without prompting.
+    Auto,
+    /// Deny shell execution while allowing read-only tools.
+    Off,
+}
+
+impl std::fmt::Display for ApprovalMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Ask => "ask before shell execution",
+            Self::Auto => "auto-run all tools",
+            Self::Off => "deny shell execution",
+        })
+    }
+}
+
+fn resolve_approval(mode: ApprovalMode, gated: bool) -> bool {
+    match mode {
+        ApprovalMode::Ask | ApprovalMode::Off => !gated,
+        ApprovalMode::Auto => true,
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -364,5 +392,32 @@ mod tests {
     fn compact_path_leaves_non_home_paths_alone() {
         let path = Path::new("/not-the-home-directory/project");
         assert_eq!(compact_path(path), path.display().to_string());
+    }
+
+    #[test]
+    fn approval_modes_parse() {
+        assert_eq!(
+            ApprovalMode::from_str("ask", false).unwrap(),
+            ApprovalMode::Ask
+        );
+        assert_eq!(
+            ApprovalMode::from_str("auto", false).unwrap(),
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            ApprovalMode::from_str("off", false).unwrap(),
+            ApprovalMode::Off
+        );
+        assert!(ApprovalMode::from_str("yolo", false).is_err());
+    }
+
+    #[test]
+    fn approval_policy_handles_gated_and_read_only_tools() {
+        assert!(!resolve_approval(ApprovalMode::Ask, true));
+        assert!(resolve_approval(ApprovalMode::Ask, false));
+        assert!(resolve_approval(ApprovalMode::Auto, true));
+        assert!(resolve_approval(ApprovalMode::Auto, false));
+        assert!(!resolve_approval(ApprovalMode::Off, true));
+        assert!(resolve_approval(ApprovalMode::Off, false));
     }
 }

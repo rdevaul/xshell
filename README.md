@@ -36,6 +36,15 @@ The default configuration expects Ollama at `http://127.0.0.1:11434` and model
 ```sh
 XSHELL_MODEL=qwen3:4b cargo run -p xshell-cli
 
+# Ask before agent-requested shell commands (default).
+cargo run -p xshell-cli -- --approval ask
+
+# Run every tool without prompting. Use only in a trusted workspace.
+cargo run -p xshell-cli -- --approval auto
+
+# Allow read-only tools but deny all agent-requested shell commands.
+cargo run -p xshell-cli -- --approval off
+
 cargo run -p xshell-cli -- \
   --provider openai \
   --base-url https://api.openai.com \
@@ -64,8 +73,11 @@ user's complete zsh/bash plugin and completion environment.
 Agent file tools are confined to the current xshell working directory after
 canonical path resolution, including symlink resolution. Read-only file tools
 run automatically and are shown in the transcript. Every agent-requested shell
-command displays the exact command and requires explicit confirmation. Shell
-tools are non-interactive, time out after 60 seconds, and have bounded output.
+command displays the exact command and, in the default `ask` mode, requires
+explicit confirmation. `--approval auto` removes that confirmation and should
+only be used in a trusted workspace; `--approval off` denies shell tools.
+Shell tools are non-interactive, time out after 60 seconds, and have bounded
+output.
 
 The working directory is therefore a meaningful trust boundary. Avoid starting
 xshell in a directory containing secrets you do not want the configured model
