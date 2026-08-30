@@ -1,0 +1,347 @@
+mod completion;
+mod tools;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, ValueEnum};
+use completion::XshellHelper;
+use rustyline::Editor;
+use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use std::env;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
+use xshell_core::{
+    AgentEvent, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute,
+    ToolCall, classify_input,
+};
+
+const MAX_AGENT_STEPS: usize = 8;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Provider {
+    Ollama,
+    Openai,
+}
+
+#[derive(Debug, Parser)]
+#[command(version, about = "An agent-first, network-aware interactive shell")]
+struct Args {
+    #[arg(long, env = "XSHELL_PROVIDER", value_enum, default_value = "ollama")]
+    provider: Provider,
+
+    #[arg(long, env = "XSHELL_MODEL", default_value = "qwen3:8b")]
+    model: String,
+
+    #[arg(long, env = "XSHELL_BASE_URL")]
+    base_url: Option<String>,
+
+    #[arg(long, env = "XSHELL_API_KEY_ENV", default_value = "OPENAI_API_KEY")]
+    api_key_env: String,
+
+    #[arg(long, env = "XSHELL_SYSTEM_PROMPT", default_value = DEFAULT_SYSTEM_PROMPT)]
+    system_prompt: String,
+
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let mut cwd = args
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
+    let mut agent = build_adapter(&args);
+    let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
+    let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
+        .context("could not initialize terminal input")?;
+    editor.set_helper(Some(XshellHelper::new(cwd.clone())));
+
+    println!("xshell local prototype — //help for commands; //quit or Ctrl-D to exit");
+    print_status(agent.as_ref(), &cwd);
+
+    loop {
+        let descriptor = agent.descriptor();
+        let prompt = format!(
+            "[local:default {} {}] › ",
+            descriptor.id,
+            compact_path(&cwd)
+        );
+
+        let line = match editor.readline(&prompt) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(error) => return Err(error).context("terminal input failed"),
+        };
+
+        if !line.trim().is_empty() {
+            let _ = editor.add_history_entry(line.as_str());
+        }
+
+        match classify_input(&line) {
+            InputRoute::Empty => {}
+            InputRoute::Shell(command) => {
+                if let Err(error) = run_shell(&command, &mut cwd) {
+                    eprintln!("xshell: {error:#}");
+                }
+                if let Some(helper) = editor.helper_mut() {
+                    helper.set_cwd(cwd.clone());
+                }
+            }
+            InputRoute::Control(ControlCommand::Quit) => break,
+            InputRoute::Control(command) => handle_control(command, agent.as_ref(), &cwd),
+            InputRoute::Agent(message) => {
+                if let Err(error) =
+                    run_agent_turn(agent.as_mut(), &mut history, message, &cwd).await
+                {
+                    eprintln!("xshell agent error: {error:#}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_agent_turn(
+    agent: &mut dyn AgentAdapter,
+    history: &mut Vec<ChatMessage>,
+    message: String,
+    cwd: &Path,
+) -> Result<()> {
+    let checkpoint = history.len();
+    history.push(ChatMessage::user(message));
+    let definitions = tools::definitions();
+
+    for _ in 0..MAX_AGENT_STEPS {
+        let mut streamed_text = false;
+        let mut emit = |event| match event {
+            AgentEvent::TextDelta(delta) => {
+                streamed_text = true;
+                print!("{delta}");
+                let _ = io::stdout().flush();
+            }
+        };
+        let response = match agent
+            .chat_stream(
+                ChatRequest {
+                    messages: history.clone(),
+                    tools: definitions.clone(),
+                },
+                &mut emit,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                history.truncate(checkpoint);
+                return Err(error.into());
+            }
+        };
+        if streamed_text {
+            println!();
+        }
+
+        history.push(ChatMessage::assistant_with_tools(
+            response.content,
+            response.tool_calls.clone(),
+        ));
+        if response.tool_calls.is_empty() {
+            println!();
+            return Ok(());
+        }
+
+        for call in response.tool_calls {
+            println!("\nagent requests: {}", tools::summary(&call));
+            let approved = !tools::requires_approval(&call) || confirm_tool(&call)?;
+            let result = if approved {
+                if !tools::requires_approval(&call) {
+                    println!("policy: allowed read-only tool within {}", cwd.display());
+                }
+                tools::execute(&call, cwd).await
+            } else {
+                "tool denied by user".into()
+            };
+            print_tool_result(&result);
+            history.push(ChatMessage::tool_result(&call, result));
+        }
+    }
+
+    bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
+}
+
+fn confirm_tool(call: &ToolCall) -> Result<bool> {
+    print!("Approve `{}`? [y/N] ", tools::summary(call));
+    io::stdout()
+        .flush()
+        .context("could not flush approval prompt")?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("could not read approval")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn print_tool_result(result: &str) {
+    const DISPLAY_LIMIT: usize = 4 * 1024;
+    let end = floor_char_boundary(result, result.len().min(DISPLAY_LIMIT));
+    println!("tool result:\n{}", &result[..end]);
+    if end < result.len() {
+        println!("[terminal display truncated; full result returned to agent]");
+    }
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn build_adapter(args: &Args) -> Box<dyn AgentAdapter> {
+    match args.provider {
+        Provider::Ollama => Box::new(OllamaAdapter::new(
+            args.base_url.as_deref().unwrap_or("http://127.0.0.1:11434"),
+            &args.model,
+        )),
+        Provider::Openai => Box::new(OpenAiCompatibleAdapter::new(
+            args.base_url.as_deref().unwrap_or("https://api.openai.com"),
+            &args.model,
+            env::var(&args.api_key_env).ok(),
+        )),
+    }
+}
+
+fn handle_control(command: ControlCommand, agent: &dyn AgentAdapter, cwd: &Path) {
+    match command {
+        ControlCommand::Help => println!(
+            "\
+xshell input routes:
+  plain text        send a message to the active agent
+  $COMMAND          run COMMAND using the configured shell
+
+control commands:
+  //help            show this help
+  //status          show local session state
+  //agent            show active agent capabilities
+  //tools            show tools exposed to the active agent
+  //quit             exit xshell"
+        ),
+        ControlCommand::Status => print_status(agent, cwd),
+        ControlCommand::Tools => {
+            for tool in tools::definitions() {
+                println!("{} — {}", tool.name, tool.description);
+            }
+        }
+        ControlCommand::Agent(args) if args.is_empty() || args == ["show"] => print_agent(agent),
+        ControlCommand::Agent(args) => eprintln!(
+            "xshell: //agent {:?} is not implemented; configure the adapter at startup",
+            args
+        ),
+        ControlCommand::Unknown { name, .. } => {
+            eprintln!("xshell: unknown control command //{name}; try //help")
+        }
+        ControlCommand::Quit => unreachable!("quit is handled by the REPL"),
+    }
+}
+
+fn print_status(agent: &dyn AgentAdapter, cwd: &Path) {
+    let descriptor = agent.descriptor();
+    println!("session: local:default");
+    println!("cwd: {}", cwd.display());
+    println!("agent: {} ({})", descriptor.display_name, descriptor.id);
+    println!("model: {}", descriptor.model);
+    println!("capabilities: {}", descriptor.capabilities.join(", "));
+    println!("approval mode: auto-read within cwd; ask before shell execution");
+}
+
+fn print_agent(agent: &dyn AgentAdapter) {
+    let descriptor = agent.descriptor();
+    println!("{} / {}", descriptor.display_name, descriptor.model);
+    println!("id: {}", descriptor.id);
+    println!("capabilities: {}", descriptor.capabilities.join(", "));
+}
+
+fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<()> {
+    if command.trim().is_empty() {
+        return Ok(());
+    }
+
+    let words = shell_words::split(command).context("could not parse shell command")?;
+    if words.first().map(String::as_str) == Some("cd") {
+        if words.len() > 2 {
+            bail!("cd expects zero or one path");
+        }
+        let destination = match words.get(1) {
+            Some(path) => expand_tilde(path)?,
+            None => home_dir()?,
+        };
+        let next = if destination.is_absolute() {
+            destination
+        } else {
+            cwd.join(destination)
+        };
+        *cwd = next
+            .canonicalize()
+            .with_context(|| format!("cannot cd to {}", next.display()))?;
+        return Ok(());
+    }
+
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let status = Command::new(&shell)
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .status()
+        .with_context(|| format!("could not launch shell {shell}"))?;
+    if !status.success() {
+        eprintln!("xshell: command exited with {status}");
+    }
+    Ok(())
+}
+
+fn home_dir() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
+}
+
+fn expand_tilde(path: &str) -> Result<PathBuf> {
+    if path == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return Ok(home_dir()?.join(rest));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn compact_path(path: &Path) -> String {
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from)
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        return format!("~/{}", relative.display());
+    }
+    path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_path_leaves_non_home_paths_alone() {
+        let path = Path::new("/not-the-home-directory/project");
+        assert_eq!(compact_path(path), path.display().to_string());
+    }
+}
