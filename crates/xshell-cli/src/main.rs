@@ -17,7 +17,9 @@ use xshell_core::{
     ToolCall, classify_input,
 };
 
-const MAX_AGENT_STEPS: usize = 8;
+/// Maximum number of agent tool-call steps per turn before the loop
+/// aborts. Kept bounded so a misbehaving model cannot loop forever.
+const MAX_AGENT_STEPS: usize = 64;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Provider {
