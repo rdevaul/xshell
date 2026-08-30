@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{
-    AgentEvent, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute,
-    ToolCall, classify_input,
+    AgentEvent, ApprovalMode, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT,
+    InputRoute, ToolCall, classify_input, resolve_approval,
 };
 
 const MAX_AGENT_STEPS: usize = 8;
@@ -45,6 +45,15 @@ struct Args {
 
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
+
+    #[arg(
+        long,
+        env = "XSHELL_APPROVAL",
+        value_enum,
+        default_value = "ask",
+        help = "Approval policy: ask (prompt, default), auto (run all), off (deny shell)"
+    )]
+    approval: ApprovalMode,
 }
 
 #[tokio::main]
@@ -61,7 +70,7 @@ async fn main() -> Result<()> {
     editor.set_helper(Some(XshellHelper::new(cwd.clone())));
 
     println!("xshell local prototype — //help for commands; //quit or Ctrl-D to exit");
-    print_status(agent.as_ref(), &cwd);
+    print_status(agent.as_ref(), &cwd, args.approval);
 
     loop {
         let descriptor = agent.descriptor();
@@ -96,10 +105,12 @@ async fn main() -> Result<()> {
                 }
             }
             InputRoute::Control(ControlCommand::Quit) => break,
-            InputRoute::Control(command) => handle_control(command, agent.as_ref(), &cwd),
+            InputRoute::Control(command) => {
+                handle_control(command, agent.as_ref(), &cwd, args.approval)
+            }
             InputRoute::Agent(message) => {
                 if let Err(error) =
-                    run_agent_turn(agent.as_mut(), &mut history, message, &cwd).await
+                    run_agent_turn(agent.as_mut(), &mut history, message, &cwd, args.approval).await
                 {
                     eprintln!("xshell agent error: {error:#}");
                 }
@@ -115,6 +126,7 @@ async fn run_agent_turn(
     history: &mut Vec<ChatMessage>,
     message: String,
     cwd: &Path,
+    approval: ApprovalMode,
 ) -> Result<()> {
     let checkpoint = history.len();
     history.push(ChatMessage::user(message));
@@ -160,7 +172,11 @@ async fn run_agent_turn(
 
         for call in response.tool_calls {
             println!("\nagent requests: {}", tools::summary(&call));
-            let approved = !tools::requires_approval(&call) || confirm_tool(&call)?;
+            // Approval policy: `auto` runs every tool, `off` denies
+            // gated (shell) tools, and `ask` (default) prompts for them.
+            let gated = tools::requires_approval(&call);
+            let approved = resolve_approval(approval, gated)
+                || (approval == ApprovalMode::Ask && gated && confirm_tool(&call)?);
             let result = if approved {
                 if !tools::requires_approval(&call) {
                     println!("policy: allowed read-only tool within {}", cwd.display());
@@ -222,7 +238,12 @@ fn build_adapter(args: &Args) -> Box<dyn AgentAdapter> {
     }
 }
 
-fn handle_control(command: ControlCommand, agent: &dyn AgentAdapter, cwd: &Path) {
+fn handle_control(
+    command: ControlCommand,
+    agent: &dyn AgentAdapter,
+    cwd: &Path,
+    approval: ApprovalMode,
+) {
     match command {
         ControlCommand::Help => println!(
             "\
@@ -237,7 +258,7 @@ control commands:
   //tools            show tools exposed to the active agent
   //quit             exit xshell"
         ),
-        ControlCommand::Status => print_status(agent, cwd),
+        ControlCommand::Status => print_status(agent, cwd, approval),
         ControlCommand::Tools => {
             for tool in tools::definitions() {
                 println!("{} — {}", tool.name, tool.description);
@@ -255,14 +276,14 @@ control commands:
     }
 }
 
-fn print_status(agent: &dyn AgentAdapter, cwd: &Path) {
+fn print_status(agent: &dyn AgentAdapter, cwd: &Path, approval: ApprovalMode) {
     let descriptor = agent.descriptor();
     println!("session: local:default");
     println!("cwd: {}", cwd.display());
     println!("agent: {} ({})", descriptor.display_name, descriptor.id);
     println!("model: {}", descriptor.model);
     println!("capabilities: {}", descriptor.capabilities.join(", "));
-    println!("approval mode: auto-read within cwd; ask before shell execution");
+    println!("approval mode: auto-read within cwd; {}", approval);
 }
 
 fn print_agent(agent: &dyn AgentAdapter) {

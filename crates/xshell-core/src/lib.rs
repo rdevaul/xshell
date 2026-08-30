@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
@@ -194,6 +195,42 @@ pub enum AdapterError {
     InvalidResponse(String),
 }
 
+/// Approval policy for tools that require user confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalMode {
+    /// Prompt the user before any tool that requires approval (e.g. shell execution).
+    Ask,
+    /// Auto-run every tool without prompting, including shell execution.
+    Auto,
+    /// Refuse every tool that requires approval; read-only tools still run.
+    Off,
+}
+
+impl fmt::Display for ApprovalMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            ApprovalMode::Ask => "ask before shell execution",
+            ApprovalMode::Auto => "auto-run all tools",
+            ApprovalMode::Off => "deny shell execution",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Decide whether a tool call runs now without prompting.
+///
+/// `gated` is true for tools that require approval (e.g. `run_shell`).
+/// `Ask` returns false for gated calls so the caller can prompt; `Auto`
+/// runs everything; `Off` refuses gated calls. Read-only tools are
+/// gated by `requires_approval` at the call site and run in every mode.
+pub fn resolve_approval(mode: ApprovalMode, gated: bool) -> bool {
+    match mode {
+        ApprovalMode::Ask => !gated,
+        ApprovalMode::Auto => true,
+        ApprovalMode::Off => !gated,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +273,49 @@ mod tests {
             classify_input("//tools"),
             InputRoute::Control(ControlCommand::Tools)
         );
+    }
+
+    #[test]
+    fn approval_mode_parses_each_variant() {
+        use clap::ValueEnum;
+        // clap 4's ValueEnum::from_str is (name, ignore_case).
+        assert_eq!(
+            ApprovalMode::from_str("ask", false).unwrap(),
+            ApprovalMode::Ask
+        );
+        assert_eq!(
+            ApprovalMode::from_str("auto", false).unwrap(),
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            ApprovalMode::from_str("off", false).unwrap(),
+            ApprovalMode::Off
+        );
+        assert!(ApprovalMode::from_str("yolo", false).is_err());
+    }
+
+    #[test]
+    fn ask_prompts_only_gated_calls() {
+        assert!(!resolve_approval(ApprovalMode::Ask, true));
+        assert!(resolve_approval(ApprovalMode::Ask, false));
+    }
+
+    #[test]
+    fn auto_runs_everything() {
+        assert!(resolve_approval(ApprovalMode::Auto, true));
+        assert!(resolve_approval(ApprovalMode::Auto, false));
+    }
+
+    #[test]
+    fn off_denies_gated_but_allows_read_only() {
+        assert!(!resolve_approval(ApprovalMode::Off, true));
+        assert!(resolve_approval(ApprovalMode::Off, false));
+    }
+
+    #[test]
+    fn approval_mode_display_names() {
+        assert_eq!(ApprovalMode::Ask.to_string(), "ask before shell execution");
+        assert_eq!(ApprovalMode::Auto.to_string(), "auto-run all tools");
+        assert_eq!(ApprovalMode::Off.to_string(), "deny shell execution");
     }
 }
