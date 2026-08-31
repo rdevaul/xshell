@@ -58,6 +58,11 @@ authenticated SSH catalog federation exists.
 - `detach`: release control and apply lifecycle policy.
 - `close`: delete a detached session or the caller's attached session.
 
+The CLI keeps a per-connection navigation history. After `//close` deletes the
+current session, it first attempts to attach the previously visited session,
+then the most recently active available session. It exits only when no session
+remains. `//quit` instead detaches without deleting the current session.
+
 The CLI synchronizes after each completed input. This favors clear recovery
 semantics over write efficiency for the prototype; future context storage will
 use an append/checkpoint model rather than rewriting large histories.

@@ -111,7 +111,7 @@ $cd crates/xshell-core               # persistently change xshell's cwd
 //new robot --model local-qwen        # create with a chosen model profile
 //switch bees                         # restore its model, cwd, and conversation
 //detach                              # preserve the session and exit
-//close                               # delete the current session and exit
+//close                               # delete it and return to the previous session
 //tools                               # inspect tools exposed to the agent
 //help                                # list control commands
 //quit                                # exit
@@ -144,6 +144,11 @@ to remove it at detach. `--fabric` marks a session for later SSH federation;
 `--host-only` keeps it out of that future export. In this first increment all
 sessions remain local and single-user, and only one interactive client may
 control a session at a time.
+
+`//quit` and Ctrl-D leave the current persistent session available for later
+attachment. `//close` deletes the current session; xshell returns to the
+previously visited available session, or otherwise the most recently active
+available session. Closing the last session exits the CLI.
 
 `xshelld` is currently a state registry, not the execution host: the attached
 CLI still runs model requests and commands. Moving execution ownership into

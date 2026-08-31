@@ -31,6 +31,7 @@ pub struct XshellHelper {
     cwd: PathBuf,
     commands: Vec<String>,
     model_profiles: Vec<String>,
+    session_names: Vec<String>,
 }
 
 impl XshellHelper {
@@ -39,6 +40,7 @@ impl XshellHelper {
             cwd,
             commands: discover_commands(),
             model_profiles,
+            session_names: Vec::new(),
         }
     }
 
@@ -49,6 +51,12 @@ impl XshellHelper {
     #[allow(dead_code)]
     pub fn set_model_profiles(&mut self, profiles: Vec<String>) {
         self.model_profiles = profiles;
+    }
+
+    pub fn set_session_names(&mut self, mut names: Vec<String>) {
+        names.sort();
+        names.dedup();
+        self.session_names = names;
     }
 }
 
@@ -74,6 +82,12 @@ impl Completer for XshellHelper {
 
             // Model profile completion: "//model <prefix>" or "//model use <prefix>"
             if let Some(result) = complete_model(line, pos, &self.model_profiles) {
+                return Ok(result);
+            }
+
+            if let Some(result) =
+                complete_single_argument(line, pos, "//switch", &self.session_names)
+            {
                 return Ok(result);
             }
 
@@ -115,6 +129,39 @@ impl Completer for XshellHelper {
 
         Ok((start, complete_path(fragment, &self.cwd)))
     }
+}
+
+fn complete_single_argument(
+    line: &str,
+    pos: usize,
+    command: &str,
+    values: &[String],
+) -> Option<(usize, Vec<Pair>)> {
+    let prefix = &line[..pos];
+    let rest = prefix.strip_prefix(command)?;
+    if rest.is_empty() {
+        return Some((command.len(), value_candidates("", values, " ")));
+    }
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let argument = rest.trim_start_matches(char::is_whitespace);
+    if argument.contains(char::is_whitespace) {
+        return Some((pos, Vec::new()));
+    }
+    let start = prefix.len() - argument.len();
+    Some((start, value_candidates(argument, values, "")))
+}
+
+fn value_candidates(prefix: &str, values: &[String], replacement_prefix: &str) -> Vec<Pair> {
+    values
+        .iter()
+        .filter(|value| value.starts_with(prefix))
+        .map(|value| Pair {
+            display: value.clone(),
+            replacement: format!("{replacement_prefix}{value}"),
+        })
+        .collect()
 }
 
 /// Attempt model-profile completion for lines that begin with `//model`.
@@ -419,5 +466,30 @@ mod tests {
             apply_completion(line, line.len(), start, &profile.replacement),
             "//model use local-qwen"
         );
+    }
+
+    #[test]
+    fn switch_completion_uses_session_catalog_and_inserts_space() {
+        let mut helper = helper_with_profiles();
+        helper.set_session_names(vec!["robot".into(), "bees".into()]);
+        let history = DefaultHistory::new();
+        let context = Context::new(&history);
+
+        let line = "//switch";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        let bees = matches
+            .iter()
+            .find(|candidate| candidate.display == "bees")
+            .unwrap();
+        assert_eq!(
+            apply_completion(line, line.len(), start, &bees.replacement),
+            "//switch bees"
+        );
+
+        let line = "//switch ro";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert_eq!(start, 9);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].replacement, "robot");
     }
 }
