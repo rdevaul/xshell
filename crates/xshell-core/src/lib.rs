@@ -22,6 +22,11 @@ pub enum ControlCommand {
     Tools,
     Model(Vec<String>),
     Agent(Vec<String>),
+    Sessions,
+    New(Vec<String>),
+    Switch(Vec<String>),
+    Detach,
+    Close(Vec<String>),
     Quit,
     Unknown { name: String, args: Vec<String> },
 }
@@ -57,6 +62,11 @@ fn parse_control(input: &str) -> ControlCommand {
         "tools" => ControlCommand::Tools,
         "model" => ControlCommand::Model(args),
         "agent" => ControlCommand::Agent(args),
+        "sessions" => ControlCommand::Sessions,
+        "new" => ControlCommand::New(args),
+        "switch" => ControlCommand::Switch(args),
+        "detach" => ControlCommand::Detach,
+        "close" => ControlCommand::Close(args),
         "quit" | "exit" => ControlCommand::Quit,
         _ => ControlCommand::Unknown {
             name: name.to_owned(),
@@ -255,6 +265,26 @@ mod tests {
         assert_eq!(
             classify_input("//audit status"),
             InputRoute::Control(ControlCommand::Audit(vec!["status".into()]))
+        );
+    }
+
+    #[test]
+    fn parses_session_control_commands() {
+        assert_eq!(
+            classify_input("//new bees --durable"),
+            InputRoute::Control(ControlCommand::New(vec!["bees".into(), "--durable".into()]))
+        );
+        assert_eq!(
+            classify_input("//switch robot"),
+            InputRoute::Control(ControlCommand::Switch(vec!["robot".into()]))
+        );
+        assert_eq!(
+            classify_input("//sessions"),
+            InputRoute::Control(ControlCommand::Sessions)
+        );
+        assert_eq!(
+            classify_input("//detach"),
+            InputRoute::Control(ControlCommand::Detach)
         );
     }
 }

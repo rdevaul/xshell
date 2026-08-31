@@ -59,6 +59,16 @@ The baseline must work in a plain terminal with no inline image protocol and on 
 
 ## Phases
 
+### Current implementation checkpoint
+
+The first local slice of Phase 3 is implemented: a versioned Unix-socket
+protocol, stable host/session identities, a single-controller registry,
+ephemeral/daemon/durable lifecycles, local session commands, and model/cwd/chat
+snapshot restoration. `xshelld` is intentionally still a state registry; live
+agent and command execution remains in the CLI until supervision moves across
+that boundary. SSH transport, remote catalog federation, and platform service
+installation remain Phase 3 work.
+
 ### Phase 0 — Architecture spikes and contract (1–2 weeks)
 
 Deliverables:
@@ -131,6 +141,8 @@ Deliverables:
 - Signed update channel, compatibility guarantees, migrations, telemetry only with opt-in.
 - Optional FUSE/macFUSE projection of explicitly shared resources.
 - Visual regression test framework for CAD rendering, including reference assets and renderer-version tolerances.
+- Explicit multi-user sessions with ACL-backed owner/operator/viewer roles, restricted operator commands, principal-aware approvals, and per-principal auditing.
+- Context inspection, auditable compaction, checkpoints, restore, and session forks.
 
 ## Workstreams and ownership boundaries
 

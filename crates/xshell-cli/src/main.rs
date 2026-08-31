@@ -1,6 +1,7 @@
 mod audit;
 mod completion;
 mod config;
+mod session;
 mod tools;
 
 use anyhow::{Context, Result, bail};
@@ -11,6 +12,7 @@ use config::{ActiveModel, ModelOverrides, Provider, XshellConfig};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
+use session::SessionRuntime;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +23,7 @@ use xshell_core::{
     AgentEvent, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute,
     ToolCall, classify_input,
 };
+use xshell_session::{PersistenceMode, SessionSnapshot, Visibility};
 
 /// Maximum number of agent tool-call steps per turn before the loop
 /// aborts. Kept bounded so a misbehaving model cannot loop forever.
@@ -85,6 +88,9 @@ struct Args {
     #[arg(long, env = "XSHELL_SYSTEM_PROMPT", default_value = DEFAULT_SYSTEM_PROMPT)]
     system_prompt: String,
 
+    #[arg(long, env = "XSHELL_SESSION")]
+    session: Option<String>,
+
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
 
@@ -115,6 +121,23 @@ async fn main() -> Result<()> {
         .cwd
         .canonicalize()
         .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
+    let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
+    let (mut sessions, restored) = SessionRuntime::start(
+        &model_config.session_fabric,
+        args.session.as_deref(),
+        &active_model,
+        &cwd,
+        &history,
+    )?;
+    if let Some(snapshot) = restored {
+        restore_session_state(
+            snapshot,
+            &mut active_model,
+            &mut cwd,
+            &mut history,
+            &args.system_prompt,
+        )?;
+    }
     let mut agent = build_adapter(&active_model)?;
     let mut audit = AuditRuntime::start(&model_config.audit)?;
     audit.append(AuditEvent::SessionStarted {
@@ -127,7 +150,7 @@ async fn main() -> Result<()> {
         system_prompt: args.system_prompt.clone(),
         approval: args.approval.to_string(),
     })?;
-    let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
+    audit_logical_session_attached(&mut audit, &sessions, "startup")?;
     let model_profiles: Vec<String> = model_config.models.keys().cloned().collect();
     let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
         .context("could not initialize terminal input")?;
@@ -137,11 +160,19 @@ async fn main() -> Result<()> {
     if config_path.exists() {
         println!("config: {}", config_path.display());
     }
-    print_status(agent.as_ref(), &active_model, &audit, &cwd, args.approval);
+    print_status(
+        agent.as_ref(),
+        &active_model,
+        &audit,
+        &sessions,
+        &cwd,
+        args.approval,
+    );
 
     let exit_reason = loop {
         let prompt = format!(
-            "[local:default {} {}] › ",
+            "[{} {} {}] › ",
+            session_label(&sessions),
             active_model_label(&active_model),
             compact_path(&cwd)
         );
@@ -194,6 +225,73 @@ async fn main() -> Result<()> {
                 }
             }
             InputRoute::Control(ControlCommand::Quit) => break "quit",
+            InputRoute::Control(ControlCommand::Sessions) => {
+                if let Err(error) = print_sessions(&mut sessions) {
+                    eprintln!("xshell: {error:#}");
+                }
+            }
+            InputRoute::Control(ControlCommand::Switch(session_args)) => {
+                let selector = match session_args.as_slice() {
+                    [selector] => selector,
+                    _ => {
+                        eprintln!("xshell: usage: //switch SESSION");
+                        continue;
+                    }
+                };
+                match switch_session(
+                    selector,
+                    &mut sessions,
+                    &mut active_model,
+                    &mut agent,
+                    &mut cwd,
+                    &mut history,
+                    &args.system_prompt,
+                    &mut editor,
+                ) {
+                    Ok(()) => audit_logical_session_attached(&mut audit, &sessions, "switch")?,
+                    Err(error) => eprintln!("xshell: {error:#}"),
+                }
+            }
+            InputRoute::Control(ControlCommand::New(session_args)) => {
+                match create_session(
+                    session_args,
+                    &model_config,
+                    &mut sessions,
+                    &mut active_model,
+                    &mut agent,
+                    &mut cwd,
+                    &mut history,
+                    &args.system_prompt,
+                    &mut editor,
+                ) {
+                    Ok(()) => audit_logical_session_attached(&mut audit, &sessions, "create")?,
+                    Err(error) => eprintln!("xshell: {error:#}"),
+                }
+            }
+            InputRoute::Control(ControlCommand::Detach) => {
+                sessions.sync(&active_model, &cwd, &history)?;
+                let detached = sessions.active().cloned();
+                if let Err(error) = sessions.detach() {
+                    eprintln!("xshell: {error:#}");
+                    continue;
+                }
+                audit_logical_session_detached(&mut audit, detached.as_ref(), "detach")?;
+                break "detach";
+            }
+            InputRoute::Control(ControlCommand::Close(close_args)) => {
+                if !close_args.is_empty() {
+                    eprintln!("xshell: usage: //close");
+                    continue;
+                }
+                sessions.sync(&active_model, &cwd, &history)?;
+                let closed = sessions.active().cloned();
+                if let Err(error) = sessions.close_current() {
+                    eprintln!("xshell: {error:#}");
+                    continue;
+                }
+                audit_logical_session_detached(&mut audit, closed.as_ref(), "close")?;
+                break "close";
+            }
             InputRoute::Control(ControlCommand::Model(model_args)) => {
                 if let Err(error) = handle_model_command(
                     model_args,
@@ -212,6 +310,7 @@ async fn main() -> Result<()> {
                 agent.as_ref(),
                 &active_model,
                 &audit,
+                &sessions,
                 &cwd,
                 args.approval,
             ),
@@ -233,8 +332,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        sessions.sync(&active_model, &cwd, &history)?;
     };
 
+    sessions.sync(&active_model, &cwd, &history)?;
     audit.close(exit_reason)
 }
 
@@ -544,11 +645,205 @@ fn active_model_label(active: &ActiveModel) -> &str {
     active.profile_name.as_deref().unwrap_or(&active.model)
 }
 
+fn session_label(sessions: &SessionRuntime) -> String {
+    sessions.active().map_or_else(
+        || "local:standalone".into(),
+        |session| format!("{}:{}", session.host_alias, session.name),
+    )
+}
+
+fn audit_logical_session_attached(
+    audit: &mut AuditRuntime,
+    sessions: &SessionRuntime,
+    action: &str,
+) -> Result<()> {
+    let Some(session) = sessions.active() else {
+        return Ok(());
+    };
+    audit.append(AuditEvent::LogicalSessionAttached {
+        action: action.into(),
+        session_id: session.id.clone(),
+        name: session.name.clone(),
+        host_id: session.host_id.clone(),
+        host_alias: session.host_alias.clone(),
+        user: session.user.clone(),
+    })
+}
+
+fn audit_logical_session_detached(
+    audit: &mut AuditRuntime,
+    session: Option<&xshell_session::SessionDescriptor>,
+    action: &str,
+) -> Result<()> {
+    let Some(session) = session else {
+        return Ok(());
+    };
+    audit.append(AuditEvent::LogicalSessionDetached {
+        action: action.into(),
+        session_id: session.id.clone(),
+        name: session.name.clone(),
+    })
+}
+
+fn restore_session_state(
+    snapshot: SessionSnapshot,
+    active_model: &mut ActiveModel,
+    cwd: &mut PathBuf,
+    history: &mut Vec<ChatMessage>,
+    default_system_prompt: &str,
+) -> Result<()> {
+    let restored_model = ActiveModel::from_session_binding(snapshot.descriptor.model)?;
+    let restored_cwd = snapshot.descriptor.cwd.canonicalize().with_context(|| {
+        format!(
+            "session {:?} working directory is unavailable: {}",
+            snapshot.descriptor.name,
+            snapshot.descriptor.cwd.display()
+        )
+    })?;
+    *active_model = restored_model;
+    *cwd = restored_cwd;
+    *history = snapshot.history;
+    if history.is_empty() {
+        history.push(ChatMessage::system(default_system_prompt));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn switch_session(
+    selector: &str,
+    sessions: &mut SessionRuntime,
+    active_model: &mut ActiveModel,
+    agent: &mut Box<dyn AgentAdapter>,
+    cwd: &mut PathBuf,
+    history: &mut Vec<ChatMessage>,
+    default_system_prompt: &str,
+    editor: &mut Editor<XshellHelper, DefaultHistory>,
+) -> Result<()> {
+    sessions.sync(active_model, cwd, history)?;
+    let snapshot = sessions.switch(selector)?;
+    restore_session_state(snapshot, active_model, cwd, history, default_system_prompt)?;
+    *agent = build_adapter(active_model)?;
+    if let Some(helper) = editor.helper_mut() {
+        helper.set_cwd(cwd.clone());
+    }
+    println!("switched to {}", session_label(sessions));
+    Ok(())
+}
+
+struct NewSessionOptions {
+    name: String,
+    profile: Option<String>,
+    persistence: PersistenceMode,
+    visibility: Visibility,
+}
+
+fn parse_new_session_options(args: &[String]) -> Result<NewSessionOptions> {
+    let Some(name) = args.first() else {
+        bail!(
+            "usage: //new NAME [--model PROFILE] [--ephemeral|--daemon|--durable] \
+[--host-only|--fabric]"
+        );
+    };
+    let mut options = NewSessionOptions {
+        name: name.clone(),
+        profile: None,
+        persistence: PersistenceMode::Daemon,
+        visibility: Visibility::Fabric,
+    };
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--model" => {
+                index += 1;
+                options.profile = Some(
+                    args.get(index)
+                        .context("--model requires a profile name")?
+                        .clone(),
+                );
+            }
+            "--ephemeral" => options.persistence = PersistenceMode::Ephemeral,
+            "--daemon" => options.persistence = PersistenceMode::Daemon,
+            "--durable" => options.persistence = PersistenceMode::Durable,
+            "--host-only" => options.visibility = Visibility::HostOnly,
+            "--fabric" => options.visibility = Visibility::Fabric,
+            argument => bail!("unknown //new option {argument:?}"),
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_session(
+    args: Vec<String>,
+    config: &XshellConfig,
+    sessions: &mut SessionRuntime,
+    active_model: &mut ActiveModel,
+    agent: &mut Box<dyn AgentAdapter>,
+    cwd: &mut PathBuf,
+    history: &mut Vec<ChatMessage>,
+    system_prompt: &str,
+    editor: &mut Editor<XshellHelper, DefaultHistory>,
+) -> Result<()> {
+    let options = parse_new_session_options(&args)?;
+    sessions.sync(active_model, cwd, history)?;
+    let new_model = match options.profile.as_deref() {
+        Some(profile) => config.resolve_profile(profile)?,
+        None => active_model.clone(),
+    };
+    let new_history = vec![ChatMessage::system(system_prompt)];
+    let snapshot = sessions.create(
+        options.name,
+        &new_model,
+        cwd,
+        new_history,
+        options.persistence,
+        options.visibility,
+    )?;
+    restore_session_state(snapshot, active_model, cwd, history, system_prompt)?;
+    *agent = build_adapter(active_model)?;
+    if let Some(helper) = editor.helper_mut() {
+        helper.set_cwd(cwd.clone());
+    }
+    println!("created and attached {}", session_label(sessions));
+    Ok(())
+}
+
+fn print_sessions(sessions: &mut SessionRuntime) -> Result<()> {
+    let active_id = sessions.active().map(|session| session.id.clone());
+    let catalog = sessions.list()?;
+    if catalog.is_empty() {
+        println!("no sessions on this host");
+        return Ok(());
+    }
+    for session in catalog {
+        let marker = if active_id.as_deref() == Some(session.id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "{marker} {}/{}:{} — {} / {} — {:?}, {:?}, {:?}",
+            session.host_alias,
+            session.user,
+            session.name,
+            session.model.profile_name.as_deref().unwrap_or("custom"),
+            session.model.model,
+            session.status,
+            session.persistence,
+            session.visibility
+        );
+    }
+    Ok(())
+}
+
 fn handle_control(
     command: ControlCommand,
     agent: &dyn AgentAdapter,
     active_model: &ActiveModel,
     audit: &AuditRuntime,
+    sessions: &SessionRuntime,
     cwd: &Path,
     approval: ApprovalMode,
 ) {
@@ -562,6 +857,11 @@ xshell input routes:
 control commands:
   //help            show this help
   //status          show local session state
+  //sessions        list named sessions on the current host
+  //new NAME        create and switch to a daemon-lifetime session
+  //switch NAME     switch to another local session
+  //detach          detach, preserving a persistent session, and exit
+  //close           close the current session and exit
   //audit           show audit session state
   //model           show the active model profile
   //model list      list configured model profiles
@@ -570,7 +870,7 @@ control commands:
   //tools            show tools exposed to the active agent
   //quit             exit xshell"
         ),
-        ControlCommand::Status => print_status(agent, active_model, audit, cwd, approval),
+        ControlCommand::Status => print_status(agent, active_model, audit, sessions, cwd, approval),
         ControlCommand::Audit(args) if args.is_empty() || args == ["status"] => {
             print_audit_status(audit)
         }
@@ -591,6 +891,11 @@ control commands:
             eprintln!("xshell: unknown control command //{name}; try //help")
         }
         ControlCommand::Model(_) => unreachable!("model is handled by the REPL"),
+        ControlCommand::Sessions
+        | ControlCommand::New(_)
+        | ControlCommand::Switch(_)
+        | ControlCommand::Detach
+        | ControlCommand::Close(_) => unreachable!("session command is handled by the REPL"),
         ControlCommand::Quit => unreachable!("quit is handled by the REPL"),
     }
 }
@@ -599,11 +904,17 @@ fn print_status(
     agent: &dyn AgentAdapter,
     active_model: &ActiveModel,
     audit: &AuditRuntime,
+    sessions: &SessionRuntime,
     cwd: &Path,
     approval: ApprovalMode,
 ) {
     let descriptor = agent.descriptor();
-    println!("session: local:default");
+    println!("session: {}", session_label(sessions));
+    if let Some(socket) = sessions.socket() {
+        println!("session service: {}", socket.display());
+    } else {
+        println!("session service: disabled");
+    }
     println!("cwd: {}", cwd.display());
     println!("agent: {} ({})", descriptor.display_name, descriptor.id);
     println!("profile: {}", active_model_label(active_model));
@@ -750,5 +1061,21 @@ mod tests {
             Some(ApprovalDecision::AbortTurn)
         );
         assert_eq!(parse_approval_response("maybe"), None);
+    }
+
+    #[test]
+    fn parses_new_session_lifecycle_visibility_and_model() {
+        let args = vec![
+            "robot".into(),
+            "--durable".into(),
+            "--host-only".into(),
+            "--model".into(),
+            "local-qwen".into(),
+        ];
+        let options = parse_new_session_options(&args).unwrap();
+        assert_eq!(options.name, "robot");
+        assert_eq!(options.profile.as_deref(), Some("local-qwen"));
+        assert_eq!(options.persistence, PersistenceMode::Durable);
+        assert_eq!(options.visibility, Visibility::HostOnly);
     }
 }

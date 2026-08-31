@@ -40,6 +40,19 @@ pub enum AuditEvent {
         system_prompt: String,
         approval: String,
     },
+    LogicalSessionAttached {
+        action: String,
+        session_id: String,
+        name: String,
+        host_id: String,
+        host_alias: String,
+        user: String,
+    },
+    LogicalSessionDetached {
+        action: String,
+        session_id: String,
+        name: String,
+    },
     Input {
         route: String,
         text: String,

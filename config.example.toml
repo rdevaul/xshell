@@ -28,3 +28,11 @@ provider = "openai"
 model = "YOUR_OPENAI_MODEL"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
+# The local session service is opt-in while the fabric is under development.
+# Start it with: xshelld --config ~/.config/xshell/config.toml
+[session_fabric]
+enabled = false
+required = true
+socket = "/tmp/xshell-session-state/xshelld.sock"
+state_directory = "/tmp/xshell-session-state"
+default_session = "default"
