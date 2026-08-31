@@ -17,7 +17,9 @@ use xshell_core::{
     ToolCall, classify_input,
 };
 
-const MAX_AGENT_STEPS: usize = 8;
+/// Maximum number of agent tool-call steps per turn before the loop
+/// aborts. Kept bounded so a misbehaving model cannot loop forever.
+const MAX_AGENT_STEPS: usize = 64;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Provider {
@@ -34,6 +36,13 @@ enum ApprovalMode {
     Auto,
     /// Deny shell execution while allowing read-only tools.
     Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    Approve,
+    Deny,
+    AbortTurn,
 }
 
 impl std::fmt::Display for ApprovalMode {
@@ -198,42 +207,73 @@ async fn run_agent_turn(
             return Ok(());
         }
 
-        for call in response.tool_calls {
-            println!("\nagent requests: {}", tools::summary(&call));
+        for (index, call) in response.tool_calls.iter().enumerate() {
+            println!("\nagent requests: {}", tools::summary(call));
             // Approval policy: `auto` runs every tool, `off` denies
             // gated (shell) tools, and `ask` (default) prompts for them.
-            let gated = tools::requires_approval(&call);
-            let approved = resolve_approval(approval, gated)
-                || (approval == ApprovalMode::Ask && gated && confirm_tool(&call)?);
-            let result = if approved {
-                if !tools::requires_approval(&call) {
+            let gated = tools::requires_approval(call);
+            let decision = if resolve_approval(approval, gated) {
+                ApprovalDecision::Approve
+            } else if approval == ApprovalMode::Ask && gated {
+                confirm_tool(call)?
+            } else {
+                ApprovalDecision::Deny
+            };
+
+            if decision == ApprovalDecision::AbortTurn {
+                for skipped in &response.tool_calls[index..] {
+                    history.push(ChatMessage::tool_result(
+                        skipped,
+                        "tool execution aborted by user; agent turn stopped",
+                    ));
+                }
+                println!("agent turn aborted; no remaining tools were executed\n");
+                return Ok(());
+            }
+
+            let result = if decision == ApprovalDecision::Approve {
+                if !tools::requires_approval(call) {
                     println!("policy: allowed read-only tool within {}", cwd.display());
                 }
-                tools::execute(&call, cwd).await
+                tools::execute(call, cwd).await
             } else {
                 "tool denied by user".into()
             };
             print_tool_result(&result);
-            history.push(ChatMessage::tool_result(&call, result));
+            history.push(ChatMessage::tool_result(call, result));
         }
     }
 
     bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
 }
 
-fn confirm_tool(call: &ToolCall) -> Result<bool> {
-    print!("Approve `{}`? [y/N] ", tools::summary(call));
-    io::stdout()
-        .flush()
-        .context("could not flush approval prompt")?;
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .context("could not read approval")?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+fn confirm_tool(call: &ToolCall) -> Result<ApprovalDecision> {
+    loop {
+        print!("Approve `{}`? [y/N/q] ", tools::summary(call));
+        io::stdout()
+            .flush()
+            .context("could not flush approval prompt")?;
+        let mut answer = String::new();
+        let bytes_read = io::stdin()
+            .read_line(&mut answer)
+            .context("could not read approval")?;
+        if bytes_read == 0 {
+            return Ok(ApprovalDecision::AbortTurn);
+        }
+        if let Some(decision) = parse_approval_response(&answer) {
+            return Ok(decision);
+        }
+        eprintln!("Please answer y (approve), n (deny), or q (abort turn).");
+    }
+}
+
+fn parse_approval_response(answer: &str) -> Option<ApprovalDecision> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(ApprovalDecision::Approve),
+        "" | "n" | "no" => Some(ApprovalDecision::Deny),
+        "q" | "quit" | "abort" => Some(ApprovalDecision::AbortTurn),
+        _ => None,
+    }
 }
 
 fn print_tool_result(result: &str) {
@@ -419,5 +459,24 @@ mod tests {
         assert!(resolve_approval(ApprovalMode::Auto, false));
         assert!(!resolve_approval(ApprovalMode::Off, true));
         assert!(resolve_approval(ApprovalMode::Off, false));
+    }
+
+    #[test]
+    fn approval_prompt_distinguishes_deny_from_abort() {
+        assert_eq!(
+            parse_approval_response("y"),
+            Some(ApprovalDecision::Approve)
+        );
+        assert_eq!(parse_approval_response(""), Some(ApprovalDecision::Deny));
+        assert_eq!(parse_approval_response("no"), Some(ApprovalDecision::Deny));
+        assert_eq!(
+            parse_approval_response("q"),
+            Some(ApprovalDecision::AbortTurn)
+        );
+        assert_eq!(
+            parse_approval_response("abort"),
+            Some(ApprovalDecision::AbortTurn)
+        );
+        assert_eq!(parse_approval_response("maybe"), None);
     }
 }

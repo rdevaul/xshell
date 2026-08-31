@@ -13,7 +13,7 @@ The current prototype supports:
 
 - streamed responses from Ollama and generic OpenAI-compatible Chat
   Completions endpoints;
-- function/tool calling with an eight-step agent loop;
+- function/tool calling with a bounded 64-step agent loop;
 - cwd-confined `read_file` and `list_directory` tools;
 - approval-gated `run_shell` calls with timeout and output limits;
 - tab completion for executables, paths, and `//` commands;
@@ -78,6 +78,10 @@ explicit confirmation. `--approval auto` removes that confirmation and should
 only be used in a trusted workspace; `--approval off` denies shell tools.
 Shell tools are non-interactive, time out after 60 seconds, and have bounded
 output.
+
+At an approval prompt, `y` executes the requested command, `n` or Enter denies
+that command while allowing the agent turn to continue, and `q` aborts the
+entire agent turn and returns to the xshell prompt.
 
 The working directory is therefore a meaningful trust boundary. Avoid starting
 xshell in a directory containing secrets you do not want the configured model
