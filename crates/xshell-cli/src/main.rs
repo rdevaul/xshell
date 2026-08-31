@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
     let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
         .context("could not initialize terminal input")?;
     editor.set_helper(Some(XshellHelper::new(cwd.clone(), model_profiles)));
+    refresh_session_completions(&mut sessions, &mut editor);
 
     println!("xshell local prototype — //help for commands; //quit or Ctrl-D to exit");
     if config_path.exists() {
@@ -224,11 +225,19 @@ async fn main() -> Result<()> {
                     helper.set_cwd(cwd.clone());
                 }
             }
-            InputRoute::Control(ControlCommand::Quit) => break "quit",
+            InputRoute::Control(ControlCommand::Quit) => {
+                sessions.sync(&active_model, &cwd, &history)?;
+                let detached = sessions.active().cloned();
+                if sessions.detach().is_ok() {
+                    audit_logical_session_detached(&mut audit, detached.as_ref(), "quit")?;
+                }
+                break "quit";
+            }
             InputRoute::Control(ControlCommand::Sessions) => {
                 if let Err(error) = print_sessions(&mut sessions) {
                     eprintln!("xshell: {error:#}");
                 }
+                refresh_session_completions(&mut sessions, &mut editor);
             }
             InputRoute::Control(ControlCommand::Switch(session_args)) => {
                 let selector = match session_args.as_slice() {
@@ -248,7 +257,10 @@ async fn main() -> Result<()> {
                     &args.system_prompt,
                     &mut editor,
                 ) {
-                    Ok(()) => audit_logical_session_attached(&mut audit, &sessions, "switch")?,
+                    Ok(()) => {
+                        audit_logical_session_attached(&mut audit, &sessions, "switch")?;
+                        refresh_session_completions(&mut sessions, &mut editor);
+                    }
                     Err(error) => eprintln!("xshell: {error:#}"),
                 }
             }
@@ -264,7 +276,10 @@ async fn main() -> Result<()> {
                     &args.system_prompt,
                     &mut editor,
                 ) {
-                    Ok(()) => audit_logical_session_attached(&mut audit, &sessions, "create")?,
+                    Ok(()) => {
+                        audit_logical_session_attached(&mut audit, &sessions, "create")?;
+                        refresh_session_completions(&mut sessions, &mut editor);
+                    }
                     Err(error) => eprintln!("xshell: {error:#}"),
                 }
             }
@@ -285,12 +300,38 @@ async fn main() -> Result<()> {
                 }
                 sessions.sync(&active_model, &cwd, &history)?;
                 let closed = sessions.active().cloned();
-                if let Err(error) = sessions.close_current() {
-                    eprintln!("xshell: {error:#}");
-                    continue;
-                }
+                let fallback = match sessions.close_current_and_fallback() {
+                    Ok(result) => result,
+                    Err(error) => {
+                        eprintln!("xshell: {error:#}");
+                        continue;
+                    }
+                };
                 audit_logical_session_detached(&mut audit, closed.as_ref(), "close")?;
-                break "close";
+                println!(
+                    "closed session {}",
+                    closed
+                        .as_ref()
+                        .map(|session| session.name.as_str())
+                        .unwrap_or("(unknown)")
+                );
+                let Some(snapshot) = fallback else {
+                    break "close";
+                };
+                restore_session_state(
+                    snapshot,
+                    &mut active_model,
+                    &mut cwd,
+                    &mut history,
+                    &args.system_prompt,
+                )?;
+                agent = build_adapter(&active_model)?;
+                if let Some(helper) = editor.helper_mut() {
+                    helper.set_cwd(cwd.clone());
+                }
+                audit_logical_session_attached(&mut audit, &sessions, "close_fallback")?;
+                refresh_session_completions(&mut sessions, &mut editor);
+                println!("switched to {}", session_label(&sessions));
             }
             InputRoute::Control(ControlCommand::Model(model_args)) => {
                 if let Err(error) = handle_model_command(
@@ -838,6 +879,18 @@ fn print_sessions(sessions: &mut SessionRuntime) -> Result<()> {
     Ok(())
 }
 
+fn refresh_session_completions(
+    sessions: &mut SessionRuntime,
+    editor: &mut Editor<XshellHelper, DefaultHistory>,
+) {
+    let Ok(names) = sessions.session_names() else {
+        return;
+    };
+    if let Some(helper) = editor.helper_mut() {
+        helper.set_session_names(names);
+    }
+}
+
 fn handle_control(
     command: ControlCommand,
     agent: &dyn AgentAdapter,
@@ -861,14 +914,14 @@ control commands:
   //new NAME        create and switch to a daemon-lifetime session
   //switch NAME     switch to another local session
   //detach          detach, preserving a persistent session, and exit
-  //close           close the current session and exit
+  //close           delete the current session and return to the previous one
   //audit           show audit session state
   //model           show the active model profile
   //model list      list configured model profiles
   //model NAME      switch profiles and start a fresh conversation
   //agent            show active agent capabilities
   //tools            show tools exposed to the active agent
-  //quit             exit xshell"
+  //quit             detach from the current session and exit xshell"
         ),
         ControlCommand::Status => print_status(agent, active_model, audit, sessions, cwd, approval),
         ControlCommand::Audit(args) if args.is_empty() || args == ["status"] => {
