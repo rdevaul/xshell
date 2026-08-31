@@ -43,7 +43,7 @@ pub struct ActiveModel {
     pub provider: Provider,
     pub model: String,
     pub base_url: String,
-    pub api_key_env: String,
+    pub api_key_env: Option<String>,
 }
 
 impl XshellConfig {
@@ -90,10 +90,14 @@ impl XshellConfig {
             .base_url
             .or_else(|| selected.and_then(|profile| profile.base_url.clone()))
             .unwrap_or_else(|| default_base_url(provider).into());
-        let api_key_env = overrides
+        let mut api_key_env = overrides
             .api_key_env
             .or_else(|| selected.and_then(|profile| profile.api_key_env.clone()))
-            .unwrap_or_else(|| "OPENAI_API_KEY".into());
+            .map(|name| validate_api_key_env(name, selected_name.as_deref()))
+            .transpose()?;
+        if api_key_env.is_none() && selected.is_none() && provider == Provider::Openai {
+            api_key_env = Some("OPENAI_API_KEY".into());
+        }
 
         Ok(ActiveModel {
             profile_name: selected_name,
@@ -117,7 +121,8 @@ impl XshellConfig {
             api_key_env: profile
                 .api_key_env
                 .clone()
-                .unwrap_or_else(|| "OPENAI_API_KEY".into()),
+                .map(|value| validate_api_key_env(value, Some(name)))
+                .transpose()?,
         })
     }
 
@@ -126,6 +131,26 @@ impl XshellConfig {
             .get(name)
             .with_context(|| format!("unknown model profile {name:?}"))
     }
+}
+
+fn validate_api_key_env(value: String, profile_name: Option<&str>) -> Result<String> {
+    let mut characters = value.chars();
+    let valid_first = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    let valid_rest =
+        characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if valid_first && valid_rest {
+        return Ok(value);
+    }
+
+    let location = profile_name
+        .map(|name| format!(" in model profile {name:?}"))
+        .unwrap_or_default();
+    bail!(
+        "invalid api_key_env{location}; expected an environment variable name such as \
+OPENROUTER_API_KEY, not an API key"
+    )
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
@@ -189,7 +214,7 @@ api_key_env = "OPENROUTER_API_KEY"
         let active = sample().resolve_profile("router").unwrap();
         assert_eq!(active.provider, Provider::Openai);
         assert_eq!(active.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(active.api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(active.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
     }
 
     #[test]
@@ -208,5 +233,15 @@ api_key_env = "OPENROUTER_API_KEY"
         assert_eq!(active.provider, Provider::Openai);
         assert_eq!(active.model, "custom/model");
         assert_eq!(active.base_url, "http://localhost:9000/v1");
+    }
+
+    #[test]
+    fn rejects_a_secret_in_api_key_env_without_echoing_it() {
+        let secret = "sk-or-v1-private-value";
+        let error = validate_api_key_env(secret.into(), Some("router"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("environment variable name"));
+        assert!(!error.contains(secret));
     }
 }

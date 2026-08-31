@@ -65,12 +65,19 @@ cp config.example.toml ~/.config/xshell/config.toml
 
 The example includes local Ollama, OpenRouter, and OpenAI-compatible profiles.
 API keys are never stored in the configuration: each profile names the
-environment variable from which xshell should read its key. For OpenRouter:
+environment variable from which xshell should read its key. `api_key_env` must
+contain the literal variable name (for example, `OPENROUTER_API_KEY`), never the
+key itself. For OpenRouter:
 
 ```sh
 export OPENROUTER_API_KEY='your-key-here'
 cargo run -p xshell-cli -- --profile openrouter-free
 ```
+
+Model and status output reports only whether credentials are set; it never
+prints the environment variable's name or value. If a configured credential is
+missing, xshell stops before sending a request rather than making an anonymous
+request that will fail at the provider.
 
 You can also try OpenRouter without creating a configuration file:
 

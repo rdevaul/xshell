@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         .cwd
         .canonicalize()
         .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
-    let mut agent = build_adapter(&active_model);
+    let mut agent = build_adapter(&active_model)?;
     let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
     let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
         .context("could not initialize terminal input")?;
@@ -318,15 +318,29 @@ fn floor_char_boundary(value: &str, mut index: usize) -> usize {
     index
 }
 
-fn build_adapter(active: &ActiveModel) -> Box<dyn AgentAdapter> {
-    match active.provider {
+fn build_adapter(active: &ActiveModel) -> Result<Box<dyn AgentAdapter>> {
+    let adapter: Box<dyn AgentAdapter> = match active.provider {
         Provider::Ollama => Box::new(OllamaAdapter::new(&active.base_url, &active.model)),
         Provider::Openai => Box::new(OpenAiCompatibleAdapter::new(
             &active.base_url,
             &active.model,
-            env::var(&active.api_key_env).ok(),
+            resolve_api_key(active)?,
         )),
+    };
+    Ok(adapter)
+}
+
+fn resolve_api_key(active: &ActiveModel) -> Result<Option<String>> {
+    let Some(variable) = &active.api_key_env else {
+        return Ok(None);
+    };
+    let value = env::var(variable).context(
+        "the configured credential environment variable is not set or is not valid Unicode",
+    )?;
+    if value.is_empty() {
+        bail!("the configured credential environment variable is empty");
     }
+    Ok(Some(value))
 }
 
 fn handle_model_command(
@@ -368,7 +382,8 @@ fn switch_model_profile(
         return Ok(());
     }
 
-    *agent = build_adapter(&next);
+    let next_agent = build_adapter(&next)?;
+    *agent = next_agent;
     *active = next;
     history.clear();
     history.push(ChatMessage::system(system_prompt));
@@ -404,7 +419,12 @@ fn print_model(active: &ActiveModel) {
     println!("model: {}", active.model);
     println!("endpoint: {}", active.base_url);
     if active.provider == Provider::Openai {
-        println!("API key environment variable: {}", active.api_key_env);
+        let credential_status = match active.api_key_env.as_deref() {
+            Some(variable) if env::var_os(variable).is_some() => "set",
+            Some(_) => "missing",
+            None => "not configured",
+        };
+        println!("credentials: {credential_status}");
     }
 }
 
