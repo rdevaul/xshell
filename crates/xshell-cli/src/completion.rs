@@ -10,7 +10,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const CONTROL_COMMANDS: &[&str] = &[
-    "//agent", "//audit", "//help", "//model", "//quit", "//status", "//tools",
+    "//agent",
+    "//audit",
+    "//close",
+    "//detach",
+    "//help",
+    "//model",
+    "//new",
+    "//quit",
+    "//sessions",
+    "//status",
+    "//switch",
+    "//tools",
 ];
 
 /// Sub-commands recognised after `//model`.

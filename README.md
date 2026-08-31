@@ -18,11 +18,12 @@ The current prototype supports:
 - approval-gated `run_shell` calls with timeout and output limits;
 - tab completion for executables, paths, and `//` commands;
 - named model profiles with live switching via `//model`;
+- named local sessions with daemon-lifetime or durable persistence;
 - optional fail-closed audit logging through a separate signing daemon;
 - persistent cwd changes through `$cd`.
 
-Persistent daemons, SSH sessions, artifact rendering, and yapCAD integration
-are specified but not implemented yet.
+SSH federation, artifact rendering, and yapCAD integration are specified but
+not implemented yet.
 
 ## Build and run
 
@@ -105,6 +106,12 @@ $cd crates/xshell-core               # persistently change xshell's cwd
 //model                               # inspect the active model profile
 //model list                          # list configured profiles
 //model openrouter-free               # switch profile and clear chat history
+//sessions                            # list sessions on this host
+//new bees --durable                  # create and enter a durable session
+//new robot --model local-qwen        # create with a chosen model profile
+//switch bees                         # restore its model, cwd, and conversation
+//detach                              # preserve the session and exit
+//close                               # delete the current session and exit
 //tools                               # inspect tools exposed to the agent
 //help                                # list control commands
 //quit                                # exit
@@ -118,6 +125,31 @@ Switching model profiles deliberately clears the conversation history. This
 prevents context given to a local model from being sent to a cloud provider
 without an explicit new message. CLI flags and their corresponding environment
 variables override values in the startup profile.
+
+## Named local sessions
+
+Named sessions are served by `xshelld` over a per-user Unix socket. Enable the
+`[session_fabric]` section in the configuration, then start the service before
+the CLI:
+
+```sh
+cargo run -p xshell-session --bin xshelld -- --config config.example.toml
+cargo run -p xshell-cli -- --config config.example.toml --session bees
+```
+
+The default `//new NAME` lifecycle is `--daemon`: it survives detach and client
+disconnects but not daemon restart. Use `--durable` to serialize the session's
+model binding, working directory, and conversation history, or `--ephemeral`
+to remove it at detach. `--fabric` marks a session for later SSH federation;
+`--host-only` keeps it out of that future export. In this first increment all
+sessions remain local and single-user, and only one interactive client may
+control a session at a time.
+
+`xshelld` is currently a state registry, not the execution host: the attached
+CLI still runs model requests and commands. Moving execution ownership into
+the daemon is the next boundary needed for truly persistent in-flight work and
+network-transparent attachment. See [the session-fabric protocol and current
+boundary](docs/session-fabric.md).
 
 ## Audit logging
 

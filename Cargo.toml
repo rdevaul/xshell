@@ -4,6 +4,7 @@ members = [
     "crates/xshell-audit",
     "crates/xshell-cli",
     "crates/xshell-core",
+    "crates/xshell-session",
 ]
 resolver = "2"
 

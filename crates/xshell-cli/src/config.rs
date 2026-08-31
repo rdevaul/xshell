@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use xshell_audit::AuditConfig;
+use xshell_session::{ModelBinding, SessionConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -29,7 +30,44 @@ pub struct XshellConfig {
     #[serde(default)]
     pub audit: AuditConfig,
     #[serde(default)]
+    pub session_fabric: SessionConfig,
+    #[serde(default)]
     pub models: BTreeMap<String, ModelProfile>,
+}
+
+impl ActiveModel {
+    pub fn to_session_binding(&self) -> ModelBinding {
+        ModelBinding {
+            profile_name: self.profile_name.clone(),
+            provider: match self.provider {
+                Provider::Ollama => "ollama",
+                Provider::Openai => "openai",
+            }
+            .into(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            api_key_env: self.api_key_env.clone(),
+        }
+    }
+
+    pub fn from_session_binding(binding: ModelBinding) -> Result<Self> {
+        let provider = match binding.provider.as_str() {
+            "ollama" => Provider::Ollama,
+            "openai" => Provider::Openai,
+            value => bail!("session uses unsupported provider {value:?}"),
+        };
+        let api_key_env = binding
+            .api_key_env
+            .map(|value| validate_api_key_env(value, binding.profile_name.as_deref()))
+            .transpose()?;
+        Ok(Self {
+            profile_name: binding.profile_name,
+            provider,
+            model: binding.model,
+            base_url: binding.base_url,
+            api_key_env,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

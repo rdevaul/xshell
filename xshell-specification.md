@@ -56,7 +56,19 @@ A session is a named, persistent execution context with:
 
 Session identifiers use `host:session`, for example `laptop:default` or `mini:cad`. The local default session is created on first launch. Sessions are resumable after disconnects and may be supervised by a platform-native user service.
 
-### 5.1 Agent adapter contract
+### 5.1 Identity, visibility, and future multi-user sessions
+
+The initial session model has one owning OS user and one interactive controller. A stable opaque UUID identifies the session; its human-readable name is unique only within a `(host, user)` namespace. Local and remote sessions use the same descriptor and switching operations.
+
+Sessions declare whether they are `host-only` or visible to authenticated fabric clients. Remote catalogs expose metadata only after SSH authentication and never expose prompts, credentials, or transcript content.
+
+A future, explicitly created multi-user session may define an ACL of authenticated principals and roles. The initial reserved roles are `owner`, `operator`, and `viewer`. An operator may use only the session's restricted command/tool surface, while owner-only authority includes arbitrary shell access, policy changes, ACL management, session lifecycle, and model configuration. Every event and approval in such a session records the acting principal. Single-user sessions must not silently become multi-user sessions.
+
+### 5.2 Context management
+
+Conversation context is session-owned state rather than terminal-client state. The protocol reserves context status, compaction, checkpoint, restore, and fork operations. Compaction must be explicit and auditable: the user can inspect token/size pressure, the material selected for retention, the generated summary, and provenance linking the compacted context to its source messages. Provider-initiated truncation must never be presented as successful xshell compaction.
+
+### 5.3 Agent adapter contract
 
 Agents are integrated behind a versioned local RPC contract. A provider adapter declares capabilities rather than claiming a common feature set.
 
@@ -146,6 +158,8 @@ Secrets are not inserted into agent context by default. SSH agent forwarding is 
 | `//connect DEST [--session NAME]` | Attach/create a remote session over SSH |
 | `//sessions` / `//switch ID` | List and select sessions |
 | `//new NAME` | Create a session on the current host |
+| `//detach` / `//close` | Detach from or terminate the active session |
+| `//context …` | Inspect or manage session context and compaction |
 | `//agent [show|set]` | Inspect or select an adapter/configuration |
 | `//share PATH …` / `//unshare ID` | Grant or revoke resource access |
 | `//chroot PATH` | Set a confined session root after confirmation |

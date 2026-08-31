@@ -1978,6 +1978,7 @@ dependencies = [
  "xshell-adapters",
  "xshell-audit",
  "xshell-core",
+ "xshell-session",
 ]
 
 [[package]]
@@ -1987,6 +1988,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "xshell-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "uuid",
+ "xshell-core",
 ]
 
 [[package]]
