@@ -110,88 +110,93 @@ impl Completer for XshellHelper {
 /// Returns `Some((start, candidates))` when the line matches the pattern,
 /// otherwise `None` so the caller can fall through to generic control
 /// command completion.
-fn complete_model(
-    line: &str,
-    pos: usize,
-    profiles: &[String],
-) -> Option<(usize, Vec<Pair>)> {
+fn complete_model(line: &str, pos: usize, profiles: &[String]) -> Option<(usize, Vec<Pair>)> {
     let prefix = &line[..pos];
+    const COMMAND: &str = "//model";
+    let rest = prefix.strip_prefix(COMMAND)?;
 
-    // "//model" alone (possibly followed by whitespace)
-    if prefix == "//model" || prefix.starts_with("//model ") {
-        let after = &prefix["//model".len()..];
-        // Strip leading space(s) to find what the user typed after `//model `
-        let trimmed = after.trim_start();
-        let space_offset = after.len() - trimmed.len();
-
-        if trimmed.is_empty() {
-            // "//model " — offer subcommands + all profiles
-            let start = "//model".len();
-            let mut candidates: Vec<Pair> = MODEL_SUBCOMMANDS
-                .iter()
-                .map(|sub| Pair {
-                    display: format!("{sub} "),
-                    replacement: sub.to_string(),
-                })
-                .chain(profiles.iter().map(|p| Pair {
-                    display: p.clone(),
-                    replacement: p.clone(),
-                }))
-                .collect();
-            candidates.sort_by(|a, b| a.display.cmp(&b.display));
-            return Some((start, candidates));
-        }
-
-        // "//model use <prefix>" — offer only profile names
-        if let Some(rest) = trimmed.strip_prefix("use") {
-            let after_use = rest.trim_start();
-            let is_exact = trimmed == "use";
-            if is_exact || after_use.is_empty() || rest.starts_with(' ') {
-                let start = "//model use".len() + space_offset;
-                let candidates = profiles
-                    .iter()
-                    .filter(|p| is_exact || p.starts_with(after_use))
-                    .map(|p| Pair {
-                        display: p.clone(),
-                        replacement: p.clone(),
-                    })
-                    .collect();
-                return Some((start, candidates));
-            }
-            // If they typed "//model usefoo" (no space), treat as a
-            // subcommand match attempt — fall through to generic logic
-            // below which will find no match and return to caller.
-        }
-
-        // "//model list" or "//model show" — no further completion
-        if trimmed == "list" || trimmed == "show" {
-            return None;
-        }
-
-        // "//model <partial-subcommand-or-profile>"
-        let is_subcommand = trimmed == "use"
-            || trimmed.starts_with("use")
-            || trimmed == "list"
-            || trimmed.starts_with("list")
-            || trimmed == "show"
-            || trimmed.starts_with("show");
-
-        if !is_subcommand {
-            // Treat as a profile-name prefix
-            let start = "//model".len() + space_offset;
-            let candidates = profiles
-                .iter()
-                .filter(|p| p.starts_with(trimmed))
-                .map(|p| Pair {
-                    display: p.clone(),
-                    replacement: p.clone(),
-                })
-                .collect();
-            return Some((start, candidates));
-        }
+    // With no separator yet, preserve the command and insert one as part of
+    // every replacement. This makes `//model<Tab>` produce a valid command.
+    if rest.is_empty() {
+        return Some((COMMAND.len(), model_root_candidates("", profiles, " ")));
+    }
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
     }
 
-    None
+    let arguments = rest.trim_start_matches(char::is_whitespace);
+    let arguments_start = prefix.len() - arguments.len();
+    if arguments.is_empty() {
+        // Keep existing whitespace and insert after it.
+        return Some((pos, model_root_candidates("", profiles, "")));
+    }
+
+    let Some(first_separator) = arguments.find(char::is_whitespace) else {
+        return match arguments {
+            "list" | "show" => Some((pos, Vec::new())),
+            "use" => Some((pos, profile_candidates("", profiles, " "))),
+            partial => Some((
+                arguments_start,
+                model_root_candidates(partial, profiles, ""),
+            )),
+        };
+    };
+
+    let first_argument = &arguments[..first_separator];
+    if first_argument != "use" {
+        return Some((pos, Vec::new()));
+    }
+
+    let after_first = &arguments[first_separator..];
+    let profile_prefix = after_first.trim_start_matches(char::is_whitespace);
+    if profile_prefix.contains(char::is_whitespace) {
+        return Some((pos, Vec::new()));
+    }
+    let profile_start = prefix.len() - profile_prefix.len();
+    Some((
+        profile_start,
+        profile_candidates(profile_prefix, profiles, ""),
+    ))
+}
+
+fn model_root_candidates(prefix: &str, profiles: &[String], replacement_prefix: &str) -> Vec<Pair> {
+    let mut candidates: Vec<Pair> = MODEL_SUBCOMMANDS
+        .iter()
+        .filter(|subcommand| subcommand.starts_with(prefix))
+        .map(|subcommand| Pair {
+            display: if *subcommand == "use" {
+                "use ".into()
+            } else {
+                (*subcommand).into()
+            },
+            replacement: format!(
+                "{replacement_prefix}{subcommand}{}",
+                if *subcommand == "use" { " " } else { "" }
+            ),
+        })
+        .chain(
+            profiles
+                .iter()
+                .filter(|profile| profile.starts_with(prefix))
+                .map(|profile| Pair {
+                    display: profile.clone(),
+                    replacement: format!("{replacement_prefix}{profile}"),
+                }),
+        )
+        .collect();
+    candidates.sort_by(|left, right| left.display.cmp(&right.display));
+    candidates
+}
+
+fn profile_candidates(prefix: &str, profiles: &[String], replacement_prefix: &str) -> Vec<Pair> {
+    profiles
+        .iter()
+        .filter(|profile| profile.starts_with(prefix))
+        .map(|profile| Pair {
+            display: profile.clone(),
+            replacement: format!("{replacement_prefix}{profile}"),
+        })
+        .collect()
 }
 
 fn discover_commands() -> Vec<String> {
@@ -289,6 +294,10 @@ mod tests {
         )
     }
 
+    fn apply_completion(line: &str, pos: usize, start: usize, replacement: &str) -> String {
+        format!("{}{}{}", &line[..start], replacement, &line[pos..])
+    }
+
     #[test]
     fn completes_control_commands() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -307,14 +316,14 @@ mod tests {
         let history = DefaultHistory::new();
         let context = Context::new(&history);
         let (start, matches) = helper.complete("//model ", 8, &context).unwrap();
-        assert_eq!(start, 7);
+        assert_eq!(start, 8);
         let displays: Vec<_> = matches.iter().map(|p| p.display.as_str()).collect();
         assert!(displays.iter().any(|d| d.starts_with("list")));
         assert!(displays.iter().any(|d| d.starts_with("show")));
         assert!(displays.iter().any(|d| d.starts_with("use")));
-        assert!(displays.iter().any(|d| *d == "local-qwen"));
-        assert!(displays.iter().any(|d| *d == "openrouter-free"));
-        assert!(displays.iter().any(|d| *d == "openai"));
+        assert!(displays.contains(&"local-qwen"));
+        assert!(displays.contains(&"openrouter-free"));
+        assert!(displays.contains(&"openai"));
     }
 
     #[test]
@@ -347,5 +356,57 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].replacement, "local-qwen");
         assert_eq!(start, 8);
+    }
+
+    #[test]
+    fn model_completion_inserts_a_missing_space() {
+        let helper = helper_with_profiles();
+        let history = DefaultHistory::new();
+        let context = Context::new(&history);
+        let line = "//model";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        let profile = matches
+            .iter()
+            .find(|candidate| candidate.display == "local-qwen")
+            .unwrap();
+
+        assert_eq!(start, line.len());
+        assert_eq!(
+            apply_completion(line, line.len(), start, &profile.replacement),
+            "//model local-qwen"
+        );
+    }
+
+    #[test]
+    fn model_completion_preserves_an_existing_space() {
+        let helper = helper_with_profiles();
+        let history = DefaultHistory::new();
+        let context = Context::new(&history);
+        let line = "//model ";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        let profile = matches
+            .iter()
+            .find(|candidate| candidate.display == "local-qwen")
+            .unwrap();
+
+        assert_eq!(
+            apply_completion(line, line.len(), start, &profile.replacement),
+            "//model local-qwen"
+        );
+    }
+
+    #[test]
+    fn model_use_completion_inserts_a_missing_space() {
+        let helper = helper_with_profiles();
+        let history = DefaultHistory::new();
+        let context = Context::new(&history);
+        let line = "//model use";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        let profile = &matches[0];
+
+        assert_eq!(
+            apply_completion(line, line.len(), start, &profile.replacement),
+            "//model use local-qwen"
+        );
     }
 }
