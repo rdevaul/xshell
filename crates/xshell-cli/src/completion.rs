@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const CONTROL_COMMANDS: &[&str] = &[
-    "//agent", "//help", "//model", "//quit", "//status", "//tools",
+    "//agent", "//audit", "//help", "//model", "//quit", "//status", "//tools",
 ];
 
 pub struct XshellHelper {

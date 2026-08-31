@@ -1,8 +1,10 @@
+mod audit;
 mod completion;
 mod config;
 mod tools;
 
 use anyhow::{Context, Result, bail};
+use audit::AuditRuntime;
 use clap::{Parser, ValueEnum};
 use completion::XshellHelper;
 use config::{ActiveModel, ModelOverrides, Provider, XshellConfig};
@@ -14,6 +16,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
+use xshell_audit::AuditEvent;
 use xshell_core::{
     AgentEvent, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute,
     ToolCall, classify_input,
@@ -113,6 +116,17 @@ async fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
     let mut agent = build_adapter(&active_model)?;
+    let mut audit = AuditRuntime::start(&model_config.audit)?;
+    audit.append(AuditEvent::SessionStarted {
+        client_version: env!("CARGO_PKG_VERSION").into(),
+        cwd: cwd.display().to_string(),
+        model_profile: active_model_label(&active_model).into(),
+        provider: format!("{:?}", active_model.provider),
+        model: active_model.model.clone(),
+        endpoint: active_model.base_url.clone(),
+        system_prompt: args.system_prompt.clone(),
+        approval: args.approval.to_string(),
+    })?;
     let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
     let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
         .context("could not initialize terminal input")?;
@@ -122,9 +136,9 @@ async fn main() -> Result<()> {
     if config_path.exists() {
         println!("config: {}", config_path.display());
     }
-    print_status(agent.as_ref(), &active_model, &cwd, args.approval);
+    print_status(agent.as_ref(), &active_model, &audit, &cwd, args.approval);
 
-    loop {
+    let exit_reason = loop {
         let prompt = format!(
             "[local:default {} {}] › ",
             active_model_label(&active_model),
@@ -137,7 +151,7 @@ async fn main() -> Result<()> {
                 println!("^C");
                 continue;
             }
-            Err(ReadlineError::Eof) => break,
+            Err(ReadlineError::Eof) => break "eof",
             Err(error) => return Err(error).context("terminal input failed"),
         };
 
@@ -145,17 +159,40 @@ async fn main() -> Result<()> {
             let _ = editor.add_history_entry(line.as_str());
         }
 
-        match classify_input(&line) {
+        let route = classify_input(&line);
+        if !matches!(route, InputRoute::Empty) {
+            audit.append(AuditEvent::Input {
+                route: input_route_name(&route).into(),
+                text: line.clone(),
+            })?;
+        }
+
+        match route {
             InputRoute::Empty => {}
             InputRoute::Shell(command) => {
-                if let Err(error) = run_shell(&command, &mut cwd) {
-                    eprintln!("xshell: {error:#}");
+                let previous_cwd = cwd.clone();
+                let outcome = match run_shell(&command, &mut cwd) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        eprintln!("xshell: {error:#}");
+                        format!("error: {error:#}")
+                    }
+                };
+                if cwd != previous_cwd {
+                    audit.append(AuditEvent::WorkingDirectoryChanged {
+                        cwd: cwd.display().to_string(),
+                    })?;
                 }
+                audit.append(AuditEvent::ShellFinished {
+                    command,
+                    outcome,
+                    cwd: cwd.display().to_string(),
+                })?;
                 if let Some(helper) = editor.helper_mut() {
                     helper.set_cwd(cwd.clone());
                 }
             }
-            InputRoute::Control(ControlCommand::Quit) => break,
+            InputRoute::Control(ControlCommand::Quit) => break "quit",
             InputRoute::Control(ControlCommand::Model(model_args)) => {
                 if let Err(error) = handle_model_command(
                     model_args,
@@ -164,24 +201,49 @@ async fn main() -> Result<()> {
                     &mut agent,
                     &mut history,
                     &args.system_prompt,
+                    &mut audit,
                 ) {
                     eprintln!("xshell: {error:#}");
                 }
             }
-            InputRoute::Control(command) => {
-                handle_control(command, agent.as_ref(), &active_model, &cwd, args.approval)
-            }
+            InputRoute::Control(command) => handle_control(
+                command,
+                agent.as_ref(),
+                &active_model,
+                &audit,
+                &cwd,
+                args.approval,
+            ),
             InputRoute::Agent(message) => {
-                if let Err(error) =
-                    run_agent_turn(agent.as_mut(), &mut history, message, &cwd, args.approval).await
+                if let Err(error) = run_agent_turn(
+                    agent.as_mut(),
+                    &mut history,
+                    message,
+                    &cwd,
+                    args.approval,
+                    &mut audit,
+                )
+                .await
                 {
+                    let _ = audit.append(AuditEvent::AgentError {
+                        message: format!("{error:#}"),
+                    });
                     eprintln!("xshell agent error: {error:#}");
                 }
             }
         }
-    }
+    };
 
-    Ok(())
+    audit.close(exit_reason)
+}
+
+fn input_route_name(route: &InputRoute) -> &'static str {
+    match route {
+        InputRoute::Agent(_) => "agent",
+        InputRoute::Shell(_) => "shell",
+        InputRoute::Control(_) => "control",
+        InputRoute::Empty => "empty",
+    }
 }
 
 async fn run_agent_turn(
@@ -190,16 +252,17 @@ async fn run_agent_turn(
     message: String,
     cwd: &Path,
     approval: ApprovalMode,
+    audit: &mut AuditRuntime,
 ) -> Result<()> {
     let checkpoint = history.len();
     history.push(ChatMessage::user(message));
     let definitions = tools::definitions();
 
     for _ in 0..MAX_AGENT_STEPS {
-        let mut streamed_text = false;
+        let mut streamed_text = String::new();
         let mut emit = |event| match event {
             AgentEvent::TextDelta(delta) => {
-                streamed_text = true;
+                streamed_text.push_str(&delta);
                 print!("{delta}");
                 let _ = io::stdout().flush();
             }
@@ -216,14 +279,33 @@ async fn run_agent_turn(
         {
             Ok(response) => response,
             Err(error) => {
+                if !streamed_text.is_empty() {
+                    audit.append(AuditEvent::AgentResponse {
+                        content: streamed_text,
+                        tool_call_count: 0,
+                        partial: true,
+                    })?;
+                }
                 history.truncate(checkpoint);
                 return Err(error.into());
             }
         };
-        if streamed_text {
+        if !streamed_text.is_empty() {
             println!();
         }
 
+        audit.append(AuditEvent::AgentResponse {
+            content: response.content.clone(),
+            tool_call_count: response.tool_calls.len(),
+            partial: false,
+        })?;
+        for call in &response.tool_calls {
+            audit.append(AuditEvent::ToolRequested {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })?;
+        }
         history.push(ChatMessage::assistant_with_tools(
             response.content,
             response.tool_calls.clone(),
@@ -245,6 +327,10 @@ async fn run_agent_turn(
             } else {
                 ApprovalDecision::Deny
             };
+            audit.append(AuditEvent::ToolDecision {
+                call_id: call.id.clone(),
+                decision: approval_decision_name(decision).into(),
+            })?;
 
             if decision == ApprovalDecision::AbortTurn {
                 for skipped in &response.tool_calls[index..] {
@@ -252,6 +338,12 @@ async fn run_agent_turn(
                         skipped,
                         "tool execution aborted by user; agent turn stopped",
                     ));
+                }
+                for skipped in &response.tool_calls[index + 1..] {
+                    audit.append(AuditEvent::ToolDecision {
+                        call_id: skipped.id.clone(),
+                        decision: "skipped_after_abort".into(),
+                    })?;
                 }
                 println!("agent turn aborted; no remaining tools were executed\n");
                 return Ok(());
@@ -265,12 +357,25 @@ async fn run_agent_turn(
             } else {
                 "tool denied by user".into()
             };
+            audit.append(AuditEvent::ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                result: result.clone(),
+            })?;
             print_tool_result(&result);
             history.push(ChatMessage::tool_result(call, result));
         }
     }
 
     bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
+}
+
+fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::Approve => "approve",
+        ApprovalDecision::Deny => "deny",
+        ApprovalDecision::AbortTurn => "abort_turn",
+    }
 }
 
 fn confirm_tool(call: &ToolCall) -> Result<ApprovalDecision> {
@@ -350,6 +455,7 @@ fn handle_model_command(
     agent: &mut Box<dyn AgentAdapter>,
     history: &mut Vec<ChatMessage>,
     system_prompt: &str,
+    audit: &mut AuditRuntime,
 ) -> Result<()> {
     if args.is_empty() || args == ["show"] {
         print_model(active);
@@ -365,7 +471,7 @@ fn handle_model_command(
         [command, name] if command == "use" => name,
         _ => bail!("usage: //model [show|list|PROFILE] or //model use PROFILE"),
     };
-    switch_model_profile(name, config, active, agent, history, system_prompt)
+    switch_model_profile(name, config, active, agent, history, system_prompt, audit)
 }
 
 fn switch_model_profile(
@@ -375,6 +481,7 @@ fn switch_model_profile(
     agent: &mut Box<dyn AgentAdapter>,
     history: &mut Vec<ChatMessage>,
     system_prompt: &str,
+    audit: &mut AuditRuntime,
 ) -> Result<()> {
     let next = config.resolve_profile(name)?;
     if next == *active {
@@ -383,6 +490,10 @@ fn switch_model_profile(
     }
 
     let next_agent = build_adapter(&next)?;
+    audit.append(AuditEvent::ModelSwitched {
+        profile: name.into(),
+        model: next.model.clone(),
+    })?;
     *agent = next_agent;
     *active = next;
     history.clear();
@@ -436,6 +547,7 @@ fn handle_control(
     command: ControlCommand,
     agent: &dyn AgentAdapter,
     active_model: &ActiveModel,
+    audit: &AuditRuntime,
     cwd: &Path,
     approval: ApprovalMode,
 ) {
@@ -449,6 +561,7 @@ xshell input routes:
 control commands:
   //help            show this help
   //status          show local session state
+  //audit           show audit session state
   //model           show the active model profile
   //model list      list configured model profiles
   //model NAME      switch profiles and start a fresh conversation
@@ -456,7 +569,13 @@ control commands:
   //tools            show tools exposed to the active agent
   //quit             exit xshell"
         ),
-        ControlCommand::Status => print_status(agent, active_model, cwd, approval),
+        ControlCommand::Status => print_status(agent, active_model, audit, cwd, approval),
+        ControlCommand::Audit(args) if args.is_empty() || args == ["status"] => {
+            print_audit_status(audit)
+        }
+        ControlCommand::Audit(args) => {
+            eprintln!("xshell: unsupported //audit arguments {args:?}; try //audit status")
+        }
         ControlCommand::Tools => {
             for tool in tools::definitions() {
                 println!("{} — {}", tool.name, tool.description);
@@ -478,6 +597,7 @@ control commands:
 fn print_status(
     agent: &dyn AgentAdapter,
     active_model: &ActiveModel,
+    audit: &AuditRuntime,
     cwd: &Path,
     approval: ApprovalMode,
 ) {
@@ -489,6 +609,20 @@ fn print_status(
     println!("model: {}", descriptor.model);
     println!("capabilities: {}", descriptor.capabilities.join(", "));
     println!("approval mode: auto-read within cwd; {}", approval);
+    print_audit_status(audit);
+}
+
+fn print_audit_status(audit: &AuditRuntime) {
+    match audit.session_id() {
+        Some(session_id) => {
+            println!("audit session: {session_id}");
+            println!(
+                "audit signing key: {}",
+                audit.signing_key_id().unwrap_or("unknown")
+            );
+        }
+        None => println!("audit: disabled"),
+    }
 }
 
 fn print_agent(agent: &dyn AgentAdapter) {
@@ -498,9 +632,9 @@ fn print_agent(agent: &dyn AgentAdapter) {
     println!("capabilities: {}", descriptor.capabilities.join(", "));
 }
 
-fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<()> {
+fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<String> {
     if command.trim().is_empty() {
-        return Ok(());
+        return Ok("empty command".into());
     }
 
     let words = shell_words::split(command).context("could not parse shell command")?;
@@ -520,7 +654,7 @@ fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<()> {
         *cwd = next
             .canonicalize()
             .with_context(|| format!("cannot cd to {}", next.display()))?;
-        return Ok(());
+        return Ok("working directory changed".into());
     }
 
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -533,7 +667,7 @@ fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<()> {
     if !status.success() {
         eprintln!("xshell: command exited with {status}");
     }
-    Ok(())
+    Ok(format!("exit status: {status}"))
 }
 
 fn home_dir() -> Result<PathBuf> {

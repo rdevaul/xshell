@@ -135,7 +135,7 @@ The system separates three independent grants:
 | Resource access | Read/write access to explicitly shared paths and artifacts |
 | Agent authority | Tools, shell execution, network use, install permission, and credential use |
 
-Default policy is read-oriented and confirmation-based. Irreversible or broad actions—including deletion, package installation, service installation, modifying shared resources, credential use, or `//chroot`—require explicit confirmation. Each session maintains a tamper-evident-at-rest audit record of control commands, grants, agent tool requests, approvals, and artifact provenance.
+Default policy is read-oriented and confirmation-based. Irreversible or broad actions—including deletion, package installation, service installation, modifying shared resources, credential use, or `//chroot`—require explicit confirmation. Each session maintains an audit record of inputs, model interactions, tool requests, approvals, results, and artifact provenance. Records are written by a privilege-separated service, hash-chained, and periodically signed. Checkpoints include blinded commitments that can later be submitted to federated or public witnesses. See [the audit design](docs/auditing.md) for the trust boundary and current capture limitations.
 
 Secrets are not inserted into agent context by default. SSH agent forwarding is opt-in per connection and visibly indicated. Remote agents receive only artifacts and paths permitted by their session policy.
 
