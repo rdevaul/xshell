@@ -1,0 +1,19 @@
+# Copy this file to ~/.config/xshell/config.toml or pass --config PATH.
+default_model = "local-qwen"
+
+[models.local-qwen]
+provider = "ollama"
+model = "qwen3:8b"
+base_url = "http://127.0.0.1:11434"
+
+[models.openrouter-free]
+provider = "openai"
+model = "openrouter/free"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[models.openai]
+provider = "openai"
+model = "YOUR_OPENAI_MODEL"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
