@@ -17,6 +17,7 @@ The current prototype supports:
 - cwd-confined `read_file` and `list_directory` tools;
 - approval-gated `run_shell` calls with timeout and output limits;
 - tab completion for executables, paths, and `//` commands;
+- named model profiles with live switching via `//model`;
 - persistent cwd changes through `$cd`.
 
 Persistent daemons, SSH sessions, artifact rendering, and yapCAD integration
@@ -52,6 +53,47 @@ cargo run -p xshell-cli -- \
   --api-key-env OPENAI_API_KEY
 ```
 
+## Model profiles and OpenRouter
+
+Copy the example configuration, then edit its models to suit the providers you
+use:
+
+```sh
+mkdir -p ~/.config/xshell
+cp config.example.toml ~/.config/xshell/config.toml
+```
+
+The example includes local Ollama, OpenRouter, and OpenAI-compatible profiles.
+API keys are never stored in the configuration: each profile names the
+environment variable from which xshell should read its key. `api_key_env` must
+contain the literal variable name (for example, `OPENROUTER_API_KEY`), never the
+key itself. For OpenRouter:
+
+```sh
+export OPENROUTER_API_KEY='your-key-here'
+cargo run -p xshell-cli -- --profile openrouter-free
+```
+
+Model and status output reports only whether credentials are set; it never
+prints the environment variable's name or value. If a configured credential is
+missing, xshell stops before sending a request rather than making an anonymous
+request that will fail at the provider.
+
+You can also try OpenRouter without creating a configuration file:
+
+```sh
+export OPENROUTER_API_KEY='your-key-here'
+cargo run -p xshell-cli -- \
+  --provider openai \
+  --base-url https://openrouter.ai/api/v1 \
+  --model openrouter/free \
+  --api-key-env OPENROUTER_API_KEY
+```
+
+`openrouter/free` is convenient for a connectivity test, but the model selected
+by OpenRouter may not support tools. Configure a specific OpenRouter model that
+supports tool calling when using xshell's agent tools.
+
 Within xshell:
 
 ```text
@@ -59,6 +101,9 @@ Explain this project                 # agent message
 $git status --short                  # ordinary shell command
 $cd crates/xshell-core               # persistently change xshell's cwd
 //status                              # inspect the active session
+//model                               # inspect the active model profile
+//model list                          # list configured profiles
+//model openrouter-free               # switch profile and clear chat history
 //tools                               # inspect tools exposed to the agent
 //help                                # list control commands
 //quit                                # exit
@@ -67,6 +112,11 @@ $cd crates/xshell-core               # persistently change xshell's cwd
 Press Tab after `$` to complete commands from `PATH` or filesystem paths.
 Completion intentionally provides a portable baseline rather than loading the
 user's complete zsh/bash plugin and completion environment.
+
+Switching model profiles deliberately clears the conversation history. This
+prevents context given to a local model from being sent to a cloud provider
+without an explicit new message. CLI flags and their corresponding environment
+variables override values in the startup profile.
 
 ## Tool safety
 

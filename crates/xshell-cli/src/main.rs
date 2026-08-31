@@ -1,9 +1,11 @@
 mod completion;
+mod config;
 mod tools;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use completion::XshellHelper;
+use config::{ActiveModel, ModelOverrides, Provider, XshellConfig};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -20,12 +22,6 @@ use xshell_core::{
 /// Maximum number of agent tool-call steps per turn before the loop
 /// aborts. Kept bounded so a misbehaving model cannot loop forever.
 const MAX_AGENT_STEPS: usize = 64;
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Provider {
-    Ollama,
-    Openai,
-}
 
 /// Approval policy for tools that require user confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -65,17 +61,23 @@ fn resolve_approval(mode: ApprovalMode, gated: bool) -> bool {
 #[derive(Debug, Parser)]
 #[command(version, about = "An agent-first, network-aware interactive shell")]
 struct Args {
-    #[arg(long, env = "XSHELL_PROVIDER", value_enum, default_value = "ollama")]
-    provider: Provider,
+    #[arg(long, env = "XSHELL_CONFIG")]
+    config: Option<PathBuf>,
 
-    #[arg(long, env = "XSHELL_MODEL", default_value = "qwen3:8b")]
-    model: String,
+    #[arg(long, env = "XSHELL_PROFILE")]
+    profile: Option<String>,
+
+    #[arg(long, env = "XSHELL_PROVIDER", value_enum)]
+    provider: Option<Provider>,
+
+    #[arg(long, env = "XSHELL_MODEL")]
+    model: Option<String>,
 
     #[arg(long, env = "XSHELL_BASE_URL")]
     base_url: Option<String>,
 
-    #[arg(long, env = "XSHELL_API_KEY_ENV", default_value = "OPENAI_API_KEY")]
-    api_key_env: String,
+    #[arg(long, env = "XSHELL_API_KEY_ENV")]
+    api_key_env: Option<String>,
 
     #[arg(long, env = "XSHELL_SYSTEM_PROMPT", default_value = DEFAULT_SYSTEM_PROMPT)]
     system_prompt: String,
@@ -96,24 +98,36 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let (model_config, config_path) = XshellConfig::load(args.config.as_deref())?;
+    let mut active_model = model_config.resolve_startup(
+        args.profile.as_deref(),
+        ModelOverrides {
+            provider: args.provider,
+            model: args.model.clone(),
+            base_url: args.base_url.clone(),
+            api_key_env: args.api_key_env.clone(),
+        },
+    )?;
     let mut cwd = args
         .cwd
         .canonicalize()
         .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
-    let mut agent = build_adapter(&args);
+    let mut agent = build_adapter(&active_model)?;
     let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
     let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
         .context("could not initialize terminal input")?;
     editor.set_helper(Some(XshellHelper::new(cwd.clone())));
 
     println!("xshell local prototype — //help for commands; //quit or Ctrl-D to exit");
-    print_status(agent.as_ref(), &cwd, args.approval);
+    if config_path.exists() {
+        println!("config: {}", config_path.display());
+    }
+    print_status(agent.as_ref(), &active_model, &cwd, args.approval);
 
     loop {
-        let descriptor = agent.descriptor();
         let prompt = format!(
             "[local:default {} {}] › ",
-            descriptor.id,
+            active_model_label(&active_model),
             compact_path(&cwd)
         );
 
@@ -142,8 +156,20 @@ async fn main() -> Result<()> {
                 }
             }
             InputRoute::Control(ControlCommand::Quit) => break,
+            InputRoute::Control(ControlCommand::Model(model_args)) => {
+                if let Err(error) = handle_model_command(
+                    model_args,
+                    &model_config,
+                    &mut active_model,
+                    &mut agent,
+                    &mut history,
+                    &args.system_prompt,
+                ) {
+                    eprintln!("xshell: {error:#}");
+                }
+            }
             InputRoute::Control(command) => {
-                handle_control(command, agent.as_ref(), &cwd, args.approval)
+                handle_control(command, agent.as_ref(), &active_model, &cwd, args.approval)
             }
             InputRoute::Agent(message) => {
                 if let Err(error) =
@@ -292,23 +318,124 @@ fn floor_char_boundary(value: &str, mut index: usize) -> usize {
     index
 }
 
-fn build_adapter(args: &Args) -> Box<dyn AgentAdapter> {
-    match args.provider {
-        Provider::Ollama => Box::new(OllamaAdapter::new(
-            args.base_url.as_deref().unwrap_or("http://127.0.0.1:11434"),
-            &args.model,
-        )),
+fn build_adapter(active: &ActiveModel) -> Result<Box<dyn AgentAdapter>> {
+    let adapter: Box<dyn AgentAdapter> = match active.provider {
+        Provider::Ollama => Box::new(OllamaAdapter::new(&active.base_url, &active.model)),
         Provider::Openai => Box::new(OpenAiCompatibleAdapter::new(
-            args.base_url.as_deref().unwrap_or("https://api.openai.com"),
-            &args.model,
-            env::var(&args.api_key_env).ok(),
+            &active.base_url,
+            &active.model,
+            resolve_api_key(active)?,
         )),
+    };
+    Ok(adapter)
+}
+
+fn resolve_api_key(active: &ActiveModel) -> Result<Option<String>> {
+    let Some(variable) = &active.api_key_env else {
+        return Ok(None);
+    };
+    let value = env::var(variable).context(
+        "the configured credential environment variable is not set or is not valid Unicode",
+    )?;
+    if value.is_empty() {
+        bail!("the configured credential environment variable is empty");
     }
+    Ok(Some(value))
+}
+
+fn handle_model_command(
+    args: Vec<String>,
+    config: &XshellConfig,
+    active: &mut ActiveModel,
+    agent: &mut Box<dyn AgentAdapter>,
+    history: &mut Vec<ChatMessage>,
+    system_prompt: &str,
+) -> Result<()> {
+    if args.is_empty() || args == ["show"] {
+        print_model(active);
+        return Ok(());
+    }
+    if args == ["list"] {
+        print_model_profiles(config, active);
+        return Ok(());
+    }
+
+    let name = match args.as_slice() {
+        [name] => name,
+        [command, name] if command == "use" => name,
+        _ => bail!("usage: //model [show|list|PROFILE] or //model use PROFILE"),
+    };
+    switch_model_profile(name, config, active, agent, history, system_prompt)
+}
+
+fn switch_model_profile(
+    name: &str,
+    config: &XshellConfig,
+    active: &mut ActiveModel,
+    agent: &mut Box<dyn AgentAdapter>,
+    history: &mut Vec<ChatMessage>,
+    system_prompt: &str,
+) -> Result<()> {
+    let next = config.resolve_profile(name)?;
+    if next == *active {
+        println!("model profile {name:?} is already active");
+        return Ok(());
+    }
+
+    let next_agent = build_adapter(&next)?;
+    *agent = next_agent;
+    *active = next;
+    history.clear();
+    history.push(ChatMessage::system(system_prompt));
+    println!("switched to model profile {name:?}; conversation history was cleared");
+    print_model(active);
+    Ok(())
+}
+
+fn print_model_profiles(config: &XshellConfig, active: &ActiveModel) {
+    if config.models.is_empty() {
+        println!("no named model profiles are configured");
+        return;
+    }
+    for (name, profile) in &config.models {
+        let marker = if active.profile_name.as_deref() == Some(name) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "{marker} {name} — {:?} / {}",
+            profile.provider, profile.model
+        );
+    }
+}
+
+fn print_model(active: &ActiveModel) {
+    println!(
+        "profile: {}",
+        active.profile_name.as_deref().unwrap_or("(command-line)")
+    );
+    println!("provider: {:?}", active.provider);
+    println!("model: {}", active.model);
+    println!("endpoint: {}", active.base_url);
+    if active.provider == Provider::Openai {
+        let credential_status = match active.api_key_env.as_deref() {
+            Some(variable) if env::var_os(variable).is_some() => "set",
+            Some(_) => "missing",
+            None => "not configured",
+        };
+        println!("credentials: {credential_status}");
+    }
+}
+
+fn active_model_label(active: &ActiveModel) -> &str {
+    active.profile_name.as_deref().unwrap_or(&active.model)
 }
 
 fn handle_control(
     command: ControlCommand,
     agent: &dyn AgentAdapter,
+    active_model: &ActiveModel,
     cwd: &Path,
     approval: ApprovalMode,
 ) {
@@ -322,11 +449,14 @@ xshell input routes:
 control commands:
   //help            show this help
   //status          show local session state
+  //model           show the active model profile
+  //model list      list configured model profiles
+  //model NAME      switch profiles and start a fresh conversation
   //agent            show active agent capabilities
   //tools            show tools exposed to the active agent
   //quit             exit xshell"
         ),
-        ControlCommand::Status => print_status(agent, cwd, approval),
+        ControlCommand::Status => print_status(agent, active_model, cwd, approval),
         ControlCommand::Tools => {
             for tool in tools::definitions() {
                 println!("{} — {}", tool.name, tool.description);
@@ -340,15 +470,22 @@ control commands:
         ControlCommand::Unknown { name, .. } => {
             eprintln!("xshell: unknown control command //{name}; try //help")
         }
+        ControlCommand::Model(_) => unreachable!("model is handled by the REPL"),
         ControlCommand::Quit => unreachable!("quit is handled by the REPL"),
     }
 }
 
-fn print_status(agent: &dyn AgentAdapter, cwd: &Path, approval: ApprovalMode) {
+fn print_status(
+    agent: &dyn AgentAdapter,
+    active_model: &ActiveModel,
+    cwd: &Path,
+    approval: ApprovalMode,
+) {
     let descriptor = agent.descriptor();
     println!("session: local:default");
     println!("cwd: {}", cwd.display());
     println!("agent: {} ({})", descriptor.display_name, descriptor.id);
+    println!("profile: {}", active_model_label(active_model));
     println!("model: {}", descriptor.model);
     println!("capabilities: {}", descriptor.capabilities.join(", "));
     println!("approval mode: auto-read within cwd; {}", approval);
