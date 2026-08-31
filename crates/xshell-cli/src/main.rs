@@ -25,6 +25,34 @@ enum Provider {
     Openai,
 }
 
+/// Approval policy for tools that require user confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ApprovalMode {
+    /// Prompt before shell execution.
+    Ask,
+    /// Run all tools without prompting.
+    Auto,
+    /// Deny shell execution while allowing read-only tools.
+    Off,
+}
+
+impl std::fmt::Display for ApprovalMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Ask => "ask before shell execution",
+            Self::Auto => "auto-run all tools",
+            Self::Off => "deny shell execution",
+        })
+    }
+}
+
+fn resolve_approval(mode: ApprovalMode, gated: bool) -> bool {
+    match mode {
+        ApprovalMode::Ask | ApprovalMode::Off => !gated,
+        ApprovalMode::Auto => true,
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about = "An agent-first, network-aware interactive shell")]
 struct Args {
@@ -45,6 +73,15 @@ struct Args {
 
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
+
+    #[arg(
+        long,
+        env = "XSHELL_APPROVAL",
+        value_enum,
+        default_value = "ask",
+        help = "Approval policy: ask (prompt, default), auto (run all), off (deny shell)"
+    )]
+    approval: ApprovalMode,
 }
 
 #[tokio::main]
@@ -61,7 +98,7 @@ async fn main() -> Result<()> {
     editor.set_helper(Some(XshellHelper::new(cwd.clone())));
 
     println!("xshell local prototype — //help for commands; //quit or Ctrl-D to exit");
-    print_status(agent.as_ref(), &cwd);
+    print_status(agent.as_ref(), &cwd, args.approval);
 
     loop {
         let descriptor = agent.descriptor();
@@ -96,10 +133,12 @@ async fn main() -> Result<()> {
                 }
             }
             InputRoute::Control(ControlCommand::Quit) => break,
-            InputRoute::Control(command) => handle_control(command, agent.as_ref(), &cwd),
+            InputRoute::Control(command) => {
+                handle_control(command, agent.as_ref(), &cwd, args.approval)
+            }
             InputRoute::Agent(message) => {
                 if let Err(error) =
-                    run_agent_turn(agent.as_mut(), &mut history, message, &cwd).await
+                    run_agent_turn(agent.as_mut(), &mut history, message, &cwd, args.approval).await
                 {
                     eprintln!("xshell agent error: {error:#}");
                 }
@@ -115,6 +154,7 @@ async fn run_agent_turn(
     history: &mut Vec<ChatMessage>,
     message: String,
     cwd: &Path,
+    approval: ApprovalMode,
 ) -> Result<()> {
     let checkpoint = history.len();
     history.push(ChatMessage::user(message));
@@ -160,7 +200,11 @@ async fn run_agent_turn(
 
         for call in response.tool_calls {
             println!("\nagent requests: {}", tools::summary(&call));
-            let approved = !tools::requires_approval(&call) || confirm_tool(&call)?;
+            // Approval policy: `auto` runs every tool, `off` denies
+            // gated (shell) tools, and `ask` (default) prompts for them.
+            let gated = tools::requires_approval(&call);
+            let approved = resolve_approval(approval, gated)
+                || (approval == ApprovalMode::Ask && gated && confirm_tool(&call)?);
             let result = if approved {
                 if !tools::requires_approval(&call) {
                     println!("policy: allowed read-only tool within {}", cwd.display());
@@ -222,7 +266,12 @@ fn build_adapter(args: &Args) -> Box<dyn AgentAdapter> {
     }
 }
 
-fn handle_control(command: ControlCommand, agent: &dyn AgentAdapter, cwd: &Path) {
+fn handle_control(
+    command: ControlCommand,
+    agent: &dyn AgentAdapter,
+    cwd: &Path,
+    approval: ApprovalMode,
+) {
     match command {
         ControlCommand::Help => println!(
             "\
@@ -237,7 +286,7 @@ control commands:
   //tools            show tools exposed to the active agent
   //quit             exit xshell"
         ),
-        ControlCommand::Status => print_status(agent, cwd),
+        ControlCommand::Status => print_status(agent, cwd, approval),
         ControlCommand::Tools => {
             for tool in tools::definitions() {
                 println!("{} — {}", tool.name, tool.description);
@@ -255,14 +304,14 @@ control commands:
     }
 }
 
-fn print_status(agent: &dyn AgentAdapter, cwd: &Path) {
+fn print_status(agent: &dyn AgentAdapter, cwd: &Path, approval: ApprovalMode) {
     let descriptor = agent.descriptor();
     println!("session: local:default");
     println!("cwd: {}", cwd.display());
     println!("agent: {} ({})", descriptor.display_name, descriptor.id);
     println!("model: {}", descriptor.model);
     println!("capabilities: {}", descriptor.capabilities.join(", "));
-    println!("approval mode: auto-read within cwd; ask before shell execution");
+    println!("approval mode: auto-read within cwd; {}", approval);
 }
 
 fn print_agent(agent: &dyn AgentAdapter) {
@@ -343,5 +392,32 @@ mod tests {
     fn compact_path_leaves_non_home_paths_alone() {
         let path = Path::new("/not-the-home-directory/project");
         assert_eq!(compact_path(path), path.display().to_string());
+    }
+
+    #[test]
+    fn approval_modes_parse() {
+        assert_eq!(
+            ApprovalMode::from_str("ask", false).unwrap(),
+            ApprovalMode::Ask
+        );
+        assert_eq!(
+            ApprovalMode::from_str("auto", false).unwrap(),
+            ApprovalMode::Auto
+        );
+        assert_eq!(
+            ApprovalMode::from_str("off", false).unwrap(),
+            ApprovalMode::Off
+        );
+        assert!(ApprovalMode::from_str("yolo", false).is_err());
+    }
+
+    #[test]
+    fn approval_policy_handles_gated_and_read_only_tools() {
+        assert!(!resolve_approval(ApprovalMode::Ask, true));
+        assert!(resolve_approval(ApprovalMode::Ask, false));
+        assert!(resolve_approval(ApprovalMode::Auto, true));
+        assert!(resolve_approval(ApprovalMode::Auto, false));
+        assert!(!resolve_approval(ApprovalMode::Off, true));
+        assert!(resolve_approval(ApprovalMode::Off, false));
     }
 }
