@@ -18,6 +18,7 @@ The current prototype supports:
 - approval-gated `run_shell` calls with timeout and output limits;
 - tab completion for executables, paths, and `//` commands;
 - named model profiles with live switching via `//model`;
+- optional fail-closed audit logging through a separate signing daemon;
 - persistent cwd changes through `$cd`.
 
 Persistent daemons, SSH sessions, artifact rendering, and yapCAD integration
@@ -117,6 +118,30 @@ Switching model profiles deliberately clears the conversation history. This
 prevents context given to a local model from being sent to a cloud provider
 without an explicit new message. CLI flags and their corresponding environment
 variables override values in the startup profile.
+
+## Audit logging
+
+The audit service records xshell interactions in hash-chained JSONL logs and
+creates periodic and final Ed25519-signed checkpoints. Each checkpoint includes
+a blinded commitment intended for future peer federation or public timestamp
+anchoring.
+
+For a local functional test, enable the `[audit]` section in
+`config.example.toml`, then start the daemon before xshell:
+
+```sh
+cargo run -p xshell-audit --bin xshell-auditd -- \
+  --directory /tmp/xshell-audit \
+  --socket /tmp/xshell-audit.sock
+
+cargo run -p xshell-cli -- --config config.example.toml
+```
+
+This same-user development setup is not protected from shell commands. A
+tamper-resistant installation must run the daemon under a dedicated OS account
+with an audit directory inaccessible to xshell and its child processes. See
+[the audit design and deployment notes](docs/auditing.md), including the
+current stdout/stderr capture limitation and example launchd/systemd units.
 
 ## Tool safety
 

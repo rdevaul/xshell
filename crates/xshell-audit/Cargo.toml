@@ -1,0 +1,31 @@
+[package]
+name = "xshell-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xshell-auditd"
+path = "src/bin/xshell-auditd.rs"
+
+[[bin]]
+name = "xshell-audit-verify"
+path = "src/bin/xshell-audit-verify.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+libc.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml = "0.9"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.21"

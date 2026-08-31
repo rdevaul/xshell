@@ -18,6 +18,7 @@ pub enum InputRoute {
 pub enum ControlCommand {
     Help,
     Status,
+    Audit(Vec<String>),
     Tools,
     Model(Vec<String>),
     Agent(Vec<String>),
@@ -52,6 +53,7 @@ fn parse_control(input: &str) -> ControlCommand {
     match name {
         "help" => ControlCommand::Help,
         "status" => ControlCommand::Status,
+        "audit" => ControlCommand::Audit(args),
         "tools" => ControlCommand::Tools,
         "model" => ControlCommand::Model(args),
         "agent" => ControlCommand::Agent(args),
@@ -245,6 +247,14 @@ mod tests {
         assert_eq!(
             classify_input("//model openrouter-free"),
             InputRoute::Control(ControlCommand::Model(vec!["openrouter-free".into()]))
+        );
+    }
+
+    #[test]
+    fn parses_audit_control_command() {
+        assert_eq!(
+            classify_input("//audit status"),
+            InputRoute::Control(ControlCommand::Audit(vec!["status".into()]))
         );
     }
 }

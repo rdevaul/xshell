@@ -1,6 +1,17 @@
 # Copy this file to ~/.config/xshell/config.toml or pass --config PATH.
 default_model = "local-qwen"
 
+# Auditing is disabled until xshell-auditd has been installed and started.
+# Development paths are shown here. A tamper-resistant deployment uses a
+# dedicated service account and protected paths under /var/db (macOS) or
+# /var/lib (Linux).
+[audit]
+enabled = false
+required = true
+socket = "/tmp/xshell-audit.sock"
+directory = "/tmp/xshell-audit"
+checkpoint_interval = 16
+
 [models.local-qwen]
 provider = "ollama"
 model = "qwen3:8b"

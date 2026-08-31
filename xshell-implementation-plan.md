@@ -20,7 +20,7 @@ xshell CLI/TUI
   ├─ input router ($ shell, // control, agent message)
   ├─ session client + multiplexer
   ├─ SSH transport
-  ├─ policy/approval engine + audit writer
+  ├─ policy/approval engine + audit client
   └─ artifact client
 
 xshelld (per host, per user)
@@ -29,6 +29,11 @@ xshelld (per host, per user)
   ├─ share/resource broker
   ├─ artifact staging and hashing
   └─ local RPC/SSH stdio endpoint
+
+xshell-auditd (dedicated service account)
+  ├─ durable append-only event writer
+  ├─ hash chain + signed checkpoints
+  └─ blinded witness commitments
 
 xshell-viewer (local)
   ├─ sandboxed renderer runners

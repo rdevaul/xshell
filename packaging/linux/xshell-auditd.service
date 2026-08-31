@@ -1,0 +1,26 @@
+[Unit]
+Description=xshell protected audit service
+After=local-fs.target
+
+[Service]
+Type=simple
+User=xshell-audit
+Group=xshell-audit
+RuntimeDirectory=xshell-audit
+RuntimeDirectoryMode=0750
+StateDirectory=xshell-audit
+StateDirectoryMode=0700
+UMask=0007
+ExecStart=/usr/local/bin/xshell-auditd --directory /var/lib/xshell-audit --socket /run/xshell-audit/audit.sock
+Restart=on-failure
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/xshell-audit /run/xshell-audit
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+

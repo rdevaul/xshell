@@ -20,4 +20,5 @@ shell-words = "1.1"
 toml = "0.9"
 tokio.workspace = true
 xshell-adapters = { path = "../xshell-adapters" }
+xshell-audit = { path = "../xshell-audit" }
 xshell-core = { path = "../xshell-core" }

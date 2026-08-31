@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use xshell_audit::AuditConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +26,8 @@ pub struct ModelProfile {
 #[serde(deny_unknown_fields)]
 pub struct XshellConfig {
     pub default_model: Option<String>,
+    #[serde(default)]
+    pub audit: AuditConfig,
     #[serde(default)]
     pub models: BTreeMap<String, ModelProfile>,
 }
