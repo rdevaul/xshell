@@ -128,9 +128,10 @@ async fn main() -> Result<()> {
         approval: args.approval.to_string(),
     })?;
     let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
+    let model_profiles: Vec<String> = model_config.models.keys().cloned().collect();
     let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
         .context("could not initialize terminal input")?;
-    editor.set_helper(Some(XshellHelper::new(cwd.clone())));
+    editor.set_helper(Some(XshellHelper::new(cwd.clone(), model_profiles)));
 
     println!("xshell local prototype — //help for commands; //quit or Ctrl-D to exit");
     if config_path.exists() {
