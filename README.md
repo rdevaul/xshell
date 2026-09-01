@@ -55,6 +55,10 @@ cargo run -p xshell-cli -- \
   --api-key-env OPENAI_API_KEY
 ```
 
+Prefix a command with `$` for a single shell input. Prefix it with `$$` to
+enter sticky shell mode: subsequent input lines begin with an editable `$`.
+Backspace over that `$` and submit plain text to return to agent input.
+
 ## Model profiles and OpenRouter
 
 Copy the example configuration, then edit its models to suit the providers you
@@ -171,6 +175,7 @@ run:
 //connect rich@mini.local --session cad
 //sessions
 //switch laptop:bees
+//switch local:default
 ```
 
 `//connect` invokes the system `ssh` command with PTY allocation disabled, so
@@ -178,10 +183,14 @@ the user's normal `~/.ssh/config`, agent, host-key policy, and authentication
 prompts apply. The remote command is `xshelld serve-stdio`; it opens no network
 port and proxies the versioned protocol to the remote user's Unix socket.
 Connected hosts remain available in the common session catalog and switcher.
+`local:NAME` always selects the session on the controller's Unix-socket host,
+regardless of that machine's configured host alias.
 Only sessions marked `fabric` are listed or attachable through this transport.
 If the selected name does not exist, xshell creates it in the remote user's
 home directory using the current model binding. Automatic remote installation
 and version negotiation beyond the protocol handshake are not implemented yet.
+Shell/path completion is currently suppressed for remote sessions until
+completion queries can be evaluated by the remote daemon.
 
 See [the session-fabric protocol and current boundary](docs/session-fabric.md).
 

@@ -10,6 +10,7 @@ actions without explaining the intended action and obtaining confirmation.";
 pub enum InputRoute {
     Agent(String),
     Shell(String),
+    StickyShell(String),
     Control(ControlCommand),
     Empty,
 }
@@ -40,6 +41,10 @@ pub fn classify_input(input: &str) -> InputRoute {
 
     if let Some(control) = trimmed.strip_prefix("//") {
         return InputRoute::Control(parse_control(control));
+    }
+
+    if let Some(shell) = trimmed.strip_prefix("$$") {
+        return InputRoute::StickyShell(shell.trim_start().to_owned());
     }
 
     if let Some(shell) = trimmed.strip_prefix('$') {
@@ -227,6 +232,10 @@ mod tests {
         assert_eq!(
             classify_input("$  git status --short"),
             InputRoute::Shell("git status --short".into())
+        );
+        assert_eq!(
+            classify_input("$$  git status --short"),
+            InputRoute::StickyShell("git status --short".into())
         );
     }
 

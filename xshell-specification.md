@@ -39,6 +39,7 @@ Input is classified before it is sent:
 |---|---|---|
 | Plain text | Send a message to the active session's agent. | `Render the current assembly and check for collisions.` |
 | `$…` | Execute the remainder in the configured shell, in the active session's working directory. | `$git status --short` |
+| `$$…` | Execute a shell command and enter sticky shell input; deleting the inserted `$` returns to agent input. | `$$git status --short` |
 | `//…` | Execute an xshell control-plane command. | `//connect rich@mini.local` |
 
 The prompt always displays the active session identity, its host connection state, and the current agent's approval mode. Shell output and agent messages are visibly distinct. An agent tool request is presented with its intended command, working directory, affected resources, and required approval.

@@ -155,11 +155,15 @@ impl SessionRuntime {
         if self.connection.is_none() {
             return Ok(Vec::new());
         }
-        Ok(self
-            .list()?
-            .into_iter()
-            .map(|session| format!("{}:{}", session.host_alias, session.name))
-            .collect())
+        let local_host_id = self.local_host_id().map(str::to_owned);
+        let mut names = Vec::new();
+        for session in self.list()? {
+            names.push(format!("{}:{}", session.host_alias, session.name));
+            if local_host_id.as_deref() == Some(session.host_id.as_str()) {
+                names.push(format!("local:{}", session.name));
+            }
+        }
+        Ok(names)
     }
 
     pub fn connect_ssh(
@@ -393,15 +397,29 @@ impl SessionRuntime {
     }
 
     fn resolve_target(&mut self, selector: &str) -> Result<(String, String)> {
+        let local_selector = selector.strip_prefix("local:");
+        let local_host_id = if local_selector.is_some() {
+            Some(
+                self.local_host_id()
+                    .context("no local xshelld connection is available")?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let matches = self
             .list()?
             .into_iter()
             .filter(|session| {
-                session.id == selector
-                    || session.name == selector
-                    || format!("{}:{}", session.host_alias, session.name) == selector
-                    || format!("{}/{}:{}", session.host_alias, session.user, session.name)
-                        == selector
+                if let (Some(name), Some(host_id)) = (local_selector, local_host_id.as_deref()) {
+                    session.host_id == host_id && session.name == name
+                } else {
+                    session.id == selector
+                        || session.name == selector
+                        || format!("{}:{}", session.host_alias, session.name) == selector
+                        || format!("{}/{}:{}", session.host_alias, session.user, session.name)
+                            == selector
+                }
             })
             .collect::<Vec<_>>();
         match matches.as_slice() {
@@ -411,6 +429,19 @@ impl SessionRuntime {
                 "session name {selector:?} is ambiguous; use HOST:SESSION"
             )),
         }
+    }
+
+    fn local_host_id(&self) -> Option<&str> {
+        self.connection
+            .as_ref()
+            .filter(|connection| matches!(&connection.endpoint, ConnectionEndpoint::Local(_)))
+            .map(|connection| connection.client.host_id())
+            .or_else(|| {
+                self.parked_connections
+                    .values()
+                    .find(|connection| matches!(&connection.endpoint, ConnectionEndpoint::Local(_)))
+                    .map(|connection| connection.client.host_id())
+            })
     }
 
     fn active_session_id(&self) -> Result<String> {
