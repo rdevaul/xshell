@@ -235,6 +235,15 @@ its inherited `PATH` and the active session cwd. It intentionally does not
 source native zsh/bash completion frameworks, startup scripts, aliases, or
 functions.
 
+Directly entered commands in local sessions run in a transient pseudoterminal
+when xshell is attached to a terminal. This supports terminal colors, pagers,
+and interactive line-oriented programs; input, output, terminal resizing, and
+terminal-generated signals are relayed byte-for-byte. Agent-requested tools
+remain noninteractive and pipe-backed. Remote session commands still use the
+daemon's noninteractive stream in this increment; remote PTY transport and
+persistent full-screen reattachment are subsequent milestones.
+See [the transient PTY design and trust boundary](docs/pty.md).
+
 See [the session-fabric protocol and current boundary](docs/session-fabric.md).
 
 ## Audit logging

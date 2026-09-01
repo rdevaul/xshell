@@ -96,10 +96,14 @@ Terminal UX will advance in this order:
    is explicitly requested. The first increment supplies safe block/inline
    rendering and fenced-code presentation; language-aware syntax highlighting
    remains the next rendering increment.
-3. **PTY-backed user shell commands.** Give directly entered `$` commands a
-   pseudoterminal while agent-requested tools remain noninteractive and
-   pipe-backed. Forward binary-safe output, input, resize, signals, and terminal
-   restoration. `cat file.json | jq | less` is the first acceptance case.
+3. **PTY-backed user shell commands (local transient PTY implemented).** Give
+   directly entered `$` commands a pseudoterminal while agent-requested tools
+   remain noninteractive and pipe-backed. Forward binary-safe output, input,
+   resize, signals, and terminal restoration. The initial
+   controller/local-host implementation provides this transient relay and
+   falls back to inherited stdio when redirected. Remote PTY protocol transport
+   remains to be implemented. `cat file.json | jq | less` is the first
+   acceptance case.
 4. **Persistent full-screen PTYs.** Preserve and reattach interactive PTYs,
    including redraw after reconnect. Truecolor, alternate screen, resize,
    bracketed paste, mouse input, signals, and an explicit terminal-escape trust

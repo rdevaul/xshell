@@ -112,7 +112,9 @@ but are not in the initial format.
 Direct `$` commands currently inherit the terminal's stdout and stderr. Their
 input and exit outcome are logged, but their byte-for-byte terminal output is
 not yet captured. Complete capture without breaking interactive terminal
-programs requires the planned PTY execution layer.
+programs requires daemon-owned PTY capture. The initial transient local PTY
+relay records the command and outcome but deliberately does not duplicate its
+mixed byte stream; see [the PTY trust boundary](pty.md).
 
 An unclean client or daemon crash leaves a verifiable hash chain but no final
 checkpoint. The verifier reports this explicitly rather than claiming the log

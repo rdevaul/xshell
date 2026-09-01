@@ -2023,6 +2023,7 @@ dependencies = [
  "xshell-audit",
  "xshell-core",
  "xshell-execution",
+ "xshell-pty",
  "xshell-session",
  "xshell-view",
 ]
@@ -2050,6 +2051,16 @@ dependencies = [
  "tokio",
  "xshell-adapters",
  "xshell-core",
+]
+
+[[package]]
+name = "xshell-pty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "nix",
+ "tempfile",
 ]
 
 [[package]]
