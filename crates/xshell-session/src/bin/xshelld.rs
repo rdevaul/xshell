@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::ffi::CStr;
 use std::fs;
@@ -23,20 +23,29 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
     about = "Local session execution and persistence service for xshell"
 )]
 struct Args {
-    #[arg(long)]
+    #[command(subcommand)]
+    command: Option<DaemonCommand>,
+
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     state_directory: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     host_alias: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     user: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Proxy the session protocol between stdin/stdout and the local daemon.
+    ServeStdio,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -47,7 +56,8 @@ struct ConfigFile {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let config = load_config(args.config.as_deref())?;
+    let config_path = resolve_config_path(args.config)?;
+    let config = load_config(config_path.as_deref())?;
     let state_directory = args
         .state_directory
         .or_else(|| config.resolved_state_directory())
@@ -56,6 +66,9 @@ fn main() -> Result<()> {
         .socket
         .or(config.socket)
         .unwrap_or_else(|| state_directory.join("xshelld.sock"));
+    if matches!(args.command, Some(DaemonCommand::ServeStdio)) {
+        return serve_stdio(&socket);
+    }
     let host_alias = args.host_alias.unwrap_or_else(system_hostname);
     let user = args.user.unwrap_or_else(system_user);
     let host_id = load_or_create_host_id(&state_directory)?;
@@ -96,6 +109,108 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    if let Some(path) = std::env::var_os("XSHELL_CONFIG") {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(home).join(".config/xshell/config.toml");
+    Ok(path.exists().then_some(path))
+}
+
+fn serve_stdio(socket: &Path) -> Result<()> {
+    let stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "cannot connect stdio transport to xshell session service at {}",
+            socket.display()
+        )
+    })?;
+    let mut daemon_reader = BufReader::new(stream.try_clone()?);
+    let mut daemon_writer = stream;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut client_reader = BufReader::new(stdin.lock());
+    let mut client_writer = stdout.lock();
+
+    while let Some(line) = read_request_line(&mut client_reader)? {
+        let request: ClientRequest =
+            serde_json::from_str(&line).context("invalid stdio request")?;
+        if let Some(response) =
+            reject_remote_request(&request, &mut daemon_reader, &mut daemon_writer)?
+        {
+            send(&mut client_writer, &response)?;
+            continue;
+        }
+
+        serde_json::to_writer(&mut daemon_writer, &request)?;
+        daemon_writer.write_all(b"\n")?;
+        daemon_writer.flush()?;
+        let response_line = read_request_line(&mut daemon_reader)?
+            .context("local session daemon closed the stdio proxy connection")?;
+        let mut response: ServerResponse =
+            serde_json::from_str(&response_line).context("invalid local daemon response")?;
+        if let ServerResponse::Catalog { sessions } = &mut response {
+            sessions.retain(|session| session.visibility == xshell_session::Visibility::Fabric);
+        }
+        send(&mut client_writer, &response)?;
+    }
+    Ok(())
+}
+
+fn reject_remote_request(
+    request: &ClientRequest,
+    daemon_reader: &mut BufReader<UnixStream>,
+    daemon_writer: &mut UnixStream,
+) -> Result<Option<ServerResponse>> {
+    if matches!(
+        request,
+        ClientRequest::Create { session }
+            if session.visibility == xshell_session::Visibility::HostOnly
+    ) {
+        return Ok(Some(remote_visibility_error()));
+    }
+    let selector = match request {
+        ClientRequest::Attach { selector, .. } | ClientRequest::Switch { selector, .. } => {
+            Some(selector.as_str())
+        }
+        ClientRequest::Close {
+            selector: Some(selector),
+        } => Some(selector.as_str()),
+        _ => None,
+    };
+    let Some(selector) = selector else {
+        return Ok(None);
+    };
+
+    serde_json::to_writer(&mut *daemon_writer, &ClientRequest::List)?;
+    daemon_writer.write_all(b"\n")?;
+    daemon_writer.flush()?;
+    let line = read_request_line(daemon_reader)?
+        .context("local session daemon closed during visibility check")?;
+    let response: ServerResponse = serde_json::from_str(&line)?;
+    let visible = matches!(
+        response,
+        ServerResponse::Catalog { sessions }
+            if sessions.iter().any(|session| {
+                session.visibility == xshell_session::Visibility::Fabric
+                    && (session.id == selector || session.name == selector)
+            })
+    );
+    Ok((!visible).then(remote_visibility_error))
+}
+
+fn remote_visibility_error() -> ServerResponse {
+    ServerResponse::Error {
+        code: "remote_session_not_visible".into(),
+        message: "session is unavailable through the remote transport".into(),
+    }
 }
 
 fn load_config(path: Option<&Path>) -> Result<SessionConfig> {
@@ -203,7 +318,15 @@ fn process_request(
             }
             Ok(ServerResponse::Catalog { sessions })
         }
-        ClientRequest::Create { session: creation } => {
+        ClientRequest::Create {
+            session: mut creation,
+        } => {
+            if creation.cwd == Path::new("~") {
+                let home = std::env::var_os("HOME").context("HOME is not set on session host")?;
+                creation.cwd = PathBuf::from(home)
+                    .canonicalize()
+                    .context("cannot resolve session host home directory")?;
+            }
             let session = registry
                 .lock()
                 .expect("session registry poisoned")
@@ -401,7 +524,7 @@ fn detach_session(
         .detach(client_id, session_id)
 }
 
-fn read_request_line(reader: &mut BufReader<UnixStream>) -> Result<Option<String>> {
+fn read_request_line(reader: &mut impl BufRead) -> Result<Option<String>> {
     let mut bytes = Vec::new();
     let count = reader
         .by_ref()
@@ -418,7 +541,7 @@ fn read_request_line(reader: &mut BufReader<UnixStream>) -> Result<Option<String
     ))
 }
 
-fn send(writer: &mut UnixStream, response: &ServerResponse) -> Result<()> {
+fn send(writer: &mut impl Write, response: &ServerResponse) -> Result<()> {
     serde_json::to_writer(&mut *writer, response)?;
     writer.write_all(b"\n")?;
     writer.flush().context("cannot flush session response")

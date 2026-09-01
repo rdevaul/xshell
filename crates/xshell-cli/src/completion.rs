@@ -13,6 +13,7 @@ const CONTROL_COMMANDS: &[&str] = &[
     "//agent",
     "//audit",
     "//close",
+    "//connect",
     "//detach",
     "//help",
     "//model",
@@ -29,6 +30,7 @@ const MODEL_SUBCOMMANDS: &[&str] = &["list", "show", "use"];
 
 pub struct XshellHelper {
     cwd: PathBuf,
+    shell_completion_enabled: bool,
     commands: Vec<String>,
     model_profiles: Vec<String>,
     session_names: Vec<String>,
@@ -38,6 +40,7 @@ impl XshellHelper {
     pub fn new(cwd: PathBuf, model_profiles: Vec<String>) -> Self {
         Self {
             cwd,
+            shell_completion_enabled: true,
             commands: discover_commands(),
             model_profiles,
             session_names: Vec::new(),
@@ -46,6 +49,10 @@ impl XshellHelper {
 
     pub fn set_cwd(&mut self, cwd: PathBuf) {
         self.cwd = cwd;
+    }
+
+    pub fn set_shell_completion_enabled(&mut self, enabled: bool) {
+        self.shell_completion_enabled = enabled;
     }
 
     #[allow(dead_code)]
@@ -105,6 +112,9 @@ impl Completer for XshellHelper {
 
         // --- Shell commands ---
         if !line[..pos].starts_with('$') {
+            return Ok((pos, Vec::new()));
+        }
+        if !self.shell_completion_enabled {
             return Ok((pos, Vec::new()));
         }
 
@@ -491,5 +501,16 @@ mod tests {
         assert_eq!(start, 9);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].replacement, "robot");
+    }
+
+    #[test]
+    fn remote_sessions_do_not_offer_local_shell_completions() {
+        let mut helper = helper_with_profiles();
+        helper.set_shell_completion_enabled(false);
+        let history = DefaultHistory::new();
+        let context = Context::new(&history);
+        let line = "$gi";
+        let (_, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert!(matches.is_empty());
     }
 }

@@ -22,6 +22,7 @@ pub enum ControlCommand {
     Tools,
     Model(Vec<String>),
     Agent(Vec<String>),
+    Connect(Vec<String>),
     Sessions,
     New(Vec<String>),
     Switch(Vec<String>),
@@ -62,6 +63,7 @@ fn parse_control(input: &str) -> ControlCommand {
         "tools" => ControlCommand::Tools,
         "model" => ControlCommand::Model(args),
         "agent" => ControlCommand::Agent(args),
+        "connect" => ControlCommand::Connect(args),
         "sessions" => ControlCommand::Sessions,
         "new" => ControlCommand::New(args),
         "switch" => ControlCommand::Switch(args),
@@ -270,6 +272,14 @@ mod tests {
 
     #[test]
     fn parses_session_control_commands() {
+        assert_eq!(
+            classify_input("//connect rich@mini.local --session cad"),
+            InputRoute::Control(ControlCommand::Connect(vec![
+                "rich@mini.local".into(),
+                "--session".into(),
+                "cad".into()
+            ]))
+        );
         assert_eq!(
             classify_input("//new bees --durable"),
             InputRoute::Control(ControlCommand::New(vec!["bees".into(), "--durable".into()]))

@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -8,8 +8,9 @@ use tempfile::TempDir;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 use xshell_session::{
-    ModelBinding, PersistenceMode, SessionActivity, SessionClient, SessionCreation,
-    SessionEventKind, TurnInput, Visibility,
+    AttachmentRole, ClientRequest, ModelBinding, PersistenceMode, SESSION_PROTOCOL_VERSION,
+    ServerResponse, SessionActivity, SessionClient, SessionCreation, SessionEventKind, TurnInput,
+    Visibility,
 };
 
 struct Daemon(Child);
@@ -39,6 +40,18 @@ fn connect_when_ready(socket: &Path) -> SessionClient {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("xshelld did not become ready at {}", socket.display());
+}
+
+fn send_request(writer: &mut impl Write, request: &ClientRequest) {
+    serde_json::to_writer(&mut *writer, request).unwrap();
+    writer.write_all(b"\n").unwrap();
+    writer.flush().unwrap();
+}
+
+fn receive_response(reader: &mut impl BufRead) -> ServerResponse {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
 }
 
 fn serve_sse(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
@@ -138,6 +151,107 @@ fn daemon_preserves_and_switches_named_sessions() {
     assert_eq!(restored.history, vec![ChatMessage::user("design a robot")]);
     reconnected.close(None).unwrap();
     assert_eq!(reconnected.list().unwrap().len(), 1);
+}
+
+#[test]
+fn stdio_transport_proxies_protocol_to_running_daemon() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .args(["--host-alias", "remote-test", "--user", "tester"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut readiness = connect_when_ready(&socket);
+    readiness
+        .create(SessionCreation {
+            name: "shared".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    readiness
+        .create(SessionCreation {
+            name: "private".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::HostOnly,
+            history: Vec::new(),
+        })
+        .unwrap();
+    drop(readiness);
+
+    let mut proxy = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["serve-stdio", "--socket", socket.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut writer = proxy.stdin.take().unwrap();
+    let mut reader = BufReader::new(proxy.stdout.take().unwrap());
+    send_request(&mut writer, &ClientRequest::open("stdio-test"));
+    match receive_response(&mut reader) {
+        ServerResponse::Opened {
+            protocol_version,
+            host_alias,
+            ..
+        } => {
+            assert_eq!(protocol_version, SESSION_PROTOCOL_VERSION);
+            assert_eq!(host_alias, "remote-test");
+        }
+        response => panic!("unexpected open response: {response:?}"),
+    }
+    send_request(&mut writer, &ClientRequest::List);
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Catalog { sessions }
+            if sessions.len() == 1 && sessions[0].name == "shared"
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::Attach {
+            selector: "private".into(),
+            role: AttachmentRole::Owner,
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Error { code, .. } if code == "remote_session_not_visible"
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::Create {
+            session: SessionCreation {
+                name: "remote-home".into(),
+                model: model("local"),
+                cwd: "~".into(),
+                persistence: PersistenceMode::Daemon,
+                visibility: Visibility::Fabric,
+                history: Vec::new(),
+            },
+        },
+    );
+    match receive_response(&mut reader) {
+        ServerResponse::Created { session } => assert_eq!(
+            session.descriptor.cwd,
+            Path::new(&std::env::var_os("HOME").unwrap())
+                .canonicalize()
+                .unwrap()
+        ),
+        response => panic!("unexpected create response: {response:?}"),
+    }
+    drop(writer);
+    assert!(proxy.wait().unwrap().success());
 }
 
 #[test]

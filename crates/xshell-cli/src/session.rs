@@ -9,10 +9,20 @@ use xshell_session::{
     SessionSnapshot, SessionStatus, TurnInput, Visibility,
 };
 
+struct HostConnection {
+    client: SessionClient,
+    endpoint: ConnectionEndpoint,
+}
+
+enum ConnectionEndpoint {
+    Local(PathBuf),
+    Ssh(String),
+}
+
 pub struct SessionRuntime {
-    client: Option<SessionClient>,
+    connection: Option<HostConnection>,
+    parked_connections: HashMap<String, HostConnection>,
     active: Option<SessionDescriptor>,
-    socket: Option<PathBuf>,
     navigation_history: Vec<String>,
     event_cursors: HashMap<String, u64>,
     active_turns: HashMap<String, Option<String>>,
@@ -61,9 +71,12 @@ impl SessionRuntime {
         let active_turns = HashMap::from([(snapshot.descriptor.id.clone(), active_turn)]);
         Ok((
             Self {
-                client: Some(client),
+                connection: Some(HostConnection {
+                    client,
+                    endpoint: ConnectionEndpoint::Local(socket),
+                }),
+                parked_connections: HashMap::new(),
                 active,
-                socket: Some(socket),
                 navigation_history: Vec::new(),
                 event_cursors,
                 active_turns,
@@ -74,9 +87,9 @@ impl SessionRuntime {
 
     pub fn disabled() -> Self {
         Self {
-            client: None,
+            connection: None,
+            parked_connections: HashMap::new(),
             active: None,
-            socket: None,
             navigation_history: Vec::new(),
             event_cursors: HashMap::new(),
             active_turns: HashMap::new(),
@@ -87,27 +100,123 @@ impl SessionRuntime {
         self.active.as_ref()
     }
 
-    pub fn socket(&self) -> Option<&Path> {
-        self.socket.as_deref()
+    pub fn service_label(&self) -> Option<String> {
+        match &self.connection.as_ref()?.endpoint {
+            ConnectionEndpoint::Local(socket) => Some(socket.display().to_string()),
+            ConnectionEndpoint::Ssh(destination) => Some(format!("ssh://{destination}")),
+        }
     }
 
     pub fn enabled(&self) -> bool {
-        self.client.is_some()
+        self.connection.is_some()
+    }
+
+    pub fn active_is_remote(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| matches!(&connection.endpoint, ConnectionEndpoint::Ssh(_)))
     }
 
     pub fn list(&mut self) -> Result<Vec<SessionDescriptor>> {
-        self.client_mut()?.list()
+        let mut sessions = Vec::new();
+        let active_error = match self.client_mut()?.list() {
+            Ok(catalog) => {
+                sessions.extend(catalog);
+                None
+            }
+            Err(error) => Some(error),
+        };
+        let host_ids = self.parked_connections.keys().cloned().collect::<Vec<_>>();
+        for host_id in host_ids {
+            let result = self
+                .parked_connections
+                .get_mut(&host_id)
+                .expect("parked host exists")
+                .client
+                .list();
+            match result {
+                Ok(catalog) => sessions.extend(catalog),
+                Err(error) => {
+                    eprintln!("xshell: dropping unavailable host connection: {error:#}");
+                    self.parked_connections.remove(&host_id);
+                }
+            }
+        }
+        if let Some(error) = active_error {
+            if sessions.is_empty() {
+                return Err(error);
+            }
+            eprintln!("xshell: active host connection is unavailable: {error:#}");
+        }
+        Ok(sessions)
     }
 
     pub fn session_names(&mut self) -> Result<Vec<String>> {
-        let Some(client) = self.client.as_mut() else {
+        if self.connection.is_none() {
             return Ok(Vec::new());
-        };
-        Ok(client
+        }
+        Ok(self
             .list()?
             .into_iter()
-            .map(|session| session.name)
+            .map(|session| format!("{}:{}", session.host_alias, session.name))
             .collect())
+    }
+
+    pub fn connect_ssh(
+        &mut self,
+        destination: &str,
+        requested_session: Option<&str>,
+        default_session: &str,
+        model: &ActiveModel,
+        system_prompt: &str,
+    ) -> Result<SessionSnapshot> {
+        let mut client = SessionClient::connect_ssh(destination, env!("CARGO_PKG_VERSION"))?;
+        let host_id = client.host_id().to_owned();
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.client.host_id() == host_id)
+            || self.parked_connections.contains_key(&host_id)
+        {
+            return Err(anyhow::anyhow!(
+                "host {} is already connected; use //switch {}:SESSION",
+                client.host_alias(),
+                client.host_alias()
+            ));
+        }
+
+        let session_name = requested_session.unwrap_or(default_session);
+        let exists = client
+            .list()?
+            .iter()
+            .any(|session| session.name == session_name || session.id == session_name);
+        let snapshot = if exists {
+            client.attach(session_name.to_owned())?
+        } else {
+            client.create(SessionCreation {
+                name: session_name.to_owned(),
+                model: model.to_session_binding(),
+                cwd: PathBuf::from("~"),
+                persistence: PersistenceMode::Daemon,
+                visibility: Visibility::Fabric,
+                history: vec![ChatMessage::system(system_prompt)],
+            })?
+        };
+
+        if let Some(previous) = self.active.as_ref().map(|session| session.id.clone()) {
+            self.navigation_history.push(previous);
+        }
+        if let Some(connection) = self.connection.take() {
+            self.parked_connections
+                .insert(connection.client.host_id().to_owned(), connection);
+        }
+        self.connection = Some(HostConnection {
+            client,
+            endpoint: ConnectionEndpoint::Ssh(destination.to_owned()),
+        });
+        self.active = Some(snapshot.descriptor.clone());
+        self.ensure_event_cursor(&snapshot.descriptor.id)?;
+        Ok(snapshot)
     }
 
     pub fn sync(&mut self, model: &ActiveModel, cwd: &Path, history: &[ChatMessage]) -> Result<()> {
@@ -126,7 +235,30 @@ impl SessionRuntime {
 
     pub fn switch(&mut self, selector: &str) -> Result<SessionSnapshot> {
         let previous = self.active.as_ref().map(|session| session.id.clone());
-        let snapshot = self.client_mut()?.switch(selector.to_owned())?;
+        let (host_id, session_id) = self.resolve_target(selector)?;
+        let active_host_id = self.client_mut()?.host_id().to_owned();
+        let snapshot = if host_id == active_host_id {
+            self.client_mut()?.switch(session_id)?
+        } else {
+            let mut target = self
+                .parked_connections
+                .remove(&host_id)
+                .context("session host connection disappeared")?;
+            let snapshot = match target.client.switch(session_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.parked_connections.insert(host_id, target);
+                    return Err(error);
+                }
+            };
+            let current = self
+                .connection
+                .replace(target)
+                .context("there is no active host connection")?;
+            self.parked_connections
+                .insert(current.client.host_id().to_owned(), current);
+            snapshot
+        };
         if let Some(previous) = previous
             && previous != snapshot.descriptor.id
         {
@@ -227,7 +359,7 @@ impl SessionRuntime {
             .as_ref()
             .map(|session| session.id.clone())
             .context("there is no active session to close")?;
-        let catalog = self.client_mut()?.list()?;
+        let catalog = self.list()?;
         self.client_mut()?.close(None)?;
         self.active = None;
         self.event_cursors.remove(&current_id);
@@ -239,7 +371,7 @@ impl SessionRuntime {
 
         let mut fallback = None;
         for candidate in candidates {
-            if let Ok(snapshot) = self.client_mut()?.attach(candidate) {
+            if let Ok(snapshot) = self.switch(&candidate) {
                 self.navigation_history
                     .retain(|session_id| session_id != &snapshot.descriptor.id);
                 self.active = Some(snapshot.descriptor.clone());
@@ -254,9 +386,31 @@ impl SessionRuntime {
     }
 
     fn client_mut(&mut self) -> Result<&mut SessionClient> {
-        self.client
+        self.connection
             .as_mut()
+            .map(|connection| &mut connection.client)
             .context("session fabric is disabled; enable [session_fabric] and start xshelld")
+    }
+
+    fn resolve_target(&mut self, selector: &str) -> Result<(String, String)> {
+        let matches = self
+            .list()?
+            .into_iter()
+            .filter(|session| {
+                session.id == selector
+                    || session.name == selector
+                    || format!("{}:{}", session.host_alias, session.name) == selector
+                    || format!("{}/{}:{}", session.host_alias, session.user, session.name)
+                        == selector
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [session] => Ok((session.host_id.clone(), session.id.clone())),
+            [] => Err(anyhow::anyhow!("unknown session {selector:?}")),
+            _ => Err(anyhow::anyhow!(
+                "session name {selector:?} is ambiguous; use HOST:SESSION"
+            )),
+        }
     }
 
     fn active_session_id(&self) -> Result<String> {
