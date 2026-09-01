@@ -70,6 +70,38 @@ transport, multi-host catalogs, and cross-host switching. Signed remote
 bootstrap, reconnect supervision, daemon-side audit appends, and platform
 service installation remain Phase 3 work.
 
+The first terminal-UX increment below is also implemented: protocol v4 provides
+bounded executable and path completion against the active local or remote
+session without evaluating shell code.
+
+### Terminal interaction and rendering plan of record
+
+Terminal UX will advance in this order:
+
+1. **Safe remote completion (implemented).** Add a bounded protocol request
+   that discovers executable names and filesystem paths on the session host. It
+   must parse tokens without evaluating them, must not source shell completion
+   frameworks or interactive startup files, and must apply candidate,
+   directory-entry, input-size, and response-size limits.
+2. **Agent Markdown rendering.** Render model responses incrementally by
+   complete Markdown block, with terminal-width wrapping, fenced-code syntax
+   highlighting, ANSI sanitization, color/NO_COLOR policy, and a plain-text
+   fallback. Shell output remains verbatim unless formatting is explicitly
+   requested.
+3. **PTY-backed user shell commands.** Give directly entered `$` commands a
+   pseudoterminal while agent-requested tools remain noninteractive and
+   pipe-backed. Forward binary-safe output, input, resize, signals, and terminal
+   restoration. `cat file.json | jq | less` is the first acceptance case.
+4. **Persistent full-screen PTYs.** Preserve and reattach interactive PTYs,
+   including redraw after reconnect. Truecolor, alternate screen, resize,
+   bracketed paste, mouse input, signals, and an explicit terminal-escape trust
+   policy are required; `emacs -nw` with a real user configuration is the
+   acceptance target.
+
+Native zsh/bash completion frameworks remain opt-in future work because their
+scripts execute user and third-party code. Remote completion initially covers
+only executable names and paths derived by `xshelld` without shell evaluation.
+
 ### Phase 0 — Architecture spikes and contract (1–2 weeks)
 
 Deliverables:

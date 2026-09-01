@@ -111,10 +111,20 @@ impl SessionRuntime {
         self.connection.is_some()
     }
 
-    pub fn active_is_remote(&self) -> bool {
-        self.connection
+    pub fn remote_completion_client(&self) -> Result<Option<(SessionClient, String)>> {
+        let Some(connection) = &self.connection else {
+            return Ok(None);
+        };
+        let ConnectionEndpoint::Ssh(destination) = &connection.endpoint else {
+            return Ok(None);
+        };
+        let session_id = self
+            .active
             .as_ref()
-            .is_some_and(|connection| matches!(&connection.endpoint, ConnectionEndpoint::Ssh(_)))
+            .map(|session| session.id.clone())
+            .context("there is no active remote session")?;
+        let client = SessionClient::connect_ssh(destination, env!("CARGO_PKG_VERSION"))?;
+        Ok(Some((client, session_id)))
     }
 
     pub fn list(&mut self) -> Result<Vec<SessionDescriptor>> {

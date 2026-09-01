@@ -189,8 +189,10 @@ Only sessions marked `fabric` are listed or attachable through this transport.
 If the selected name does not exist, xshell creates it in the remote user's
 home directory using the current model binding. Automatic remote installation
 and version negotiation beyond the protocol handshake are not implemented yet.
-Shell/path completion is currently suppressed for remote sessions until
-completion queries can be evaluated by the remote daemon.
+Shell command and path completion is evaluated by the remote daemon against
+its inherited `PATH` and the active session cwd. It intentionally does not
+source native zsh/bash completion frameworks, startup scripts, aliases, or
+functions.
 
 See [the session-fabric protocol and current boundary](docs/session-fabric.md).
 

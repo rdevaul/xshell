@@ -15,7 +15,7 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 3. The daemon
+with protocol version 4. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 
@@ -66,9 +66,14 @@ locally. New remote sessions use the remote user's home directory; local
 filesystem resolution is never applied to a remote cwd.
 
 The selector alias `local:NAME` resolves only against the controller's local
-Unix-socket connection, even when another host is active. Local command and
-path completion is suppressed for remote sessions; a future completion RPC
-will evaluate command discovery and directory reads on the owning daemon.
+Unix-socket connection, even when another host is active. Command and path
+completion for remote sessions uses a separate, unattached protocol connection
+that the CLI uses only for completion. Completion scans the daemon's inherited
+`PATH` and the active session cwd, refreshing its command catalog at most once
+every 30 seconds, with a one-second daemon deadline and strict input, scan,
+candidate, and filename limits. Control-character names are excluded and
+insertions are shell-escaped. It does not launch a shell, evaluate input,
+expand variables, or source shell startup/completion scripts.
 
 This increment requires a compatible `xshelld` to already be installed and its
 daemon to be running. Signed bootstrap installation, richer compatibility
@@ -89,6 +94,7 @@ work.
 - `approve`: answer a particular turn/tool approval rendezvous.
 - `cancel`: cancel the active turn by stable turn ID.
 - `snapshot`: obtain completed model, cwd, and conversation state.
+- `complete_shell`: return bounded executable/path candidates for a session.
 
 The CLI keeps a per-connection navigation history. After `//close` deletes the
 current session, it first attempts to attach the previously visited session,
