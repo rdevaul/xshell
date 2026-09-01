@@ -65,6 +65,11 @@ catalogs, and accepts `HOST:SESSION` selectors in the same `//switch` path used
 locally. New remote sessions use the remote user's home directory; local
 filesystem resolution is never applied to a remote cwd.
 
+The selector alias `local:NAME` resolves only against the controller's local
+Unix-socket connection, even when another host is active. Local command and
+path completion is suppressed for remote sessions; a future completion RPC
+will evaluate command discovery and directory reads on the owning daemon.
+
 This increment requires a compatible `xshelld` to already be installed and its
 daemon to be running. Signed bootstrap installation, richer compatibility
 negotiation, reconnect backoff, and SSH connection multiplexing remain future

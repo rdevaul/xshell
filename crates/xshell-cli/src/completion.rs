@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn switch_completion_uses_session_catalog_and_inserts_space() {
         let mut helper = helper_with_profiles();
-        helper.set_session_names(vec!["robot".into(), "bees".into()]);
+        helper.set_session_names(vec!["robot".into(), "bees".into(), "local:default".into()]);
         let history = DefaultHistory::new();
         let context = Context::new(&history);
 
@@ -501,6 +501,12 @@ mod tests {
         assert_eq!(start, 9);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].replacement, "robot");
+
+        let line = "//switch local:d";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert_eq!(start, 9);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].replacement, "local:default");
     }
 
     #[test]

@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
         )?;
     }
 
+    let mut sticky_shell = false;
     let exit_reason = loop {
         let prompt = format!(
             "[{} {} {}] › ",
@@ -169,7 +170,11 @@ async fn main() -> Result<()> {
             compact_path(&cwd)
         );
 
-        let line = match editor.readline(&prompt) {
+        let line = match if sticky_shell {
+            editor.readline_with_initial(&prompt, ("$", ""))
+        } else {
+            editor.readline(&prompt)
+        } {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
                 println!("^C");
@@ -183,7 +188,7 @@ async fn main() -> Result<()> {
             let _ = editor.add_history_entry(line.as_str());
         }
 
-        let route = classify_input(&line);
+        let route = apply_sticky_shell_mode(classify_input(&line), &mut sticky_shell);
         if !matches!(route, InputRoute::Empty) {
             audit.append(AuditEvent::Input {
                 route: input_route_name(&route).into(),
@@ -456,6 +461,9 @@ async fn main() -> Result<()> {
                     eprintln!("xshell agent error: {error:#}");
                 }
             }
+            InputRoute::StickyShell(_) => {
+                unreachable!("sticky shell routes are normalized before dispatch")
+            }
         }
         sessions.sync(&active_model, &cwd, &history)?;
     };
@@ -467,9 +475,23 @@ async fn main() -> Result<()> {
 fn input_route_name(route: &InputRoute) -> &'static str {
     match route {
         InputRoute::Agent(_) => "agent",
-        InputRoute::Shell(_) => "shell",
+        InputRoute::Shell(_) | InputRoute::StickyShell(_) => "shell",
         InputRoute::Control(_) => "control",
         InputRoute::Empty => "empty",
+    }
+}
+
+fn apply_sticky_shell_mode(route: InputRoute, sticky: &mut bool) -> InputRoute {
+    match route {
+        InputRoute::StickyShell(command) => {
+            *sticky = true;
+            InputRoute::Shell(command)
+        }
+        InputRoute::Shell(command) => InputRoute::Shell(command),
+        route => {
+            *sticky = false;
+            route
+        }
     }
 }
 
@@ -1175,6 +1197,7 @@ fn handle_control(
 xshell input routes:
   plain text        send a message to the active agent
   $COMMAND          run COMMAND using the configured shell
+  $$COMMAND         run COMMAND and keep `$` inserted for following inputs
 
 control commands:
   //help            show this help
@@ -1359,6 +1382,26 @@ mod tests {
             ApprovalPolicy::Off
         );
         assert!(ApprovalPolicy::from_str("yolo", false).is_err());
+    }
+
+    #[test]
+    fn double_dollar_enters_sticky_shell_until_prefix_is_removed() {
+        let mut sticky = false;
+        assert_eq!(
+            apply_sticky_shell_mode(classify_input("$$pwd"), &mut sticky),
+            InputRoute::Shell("pwd".into())
+        );
+        assert!(sticky);
+        assert_eq!(
+            apply_sticky_shell_mode(classify_input("$ls"), &mut sticky),
+            InputRoute::Shell("ls".into())
+        );
+        assert!(sticky);
+        assert_eq!(
+            apply_sticky_shell_mode(classify_input("explain this"), &mut sticky),
+            InputRoute::Agent("explain this".into())
+        );
+        assert!(!sticky);
     }
 
     #[test]
