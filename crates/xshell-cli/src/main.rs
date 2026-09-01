@@ -1,6 +1,7 @@
 mod audit;
 mod completion;
 mod config;
+mod renderer;
 mod session;
 mod tools;
 
@@ -8,7 +9,8 @@ use anyhow::{Context, Result, bail};
 use audit::AuditRuntime;
 use clap::Parser;
 use completion::XshellHelper;
-use config::{ActiveModel, ModelOverrides, Provider, XshellConfig};
+use config::{ActiveModel, ModelOverrides, OutputMode, Provider, XshellConfig};
+use renderer::{AgentRenderer, RenderOptions};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -78,12 +80,30 @@ struct Args {
         help = "Approval policy: ask (prompt, default), auto (run all), off (deny shell)"
     )]
     approval: ApprovalPolicy,
+
+    #[arg(
+        long,
+        env = "XSHELL_MARKDOWN",
+        value_enum,
+        help = "Agent Markdown rendering: auto, always, or never"
+    )]
+    markdown: Option<OutputMode>,
+
+    #[arg(
+        long,
+        env = "XSHELL_COLOR",
+        value_enum,
+        help = "Rendered ANSI styling: auto, always, or never (NO_COLOR wins)"
+    )]
+    color: Option<OutputMode>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let (model_config, config_path) = XshellConfig::load(args.config.as_deref())?;
+    let render_options =
+        RenderOptions::resolve(&model_config.rendering, args.markdown, args.color)?;
     let mut active_model = model_config.resolve_startup(
         args.profile.as_deref(),
         ModelOverrides {
@@ -149,7 +169,7 @@ async fn main() -> Result<()> {
 
     if let Some(turn_id) = sessions.active_turn_id().map(str::to_owned) {
         println!("reattaching to active turn {turn_id}");
-        let snapshot = follow_daemon_turn(&mut sessions, &mut audit)?;
+        let snapshot = follow_daemon_turn(&mut sessions, &mut audit, render_options)?;
         apply_runtime_snapshot(
             snapshot,
             &mut active_model,
@@ -208,6 +228,7 @@ async fn main() -> Result<()> {
                         },
                         args.approval,
                         &mut audit,
+                        render_options,
                     ) {
                         Ok(snapshot) => apply_runtime_snapshot(
                             snapshot,
@@ -426,6 +447,7 @@ async fn main() -> Result<()> {
                         },
                         args.approval,
                         &mut audit,
+                        render_options,
                     ) {
                         Ok(snapshot) => apply_runtime_snapshot(
                             snapshot,
@@ -453,6 +475,7 @@ async fn main() -> Result<()> {
                     &cwd,
                     args.approval,
                     &mut audit,
+                    render_options,
                 )
                 .await
                 {
@@ -501,16 +524,19 @@ fn run_daemon_turn(
     input: TurnInput,
     approval: ApprovalPolicy,
     audit: &mut AuditRuntime,
+    render_options: RenderOptions,
 ) -> Result<SessionSnapshot> {
     sessions.submit(input, approval)?;
-    follow_daemon_turn(sessions, audit)
+    follow_daemon_turn(sessions, audit, render_options)
 }
 
 fn follow_daemon_turn(
     sessions: &mut SessionRuntime,
     audit: &mut AuditRuntime,
+    render_options: RenderOptions,
 ) -> Result<SessionSnapshot> {
-    let mut streamed_since_response = false;
+    let mut renderer = AgentRenderer::new(render_options);
+    let mut stdout = io::stdout();
     let mut shell_finished: Option<(String, String)> = None;
     loop {
         let batch = sessions.events(1_000)?;
@@ -525,22 +551,18 @@ fn follow_daemon_turn(
                 SessionEventKind::TurnStarted { .. } => {}
                 SessionEventKind::Execution { event } => match event {
                     ExecutionEvent::TextDelta { text } => {
-                        streamed_since_response = true;
-                        print!("{text}");
-                        io::stdout().flush()?;
+                        renderer.push(&text, &mut stdout)?;
                     }
                     ExecutionEvent::AgentResponse {
                         content,
                         tool_call_count,
                         partial,
                     } => {
-                        if !streamed_since_response && !content.is_empty() {
-                            print!("{content}");
+                        if !renderer.received_delta() && !content.is_empty() {
+                            renderer.push(&content, &mut stdout)?;
                         }
-                        if streamed_since_response || !content.is_empty() {
-                            println!();
-                        }
-                        streamed_since_response = false;
+                        renderer.finish(&mut stdout)?;
+                        renderer = AgentRenderer::new(render_options);
                         audit.append(AuditEvent::AgentResponse {
                             content,
                             tool_call_count,
@@ -586,8 +608,8 @@ fn follow_daemon_turn(
                         eprint!("{text}");
                         io::stderr().flush()?;
                     } else {
-                        print!("{text}");
-                        io::stdout().flush()?;
+                        write!(stdout, "{text}")?;
+                        stdout.flush()?;
                     }
                 }
                 SessionEventKind::WorkingDirectoryChanged { cwd } => {
@@ -603,6 +625,7 @@ fn follow_daemon_turn(
                 }
                 SessionEventKind::TurnCompleted => {
                     sessions.mark_turn_finished();
+                    renderer.finish(&mut stdout)?;
                     let snapshot = sessions.refresh_snapshot()?;
                     if let Some((command, status)) = shell_finished.take() {
                         audit.append(AuditEvent::ShellFinished {
@@ -615,10 +638,12 @@ fn follow_daemon_turn(
                 }
                 SessionEventKind::TurnFailed { message } => {
                     sessions.mark_turn_finished();
+                    renderer.finish(&mut stdout)?;
                     bail!("{message}");
                 }
                 SessionEventKind::TurnCancelled => {
                     sessions.mark_turn_finished();
+                    renderer.finish(&mut stdout)?;
                     bail!("session turn was cancelled");
                 }
             }
@@ -652,6 +677,7 @@ async fn run_agent_turn(
     cwd: &Path,
     approval: ApprovalPolicy,
     audit: &mut AuditRuntime,
+    render_options: RenderOptions,
 ) -> Result<()> {
     let checkpoint = history.len();
     history.push(ChatMessage::user(message));
@@ -659,11 +685,17 @@ async fn run_agent_turn(
 
     for _ in 0..MAX_AGENT_STEPS {
         let mut streamed_text = String::new();
+        let mut renderer = AgentRenderer::new(render_options);
+        let mut stdout = io::stdout();
+        let mut render_error = None;
         let mut emit = |event| match event {
             AgentEvent::TextDelta(delta) => {
                 streamed_text.push_str(&delta);
-                print!("{delta}");
-                let _ = io::stdout().flush();
+                if render_error.is_none()
+                    && let Err(error) = renderer.push(&delta, &mut stdout)
+                {
+                    render_error = Some(error);
+                }
             }
         };
         let response = match agent
@@ -678,6 +710,7 @@ async fn run_agent_turn(
         {
             Ok(response) => response,
             Err(error) => {
+                let _ = renderer.finish(&mut stdout);
                 if !streamed_text.is_empty() {
                     audit.append(AuditEvent::AgentResponse {
                         content: streamed_text,
@@ -689,9 +722,13 @@ async fn run_agent_turn(
                 return Err(error.into());
             }
         };
-        if !streamed_text.is_empty() {
-            println!();
+        if let Some(error) = render_error {
+            return Err(error).context("could not render agent response");
         }
+        if !renderer.received_delta() && !response.content.is_empty() {
+            renderer.push(&response.content, &mut stdout)?;
+        }
+        renderer.finish(&mut stdout)?;
 
         audit.append(AuditEvent::AgentResponse {
             content: response.content.clone(),
