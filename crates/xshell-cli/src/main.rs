@@ -1,7 +1,6 @@
 mod audit;
 mod completion;
 mod config;
-mod renderer;
 mod session;
 mod tools;
 
@@ -10,7 +9,6 @@ use audit::AuditRuntime;
 use clap::Parser;
 use completion::XshellHelper;
 use config::{ActiveModel, ModelOverrides, OutputMode, Provider, XshellConfig};
-use renderer::{AgentRenderer, RenderOptions};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -29,7 +27,10 @@ use xshell_execution::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, ExecutionEvent,
     build_adapter as build_execution_adapter, tool_summary,
 };
-use xshell_session::{PersistenceMode, SessionEventKind, SessionSnapshot, TurnInput, Visibility};
+use xshell_session::{
+    PersistenceMode, SessionEventKind, SessionSnapshot, TurnInput, Visibility, load_view_resource,
+};
+use xshell_view::{AgentRenderer, RenderOptions, ViewInput, ViewerRegistry};
 
 /// Maximum number of agent tool-call steps per turn before the loop
 /// aborts. Kept bounded so a misbehaving model cannot loop forever.
@@ -104,6 +105,7 @@ async fn main() -> Result<()> {
     let (model_config, config_path) = XshellConfig::load(args.config.as_deref())?;
     let render_options =
         RenderOptions::resolve(&model_config.rendering, args.markdown, args.color)?;
+    let viewers = ViewerRegistry::with_builtins();
     let mut active_model = model_config.resolve_startup(
         args.profile.as_deref(),
         ModelOverrides {
@@ -425,6 +427,18 @@ async fn main() -> Result<()> {
                     &args.system_prompt,
                     &mut audit,
                     sessions.enabled(),
+                ) {
+                    eprintln!("xshell: {error:#}");
+                }
+            }
+            InputRoute::Control(ControlCommand::View(view_args)) => {
+                if let Err(error) = handle_view(
+                    &view_args,
+                    &mut sessions,
+                    &cwd,
+                    &viewers,
+                    render_options,
+                    &mut audit,
                 ) {
                     eprintln!("xshell: {error:#}");
                 }
@@ -1239,6 +1253,128 @@ fn refresh_shell_completions(
     }
 }
 
+struct ViewOptions {
+    path: PathBuf,
+    viewer: Option<String>,
+}
+
+fn parse_view_options(arguments: &str) -> Result<ViewOptions> {
+    let words = shell_words::split(arguments).context("invalid //view quoting")?;
+    let mut path = None;
+    let mut viewer = None;
+    let mut parse_options = true;
+    let mut index = 0;
+    while index < words.len() {
+        let word = &words[index];
+        if parse_options && word == "--" {
+            parse_options = false;
+        } else if parse_options && word == "--as" {
+            index += 1;
+            let value = words
+                .get(index)
+                .context("//view --as requires a viewer name")?;
+            if viewer.replace(value.clone()).is_some() {
+                bail!("//view accepts --as only once");
+            }
+        } else if parse_options && word.starts_with("--as=") {
+            let value = word.trim_start_matches("--as=");
+            if value.is_empty() {
+                bail!("//view --as requires a viewer name");
+            }
+            if viewer.replace(value.into()).is_some() {
+                bail!("//view accepts --as only once");
+            }
+        } else if parse_options && word.starts_with('-') {
+            bail!("unknown //view option {word:?}");
+        } else if path.replace(PathBuf::from(word)).is_some() {
+            bail!("//view accepts exactly one path");
+        }
+        index += 1;
+    }
+    Ok(ViewOptions {
+        path: path.context("usage: //view [--as VIEWER] PATH")?,
+        viewer,
+    })
+}
+
+fn handle_view(
+    arguments: &str,
+    sessions: &mut SessionRuntime,
+    cwd: &Path,
+    viewers: &ViewerRegistry,
+    render_options: RenderOptions,
+    audit: &mut AuditRuntime,
+) -> Result<()> {
+    let options = parse_view_options(arguments)?;
+    let requested_path = options.path.display().to_string();
+    let resource = match if sessions.enabled() {
+        sessions.view_source(options.path.clone())
+    } else {
+        load_view_resource(&options.path, cwd)
+    } {
+        Ok(resource) => resource,
+        Err(error) => {
+            audit.append(AuditEvent::ViewOperation {
+                path: requested_path,
+                sha256: None,
+                viewer: options.viewer,
+                media_type: None,
+                byte_len: None,
+                outcome: format!("acquisition failed: {error:#}"),
+            })?;
+            return Err(error);
+        }
+    };
+
+    let rendered = match viewers.render(
+        &ViewInput {
+            name: &resource.path.to_string_lossy(),
+            media_type: &resource.media_type,
+            text: &resource.content,
+        },
+        options.viewer.as_deref(),
+        render_options,
+    ) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            audit.append(AuditEvent::ViewOperation {
+                path: resource.path.display().to_string(),
+                sha256: Some(resource.sha256),
+                viewer: options.viewer,
+                media_type: Some(resource.media_type),
+                byte_len: Some(resource.byte_len),
+                outcome: format!("render failed: {error:#}"),
+            })?;
+            return Err(error);
+        }
+    };
+
+    let mut stdout = io::stdout();
+    if let Err(error) = stdout
+        .write_all(&rendered.bytes)
+        .and_then(|()| stdout.flush())
+    {
+        audit.append(AuditEvent::ViewOperation {
+            path: resource.path.display().to_string(),
+            sha256: Some(resource.sha256),
+            viewer: Some(rendered.viewer_id),
+            media_type: Some(resource.media_type),
+            byte_len: Some(resource.byte_len),
+            outcome: format!("display failed: {error}"),
+        })?;
+        return Err(error).context("cannot display view resource");
+    }
+    audit.append(AuditEvent::ViewOperation {
+        path: resource.path.display().to_string(),
+        sha256: Some(resource.sha256),
+        viewer: Some(rendered.viewer_id),
+        media_type: Some(resource.media_type),
+        byte_len: Some(resource.byte_len),
+        outcome: "rendered".into(),
+    })?;
+    Ok(())
+}
+
 fn handle_control(
     command: ControlCommand,
     agent: &dyn AgentAdapter,
@@ -1271,6 +1407,7 @@ control commands:
   //model NAME      switch profiles and start a fresh conversation
   //agent            show active agent capabilities
   //tools            show tools exposed to the active agent
+  //view PATH        render a Markdown or reStructuredText file
   //quit             detach from the current session and exit xshell"
         ),
         ControlCommand::Status => print_status(agent, active_model, audit, sessions, cwd, approval),
@@ -1294,6 +1431,7 @@ control commands:
             eprintln!("xshell: unknown control command //{name}; try //help")
         }
         ControlCommand::Model(_) => unreachable!("model is handled by the REPL"),
+        ControlCommand::View(_) => unreachable!("view is handled by the REPL"),
         ControlCommand::Connect(_)
         | ControlCommand::Sessions
         | ControlCommand::New(_)
@@ -1513,5 +1651,18 @@ mod tests {
         assert_eq!(options.destination, "rich@mini.local");
         assert_eq!(options.session.as_deref(), Some("cad"));
         assert!(parse_connect_options(&[]).is_err());
+    }
+
+    #[test]
+    fn parses_view_path_and_explicit_viewer() {
+        let options = parse_view_options("--as rst \"docs/design notes.rst\"").unwrap();
+        assert_eq!(options.path, Path::new("docs/design notes.rst"));
+        assert_eq!(options.viewer.as_deref(), Some("rst"));
+
+        let options = parse_view_options("--as=markdown -- -draft.md").unwrap();
+        assert_eq!(options.path, Path::new("-draft.md"));
+        assert_eq!(options.viewer.as_deref(), Some("markdown"));
+        assert!(parse_view_options("").is_err());
+        assert!(parse_view_options("one.md two.md").is_err());
     }
 }

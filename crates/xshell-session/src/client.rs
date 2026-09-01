@@ -1,7 +1,7 @@
 use crate::{
     ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding,
     SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot,
-    ShellCompletionResult, TurnInput,
+    ShellCompletionResult, TurnInput, ViewResource,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -277,6 +277,14 @@ impl SessionClient {
         match self.receive()? {
             ServerResponse::ShellCompletions { result } => Ok(result),
             response => response_error("shell completion", response),
+        }
+    }
+
+    pub fn view_source(&mut self, session_id: String, path: PathBuf) -> Result<ViewResource> {
+        self.send(&ClientRequest::ViewSource { session_id, path })?;
+        match self.receive()? {
+            ServerResponse::ViewSource { resource } => Ok(resource),
+            response => response_error("view source", response),
         }
     }
 

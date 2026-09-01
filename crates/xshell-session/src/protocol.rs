@@ -1,6 +1,7 @@
 use crate::{
     ApprovalReply, AttachmentRole, EventBatch, ModelBinding, SESSION_PROTOCOL_VERSION,
     SessionCreation, SessionDescriptor, SessionSnapshot, ShellCompletionResult, TurnInput,
+    ViewResource,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -58,6 +59,10 @@ pub enum ClientRequest {
         line: String,
         cursor: usize,
     },
+    ViewSource {
+        session_id: String,
+        path: PathBuf,
+    },
     Detach,
     Close {
         selector: Option<String>,
@@ -109,6 +114,9 @@ pub enum ServerResponse {
     CancellationAccepted,
     ShellCompletions {
         result: ShellCompletionResult,
+    },
+    ViewSource {
+        resource: ViewResource,
     },
     Detached {
         session_id: Option<String>,

@@ -6,6 +6,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use xshell_audit::AuditConfig;
 use xshell_session::{ModelBinding, SessionConfig};
+pub use xshell_view::{OutputMode, RenderingConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,33 +36,6 @@ pub struct XshellConfig {
     pub session_fabric: SessionConfig,
     #[serde(default)]
     pub models: BTreeMap<String, ModelProfile>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum OutputMode {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct RenderingConfig {
-    pub markdown: OutputMode,
-    pub color: OutputMode,
-    pub width: Option<usize>,
-}
-
-impl Default for RenderingConfig {
-    fn default() -> Self {
-        Self {
-            markdown: OutputMode::Auto,
-            color: OutputMode::Auto,
-            width: None,
-        }
-    }
 }
 
 impl ActiveModel {

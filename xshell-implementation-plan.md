@@ -74,6 +74,12 @@ The first terminal-UX increment below is also implemented: protocol v4 provides
 bounded executable and path completion against the active local or remote
 session without evaluating shell code.
 
+The initial viewer foundation is implemented in `xshell-view`: a reusable
+terminal renderer, an in-process viewer trait and registry, built-in Markdown
+and safe-subset reStructuredText viewers, and protocol-v5 bounded source
+acquisition from the active local or remote session. External renderers remain
+future out-of-process plugins.
+
 ### Terminal interaction and rendering plan of record
 
 Terminal UX will advance in this order:

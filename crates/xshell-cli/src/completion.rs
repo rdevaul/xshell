@@ -5,7 +5,7 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use xshell_session::{SessionClient, complete_shell};
+use xshell_session::{SessionClient, ShellCompletionResult, complete_shell};
 
 const CONTROL_COMMANDS: &[&str] = &[
     "//agent",
@@ -21,10 +21,12 @@ const CONTROL_COMMANDS: &[&str] = &[
     "//status",
     "//switch",
     "//tools",
+    "//view",
 ];
 
 /// Sub-commands recognised after `//model`.
 const MODEL_SUBCOMMANDS: &[&str] = &["list", "show", "use"];
+const VIEWERS: &[&str] = &["markdown", "rst"];
 
 pub struct XshellHelper {
     cwd: PathBuf,
@@ -75,6 +77,26 @@ impl XshellHelper {
         names.dedup();
         self.session_names = names;
     }
+
+    fn shell_candidates(&self, line: &str, pos: usize) -> Option<ShellCompletionResult> {
+        if !self.shell_completion_enabled {
+            return None;
+        }
+        if let Some(remote) = &self.remote_shell_completion {
+            let Ok(mut guard) = remote.client.lock() else {
+                return None;
+            };
+            let client = guard.as_mut()?;
+            return match client.complete_shell(remote.session_id.clone(), line.into(), pos) {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    *guard = None;
+                    None
+                }
+            };
+        }
+        complete_shell(line, pos, &self.cwd).ok()
+    }
 }
 
 impl Helper for XshellHelper {}
@@ -96,6 +118,10 @@ impl Completer for XshellHelper {
         // --- Control commands ---
         if line[..pos].starts_with("//") {
             let fragment = &line[..pos];
+
+            if let Some(result) = complete_view(self, line, pos) {
+                return Ok(result);
+            }
 
             // Model profile completion: "//model <prefix>" or "//model use <prefix>"
             if let Some(result) = complete_model(line, pos, &self.model_profiles) {
@@ -124,29 +150,8 @@ impl Completer for XshellHelper {
         if !line[..pos].starts_with('$') {
             return Ok((pos, Vec::new()));
         }
-        if !self.shell_completion_enabled {
+        let Some(result) = self.shell_candidates(line, pos) else {
             return Ok((pos, Vec::new()));
-        }
-
-        let result = if let Some(remote) = &self.remote_shell_completion {
-            let Ok(mut guard) = remote.client.lock() else {
-                return Ok((pos, Vec::new()));
-            };
-            let Some(client) = guard.as_mut() else {
-                return Ok((pos, Vec::new()));
-            };
-            match client.complete_shell(remote.session_id.clone(), line.into(), pos) {
-                Ok(result) => result,
-                Err(_) => {
-                    *guard = None;
-                    return Ok((pos, Vec::new()));
-                }
-            }
-        } else {
-            match complete_shell(line, pos, &self.cwd) {
-                Ok(result) => result,
-                Err(_) => return Ok((pos, Vec::new())),
-            }
         };
         Ok((
             result.start,
@@ -160,6 +165,85 @@ impl Completer for XshellHelper {
                 .collect(),
         ))
     }
+}
+
+fn complete_view(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+    let prefix = &line[..pos];
+    let rest = prefix.strip_prefix("//view")?;
+    if rest.is_empty() {
+        let synthetic = "$cat ";
+        let result = helper.shell_candidates(synthetic, synthetic.len())?;
+        return Some((
+            "//view".len(),
+            result
+                .candidates
+                .into_iter()
+                .map(|candidate| Pair {
+                    display: candidate.display,
+                    replacement: format!(" {}", candidate.replacement),
+                })
+                .collect(),
+        ));
+    }
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let arguments = rest.trim_start_matches(char::is_whitespace);
+    if let Some(viewer_prefix) = arguments.strip_prefix("--as=")
+        && !viewer_prefix.contains(char::is_whitespace)
+    {
+        let start = prefix.len() - viewer_prefix.len() - "--as=".len();
+        let candidates = VIEWERS
+            .iter()
+            .filter(|viewer| viewer.starts_with(viewer_prefix))
+            .map(|viewer| Pair {
+                display: (*viewer).into(),
+                replacement: format!("--as={viewer}"),
+            })
+            .collect();
+        return Some((start, candidates));
+    }
+    let words = arguments.split_whitespace().collect::<Vec<_>>();
+    let ends_with_space = arguments.chars().last().is_some_and(char::is_whitespace);
+    if words.first() == Some(&"--as")
+        && ((words.len() == 1 && ends_with_space) || (words.len() == 2 && !ends_with_space))
+    {
+        let viewer_prefix = words.get(1).copied().unwrap_or("");
+        let start = prefix.len() - viewer_prefix.len();
+        let candidates = VIEWERS
+            .iter()
+            .filter(|viewer| viewer.starts_with(viewer_prefix))
+            .map(|viewer| Pair {
+                display: (*viewer).into(),
+                replacement: (*viewer).into(),
+            })
+            .collect();
+        return Some((start, candidates));
+    }
+    if arguments.trim_end().ends_with("--as") {
+        return Some((pos, Vec::new()));
+    }
+
+    let fragment_start = prefix
+        .rfind(char::is_whitespace)
+        .map_or("//view".len(), |index| index + 1);
+    let fragment = &prefix[fragment_start..];
+    if fragment.starts_with('-') {
+        return Some((pos, Vec::new()));
+    }
+    let synthetic = format!("$cat {fragment}");
+    let result = helper.shell_candidates(&synthetic, synthetic.len())?;
+    Some((
+        fragment_start,
+        result
+            .candidates
+            .into_iter()
+            .map(|candidate| Pair {
+                display: candidate.display,
+                replacement: candidate.replacement,
+            })
+            .collect(),
+    ))
 }
 
 fn complete_single_argument(
@@ -474,5 +558,28 @@ mod tests {
         let line = "$gi";
         let (_, matches) = helper.complete(line, line.len(), &context).unwrap();
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn completes_viewer_names_and_view_paths() {
+        let helper = helper_with_profiles();
+        let history = DefaultHistory::new();
+        let context = Context::new(&history);
+
+        let line = "//view --as r";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert_eq!(start, 12);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].replacement, "rst");
+
+        let line = "//view Cargo";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert_eq!(start, 7);
+        assert!(matches.iter().any(|pair| pair.replacement == "Cargo.toml"));
+
+        let line = "//view";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert_eq!(start, 6);
+        assert!(matches.iter().any(|pair| pair.replacement == " Cargo.toml"));
     }
 }

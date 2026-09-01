@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-pub const SESSION_PROTOCOL_VERSION: u32 = 4;
+pub const SESSION_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -213,4 +213,13 @@ pub struct ShellCompletionCandidate {
 pub struct ShellCompletionResult {
     pub start: usize,
     pub candidates: Vec<ShellCompletionCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ViewResource {
+    pub path: PathBuf,
+    pub media_type: String,
+    pub content: String,
+    pub byte_len: u64,
+    pub sha256: String,
 }

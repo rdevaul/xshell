@@ -1,0 +1,15 @@
+[package]
+name = "xshell-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+pulldown-cmark = "0.13"
+serde.workspace = true
+terminal_size = "0.4"
+unicode-width = "0.2"

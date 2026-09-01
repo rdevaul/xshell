@@ -2013,20 +2013,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "pulldown-cmark",
  "rustyline",
  "serde",
  "serde_json",
  "shell-words",
- "terminal_size",
  "tokio",
  "toml",
- "unicode-width",
  "xshell-adapters",
  "xshell-audit",
  "xshell-core",
  "xshell-execution",
  "xshell-session",
+ "xshell-view",
 ]
 
 [[package]]
@@ -2064,12 +2062,25 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml",
  "uuid",
  "xshell-core",
  "xshell-execution",
+]
+
+[[package]]
+name = "xshell-view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pulldown-cmark",
+ "serde",
+ "terminal_size",
+ "unicode-width",
 ]
 
 [[package]]

@@ -15,7 +15,7 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 4. The daemon
+with protocol version 5. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 
@@ -95,6 +95,14 @@ work.
 - `cancel`: cancel the active turn by stable turn ID.
 - `snapshot`: obtain completed model, cwd, and conversation state.
 - `complete_shell`: return bounded executable/path candidates for a session.
+- `view_source`: return a bounded UTF-8 resource resolved against the attached
+  session cwd, with media type, length, and SHA-256 metadata.
+
+`view_source` requires the requesting connection to own the active session.
+The SSH proxy additionally rejects requests for `host_only` sessions. The
+daemon reads only regular files, enforces a 4 MiB limit and three-second
+deadline, and returns text through the existing authenticated stdio tunnel.
+Rendering remains local to the controller.
 
 The CLI keeps a per-connection navigation history. After `//close` deletes the
 current session, it first attempts to attach the previously visited session,

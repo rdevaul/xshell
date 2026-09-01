@@ -101,7 +101,9 @@ signatures, and the final-checkpoint marker.
 The initial implementation records session configuration (never API
 credentials), user input, cwd and model changes, model responses, model errors,
 tool calls, approval decisions, tool results, direct shell completion, and
-session closure.
+session closure. View operations record the requested or resolved path,
+content hash and size when acquisition succeeded, media type, selected viewer,
+and outcome; file contents are not duplicated into the audit log.
 
 Audit logs contain prompts, source text, commands, and tool output. They should
 be treated as sensitive. At-rest encryption and retention policy are planned
@@ -115,3 +117,7 @@ programs requires the planned PTY execution layer.
 An unclean client or daemon crash leaves a verifiable hash chain but no final
 checkpoint. The verifier reports this explicitly rather than claiming the log
 is complete.
+
+View-operation events advance the audit client/daemon protocol to version 2.
+Upgrade and restart `xshell-auditd` together with the CLI; the on-disk audit
+format remains version 1.

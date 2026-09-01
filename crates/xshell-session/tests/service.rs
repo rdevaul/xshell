@@ -169,6 +169,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     let _daemon = Daemon(child);
     let mut readiness = connect_when_ready(&socket);
     std::fs::write(temporary.path().join("remote-file.txt"), "test").unwrap();
+    std::fs::write(temporary.path().join("remote-view.md"), "# Remote\n").unwrap();
     let shared = readiness
         .create(SessionCreation {
             name: "shared".into(),
@@ -228,6 +229,42 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     assert!(matches!(
         receive_response(&mut reader),
         ServerResponse::Error { code, .. } if code == "remote_session_not_visible"
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::ViewSource {
+            session_id: private.descriptor.id.clone(),
+            path: "remote-view.md".into(),
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Error { code, .. } if code == "remote_session_not_visible"
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::Attach {
+            selector: "shared".into(),
+            role: AttachmentRole::Owner,
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Attached { session, .. } if session.descriptor.id == shared.descriptor.id
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::ViewSource {
+            session_id: shared.descriptor.id.clone(),
+            path: "remote-view.md".into(),
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::ViewSource { resource }
+            if resource.content == "# Remote\n"
+                && resource.media_type == "text/markdown"
+                && resource.sha256.len() == 64
     ));
     send_request(
         &mut writer,
