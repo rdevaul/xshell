@@ -28,11 +28,40 @@ pub struct ModelProfile {
 pub struct XshellConfig {
     pub default_model: Option<String>,
     #[serde(default)]
+    pub rendering: RenderingConfig,
+    #[serde(default)]
     pub audit: AuditConfig,
     #[serde(default)]
     pub session_fabric: SessionConfig,
     #[serde(default)]
     pub models: BTreeMap<String, ModelProfile>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RenderingConfig {
+    pub markdown: OutputMode,
+    pub color: OutputMode,
+    pub width: Option<usize>,
+}
+
+impl Default for RenderingConfig {
+    fn default() -> Self {
+        Self {
+            markdown: OutputMode::Auto,
+            color: OutputMode::Auto,
+            width: None,
+        }
+    }
 }
 
 impl ActiveModel {
@@ -218,6 +247,11 @@ mod tests {
             r#"
 default_model = "local"
 
+[rendering]
+markdown = "always"
+color = "never"
+width = 100
+
 [models.local]
 provider = "ollama"
 model = "qwen3:8b"
@@ -248,6 +282,15 @@ api_key_env = "OPENROUTER_API_KEY"
         assert_eq!(active.profile_name.as_deref(), Some("local"));
         assert_eq!(active.provider, Provider::Ollama);
         assert_eq!(active.base_url, "http://127.0.0.1:11434");
+        assert_eq!(sample().rendering.markdown, OutputMode::Always);
+        assert_eq!(sample().rendering.color, OutputMode::Never);
+        assert_eq!(sample().rendering.width, Some(100));
+    }
+
+    #[test]
+    fn rendering_defaults_preserve_existing_configurations() {
+        let config: XshellConfig = toml::from_str("").unwrap();
+        assert_eq!(config.rendering, RenderingConfig::default());
     }
 
     #[test]

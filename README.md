@@ -59,6 +59,32 @@ Prefix a command with `$` for a single shell input. Prefix it with `$$` to
 enter sticky shell mode: subsequent input lines begin with an editable `$`.
 Backspace over that `$` and submit plain text to return to agent input.
 
+## Agent response rendering
+
+On a terminal, xshell renders streamed agent Markdown as readable headings,
+paragraphs, lists, quotes, tables, links, inline code, and fenced code blocks.
+Prose wraps to the detected terminal width while code is left structurally
+intact. Rendering is performed only by the client: conversation history,
+session state, and audit records retain the model's original response. Shell
+stdout and stderr also remain verbatim.
+
+Model output is stripped of terminal control sequences before display. ANSI
+styling is enabled only for a terminal and is disabled whenever `NO_COLOR` is
+set. Configure the policy in `config.toml`:
+
+```toml
+[rendering]
+markdown = "auto" # auto, always, or never
+color = "auto"    # auto, always, or never
+# width = 100      # optional; valid range is 20..512
+```
+
+The equivalent one-run overrides are `--markdown`, `--color`,
+`XSHELL_MARKDOWN`, and `XSHELL_COLOR`. `markdown = "never"` preserves the
+model's Markdown source layout but still removes terminal control sequences.
+When output is redirected, both policies default to `never` through their
+`auto` setting.
+
 ## Model profiles and OpenRouter
 
 Copy the example configuration, then edit its models to suit the providers you

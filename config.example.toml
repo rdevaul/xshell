@@ -1,6 +1,14 @@
 # Copy this file to ~/.config/xshell/config.toml or pass --config PATH.
 default_model = "local-qwen"
 
+# Markdown is rendered when stdout is a terminal. Set markdown to "always" for
+# forced rendering or "never" for sanitized, otherwise verbatim model output.
+# NO_COLOR disables ANSI styling even when color is "always".
+[rendering]
+markdown = "auto"
+color = "auto"
+# width = 100
+
 # Auditing is disabled until xshell-auditd has been installed and started.
 # Development paths are shown here. A tamper-resistant deployment uses a
 # dedicated service account and protected paths under /var/db (macOS) or

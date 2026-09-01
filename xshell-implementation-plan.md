@@ -83,11 +83,13 @@ Terminal UX will advance in this order:
    must parse tokens without evaluating them, must not source shell completion
    frameworks or interactive startup files, and must apply candidate,
    directory-entry, input-size, and response-size limits.
-2. **Agent Markdown rendering.** Render model responses incrementally by
-   complete Markdown block, with terminal-width wrapping, fenced-code syntax
-   highlighting, ANSI sanitization, color/NO_COLOR policy, and a plain-text
-   fallback. Shell output remains verbatim unless formatting is explicitly
-   requested.
+2. **Agent Markdown rendering (structure implemented).** Render model responses
+   incrementally by complete Markdown block, with terminal-width wrapping,
+   fenced-code syntax highlighting, ANSI sanitization, color/NO_COLOR policy,
+   and a plain-text fallback. Shell output remains verbatim unless formatting
+   is explicitly requested. The first increment supplies safe block/inline
+   rendering and fenced-code presentation; language-aware syntax highlighting
+   remains the next rendering increment.
 3. **PTY-backed user shell commands.** Give directly entered `$` commands a
    pseudoterminal while agent-requested tools remain noninteractive and
    pipe-backed. Forward binary-safe output, input, resize, signals, and terminal
