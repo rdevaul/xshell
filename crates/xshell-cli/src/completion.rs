@@ -3,11 +3,9 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
-use std::collections::BTreeSet;
-use std::env;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use xshell_session::{SessionClient, complete_shell};
 
 const CONTROL_COMMANDS: &[&str] = &[
     "//agent",
@@ -31,9 +29,14 @@ const MODEL_SUBCOMMANDS: &[&str] = &["list", "show", "use"];
 pub struct XshellHelper {
     cwd: PathBuf,
     shell_completion_enabled: bool,
-    commands: Vec<String>,
+    remote_shell_completion: Option<RemoteShellCompletion>,
     model_profiles: Vec<String>,
     session_names: Vec<String>,
+}
+
+struct RemoteShellCompletion {
+    client: Mutex<Option<SessionClient>>,
+    session_id: String,
 }
 
 impl XshellHelper {
@@ -41,7 +44,7 @@ impl XshellHelper {
         Self {
             cwd,
             shell_completion_enabled: true,
-            commands: discover_commands(),
+            remote_shell_completion: None,
             model_profiles,
             session_names: Vec::new(),
         }
@@ -53,6 +56,13 @@ impl XshellHelper {
 
     pub fn set_shell_completion_enabled(&mut self, enabled: bool) {
         self.shell_completion_enabled = enabled;
+    }
+
+    pub fn set_remote_shell_completion(&mut self, remote: Option<(SessionClient, String)>) {
+        self.remote_shell_completion = remote.map(|(client, session_id)| RemoteShellCompletion {
+            client: Mutex::new(Some(client)),
+            session_id,
+        });
     }
 
     #[allow(dead_code)]
@@ -118,26 +128,37 @@ impl Completer for XshellHelper {
             return Ok((pos, Vec::new()));
         }
 
-        let start = line[..pos]
-            .rfind(|character: char| character.is_whitespace() || "|&;<>".contains(character))
-            .map_or(1, |index| index + 1);
-        let fragment = &line[start..pos];
-        let first_word = !line[1..start].chars().any(char::is_whitespace);
-
-        if first_word && !fragment.contains('/') {
-            let matches = self
-                .commands
-                .iter()
-                .filter(|command| command.starts_with(fragment))
-                .map(|command| Pair {
-                    display: command.clone(),
-                    replacement: command.clone(),
+        let result = if let Some(remote) = &self.remote_shell_completion {
+            let Ok(mut guard) = remote.client.lock() else {
+                return Ok((pos, Vec::new()));
+            };
+            let Some(client) = guard.as_mut() else {
+                return Ok((pos, Vec::new()));
+            };
+            match client.complete_shell(remote.session_id.clone(), line.into(), pos) {
+                Ok(result) => result,
+                Err(_) => {
+                    *guard = None;
+                    return Ok((pos, Vec::new()));
+                }
+            }
+        } else {
+            match complete_shell(line, pos, &self.cwd) {
+                Ok(result) => result,
+                Err(_) => return Ok((pos, Vec::new())),
+            }
+        };
+        Ok((
+            result.start,
+            result
+                .candidates
+                .into_iter()
+                .map(|candidate| Pair {
+                    display: candidate.display,
+                    replacement: candidate.replacement,
                 })
-                .collect();
-            return Ok((start, matches));
-        }
-
-        Ok((start, complete_path(fragment, &self.cwd)))
+                .collect(),
+        ))
     }
 }
 
@@ -267,87 +288,22 @@ fn profile_candidates(prefix: &str, profiles: &[String], replacement_prefix: &st
         .collect()
 }
 
-fn discover_commands() -> Vec<String> {
-    let mut commands = BTreeSet::from(["cd".to_owned()]);
-    let Some(path) = env::var_os("PATH") else {
-        return commands.into_iter().collect();
-    };
-    for directory in env::split_paths(&path) {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.is_file()
-                && metadata.permissions().mode() & 0o111 != 0
-                && let Some(name) = entry.file_name().to_str()
-            {
-                commands.insert(name.to_owned());
-            }
-        }
-    }
-    commands.into_iter().collect()
-}
-
-fn complete_path(fragment: &str, cwd: &Path) -> Vec<Pair> {
-    let fragment = fragment.replace("\\ ", " ");
-    let (text_directory, name_prefix) = fragment
-        .rfind('/')
-        .map_or(("", fragment.as_str()), |slash| {
-            (&fragment[..=slash], &fragment[slash + 1..])
-        });
-    let search_directory = if text_directory.is_empty() {
-        cwd.to_owned()
-    } else if let Some(rest) = text_directory.strip_prefix("~/") {
-        match env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(rest),
-            None => return Vec::new(),
-        }
-    } else if Path::new(text_directory).is_absolute() {
-        PathBuf::from(text_directory)
-    } else {
-        cwd.join(text_directory)
-    };
-
-    let Ok(entries) = fs::read_dir(search_directory) else {
-        return Vec::new();
-    };
-    let mut matches = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            if !name.starts_with(name_prefix)
-                || (name.starts_with('.') && !name_prefix.starts_with('.'))
-            {
-                return None;
-            }
-            let suffix = if entry.file_type().ok()?.is_dir() {
-                "/"
-            } else {
-                ""
-            };
-            let replacement = format!("{}{}{}", text_directory, name.replace(' ', "\\ "), suffix);
-            Some(Pair {
-                display: format!("{name}{suffix}"),
-                replacement,
-            })
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|left, right| left.display.cmp(&right.display));
-    matches
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
+    use std::path::Path;
 
     #[test]
     fn path_completion_uses_xshell_cwd() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let matches = complete_path("Cargo", root);
-        assert!(matches.iter().any(|pair| pair.replacement == "Cargo.toml"));
+        let result = complete_shell("$cat Cargo", 10, root).unwrap();
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.replacement == "Cargo.toml")
+        );
     }
 
     fn helper_with_profiles() -> XshellHelper {
@@ -510,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_sessions_do_not_offer_local_shell_completions() {
+    fn disabled_shell_completion_does_not_offer_local_candidates() {
         let mut helper = helper_with_profiles();
         helper.set_shell_completion_enabled(false);
         let history = DefaultHistory::new();

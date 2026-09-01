@@ -168,7 +168,8 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
         .unwrap();
     let _daemon = Daemon(child);
     let mut readiness = connect_when_ready(&socket);
-    readiness
+    std::fs::write(temporary.path().join("remote-file.txt"), "test").unwrap();
+    let shared = readiness
         .create(SessionCreation {
             name: "shared".into(),
             model: model("local"),
@@ -178,7 +179,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             history: Vec::new(),
         })
         .unwrap();
-    readiness
+    let private = readiness
         .create(SessionCreation {
             name: "private".into(),
             model: model("local"),
@@ -222,6 +223,31 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
         &ClientRequest::Attach {
             selector: "private".into(),
             role: AttachmentRole::Owner,
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Error { code, .. } if code == "remote_session_not_visible"
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::CompleteShell {
+            session_id: shared.descriptor.id,
+            line: "$cat remote".into(),
+            cursor: 11,
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::ShellCompletions { result }
+            if result.candidates.iter().any(|candidate| candidate.replacement == "remote-file.txt")
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::CompleteShell {
+            session_id: private.descriptor.id,
+            line: "$cat remote".into(),
+            cursor: 11,
         },
     );
     assert!(matches!(

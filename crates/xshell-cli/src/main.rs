@@ -132,6 +132,7 @@ async fn main() -> Result<()> {
         .context("could not initialize terminal input")?;
     editor.set_helper(Some(XshellHelper::new(cwd.clone(), model_profiles)));
     refresh_session_completions(&mut sessions, &mut editor);
+    refresh_shell_completions(&sessions, &mut editor);
 
     println!("xshell local prototype — //help for commands; //quit or Ctrl-D to exit");
     if config_path.exists() {
@@ -282,9 +283,7 @@ async fn main() -> Result<()> {
                             &mut editor,
                             true,
                         )?;
-                        if let Some(helper) = editor.helper_mut() {
-                            helper.set_shell_completion_enabled(!sessions.active_is_remote());
-                        }
+                        refresh_shell_completions(&sessions, &mut editor);
                         audit_logical_session_attached(&mut audit, &sessions, "connect_ssh")?;
                         refresh_session_completions(&mut sessions, &mut editor);
                         println!("connected to {}", session_label(&sessions));
@@ -317,6 +316,7 @@ async fn main() -> Result<()> {
                     &mut editor,
                 ) {
                     Ok(()) => {
+                        refresh_shell_completions(&sessions, &mut editor);
                         audit_logical_session_attached(&mut audit, &sessions, "switch")?;
                         refresh_session_completions(&mut sessions, &mut editor);
                     }
@@ -336,6 +336,7 @@ async fn main() -> Result<()> {
                     &mut editor,
                 ) {
                     Ok(()) => {
+                        refresh_shell_completions(&sessions, &mut editor);
                         audit_logical_session_attached(&mut audit, &sessions, "create")?;
                         refresh_session_completions(&mut sessions, &mut editor);
                     }
@@ -387,8 +388,8 @@ async fn main() -> Result<()> {
                 agent = build_adapter(&active_model, false)?;
                 if let Some(helper) = editor.helper_mut() {
                     helper.set_cwd(cwd.clone());
-                    helper.set_shell_completion_enabled(!sessions.active_is_remote());
                 }
+                refresh_shell_completions(&sessions, &mut editor);
                 audit_logical_session_attached(&mut audit, &sessions, "close_fallback")?;
                 refresh_session_completions(&mut sessions, &mut editor);
                 println!("switched to {}", session_label(&sessions));
@@ -1024,7 +1025,6 @@ fn switch_session(
     *agent = build_adapter(active_model, false)?;
     if let Some(helper) = editor.helper_mut() {
         helper.set_cwd(cwd.clone());
-        helper.set_shell_completion_enabled(!sessions.active_is_remote());
     }
     println!("switched to {}", session_label(sessions));
     Ok(())
@@ -1135,7 +1135,6 @@ fn create_session(
     *agent = build_adapter(active_model, false)?;
     if let Some(helper) = editor.helper_mut() {
         helper.set_cwd(cwd.clone());
-        helper.set_shell_completion_enabled(!sessions.active_is_remote());
     }
     println!("created and attached {}", session_label(sessions));
     Ok(())
@@ -1179,6 +1178,27 @@ fn refresh_session_completions(
     };
     if let Some(helper) = editor.helper_mut() {
         helper.set_session_names(names);
+    }
+}
+
+fn refresh_shell_completions(
+    sessions: &SessionRuntime,
+    editor: &mut Editor<XshellHelper, DefaultHistory>,
+) {
+    let remote = match sessions.remote_completion_client() {
+        Ok(remote) => remote,
+        Err(error) => {
+            eprintln!("xshell: remote shell completion unavailable: {error:#}");
+            if let Some(helper) = editor.helper_mut() {
+                helper.set_remote_shell_completion(None);
+                helper.set_shell_completion_enabled(false);
+            }
+            return;
+        }
+    };
+    if let Some(helper) = editor.helper_mut() {
+        helper.set_remote_shell_completion(remote);
+        helper.set_shell_completion_enabled(true);
     }
 }
 

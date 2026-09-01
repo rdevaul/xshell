@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-pub const SESSION_PROTOCOL_VERSION: u32 = 3;
+pub const SESSION_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -201,4 +201,16 @@ pub struct ApprovalReply {
     pub turn_id: String,
     pub call_id: String,
     pub decision: ApprovalDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellCompletionCandidate {
+    pub display: String,
+    pub replacement: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellCompletionResult {
+    pub start: usize,
+    pub candidates: Vec<ShellCompletionCandidate>,
 }

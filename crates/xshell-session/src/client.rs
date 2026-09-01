@@ -1,7 +1,7 @@
 use crate::{
     ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding,
     SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot,
-    TurnInput,
+    ShellCompletionResult, TurnInput,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -260,6 +260,23 @@ impl SessionClient {
         match self.receive()? {
             ServerResponse::CancellationAccepted => Ok(()),
             response => response_error("cancel", response),
+        }
+    }
+
+    pub fn complete_shell(
+        &mut self,
+        session_id: String,
+        line: String,
+        cursor: usize,
+    ) -> Result<ShellCompletionResult> {
+        self.send(&ClientRequest::CompleteShell {
+            session_id,
+            line,
+            cursor,
+        })?;
+        match self.receive()? {
+            ServerResponse::ShellCompletions { result } => Ok(result),
+            response => response_error("shell completion", response),
         }
     }
 

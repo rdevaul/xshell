@@ -7,15 +7,17 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
 use xshell_session::{
     ClientRequest, ExecutionCoordinator, PersistenceMode, SESSION_PROTOCOL_VERSION, ServerResponse,
-    SessionConfig, SessionRegistry,
+    SessionConfig, SessionRegistry, complete_shell,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -183,6 +185,7 @@ fn reject_remote_request(
         ClientRequest::Close {
             selector: Some(selector),
         } => Some(selector.as_str()),
+        ClientRequest::CompleteShell { session_id, .. } => Some(session_id.as_str()),
         _ => None,
     };
     let Some(selector) = selector else {
@@ -434,6 +437,21 @@ fn process_request(
             execution.cancel(&session_id, &turn_id)?;
             Ok(ServerResponse::CancellationAccepted)
         }
+        ClientRequest::CompleteShell {
+            session_id,
+            line,
+            cursor,
+        } => {
+            let cwd = registry
+                .lock()
+                .expect("session registry poisoned")
+                .snapshot(&session_id)?
+                .descriptor
+                .cwd;
+            Ok(ServerResponse::ShellCompletions {
+                result: complete_shell_bounded(line, cursor, cwd)?,
+            })
+        }
         ClientRequest::Detach => {
             let detached = match attached_session.take() {
                 Some(session_id) => detach_session(registry, execution, client_id, &session_id)?,
@@ -465,6 +483,23 @@ fn process_request(
         }
         ClientRequest::Open { .. } => bail!("connection is already open"),
     }
+}
+
+fn complete_shell_bounded(
+    line: String,
+    cursor: usize,
+    cwd: PathBuf,
+) -> Result<xshell_session::ShellCompletionResult> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("xshelld-completion".into())
+        .spawn(move || {
+            let _ = sender.send(complete_shell(&line, cursor, &cwd));
+        })
+        .context("cannot start shell completion worker")?;
+    receiver
+        .recv_timeout(COMPLETION_TIMEOUT)
+        .context("shell completion timed out")?
 }
 
 fn require_current(attached_session: &Option<String>, session_id: &str) -> Result<()> {

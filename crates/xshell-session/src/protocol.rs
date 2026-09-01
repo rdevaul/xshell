@@ -1,6 +1,6 @@
 use crate::{
     ApprovalReply, AttachmentRole, EventBatch, ModelBinding, SESSION_PROTOCOL_VERSION,
-    SessionCreation, SessionDescriptor, SessionSnapshot, TurnInput,
+    SessionCreation, SessionDescriptor, SessionSnapshot, ShellCompletionResult, TurnInput,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -53,6 +53,11 @@ pub enum ClientRequest {
         session_id: String,
         turn_id: String,
     },
+    CompleteShell {
+        session_id: String,
+        line: String,
+        cursor: usize,
+    },
     Detach,
     Close {
         selector: Option<String>,
@@ -102,6 +107,9 @@ pub enum ServerResponse {
     },
     ApprovalAccepted,
     CancellationAccepted,
+    ShellCompletions {
+        result: ShellCompletionResult,
+    },
     Detached {
         session_id: Option<String>,
     },
