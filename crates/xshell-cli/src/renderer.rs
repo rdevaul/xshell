@@ -209,13 +209,18 @@ impl AgentRenderer {
         }
         let lines = mem::take(&mut self.block);
         self.block_bytes = 0;
-        if is_table(&lines) {
-            return self.write_table(&lines, output);
-        }
-
         let mut paragraph = Vec::new();
-        for line in lines {
-            if let Some((level, content)) = heading(&line) {
+        let mut index = 0;
+        while index < lines.len() {
+            if let Some(end) = table_extent(&lines, index) {
+                self.flush_paragraph(&mut paragraph, output)?;
+                self.write_table(&lines[index..end], output)?;
+                index = end;
+                continue;
+            }
+
+            let line = &lines[index];
+            if let Some((level, content)) = heading(line) {
                 self.flush_paragraph(&mut paragraph, output)?;
                 let marker = if level == 1 { "▌ " } else { "▸ " };
                 self.write_line(
@@ -225,7 +230,7 @@ impl AgentRenderer {
                     Style::default().bold().cyan(),
                     output,
                 )?;
-            } else if let Some((marker, content)) = list_item(&line) {
+            } else if let Some((marker, content)) = list_item(line) {
                 self.flush_paragraph(&mut paragraph, output)?;
                 let continuation = " ".repeat(UnicodeWidthStr::width(marker.as_str()));
                 self.write_line(
@@ -244,15 +249,16 @@ impl AgentRenderer {
                     Style::default().dim(),
                     output,
                 )?;
-            } else if is_rule(&line) {
+            } else if is_rule(line) {
                 self.flush_paragraph(&mut paragraph, output)?;
                 let length = self.options.width.min(40);
                 writeln!(output, "{}", "─".repeat(length))?;
                 self.wrote_any = true;
                 self.ends_with_newline = true;
             } else {
-                paragraph.push(line);
+                paragraph.push(line.clone());
             }
+            index += 1;
         }
         self.flush_paragraph(&mut paragraph, output)
     }
@@ -358,22 +364,35 @@ impl AgentRenderer {
         }
 
         for (row_index, row) in rows.iter().enumerate() {
-            self.write_styled("│", Style::default().dim(), output)?;
-            for (column, width) in widths.iter().enumerate() {
-                let cell = row.get(column).map(String::as_str).unwrap_or("");
-                let cell = truncate_width(&plain_inline(cell), *width);
-                let padding = width.saturating_sub(visible_width(&cell));
-                write!(output, " ")?;
-                let style = if row_index == 0 {
-                    Style::default().bold()
-                } else {
-                    Style::default()
-                };
-                self.write_styled(&cell, style, output)?;
-                write!(output, "{} ", " ".repeat(padding))?;
+            let wrapped = widths
+                .iter()
+                .enumerate()
+                .map(|(column, width)| {
+                    let cell = row.get(column).map(String::as_str).unwrap_or("");
+                    wrap_plain(&plain_inline(cell), *width)
+                })
+                .collect::<Vec<_>>();
+            let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+            let style = if row_index == 0 {
+                Style::default().bold()
+            } else {
+                Style::default()
+            };
+            for physical_line in 0..height {
                 self.write_styled("│", Style::default().dim(), output)?;
+                for (column, width) in widths.iter().enumerate() {
+                    let cell = wrapped[column]
+                        .get(physical_line)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let padding = width.saturating_sub(visible_width(cell));
+                    write!(output, " ")?;
+                    self.write_styled(cell, style, output)?;
+                    write!(output, "{} ", " ".repeat(padding))?;
+                    self.write_styled("│", Style::default().dim(), output)?;
+                }
+                writeln!(output)?;
             }
-            writeln!(output)?;
             if row_index == 0 {
                 self.write_styled("├", Style::default().dim(), output)?;
                 for (index, width) in widths.iter().enumerate() {
@@ -679,6 +698,22 @@ fn is_table(lines: &[String]) -> bool {
         })
 }
 
+fn table_extent(lines: &[String], start: usize) -> Option<usize> {
+    let remaining = lines.get(start..)?;
+    if !is_table(remaining) {
+        return None;
+    }
+    let columns = split_table_row(&remaining[0]).len();
+    let mut end = start + 2;
+    while let Some(line) = lines.get(end) {
+        if !line.contains('|') || split_table_row(line).len() != columns {
+            break;
+        }
+        end += 1;
+    }
+    Some(end)
+}
+
 fn split_table_row(line: &str) -> Vec<String> {
     line.trim()
         .trim_start_matches('|')
@@ -688,23 +723,51 @@ fn split_table_row(line: &str) -> Vec<String> {
         .collect()
 }
 
-fn truncate_width(text: &str, width: usize) -> String {
-    if visible_width(text) <= width {
-        return text.to_owned();
-    }
-    let target = width.saturating_sub(1);
-    let mut result = String::new();
-    let mut used = 0;
-    for character in text.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used + character_width > target {
-            break;
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_width = visible_width(word);
+        if word_width > width {
+            if !current.is_empty() {
+                lines.push(mem::take(&mut current));
+            }
+            lines.extend(split_at_width(word, width));
+        } else if current.is_empty() {
+            current.push_str(word);
+        } else if visible_width(&current) + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(mem::replace(&mut current, word.to_owned()));
         }
-        result.push(character);
-        used += character_width;
     }
-    result.push('…');
-    result
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn split_at_width(word: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for character in word.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if !current.is_empty() && current_width + character_width > width {
+            chunks.push(mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(character);
+        current_width += character_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -864,6 +927,39 @@ mod tests {
         assert!(rendered.contains("│ Name"));
         assert!(rendered.contains("│ bee"));
         assert!(!rendered.contains("```"));
+    }
+
+    #[test]
+    fn recognizes_a_table_immediately_after_a_heading_and_wraps_cells() {
+        let mut renderer = AgentRenderer::new(options(true, false, 72));
+        let mut output = Vec::new();
+        renderer
+            .push(
+                "### 📋 Not Yet Implemented (Future Phases)\n| Feature | Target Phase | Notes |\n|---|---|---|\n| CAD/Artifact Viewer | Phase 2 | F3D renderer plugin, content-addressed staging, multimodal attachment |\n| Remote Bootstrap | Phase 3 | Signed releases, launchd/systemd packaging, reconnect supervision |",
+                &mut output,
+            )
+            .unwrap();
+        renderer.finish(&mut output).unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.starts_with("▸ 📋 Not Yet Implemented (Future Phases)\n│"));
+        assert!(rendered.contains("├"));
+        assert!(!rendered.contains("|---|"));
+        for expected in [
+            "CAD/Artifact",
+            "Viewer",
+            "content-addressed",
+            "multimodal",
+            "attachment",
+            "launchd/systemd",
+            "supervision",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}:\n{rendered}"
+            );
+        }
+        assert!(rendered.lines().all(|line| visible_width(line) <= 72));
     }
 
     #[test]
