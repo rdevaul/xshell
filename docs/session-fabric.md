@@ -14,7 +14,8 @@ standalone CLI retains an in-process execution path when the fabric is
 disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
-socket. The first request must be `open` with protocol version 2. The daemon
+socket or an authenticated SSH stdio proxy. The first request must be `open`
+with protocol version 3. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 
@@ -44,8 +45,30 @@ binding stores only the name of the credential environment variable.
 
 Durable state is written to `sessions.json` through a same-directory temporary
 file, `fsync`, and atomic rename. Restored sessions are always detached.
-`host_only` and `fabric` visibility are recorded now; both remain local until
-authenticated SSH catalog federation exists.
+The `xshelld serve-stdio` boundary exports only `fabric` descriptors and rejects
+remote create, attach, switch, and named-close operations involving `host_only`
+sessions.
+
+## SSH transport
+
+The client starts `ssh -T -- DEST xshelld serve-stdio`. OpenSSH retains control
+of destination parsing, host-key verification, `~/.ssh/config`, agent use, and
+authentication. No agent forwarding is enabled by xshell. The remote helper
+automatically reads `$XSHELL_CONFIG` or `~/.config/xshell/config.toml` when
+present, resolves the daemon socket, and proxies protocol requests to that
+socket. Stdout contains protocol frames only; diagnostics use stderr.
+
+The proxy is deliberately stateless. Killing the SSH process closes its daemon
+client connection, applying ordinary detach semantics while daemon-owned work
+continues. The CLI keeps one connection per discovered host, aggregates their
+catalogs, and accepts `HOST:SESSION` selectors in the same `//switch` path used
+locally. New remote sessions use the remote user's home directory; local
+filesystem resolution is never applied to a remote cwd.
+
+This increment requires a compatible `xshelld` to already be installed and its
+daemon to be running. Signed bootstrap installation, richer compatibility
+negotiation, reconnect backoff, and SSH connection multiplexing remain future
+work.
 
 ## Protocol operations
 
@@ -85,10 +108,8 @@ model bindings contain an environment-variable name, never its value.
 
 ## Reserved evolution
 
-Remote federation will carry the same protocol over authenticated SSH stdio,
-export only `fabric` descriptors, and preserve host/user identity in selectors
-and audit events. It must not expose transcript contents during catalog
-discovery.
+Further federation work will add signed bootstrap installation, connection
+health/reconnect state, and discovery without exposing transcript contents.
 
 Execution events are currently mirrored into the audit stream by an attached
 client. Moving that append responsibility into `xshelld` is required before

@@ -65,9 +65,10 @@ The local foundation of Phase 3 is implemented: a versioned Unix-socket
 protocol, stable host/session identities, a single-controller registry,
 ephemeral/daemon/durable lifecycles, local session commands, model/cwd/chat
 snapshot restoration, daemon-owned agent and shell turns, approval rendezvous,
-cancellation, and bounded event replay after reconnect. SSH transport, remote
-catalog federation, daemon-side audit appends, and platform service
-installation remain Phase 3 work.
+cancellation, bounded event replay after reconnect, authenticated SSH stdio
+transport, multi-host catalogs, and cross-host switching. Signed remote
+bootstrap, reconnect supervision, daemon-side audit appends, and platform
+service installation remain Phase 3 work.
 
 ### Phase 0 — Architecture spikes and contract (1–2 weeks)
 

@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 
@@ -18,8 +19,23 @@ pub struct SessionClient {
     host_id: String,
     host_alias: String,
     user: String,
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Box<dyn Read + Send>>,
+    writer: Box<dyn Write + Send>,
+    _transport: TransportGuard,
+}
+
+enum TransportGuard {
+    Local,
+    Ssh(Child),
+}
+
+impl Drop for TransportGuard {
+    fn drop(&mut self) {
+        if let Self::Ssh(child) = self {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl SessionClient {
@@ -33,13 +49,50 @@ impl SessionClient {
         set_close_on_exec(&stream)?;
         let writer = stream.try_clone().context("cannot clone session socket")?;
         set_close_on_exec(&writer)?;
+        Self::open(
+            Box::new(stream),
+            Box::new(writer),
+            TransportGuard::Local,
+            client_version,
+        )
+    }
+
+    pub fn connect_ssh(destination: &str, client_version: &str) -> Result<Self> {
+        if destination.trim().is_empty() || destination.starts_with('-') {
+            bail!("SSH destination must be non-empty and may not begin with '-'");
+        }
+        let mut child = Command::new("ssh")
+            .args(["-T", "--", destination, "xshelld", "serve-stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("cannot start ssh connection to {destination:?}"))?;
+        let reader = child.stdout.take().context("cannot capture ssh stdout")?;
+        let writer = child.stdin.take().context("cannot open ssh stdin")?;
+        Self::open(
+            Box::new(reader),
+            Box::new(writer),
+            TransportGuard::Ssh(child),
+            client_version,
+        )
+        .with_context(|| format!("cannot open xshell session service on {destination:?}"))
+    }
+
+    fn open(
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        transport: TransportGuard,
+        client_version: &str,
+    ) -> Result<Self> {
         let mut client = Self {
             client_id: String::new(),
             host_id: String::new(),
             host_alias: String::new(),
             user: String::new(),
-            reader: BufReader::new(stream),
+            reader: BufReader::new(reader),
             writer,
+            _transport: transport,
         };
         client.send(&ClientRequest::open(client_version))?;
         match client.receive()? {

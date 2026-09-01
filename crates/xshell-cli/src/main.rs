@@ -247,6 +247,46 @@ async fn main() -> Result<()> {
                 }
                 break "quit";
             }
+            InputRoute::Control(ControlCommand::Connect(connect_args)) => {
+                let options = match parse_connect_options(&connect_args) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        eprintln!("xshell: {error:#}");
+                        continue;
+                    }
+                };
+                if let Err(error) = sessions.sync(&active_model, &cwd, &history) {
+                    eprintln!("xshell: cannot synchronize current session: {error:#}");
+                    continue;
+                }
+                match sessions.connect_ssh(
+                    &options.destination,
+                    options.session.as_deref(),
+                    &model_config.session_fabric.default_session,
+                    &active_model,
+                    &args.system_prompt,
+                ) {
+                    Ok(snapshot) => {
+                        apply_runtime_snapshot(
+                            snapshot,
+                            &mut active_model,
+                            &mut agent,
+                            &mut cwd,
+                            &mut history,
+                            &args.system_prompt,
+                            &mut editor,
+                            true,
+                        )?;
+                        if let Some(helper) = editor.helper_mut() {
+                            helper.set_shell_completion_enabled(!sessions.active_is_remote());
+                        }
+                        audit_logical_session_attached(&mut audit, &sessions, "connect_ssh")?;
+                        refresh_session_completions(&mut sessions, &mut editor);
+                        println!("connected to {}", session_label(&sessions));
+                    }
+                    Err(error) => eprintln!("xshell: {error:#}"),
+                }
+            }
             InputRoute::Control(ControlCommand::Sessions) => {
                 if let Err(error) = print_sessions(&mut sessions) {
                     eprintln!("xshell: {error:#}");
@@ -342,6 +382,7 @@ async fn main() -> Result<()> {
                 agent = build_adapter(&active_model, false)?;
                 if let Some(helper) = editor.helper_mut() {
                     helper.set_cwd(cwd.clone());
+                    helper.set_shell_completion_enabled(!sessions.active_is_remote());
                 }
                 audit_logical_session_attached(&mut audit, &sessions, "close_fallback")?;
                 refresh_session_completions(&mut sessions, &mut editor);
@@ -933,15 +974,10 @@ fn restore_session_state(
     default_system_prompt: &str,
 ) -> Result<()> {
     let restored_model = ActiveModel::from_session_binding(snapshot.descriptor.model)?;
-    let restored_cwd = snapshot.descriptor.cwd.canonicalize().with_context(|| {
-        format!(
-            "session {:?} working directory is unavailable: {}",
-            snapshot.descriptor.name,
-            snapshot.descriptor.cwd.display()
-        )
-    })?;
     *active_model = restored_model;
-    *cwd = restored_cwd;
+    // The active working directory may be on another host. Its daemon validates
+    // the path; a controller must not try to resolve it against its local filesystem.
+    *cwd = snapshot.descriptor.cwd;
     *history = snapshot.history;
     if history.is_empty() {
         history.push(ChatMessage::system(default_system_prompt));
@@ -966,6 +1002,7 @@ fn switch_session(
     *agent = build_adapter(active_model, false)?;
     if let Some(helper) = editor.helper_mut() {
         helper.set_cwd(cwd.clone());
+        helper.set_shell_completion_enabled(!sessions.active_is_remote());
     }
     println!("switched to {}", session_label(sessions));
     Ok(())
@@ -976,6 +1013,37 @@ struct NewSessionOptions {
     profile: Option<String>,
     persistence: PersistenceMode,
     visibility: Visibility,
+}
+
+struct ConnectOptions {
+    destination: String,
+    session: Option<String>,
+}
+
+fn parse_connect_options(args: &[String]) -> Result<ConnectOptions> {
+    let Some(destination) = args.first() else {
+        bail!("usage: //connect SSH_DESTINATION [--session NAME]");
+    };
+    let mut session = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session" => {
+                index += 1;
+                session = Some(
+                    args.get(index)
+                        .context("--session requires a session name")?
+                        .clone(),
+                );
+            }
+            argument => bail!("unknown //connect option {argument:?}"),
+        }
+        index += 1;
+    }
+    Ok(ConnectOptions {
+        destination: destination.clone(),
+        session,
+    })
 }
 
 fn parse_new_session_options(args: &[String]) -> Result<NewSessionOptions> {
@@ -1045,6 +1113,7 @@ fn create_session(
     *agent = build_adapter(active_model, false)?;
     if let Some(helper) = editor.helper_mut() {
         helper.set_cwd(cwd.clone());
+        helper.set_shell_completion_enabled(!sessions.active_is_remote());
     }
     println!("created and attached {}", session_label(sessions));
     Ok(())
@@ -1054,7 +1123,7 @@ fn print_sessions(sessions: &mut SessionRuntime) -> Result<()> {
     let active_id = sessions.active().map(|session| session.id.clone());
     let catalog = sessions.list()?;
     if catalog.is_empty() {
-        println!("no sessions on this host");
+        println!("no sessions on connected hosts");
         return Ok(());
     }
     for session in catalog {
@@ -1110,9 +1179,10 @@ xshell input routes:
 control commands:
   //help            show this help
   //status          show local session state
-  //sessions        list named sessions on the current host
+  //connect DEST    connect to xshelld on an SSH host
+  //sessions        list named sessions on connected hosts
   //new NAME        create and switch to a daemon-lifetime session
-  //switch NAME     switch to another local session
+  //switch SESSION  switch locally or across connected hosts
   //detach          detach, preserving a persistent session, and exit
   //close           delete the current session and return to the previous one
   //audit           show audit session state
@@ -1144,7 +1214,8 @@ control commands:
             eprintln!("xshell: unknown control command //{name}; try //help")
         }
         ControlCommand::Model(_) => unreachable!("model is handled by the REPL"),
-        ControlCommand::Sessions
+        ControlCommand::Connect(_)
+        | ControlCommand::Sessions
         | ControlCommand::New(_)
         | ControlCommand::Switch(_)
         | ControlCommand::Detach
@@ -1163,8 +1234,8 @@ fn print_status(
 ) {
     let descriptor = agent.descriptor();
     println!("session: {}", session_label(sessions));
-    if let Some(socket) = sessions.socket() {
-        println!("session service: {}", socket.display());
+    if let Some(service) = sessions.service_label() {
+        println!("session service: {service}");
         println!("execution owner: xshelld");
     } else {
         println!("session service: disabled");
@@ -1333,5 +1404,14 @@ mod tests {
         assert_eq!(options.profile.as_deref(), Some("local-qwen"));
         assert_eq!(options.persistence, PersistenceMode::Durable);
         assert_eq!(options.visibility, Visibility::HostOnly);
+    }
+
+    #[test]
+    fn parses_ssh_connection_destination_and_session() {
+        let args = vec!["rich@mini.local".into(), "--session".into(), "cad".into()];
+        let options = parse_connect_options(&args).unwrap();
+        assert_eq!(options.destination, "rich@mini.local");
+        assert_eq!(options.session.as_deref(), Some("cad"));
+        assert!(parse_connect_options(&[]).is_err());
     }
 }

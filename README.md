@@ -126,7 +126,7 @@ prevents context given to a local model from being sent to a cloud provider
 without an explicit new message. CLI flags and their corresponding environment
 variables override values in the startup profile.
 
-## Named local sessions
+## Named local and SSH sessions
 
 Named sessions are served by `xshelld` over a per-user Unix socket. Enable the
 `[session_fabric]` section in the configuration, then start the service before
@@ -160,7 +160,30 @@ daemon restart, but an in-flight turn does not yet survive daemon restart.
 Credential environment variables named by a model profile must be available
 to the `xshelld` process. They are not sent to or resolved by an attached CLI.
 This distinction becomes important once the CLI and daemon are on different
-hosts. See [the session-fabric protocol and current boundary](docs/session-fabric.md).
+hosts.
+
+To connect another macOS or Linux host, install `xshelld` somewhere on that
+host's non-interactive SSH `PATH`, configure and start its per-user daemon, then
+run:
+
+```text
+//connect rich@mini.local
+//connect rich@mini.local --session cad
+//sessions
+//switch laptop:bees
+```
+
+`//connect` invokes the system `ssh` command with PTY allocation disabled, so
+the user's normal `~/.ssh/config`, agent, host-key policy, and authentication
+prompts apply. The remote command is `xshelld serve-stdio`; it opens no network
+port and proxies the versioned protocol to the remote user's Unix socket.
+Connected hosts remain available in the common session catalog and switcher.
+Only sessions marked `fabric` are listed or attachable through this transport.
+If the selected name does not exist, xshell creates it in the remote user's
+home directory using the current model binding. Automatic remote installation
+and version negotiation beyond the protocol handshake are not implemented yet.
+
+See [the session-fabric protocol and current boundary](docs/session-fabric.md).
 
 ## Audit logging
 
