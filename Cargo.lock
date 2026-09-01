@@ -1978,6 +1978,7 @@ dependencies = [
  "xshell-adapters",
  "xshell-audit",
  "xshell-core",
+ "xshell-execution",
  "xshell-session",
 ]
 
@@ -1991,18 +1992,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "xshell-execution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tempfile",
+ "tokio",
+ "xshell-adapters",
+ "xshell-core",
+]
+
+[[package]]
 name = "xshell-session"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
  "uuid",
  "xshell-core",
+ "xshell-execution",
 ]
 
 [[package]]

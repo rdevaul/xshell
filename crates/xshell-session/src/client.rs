@@ -1,6 +1,7 @@
 use crate::{
-    AttachmentRole, ClientRequest, ModelBinding, SESSION_PROTOCOL_VERSION, ServerResponse,
-    SessionCreation, SessionDescriptor, SessionSnapshot,
+    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding,
+    SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot,
+    TurnInput,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -8,6 +9,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
+use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -131,6 +133,80 @@ impl SessionClient {
         match self.receive()? {
             ServerResponse::Updated { session } => Ok(session),
             response => response_error("update", response),
+        }
+    }
+
+    pub fn snapshot(&mut self, session_id: String) -> Result<SessionSnapshot> {
+        self.send(&ClientRequest::Snapshot { session_id })?;
+        match self.receive()? {
+            ServerResponse::Snapshot { session } => Ok(session),
+            response => response_error("snapshot", response),
+        }
+    }
+
+    pub fn submit(
+        &mut self,
+        session_id: String,
+        input: TurnInput,
+        approval: ApprovalPolicy,
+    ) -> Result<String> {
+        self.send(&ClientRequest::Submit {
+            session_id,
+            input,
+            approval,
+        })?;
+        match self.receive()? {
+            ServerResponse::Accepted { turn_id } => Ok(turn_id),
+            response => response_error("submit", response),
+        }
+    }
+
+    pub fn events(
+        &mut self,
+        session_id: String,
+        after_sequence: u64,
+        wait_ms: u64,
+    ) -> Result<EventBatch> {
+        self.send(&ClientRequest::Events {
+            session_id,
+            after_sequence,
+            wait_ms,
+        })?;
+        match self.receive()? {
+            ServerResponse::Events { batch } => Ok(batch),
+            response => response_error("events", response),
+        }
+    }
+
+    pub fn approve(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+        call_id: String,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
+        self.send(&ClientRequest::Approve {
+            session_id,
+            reply: ApprovalReply {
+                turn_id,
+                call_id,
+                decision,
+            },
+        })?;
+        match self.receive()? {
+            ServerResponse::ApprovalAccepted => Ok(()),
+            response => response_error("approval", response),
+        }
+    }
+
+    pub fn cancel(&mut self, session_id: String, turn_id: String) -> Result<()> {
+        self.send(&ClientRequest::Cancel {
+            session_id,
+            turn_id,
+        })?;
+        match self.receive()? {
+            ServerResponse::CancellationAccepted => Ok(()),
+            response => response_error("cancel", response),
         }
     }
 

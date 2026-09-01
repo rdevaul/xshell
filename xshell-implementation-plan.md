@@ -61,12 +61,12 @@ The baseline must work in a plain terminal with no inline image protocol and on 
 
 ### Current implementation checkpoint
 
-The first local slice of Phase 3 is implemented: a versioned Unix-socket
+The local foundation of Phase 3 is implemented: a versioned Unix-socket
 protocol, stable host/session identities, a single-controller registry,
-ephemeral/daemon/durable lifecycles, local session commands, and model/cwd/chat
-snapshot restoration. `xshelld` is intentionally still a state registry; live
-agent and command execution remains in the CLI until supervision moves across
-that boundary. SSH transport, remote catalog federation, and platform service
+ephemeral/daemon/durable lifecycles, local session commands, model/cwd/chat
+snapshot restoration, daemon-owned agent and shell turns, approval rendezvous,
+cancellation, and bounded event replay after reconnect. SSH transport, remote
+catalog federation, daemon-side audit appends, and platform service
 installation remain Phase 3 work.
 
 ### Phase 0 — Architecture spikes and contract (1–2 weeks)
