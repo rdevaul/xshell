@@ -222,7 +222,7 @@ async fn main() -> Result<()> {
         match route {
             InputRoute::Empty => {}
             InputRoute::Shell(command) => {
-                if sessions.enabled() {
+                if sessions.enabled() && !sessions.active_host_is_local() {
                     match run_daemon_turn(
                         &mut sessions,
                         TurnInput::Shell {
@@ -1514,12 +1514,16 @@ fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<String> {
     }
 
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let status = Command::new(&shell)
-        .arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .status()
-        .with_context(|| format!("could not launch shell {shell}"))?;
+    let status = if xshell_pty::controller_is_terminal() {
+        xshell_pty::run(command, cwd)?
+    } else {
+        Command::new(&shell)
+            .arg("-lc")
+            .arg(command)
+            .current_dir(cwd)
+            .status()
+            .with_context(|| format!("could not launch shell {shell}"))?
+    };
     if !status.success() {
         eprintln!("xshell: command exited with {status}");
     }

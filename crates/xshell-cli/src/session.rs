@@ -111,6 +111,12 @@ impl SessionRuntime {
         self.connection.is_some()
     }
 
+    pub fn active_host_is_local(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| matches!(connection.endpoint, ConnectionEndpoint::Local(_)))
+    }
+
     pub fn remote_completion_client(&self) -> Result<Option<(SessionClient, String)>> {
         let Some(connection) = &self.connection else {
             return Ok(None);
