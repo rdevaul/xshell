@@ -150,11 +150,17 @@ attachment. `//close` deletes the current session; xshell returns to the
 previously visited available session, or otherwise the most recently active
 available session. Closing the last session exits the CLI.
 
-`xshelld` is currently a state registry, not the execution host: the attached
-CLI still runs model requests and commands. Moving execution ownership into
-the daemon is the next boundary needed for truly persistent in-flight work and
-network-transparent attachment. See [the session-fabric protocol and current
-boundary](docs/session-fabric.md).
+When the session fabric is enabled, `xshelld` owns model requests, agent tool
+loops, approvals, and `$` command execution. The CLI renders its sequenced
+event stream and sends approval decisions. A daemon-lifetime or durable turn
+continues if the client disconnects; reattachment replays the bounded event
+journal before resuming live output. Completed durable session state survives
+daemon restart, but an in-flight turn does not yet survive daemon restart.
+
+Credential environment variables named by a model profile must be available
+to the `xshelld` process. They are not sent to or resolved by an attached CLI.
+This distinction becomes important once the CLI and daemon are on different
+hosts. See [the session-fabric protocol and current boundary](docs/session-fabric.md).
 
 ## Audit logging
 

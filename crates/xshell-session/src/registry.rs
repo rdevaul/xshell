@@ -1,6 +1,6 @@
 use crate::{
-    AccessMode, AttachmentRole, ModelBinding, PersistenceMode, SessionCreation, SessionDescriptor,
-    SessionSnapshot, SessionStatus,
+    AccessMode, AttachmentRole, ModelBinding, PersistenceMode, SessionActivity, SessionCreation,
+    SessionDescriptor, SessionSnapshot, SessionStatus,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,7 @@ impl SessionRegistry {
                 snapshot.descriptor.host_alias.clone_from(&host_alias);
                 snapshot.descriptor.user.clone_from(&user);
                 snapshot.descriptor.status = SessionStatus::Detached;
+                snapshot.descriptor.activity = SessionActivity::Idle;
                 snapshot.descriptor.attached_clients = 0;
                 if sessions
                     .insert(
@@ -139,6 +140,7 @@ impl SessionRegistry {
             visibility: creation.visibility,
             access_mode: AccessMode::SingleUser,
             status: SessionStatus::Attached,
+            activity: SessionActivity::Idle,
             attached_clients: 1,
             created_at_unix_ms: now,
             last_active_at_unix_ms: now,
@@ -213,6 +215,24 @@ impl SessionRegistry {
             );
         }
         record.snapshot.descriptor.model = model;
+        record.snapshot.descriptor.cwd = cwd;
+        record.snapshot.descriptor.last_active_at_unix_ms = timestamp_ms()?;
+        record.snapshot.history = history;
+        let descriptor = descriptor_with_status(record);
+        self.persist()?;
+        Ok(descriptor)
+    }
+
+    pub fn update_execution_state(
+        &mut self,
+        session_id: &str,
+        cwd: PathBuf,
+        history: Vec<xshell_core::ChatMessage>,
+    ) -> Result<SessionDescriptor> {
+        let record = self
+            .sessions
+            .get_mut(session_id)
+            .with_context(|| format!("unknown session {session_id:?}"))?;
         record.snapshot.descriptor.cwd = cwd;
         record.snapshot.descriptor.last_active_at_unix_ms = timestamp_ms()?;
         record.snapshot.history = history;

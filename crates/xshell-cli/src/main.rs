@@ -6,7 +6,7 @@ mod tools;
 
 use anyhow::{Context, Result, bail};
 use audit::AuditRuntime;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use completion::XshellHelper;
 use config::{ActiveModel, ModelOverrides, Provider, XshellConfig};
 use rustyline::Editor;
@@ -17,50 +17,26 @@ use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
+use xshell_adapters::AgentAdapter;
 use xshell_audit::AuditEvent;
 use xshell_core::{
     AgentEvent, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute,
     ToolCall, classify_input,
 };
-use xshell_session::{PersistenceMode, SessionSnapshot, Visibility};
+use xshell_execution::{
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, ExecutionEvent,
+    build_adapter as build_execution_adapter, tool_summary,
+};
+use xshell_session::{PersistenceMode, SessionEventKind, SessionSnapshot, TurnInput, Visibility};
 
 /// Maximum number of agent tool-call steps per turn before the loop
 /// aborts. Kept bounded so a misbehaving model cannot loop forever.
 const MAX_AGENT_STEPS: usize = 64;
 
-/// Approval policy for tools that require user confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ApprovalMode {
-    /// Prompt before shell execution.
-    Ask,
-    /// Run all tools without prompting.
-    Auto,
-    /// Deny shell execution while allowing read-only tools.
-    Off,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApprovalDecision {
-    Approve,
-    Deny,
-    AbortTurn,
-}
-
-impl std::fmt::Display for ApprovalMode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Ask => "ask before shell execution",
-            Self::Auto => "auto-run all tools",
-            Self::Off => "deny shell execution",
-        })
-    }
-}
-
-fn resolve_approval(mode: ApprovalMode, gated: bool) -> bool {
+fn resolve_approval(mode: ApprovalPolicy, gated: bool) -> bool {
     match mode {
-        ApprovalMode::Ask | ApprovalMode::Off => !gated,
-        ApprovalMode::Auto => true,
+        ApprovalPolicy::Ask | ApprovalPolicy::Off => !gated,
+        ApprovalPolicy::Auto => true,
     }
 }
 
@@ -101,7 +77,7 @@ struct Args {
         default_value = "ask",
         help = "Approval policy: ask (prompt, default), auto (run all), off (deny shell)"
     )]
-    approval: ApprovalMode,
+    approval: ApprovalPolicy,
 }
 
 #[tokio::main]
@@ -138,7 +114,7 @@ async fn main() -> Result<()> {
             &args.system_prompt,
         )?;
     }
-    let mut agent = build_adapter(&active_model)?;
+    let mut agent = build_adapter(&active_model, !sessions.enabled())?;
     let mut audit = AuditRuntime::start(&model_config.audit)?;
     audit.append(AuditEvent::SessionStarted {
         client_version: env!("CARGO_PKG_VERSION").into(),
@@ -169,6 +145,21 @@ async fn main() -> Result<()> {
         &cwd,
         args.approval,
     );
+
+    if let Some(turn_id) = sessions.active_turn_id().map(str::to_owned) {
+        println!("reattaching to active turn {turn_id}");
+        let snapshot = follow_daemon_turn(&mut sessions, &mut audit)?;
+        apply_runtime_snapshot(
+            snapshot,
+            &mut active_model,
+            &mut agent,
+            &mut cwd,
+            &mut history,
+            &args.system_prompt,
+            &mut editor,
+            true,
+        )?;
+    }
 
     let exit_reason = loop {
         let prompt = format!(
@@ -203,6 +194,29 @@ async fn main() -> Result<()> {
         match route {
             InputRoute::Empty => {}
             InputRoute::Shell(command) => {
+                if sessions.enabled() {
+                    match run_daemon_turn(
+                        &mut sessions,
+                        TurnInput::Shell {
+                            command: command.clone(),
+                        },
+                        args.approval,
+                        &mut audit,
+                    ) {
+                        Ok(snapshot) => apply_runtime_snapshot(
+                            snapshot,
+                            &mut active_model,
+                            &mut agent,
+                            &mut cwd,
+                            &mut history,
+                            &args.system_prompt,
+                            &mut editor,
+                            true,
+                        )?,
+                        Err(error) => eprintln!("xshell: {error:#}"),
+                    }
+                    continue;
+                }
                 let previous_cwd = cwd.clone();
                 let outcome = match run_shell(&command, &mut cwd) {
                     Ok(outcome) => outcome,
@@ -325,7 +339,7 @@ async fn main() -> Result<()> {
                     &mut history,
                     &args.system_prompt,
                 )?;
-                agent = build_adapter(&active_model)?;
+                agent = build_adapter(&active_model, false)?;
                 if let Some(helper) = editor.helper_mut() {
                     helper.set_cwd(cwd.clone());
                 }
@@ -342,6 +356,7 @@ async fn main() -> Result<()> {
                     &mut history,
                     &args.system_prompt,
                     &mut audit,
+                    sessions.enabled(),
                 ) {
                     eprintln!("xshell: {error:#}");
                 }
@@ -356,6 +371,34 @@ async fn main() -> Result<()> {
                 args.approval,
             ),
             InputRoute::Agent(message) => {
+                if sessions.enabled() {
+                    match run_daemon_turn(
+                        &mut sessions,
+                        TurnInput::Agent {
+                            message: message.clone(),
+                        },
+                        args.approval,
+                        &mut audit,
+                    ) {
+                        Ok(snapshot) => apply_runtime_snapshot(
+                            snapshot,
+                            &mut active_model,
+                            &mut agent,
+                            &mut cwd,
+                            &mut history,
+                            &args.system_prompt,
+                            &mut editor,
+                            true,
+                        )?,
+                        Err(error) => {
+                            let _ = audit.append(AuditEvent::AgentError {
+                                message: format!("{error:#}"),
+                            });
+                            eprintln!("xshell agent error: {error:#}");
+                        }
+                    }
+                    continue;
+                }
                 if let Err(error) = run_agent_turn(
                     agent.as_mut(),
                     &mut history,
@@ -389,12 +432,161 @@ fn input_route_name(route: &InputRoute) -> &'static str {
     }
 }
 
+fn run_daemon_turn(
+    sessions: &mut SessionRuntime,
+    input: TurnInput,
+    approval: ApprovalPolicy,
+    audit: &mut AuditRuntime,
+) -> Result<SessionSnapshot> {
+    sessions.submit(input, approval)?;
+    follow_daemon_turn(sessions, audit)
+}
+
+fn follow_daemon_turn(
+    sessions: &mut SessionRuntime,
+    audit: &mut AuditRuntime,
+) -> Result<SessionSnapshot> {
+    let mut streamed_since_response = false;
+    let mut shell_finished: Option<(String, String)> = None;
+    loop {
+        let batch = sessions.events(1_000)?;
+        if let Some(sequence) = batch.truncated_before {
+            eprintln!("xshell: session event replay was truncated before sequence {sequence}");
+        }
+        if batch.events.is_empty() && batch.active_turn_id.is_none() {
+            bail!("session turn ended without a terminal event");
+        }
+        for record in batch.events {
+            match record.event {
+                SessionEventKind::TurnStarted { .. } => {}
+                SessionEventKind::Execution { event } => match event {
+                    ExecutionEvent::TextDelta { text } => {
+                        streamed_since_response = true;
+                        print!("{text}");
+                        io::stdout().flush()?;
+                    }
+                    ExecutionEvent::AgentResponse {
+                        content,
+                        tool_call_count,
+                        partial,
+                    } => {
+                        if !streamed_since_response && !content.is_empty() {
+                            print!("{content}");
+                        }
+                        if streamed_since_response || !content.is_empty() {
+                            println!();
+                        }
+                        streamed_since_response = false;
+                        audit.append(AuditEvent::AgentResponse {
+                            content,
+                            tool_call_count,
+                            partial,
+                        })?;
+                    }
+                    ExecutionEvent::ToolRequested { call } => {
+                        println!("agent requests: {}", tool_summary(&call));
+                        audit.append(AuditEvent::ToolRequested {
+                            call_id: call.id,
+                            name: call.name,
+                            arguments: call.arguments,
+                        })?;
+                    }
+                    ExecutionEvent::ApprovalRequested { call } => {
+                        let decision = confirm_tool(&call)?;
+                        sessions.approve(record.turn_id.clone(), call.id.clone(), decision)?;
+                    }
+                    ExecutionEvent::ToolDecision { call_id, decision } => {
+                        audit.append(AuditEvent::ToolDecision {
+                            call_id,
+                            decision: approval_decision_name(decision).into(),
+                        })?;
+                    }
+                    ExecutionEvent::ToolResult {
+                        call_id,
+                        name,
+                        result,
+                    } => {
+                        audit.append(AuditEvent::ToolResult {
+                            call_id,
+                            name,
+                            result: result.clone(),
+                        })?;
+                        print_tool_result(&result);
+                    }
+                    ExecutionEvent::TurnAborted => {
+                        println!("agent turn aborted; no remaining tools were executed");
+                    }
+                },
+                SessionEventKind::ShellOutput { stream, text } => {
+                    if stream == "stderr" {
+                        eprint!("{text}");
+                        io::stderr().flush()?;
+                    } else {
+                        print!("{text}");
+                        io::stdout().flush()?;
+                    }
+                }
+                SessionEventKind::WorkingDirectoryChanged { cwd } => {
+                    audit.append(AuditEvent::WorkingDirectoryChanged {
+                        cwd: cwd.display().to_string(),
+                    })?;
+                }
+                SessionEventKind::ShellFinished { command, status } => {
+                    if status != "exit status: 0" && status != "working directory changed" {
+                        eprintln!("xshell: command finished with {status}");
+                    }
+                    shell_finished = Some((command, status));
+                }
+                SessionEventKind::TurnCompleted => {
+                    sessions.mark_turn_finished();
+                    let snapshot = sessions.refresh_snapshot()?;
+                    if let Some((command, status)) = shell_finished.take() {
+                        audit.append(AuditEvent::ShellFinished {
+                            command,
+                            outcome: status,
+                            cwd: snapshot.descriptor.cwd.display().to_string(),
+                        })?;
+                    }
+                    return Ok(snapshot);
+                }
+                SessionEventKind::TurnFailed { message } => {
+                    sessions.mark_turn_finished();
+                    bail!("{message}");
+                }
+                SessionEventKind::TurnCancelled => {
+                    sessions.mark_turn_finished();
+                    bail!("session turn was cancelled");
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_runtime_snapshot(
+    snapshot: SessionSnapshot,
+    active_model: &mut ActiveModel,
+    agent: &mut Box<dyn AgentAdapter>,
+    cwd: &mut PathBuf,
+    history: &mut Vec<ChatMessage>,
+    default_system_prompt: &str,
+    editor: &mut Editor<XshellHelper, DefaultHistory>,
+    daemon_owned: bool,
+) -> Result<()> {
+    restore_session_state(snapshot, active_model, cwd, history, default_system_prompt)?;
+    *agent = build_adapter(active_model, !daemon_owned)?;
+    if let Some(helper) = editor.helper_mut() {
+        helper.set_cwd(cwd.clone());
+    }
+    Ok(())
+}
+
 async fn run_agent_turn(
     agent: &mut dyn AgentAdapter,
     history: &mut Vec<ChatMessage>,
     message: String,
     cwd: &Path,
-    approval: ApprovalMode,
+    approval: ApprovalPolicy,
     audit: &mut AuditRuntime,
 ) -> Result<()> {
     let checkpoint = history.len();
@@ -465,7 +657,7 @@ async fn run_agent_turn(
             let gated = tools::requires_approval(call);
             let decision = if resolve_approval(approval, gated) {
                 ApprovalDecision::Approve
-            } else if approval == ApprovalMode::Ask && gated {
+            } else if approval == ApprovalPolicy::Ask && gated {
                 confirm_tool(call)?
             } else {
                 ApprovalDecision::Deny
@@ -566,31 +758,22 @@ fn floor_char_boundary(value: &str, mut index: usize) -> usize {
     index
 }
 
-fn build_adapter(active: &ActiveModel) -> Result<Box<dyn AgentAdapter>> {
-    let adapter: Box<dyn AgentAdapter> = match active.provider {
-        Provider::Ollama => Box::new(OllamaAdapter::new(&active.base_url, &active.model)),
-        Provider::Openai => Box::new(OpenAiCompatibleAdapter::new(
-            &active.base_url,
-            &active.model,
-            resolve_api_key(active)?,
-        )),
-    };
-    Ok(adapter)
+fn build_adapter(active: &ActiveModel, include_credentials: bool) -> Result<Box<dyn AgentAdapter>> {
+    build_execution_adapter(&AdapterConfig {
+        provider: match active.provider {
+            Provider::Ollama => "ollama",
+            Provider::Openai => "openai",
+        }
+        .into(),
+        model: active.model.clone(),
+        base_url: active.base_url.clone(),
+        api_key_env: include_credentials
+            .then(|| active.api_key_env.clone())
+            .flatten(),
+    })
 }
 
-fn resolve_api_key(active: &ActiveModel) -> Result<Option<String>> {
-    let Some(variable) = &active.api_key_env else {
-        return Ok(None);
-    };
-    let value = env::var(variable).context(
-        "the configured credential environment variable is not set or is not valid Unicode",
-    )?;
-    if value.is_empty() {
-        bail!("the configured credential environment variable is empty");
-    }
-    Ok(Some(value))
-}
-
+#[allow(clippy::too_many_arguments)]
 fn handle_model_command(
     args: Vec<String>,
     config: &XshellConfig,
@@ -599,9 +782,10 @@ fn handle_model_command(
     history: &mut Vec<ChatMessage>,
     system_prompt: &str,
     audit: &mut AuditRuntime,
+    daemon_owned: bool,
 ) -> Result<()> {
     if args.is_empty() || args == ["show"] {
-        print_model(active);
+        print_model(active, daemon_owned);
         return Ok(());
     }
     if args == ["list"] {
@@ -614,9 +798,19 @@ fn handle_model_command(
         [command, name] if command == "use" => name,
         _ => bail!("usage: //model [show|list|PROFILE] or //model use PROFILE"),
     };
-    switch_model_profile(name, config, active, agent, history, system_prompt, audit)
+    switch_model_profile(
+        name,
+        config,
+        active,
+        agent,
+        history,
+        system_prompt,
+        audit,
+        daemon_owned,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn switch_model_profile(
     name: &str,
     config: &XshellConfig,
@@ -625,6 +819,7 @@ fn switch_model_profile(
     history: &mut Vec<ChatMessage>,
     system_prompt: &str,
     audit: &mut AuditRuntime,
+    daemon_owned: bool,
 ) -> Result<()> {
     let next = config.resolve_profile(name)?;
     if next == *active {
@@ -632,7 +827,7 @@ fn switch_model_profile(
         return Ok(());
     }
 
-    let next_agent = build_adapter(&next)?;
+    let next_agent = build_adapter(&next, !daemon_owned)?;
     audit.append(AuditEvent::ModelSwitched {
         profile: name.into(),
         model: next.model.clone(),
@@ -642,7 +837,7 @@ fn switch_model_profile(
     history.clear();
     history.push(ChatMessage::system(system_prompt));
     println!("switched to model profile {name:?}; conversation history was cleared");
-    print_model(active);
+    print_model(active, daemon_owned);
     Ok(())
 }
 
@@ -664,7 +859,7 @@ fn print_model_profiles(config: &XshellConfig, active: &ActiveModel) {
     }
 }
 
-fn print_model(active: &ActiveModel) {
+fn print_model(active: &ActiveModel, daemon_owned: bool) {
     println!(
         "profile: {}",
         active.profile_name.as_deref().unwrap_or("(command-line)")
@@ -673,6 +868,10 @@ fn print_model(active: &ActiveModel) {
     println!("model: {}", active.model);
     println!("endpoint: {}", active.base_url);
     if active.provider == Provider::Openai {
+        if daemon_owned {
+            println!("credentials: resolved by xshelld");
+            return;
+        }
         let credential_status = match active.api_key_env.as_deref() {
             Some(variable) if env::var_os(variable).is_some() => "set",
             Some(_) => "missing",
@@ -764,7 +963,7 @@ fn switch_session(
     sessions.sync(active_model, cwd, history)?;
     let snapshot = sessions.switch(selector)?;
     restore_session_state(snapshot, active_model, cwd, history, default_system_prompt)?;
-    *agent = build_adapter(active_model)?;
+    *agent = build_adapter(active_model, false)?;
     if let Some(helper) = editor.helper_mut() {
         helper.set_cwd(cwd.clone());
     }
@@ -843,7 +1042,7 @@ fn create_session(
         options.visibility,
     )?;
     restore_session_state(snapshot, active_model, cwd, history, system_prompt)?;
-    *agent = build_adapter(active_model)?;
+    *agent = build_adapter(active_model, false)?;
     if let Some(helper) = editor.helper_mut() {
         helper.set_cwd(cwd.clone());
     }
@@ -865,13 +1064,14 @@ fn print_sessions(sessions: &mut SessionRuntime) -> Result<()> {
             " "
         };
         println!(
-            "{marker} {}/{}:{} — {} / {} — {:?}, {:?}, {:?}",
+            "{marker} {}/{}:{} — {} / {} — {:?}, {:?}, {:?}, {:?}",
             session.host_alias,
             session.user,
             session.name,
             session.model.profile_name.as_deref().unwrap_or("custom"),
             session.model.model,
             session.status,
+            session.activity,
             session.persistence,
             session.visibility
         );
@@ -898,7 +1098,7 @@ fn handle_control(
     audit: &AuditRuntime,
     sessions: &SessionRuntime,
     cwd: &Path,
-    approval: ApprovalMode,
+    approval: ApprovalPolicy,
 ) {
     match command {
         ControlCommand::Help => println!(
@@ -959,14 +1159,16 @@ fn print_status(
     audit: &AuditRuntime,
     sessions: &SessionRuntime,
     cwd: &Path,
-    approval: ApprovalMode,
+    approval: ApprovalPolicy,
 ) {
     let descriptor = agent.descriptor();
     println!("session: {}", session_label(sessions));
     if let Some(socket) = sessions.socket() {
         println!("session service: {}", socket.display());
+        println!("execution owner: xshelld");
     } else {
         println!("session service: disabled");
+        println!("execution owner: xshell CLI");
     }
     println!("cwd: {}", cwd.display());
     println!("agent: {} ({})", descriptor.display_name, descriptor.id);
@@ -1063,6 +1265,7 @@ fn compact_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum;
 
     #[test]
     fn compact_path_leaves_non_home_paths_alone() {
@@ -1073,28 +1276,28 @@ mod tests {
     #[test]
     fn approval_modes_parse() {
         assert_eq!(
-            ApprovalMode::from_str("ask", false).unwrap(),
-            ApprovalMode::Ask
+            ApprovalPolicy::from_str("ask", false).unwrap(),
+            ApprovalPolicy::Ask
         );
         assert_eq!(
-            ApprovalMode::from_str("auto", false).unwrap(),
-            ApprovalMode::Auto
+            ApprovalPolicy::from_str("auto", false).unwrap(),
+            ApprovalPolicy::Auto
         );
         assert_eq!(
-            ApprovalMode::from_str("off", false).unwrap(),
-            ApprovalMode::Off
+            ApprovalPolicy::from_str("off", false).unwrap(),
+            ApprovalPolicy::Off
         );
-        assert!(ApprovalMode::from_str("yolo", false).is_err());
+        assert!(ApprovalPolicy::from_str("yolo", false).is_err());
     }
 
     #[test]
     fn approval_policy_handles_gated_and_read_only_tools() {
-        assert!(!resolve_approval(ApprovalMode::Ask, true));
-        assert!(resolve_approval(ApprovalMode::Ask, false));
-        assert!(resolve_approval(ApprovalMode::Auto, true));
-        assert!(resolve_approval(ApprovalMode::Auto, false));
-        assert!(!resolve_approval(ApprovalMode::Off, true));
-        assert!(resolve_approval(ApprovalMode::Off, false));
+        assert!(!resolve_approval(ApprovalPolicy::Ask, true));
+        assert!(resolve_approval(ApprovalPolicy::Ask, false));
+        assert!(resolve_approval(ApprovalPolicy::Auto, true));
+        assert!(resolve_approval(ApprovalPolicy::Auto, false));
+        assert!(!resolve_approval(ApprovalPolicy::Off, true));
+        assert!(resolve_approval(ApprovalPolicy::Off, false));
     }
 
     #[test]

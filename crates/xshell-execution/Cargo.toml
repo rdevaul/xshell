@@ -1,26 +1,21 @@
 [package]
-name = "xshell-cli"
+name = "xshell-execution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "xshell"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
-rustyline = "17.0"
 serde.workspace = true
 serde_json.workspace = true
 shell-words = "1.1"
-toml = "0.9"
 tokio.workspace = true
 xshell-adapters = { path = "../xshell-adapters" }
-xshell-audit = { path = "../xshell-audit" }
 xshell-core = { path = "../xshell-core" }
-xshell-execution = { path = "../xshell-execution" }
-xshell-session = { path = "../xshell-session" }
+
+[dev-dependencies]
+tempfile = "3.21"

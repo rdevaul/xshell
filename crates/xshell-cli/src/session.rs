@@ -1,11 +1,12 @@
 use crate::config::ActiveModel;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
+use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
-    PersistenceMode, SessionClient, SessionConfig, SessionCreation, SessionDescriptor,
-    SessionSnapshot, SessionStatus, Visibility,
+    EventBatch, PersistenceMode, SessionClient, SessionConfig, SessionCreation, SessionDescriptor,
+    SessionSnapshot, SessionStatus, TurnInput, Visibility,
 };
 
 pub struct SessionRuntime {
@@ -13,6 +14,8 @@ pub struct SessionRuntime {
     active: Option<SessionDescriptor>,
     socket: Option<PathBuf>,
     navigation_history: Vec<String>,
+    event_cursors: HashMap<String, u64>,
+    active_turns: HashMap<String, Option<String>>,
 }
 
 impl SessionRuntime {
@@ -53,12 +56,17 @@ impl SessionRuntime {
             })?
         };
         let active = Some(snapshot.descriptor.clone());
+        let (cursor, active_turn) = initial_event_cursor(&mut client, &snapshot.descriptor.id)?;
+        let event_cursors = HashMap::from([(snapshot.descriptor.id.clone(), cursor)]);
+        let active_turns = HashMap::from([(snapshot.descriptor.id.clone(), active_turn)]);
         Ok((
             Self {
                 client: Some(client),
                 active,
                 socket: Some(socket),
                 navigation_history: Vec::new(),
+                event_cursors,
+                active_turns,
             },
             Some(snapshot),
         ))
@@ -70,6 +78,8 @@ impl SessionRuntime {
             active: None,
             socket: None,
             navigation_history: Vec::new(),
+            event_cursors: HashMap::new(),
+            active_turns: HashMap::new(),
         }
     }
 
@@ -79,6 +89,10 @@ impl SessionRuntime {
 
     pub fn socket(&self) -> Option<&Path> {
         self.socket.as_deref()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.client.is_some()
     }
 
     pub fn list(&mut self) -> Result<Vec<SessionDescriptor>> {
@@ -119,6 +133,7 @@ impl SessionRuntime {
             self.navigation_history.push(previous);
         }
         self.active = Some(snapshot.descriptor.clone());
+        self.ensure_event_cursor(&snapshot.descriptor.id)?;
         Ok(snapshot)
     }
 
@@ -144,6 +159,7 @@ impl SessionRuntime {
             self.navigation_history.push(previous);
         }
         self.active = Some(snapshot.descriptor.clone());
+        self.ensure_event_cursor(&snapshot.descriptor.id)?;
         Ok(snapshot)
     }
 
@@ -151,6 +167,58 @@ impl SessionRuntime {
         let detached = self.client_mut()?.detach()?;
         self.active = None;
         Ok(detached)
+    }
+
+    pub fn submit(&mut self, input: TurnInput, approval: ApprovalPolicy) -> Result<String> {
+        let session_id = self.active_session_id()?;
+        let turn_id = self
+            .client_mut()?
+            .submit(session_id.clone(), input, approval)?;
+        self.active_turns.insert(session_id, Some(turn_id.clone()));
+        Ok(turn_id)
+    }
+
+    pub fn events(&mut self, wait_ms: u64) -> Result<EventBatch> {
+        let session_id = self.active_session_id()?;
+        let after_sequence = self.event_cursors.get(&session_id).copied().unwrap_or(0);
+        let batch = self
+            .client_mut()?
+            .events(session_id.clone(), after_sequence, wait_ms)?;
+        if let Some(last) = batch.events.last() {
+            self.event_cursors.insert(session_id.clone(), last.sequence);
+        }
+        self.active_turns
+            .insert(session_id, batch.active_turn_id.clone());
+        Ok(batch)
+    }
+
+    pub fn approve(
+        &mut self,
+        turn_id: String,
+        call_id: String,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
+        let session_id = self.active_session_id()?;
+        self.client_mut()?
+            .approve(session_id, turn_id, call_id, decision)
+    }
+
+    pub fn refresh_snapshot(&mut self) -> Result<SessionSnapshot> {
+        let session_id = self.active_session_id()?;
+        let snapshot = self.client_mut()?.snapshot(session_id)?;
+        self.active = Some(snapshot.descriptor.clone());
+        Ok(snapshot)
+    }
+
+    pub fn active_turn_id(&self) -> Option<&str> {
+        let session_id = self.active.as_ref()?.id.as_str();
+        self.active_turns.get(session_id).and_then(Option::as_deref)
+    }
+
+    pub fn mark_turn_finished(&mut self) {
+        if let Some(session_id) = self.active.as_ref().map(|session| session.id.clone()) {
+            self.active_turns.insert(session_id, None);
+        }
     }
 
     pub fn close_current_and_fallback(&mut self) -> Result<Option<SessionSnapshot>> {
@@ -162,6 +230,8 @@ impl SessionRuntime {
         let catalog = self.client_mut()?.list()?;
         self.client_mut()?.close(None)?;
         self.active = None;
+        self.event_cursors.remove(&current_id);
+        self.active_turns.remove(&current_id);
         self.navigation_history
             .retain(|session_id| session_id != &current_id);
 
@@ -177,6 +247,9 @@ impl SessionRuntime {
                 break;
             }
         }
+        if let Some(snapshot) = &fallback {
+            self.ensure_event_cursor(&snapshot.descriptor.id)?;
+        }
         Ok(fallback)
     }
 
@@ -185,6 +258,40 @@ impl SessionRuntime {
             .as_mut()
             .context("session fabric is disabled; enable [session_fabric] and start xshelld")
     }
+
+    fn active_session_id(&self) -> Result<String> {
+        self.active
+            .as_ref()
+            .map(|session| session.id.clone())
+            .context("there is no active session")
+    }
+
+    fn ensure_event_cursor(&mut self, session_id: &str) -> Result<()> {
+        if self.event_cursors.contains_key(session_id) {
+            return Ok(());
+        }
+        let (cursor, active_turn) = initial_event_cursor(self.client_mut()?, session_id)?;
+        self.event_cursors.insert(session_id.to_owned(), cursor);
+        self.active_turns.insert(session_id.to_owned(), active_turn);
+        Ok(())
+    }
+}
+
+fn initial_event_cursor(
+    client: &mut SessionClient,
+    session_id: &str,
+) -> Result<(u64, Option<String>)> {
+    let batch = client.events(session_id.to_owned(), 0, 0)?;
+    let cursor = if batch.active_turn_id.is_some() {
+        batch
+            .events
+            .first()
+            .map(|event| event.sequence.saturating_sub(1))
+            .unwrap_or_else(|| batch.next_sequence.saturating_sub(1))
+    } else {
+        batch.next_sequence.saturating_sub(1)
+    };
+    Ok((cursor, batch.active_turn_id))
 }
 
 fn fallback_candidates(

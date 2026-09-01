@@ -56,6 +56,12 @@ A session is a named, persistent execution context with:
 
 Session identifiers use `host:session`, for example `laptop:default` or `mini:cad`. The local default session is created on first launch. Sessions are resumable after disconnects and may be supervised by a platform-native user service.
 
+The host's `xshelld` owns live agent adapters, tool loops, shell processes, and
+conversation mutation. Clients submit inputs and render a sequenced event
+stream. Disconnecting a client does not terminate persistent work; reattachment
+replays retained events from the client's last acknowledged sequence. Approval
+requests remain bound to a stable turn and tool-call identity.
+
 ### 5.1 Identity, visibility, and future multi-user sessions
 
 The initial session model has one owning OS user and one interactive controller. A stable opaque UUID identifies the session; its human-readable name is unique only within a `(host, user)` namespace. Local and remote sessions use the same descriptor and switching operations.

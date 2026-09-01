@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use uuid::Uuid;
 use xshell_session::{
-    ClientRequest, SESSION_PROTOCOL_VERSION, ServerResponse, SessionConfig, SessionRegistry,
+    ClientRequest, ExecutionCoordinator, PersistenceMode, SESSION_PROTOCOL_VERSION, ServerResponse,
+    SessionConfig, SessionRegistry,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -19,7 +20,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Local session registry and persistence service for xshell"
+    about = "Local session execution and persistence service for xshell"
 )]
 struct Args {
     #[arg(long)]
@@ -64,6 +65,7 @@ fn main() -> Result<()> {
         host_alias,
         user,
     )?));
+    let execution = ExecutionCoordinator::new(Arc::clone(&registry));
 
     prepare_socket(&socket)?;
     let listener = UnixListener::bind(&socket)
@@ -83,8 +85,9 @@ fn main() -> Result<()> {
         match connection {
             Ok(stream) => {
                 let registry = Arc::clone(&registry);
+                let execution = execution.clone();
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, registry) {
+                    if let Err(error) = handle_client(stream, registry, execution) {
                         eprintln!("xshelld client error: {error:#}");
                     }
                 });
@@ -106,7 +109,11 @@ fn load_config(path: Option<&Path>) -> Result<SessionConfig> {
     Ok(config.session_fabric)
 }
 
-fn handle_client(stream: UnixStream, registry: Arc<Mutex<SessionRegistry>>) -> Result<()> {
+fn handle_client(
+    stream: UnixStream,
+    registry: Arc<Mutex<SessionRegistry>>,
+    execution: ExecutionCoordinator,
+) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let Some(line) = read_request_line(&mut reader)? else {
@@ -152,7 +159,12 @@ fn handle_client(stream: UnixStream, registry: Arc<Mutex<SessionRegistry>>) -> R
     let mut attached_session: Option<String> = None;
     loop {
         let Some(line) = read_request_line(&mut reader)? else {
-            detach_on_disconnect(&registry, &client_id, attached_session.as_deref());
+            detach_on_disconnect(
+                &registry,
+                &execution,
+                &client_id,
+                attached_session.as_deref(),
+            );
             return Ok(());
         };
         let request: ClientRequest = match serde_json::from_str(&line) {
@@ -162,7 +174,13 @@ fn handle_client(stream: UnixStream, registry: Arc<Mutex<SessionRegistry>>) -> R
                 continue;
             }
         };
-        let response = process_request(request, &registry, &client_id, &mut attached_session);
+        let response = process_request(
+            request,
+            &registry,
+            &execution,
+            &client_id,
+            &mut attached_session,
+        );
         match response {
             Ok(response) => send(&mut writer, &response)?,
             Err(error) => send_error(&mut writer, "request_failed", &format!("{error:#}"))?,
@@ -173,39 +191,60 @@ fn handle_client(stream: UnixStream, registry: Arc<Mutex<SessionRegistry>>) -> R
 fn process_request(
     request: ClientRequest,
     registry: &Arc<Mutex<SessionRegistry>>,
+    execution: &ExecutionCoordinator,
     client_id: &str,
     attached_session: &mut Option<String>,
 ) -> Result<ServerResponse> {
-    let mut registry = registry.lock().expect("session registry poisoned");
     match request {
-        ClientRequest::List => Ok(ServerResponse::Catalog {
-            sessions: registry.list(),
-        }),
+        ClientRequest::List => {
+            let mut sessions = registry.lock().expect("session registry poisoned").list();
+            for session in &mut sessions {
+                session.activity = execution.activity(&session.id);
+            }
+            Ok(ServerResponse::Catalog { sessions })
+        }
         ClientRequest::Create { session: creation } => {
-            let session = registry.create(client_id, creation)?;
+            let session = registry
+                .lock()
+                .expect("session registry poisoned")
+                .create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
-                registry.detach(client_id, &previous)?;
+                detach_session(registry, execution, client_id, &previous)?;
             }
             *attached_session = Some(session.descriptor.id.clone());
-            Ok(ServerResponse::Created { session })
+            Ok(ServerResponse::Created {
+                session: with_activity(session, execution),
+            })
         }
         ClientRequest::Attach { selector, role } => {
             if attached_session.is_some() {
                 bail!("detach the current session before attaching another one");
             }
-            let session = registry.attach(client_id, &selector, role)?;
+            let session = registry
+                .lock()
+                .expect("session registry poisoned")
+                .attach(client_id, &selector, role)?;
             *attached_session = Some(session.descriptor.id.clone());
-            Ok(ServerResponse::Attached { session, role })
+            Ok(ServerResponse::Attached {
+                session: with_activity(session, execution),
+                role,
+            })
         }
         ClientRequest::Switch { selector, role } => {
-            let session = registry.attach(client_id, &selector, role)?;
+            let session = registry
+                .lock()
+                .expect("session registry poisoned")
+                .attach(client_id, &selector, role)?;
             if let Some(previous) = attached_session.take()
                 && previous != session.descriptor.id
             {
-                registry.detach(client_id, &previous)?;
+                detach_session(registry, execution, client_id, &previous)?;
             }
             *attached_session = Some(session.descriptor.id.clone());
-            Ok(ServerResponse::Attached { session, role })
+            Ok(ServerResponse::Attached {
+                session: with_activity(session, execution),
+                role,
+            })
         }
         ClientRequest::Update {
             session_id,
@@ -216,12 +255,65 @@ fn process_request(
             if attached_session.as_deref() != Some(session_id.as_str()) {
                 bail!("the requested session is not this connection's current session");
             }
-            let session = registry.update(client_id, &session_id, model, cwd, history)?;
-            Ok(ServerResponse::Updated { session })
+            if execution.active_turn(&session_id).is_some() {
+                bail!("cannot replace session state while a turn is active");
+            }
+            let session = registry.lock().expect("session registry poisoned").update(
+                client_id,
+                &session_id,
+                model,
+                cwd,
+                history,
+            )?;
+            Ok(ServerResponse::Updated {
+                session: descriptor_with_activity(session, execution),
+            })
+        }
+        ClientRequest::Snapshot { session_id } => {
+            require_current(attached_session, &session_id)?;
+            let session = registry
+                .lock()
+                .expect("session registry poisoned")
+                .snapshot(&session_id)?;
+            Ok(ServerResponse::Snapshot {
+                session: with_activity(session, execution),
+            })
+        }
+        ClientRequest::Submit {
+            session_id,
+            input,
+            approval,
+        } => {
+            require_current(attached_session, &session_id)?;
+            let turn_id = execution.submit(&session_id, input, approval)?;
+            Ok(ServerResponse::Accepted { turn_id })
+        }
+        ClientRequest::Events {
+            session_id,
+            after_sequence,
+            wait_ms,
+        } => {
+            require_current(attached_session, &session_id)?;
+            Ok(ServerResponse::Events {
+                batch: execution.events(&session_id, after_sequence, wait_ms),
+            })
+        }
+        ClientRequest::Approve { session_id, reply } => {
+            require_current(attached_session, &session_id)?;
+            execution.approve(&session_id, reply)?;
+            Ok(ServerResponse::ApprovalAccepted)
+        }
+        ClientRequest::Cancel {
+            session_id,
+            turn_id,
+        } => {
+            require_current(attached_session, &session_id)?;
+            execution.cancel(&session_id, &turn_id)?;
+            Ok(ServerResponse::CancellationAccepted)
         }
         ClientRequest::Detach => {
             let detached = match attached_session.take() {
-                Some(session_id) => registry.detach(client_id, &session_id)?,
+                Some(session_id) => detach_session(registry, execution, client_id, &session_id)?,
                 None => None,
             };
             Ok(ServerResponse::Detached {
@@ -232,7 +324,17 @@ fn process_request(
             let selector = selector
                 .or_else(|| attached_session.clone())
                 .context("close requires a session selector when detached")?;
-            let session_id = registry.close(client_id, &selector)?;
+            let resolved = registry
+                .lock()
+                .expect("session registry poisoned")
+                .snapshot(&selector)?
+                .descriptor
+                .id;
+            let session_id = registry
+                .lock()
+                .expect("session registry poisoned")
+                .close(client_id, &selector)?;
+            execution.cancel_and_remove(&resolved);
             if attached_session.as_deref() == Some(session_id.as_str()) {
                 *attached_session = None;
             }
@@ -242,19 +344,61 @@ fn process_request(
     }
 }
 
+fn require_current(attached_session: &Option<String>, session_id: &str) -> Result<()> {
+    if attached_session.as_deref() != Some(session_id) {
+        bail!("the requested session is not this connection's current session");
+    }
+    Ok(())
+}
+
+fn with_activity(
+    mut snapshot: xshell_session::SessionSnapshot,
+    execution: &ExecutionCoordinator,
+) -> xshell_session::SessionSnapshot {
+    snapshot.descriptor.activity = execution.activity(&snapshot.descriptor.id);
+    snapshot
+}
+
+fn descriptor_with_activity(
+    mut descriptor: xshell_session::SessionDescriptor,
+    execution: &ExecutionCoordinator,
+) -> xshell_session::SessionDescriptor {
+    descriptor.activity = execution.activity(&descriptor.id);
+    descriptor
+}
+
 fn detach_on_disconnect(
     registry: &Arc<Mutex<SessionRegistry>>,
+    execution: &ExecutionCoordinator,
     client_id: &str,
     session_id: Option<&str>,
 ) {
     if let Some(session_id) = session_id
-        && let Err(error) = registry
-            .lock()
-            .expect("session registry poisoned")
-            .detach(client_id, session_id)
+        && let Err(error) = detach_session(registry, execution, client_id, session_id)
     {
         eprintln!("xshelld detach error: {error:#}");
     }
+}
+
+fn detach_session(
+    registry: &Arc<Mutex<SessionRegistry>>,
+    execution: &ExecutionCoordinator,
+    client_id: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let persistence = registry
+        .lock()
+        .expect("session registry poisoned")
+        .snapshot(session_id)?
+        .descriptor
+        .persistence;
+    if persistence == PersistenceMode::Ephemeral {
+        execution.cancel_and_remove(session_id);
+    }
+    registry
+        .lock()
+        .expect("session registry poisoned")
+        .detach(client_id, session_id)
 }
 
 fn read_request_line(reader: &mut BufReader<UnixStream>) -> Result<Option<String>> {

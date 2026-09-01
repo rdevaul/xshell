@@ -1,21 +1,20 @@
 # xshell session fabric
 
-This document describes the first local increment of the session fabric. The
+This document describes the local execution increment of the session fabric. The
 wire types in `xshell-session` are authoritative; incompatible changes require
 a protocol-version increment.
 
 ## Current boundary
 
-`xshelld` is a per-host, per-OS-user state service. It owns session identity,
-cataloging, attachment arbitration, metadata, conversation snapshots, and
-durable serialization. In this increment the attached `xshell` CLI still owns
-the live agent adapter and executes shell/tool requests. Consequently, a
-detached session preserves completed state but cannot continue an in-flight
-agent turn. Moving execution supervision into `xshelld` is required before
-remote clients and persistent background work are added.
+`xshelld` is a per-host, per-OS-user execution and state service. It owns
+session identity, attachment arbitration, model adapters, agent/tool loops,
+approval rendezvous, shell execution, conversation snapshots, and durable
+serialization. The attached `xshell` CLI is a controller and renderer. The
+standalone CLI retains an in-process execution path when the fabric is
+disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
-socket. The first request must be `open` with protocol version 1. The daemon
+socket. The first request must be `open` with protocol version 2. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 
@@ -57,15 +56,32 @@ authenticated SSH catalog federation exists.
 - `update`: replace the attached session's model, cwd, and history snapshot.
 - `detach`: release control and apply lifecycle policy.
 - `close`: delete a detached session or the caller's attached session.
+- `submit`: start one daemon-owned agent or shell turn for the attached session.
+- `events`: long-poll sequenced turn events from a replay cursor.
+- `approve`: answer a particular turn/tool approval rendezvous.
+- `cancel`: cancel the active turn by stable turn ID.
+- `snapshot`: obtain completed model, cwd, and conversation state.
 
 The CLI keeps a per-connection navigation history. After `//close` deletes the
 current session, it first attempts to attach the previously visited session,
 then the most recently active available session. It exits only when no session
 remains. `//quit` instead detaches without deleting the current session.
 
-The CLI synchronizes after each completed input. This favors clear recovery
-semantics over write efficiency for the prototype; future context storage will
-use an append/checkpoint model rather than rewriting large histories.
+One turn may run per session. Events are sequence-numbered and retained in a
+bounded in-memory journal (8,192 events and 16 MiB per session). Disconnecting
+detaches the controller but does not cancel daemon-lifetime or durable work.
+On reattachment, the client replays missed events and then follows live output.
+An approval-required turn remains paused until an attached controller answers
+or cancellation occurs. Ephemeral sessions retain their existing delete-on-
+detach behavior and therefore cancel in-flight work when detached.
+
+Completed durable state is atomically checkpointed as before. The event
+journal and active process are not yet restored across daemon restart. Future
+context storage will use an append/checkpoint model rather than rewriting
+large histories.
+
+Execution credentials are resolved only in the daemon environment. Protocol
+model bindings contain an environment-variable name, never its value.
 
 ## Reserved evolution
 
@@ -73,6 +89,10 @@ Remote federation will carry the same protocol over authenticated SSH stdio,
 export only `fabric` descriptors, and preserve host/user identity in selectors
 and audit events. It must not expose transcript contents during catalog
 discovery.
+
+Execution events are currently mirrored into the audit stream by an attached
+client. Moving that append responsibility into `xshelld` is required before
+unattended remote execution can claim complete audit coverage.
 
 Multi-user sessions will be a distinct access mode with an explicit ACL.
 Owner, operator, and viewer authorization will be enforced by the daemon, with

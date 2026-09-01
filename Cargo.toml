@@ -4,6 +4,7 @@ members = [
     "crates/xshell-audit",
     "crates/xshell-cli",
     "crates/xshell-core",
+    "crates/xshell-execution",
     "crates/xshell-session",
 ]
 resolver = "2"
@@ -29,7 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 sha2 = "0.10"
-tokio = { version = "1.47", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 
 [profile.release]
