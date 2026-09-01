@@ -23,6 +23,7 @@ pub enum ControlCommand {
     Tools,
     Model(Vec<String>),
     Agent(Vec<String>),
+    View(String),
     Connect(Vec<String>),
     Sessions,
     New(Vec<String>),
@@ -55,11 +56,15 @@ pub fn classify_input(input: &str) -> InputRoute {
 }
 
 fn parse_control(input: &str) -> ControlCommand {
-    let mut words = input.split_whitespace();
+    let mut words = input.splitn(2, char::is_whitespace);
     let Some(name) = words.next() else {
         return ControlCommand::Help;
     };
-    let args: Vec<String> = words.map(str::to_owned).collect();
+    let rest = words.next().unwrap_or("").trim();
+    if name == "view" {
+        return ControlCommand::View(rest.to_owned());
+    }
+    let args: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
 
     match name {
         "help" => ControlCommand::Help,
@@ -304,6 +309,16 @@ mod tests {
         assert_eq!(
             classify_input("//detach"),
             InputRoute::Control(ControlCommand::Detach)
+        );
+    }
+
+    #[test]
+    fn preserves_view_arguments_for_quoted_paths() {
+        assert_eq!(
+            classify_input("//view --as rst \"docs/design notes.rst\""),
+            InputRoute::Control(ControlCommand::View(
+                "--as rst \"docs/design notes.rst\"".into()
+            ))
         );
     }
 }

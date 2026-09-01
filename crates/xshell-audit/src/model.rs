@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 pub const AUDIT_FORMAT_VERSION: u32 = 1;
-pub const AUDIT_PROTOCOL_VERSION: u32 = 1;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -85,6 +85,14 @@ pub enum AuditEvent {
         call_id: String,
         name: String,
         result: String,
+    },
+    ViewOperation {
+        path: String,
+        sha256: Option<String>,
+        viewer: Option<String>,
+        media_type: Option<String>,
+        byte_len: Option<u64>,
+        outcome: String,
     },
     ShellFinished {
         command: String,

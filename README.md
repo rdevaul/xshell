@@ -85,6 +85,20 @@ model's Markdown source layout but still removes terminal control sequences.
 When output is redirected, both policies default to `never` through their
 `auto` setting.
 
+The same rendering engine powers the modular `//view` command:
+
+```text
+//view README.md
+//view docs/design.rst
+//view --as markdown notes.txt
+```
+
+Paths are resolved on the active session host, so the command behaves the same
+for local and SSH sessions. The first built-in viewers support Markdown and a
+safe reStructuredText subset. Text acquisition is limited to 4 MiB and records
+the resolved path, media type, byte length, SHA-256 hash, selected viewer, and
+outcome in the audit log. See [the viewer architecture](docs/viewers.md).
+
 ## Model profiles and OpenRouter
 
 Copy the example configuration, then edit its models to suit the providers you
@@ -143,6 +157,7 @@ $cd crates/xshell-core               # persistently change xshell's cwd
 //detach                              # preserve the session and exit
 //close                               # delete it and return to the previous session
 //tools                               # inspect tools exposed to the agent
+//view README.md                      # render a file on the active session host
 //help                                # list control commands
 //quit                                # exit
 ```

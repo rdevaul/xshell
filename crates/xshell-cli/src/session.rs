@@ -6,7 +6,7 @@ use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
     EventBatch, PersistenceMode, SessionClient, SessionConfig, SessionCreation, SessionDescriptor,
-    SessionSnapshot, SessionStatus, TurnInput, Visibility,
+    SessionSnapshot, SessionStatus, TurnInput, ViewResource, Visibility,
 };
 
 struct HostConnection {
@@ -322,6 +322,11 @@ impl SessionRuntime {
             .submit(session_id.clone(), input, approval)?;
         self.active_turns.insert(session_id, Some(turn_id.clone()));
         Ok(turn_id)
+    }
+
+    pub fn view_source(&mut self, path: PathBuf) -> Result<ViewResource> {
+        let session_id = self.active_session_id()?;
+        self.client_mut()?.view_source(session_id, path)
     }
 
     pub fn events(&mut self, wait_ms: u64) -> Result<EventBatch> {

@@ -1,9 +1,11 @@
-use crate::config::{OutputMode, RenderingConfig};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use serde::Deserialize;
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::mem;
+use std::path::Path;
 use terminal_size::{Width, terminal_size};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -12,6 +14,33 @@ const MIN_WIDTH: usize = 20;
 const MAX_WIDTH: usize = 512;
 const MAX_PENDING_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RenderingConfig {
+    pub markdown: OutputMode,
+    pub color: OutputMode,
+    pub width: Option<usize>,
+}
+
+impl Default for RenderingConfig {
+    fn default() -> Self {
+        Self {
+            markdown: OutputMode::Auto,
+            color: OutputMode::Auto,
+            width: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderOptions {
@@ -787,6 +816,324 @@ struct TerminalSanitizer {
     state: SanitizeState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewerDescriptor {
+    pub id: &'static str,
+    pub aliases: &'static [&'static str],
+    pub media_types: &'static [&'static str],
+    pub extensions: &'static [&'static str],
+}
+
+pub struct ViewInput<'a> {
+    pub name: &'a str,
+    pub media_type: &'a str,
+    pub text: &'a str,
+}
+
+pub enum ViewerContent {
+    TerminalMarkdown(String),
+}
+
+pub trait ViewerPlugin: Send + Sync {
+    fn descriptor(&self) -> ViewerDescriptor;
+    fn render(&self, input: &ViewInput<'_>) -> Result<ViewerContent>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedView {
+    pub viewer_id: String,
+    pub bytes: Vec<u8>,
+}
+
+pub struct ViewerRegistry {
+    viewers: Vec<Box<dyn ViewerPlugin>>,
+}
+
+impl ViewerRegistry {
+    pub fn with_builtins() -> Self {
+        Self {
+            viewers: vec![Box::new(MarkdownViewer), Box::new(RestructuredTextViewer)],
+        }
+    }
+
+    pub fn register(&mut self, viewer: Box<dyn ViewerPlugin>) {
+        self.viewers.push(viewer);
+    }
+
+    pub fn render(
+        &self,
+        input: &ViewInput<'_>,
+        requested_viewer: Option<&str>,
+        options: RenderOptions,
+    ) -> Result<RenderedView> {
+        let viewer = match requested_viewer {
+            Some(requested) => self
+                .viewers
+                .iter()
+                .find(|viewer| viewer_matches_id(viewer.descriptor(), requested))
+                .with_context(|| format!("unknown viewer {requested:?}"))?,
+            None => self
+                .viewers
+                .iter()
+                .find(|viewer| viewer_supports(viewer.descriptor(), input))
+                .with_context(|| {
+                    format!(
+                        "no viewer supports {} ({})",
+                        input.name,
+                        if input.media_type.is_empty() {
+                            "unknown media type"
+                        } else {
+                            input.media_type
+                        }
+                    )
+                })?,
+        };
+        let descriptor = viewer.descriptor();
+        let content = viewer.render(input)?;
+        let mut bytes = Vec::new();
+        match content {
+            ViewerContent::TerminalMarkdown(markdown) => {
+                let mut renderer = AgentRenderer::new(options);
+                renderer.push(&markdown, &mut bytes)?;
+                renderer.finish(&mut bytes)?;
+            }
+        }
+        Ok(RenderedView {
+            viewer_id: descriptor.id.into(),
+            bytes,
+        })
+    }
+
+    pub fn descriptors(&self) -> Vec<ViewerDescriptor> {
+        self.viewers
+            .iter()
+            .map(|viewer| viewer.descriptor())
+            .collect()
+    }
+}
+
+impl Default for ViewerRegistry {
+    fn default() -> Self {
+        Self::with_builtins()
+    }
+}
+
+fn viewer_matches_id(descriptor: ViewerDescriptor, requested: &str) -> bool {
+    descriptor.id.eq_ignore_ascii_case(requested)
+        || descriptor
+            .aliases
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(requested))
+}
+
+fn viewer_supports(descriptor: ViewerDescriptor, input: &ViewInput<'_>) -> bool {
+    if descriptor
+        .media_types
+        .iter()
+        .any(|media_type| media_type.eq_ignore_ascii_case(input.media_type))
+    {
+        return true;
+    }
+    let extension = Path::new(input.name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    extension.is_some_and(|extension| {
+        descriptor
+            .extensions
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(extension))
+    })
+}
+
+struct MarkdownViewer;
+
+impl ViewerPlugin for MarkdownViewer {
+    fn descriptor(&self) -> ViewerDescriptor {
+        ViewerDescriptor {
+            id: "markdown",
+            aliases: &["md"],
+            media_types: &["text/markdown", "text/x-markdown"],
+            extensions: &["md", "markdown", "mdown", "mkd"],
+        }
+    }
+
+    fn render(&self, input: &ViewInput<'_>) -> Result<ViewerContent> {
+        Ok(ViewerContent::TerminalMarkdown(input.text.to_owned()))
+    }
+}
+
+struct RestructuredTextViewer;
+
+impl ViewerPlugin for RestructuredTextViewer {
+    fn descriptor(&self) -> ViewerDescriptor {
+        ViewerDescriptor {
+            id: "rst",
+            aliases: &["restructuredtext", "restructured-text"],
+            media_types: &["text/x-rst", "text/prs.fallenstein.rst"],
+            extensions: &["rst", "rest"],
+        }
+    }
+
+    fn render(&self, input: &ViewInput<'_>) -> Result<ViewerContent> {
+        Ok(ViewerContent::TerminalMarkdown(rst_to_markdown(input.text)))
+    }
+}
+
+fn rst_to_markdown(source: &str) -> String {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut markdown = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(level) = lines
+            .get(index + 1)
+            .and_then(|underline| rst_heading_level(line, underline))
+        {
+            markdown.push_str(&"#".repeat(level));
+            markdown.push(' ');
+            markdown.push_str(&rst_inline(line.trim()));
+            markdown.push_str("\n\n");
+            index += 2;
+            continue;
+        }
+
+        if let Some(language) = line
+            .trim_start()
+            .strip_prefix(".. code-block::")
+            .or_else(|| line.trim_start().strip_prefix(".. code::"))
+        {
+            index += 1;
+            while lines.get(index).is_some_and(|line| line.trim().is_empty()) {
+                index += 1;
+            }
+            let (code, next) = take_indented_block(&lines, index);
+            let fence = markdown_fence(&code);
+            markdown.push_str(&fence);
+            markdown.push_str(language.trim());
+            markdown.push('\n');
+            markdown.push_str(&code);
+            if !code.ends_with('\n') {
+                markdown.push('\n');
+            }
+            markdown.push_str(&fence);
+            markdown.push_str("\n\n");
+            index = next;
+            continue;
+        }
+
+        if line.trim_end().ends_with("::") {
+            let mut content_start = index + 1;
+            while lines
+                .get(content_start)
+                .is_some_and(|line| line.trim().is_empty())
+            {
+                content_start += 1;
+            }
+            if lines
+                .get(content_start)
+                .is_some_and(|line| is_indented(line))
+            {
+                let introduction = line.trim_end().trim_end_matches(':');
+                if !introduction.is_empty() {
+                    markdown.push_str(&rst_inline(introduction));
+                    markdown.push_str("\n\n");
+                }
+                let (code, next) = take_indented_block(&lines, content_start);
+                let fence = markdown_fence(&code);
+                markdown.push_str(&fence);
+                markdown.push('\n');
+                markdown.push_str(&code);
+                if !code.ends_with('\n') {
+                    markdown.push('\n');
+                }
+                markdown.push_str(&fence);
+                markdown.push_str("\n\n");
+                index = next;
+                continue;
+            }
+        }
+
+        markdown.push_str(&rst_inline(line));
+        markdown.push('\n');
+        index += 1;
+    }
+    markdown
+}
+
+fn rst_heading_level(title: &str, underline: &str) -> Option<usize> {
+    if title.trim().is_empty() || visible_width(underline.trim()) < visible_width(title.trim()) {
+        return None;
+    }
+    let marker = underline.trim().chars().next()?;
+    if !underline
+        .trim()
+        .chars()
+        .all(|character| character == marker)
+    {
+        return None;
+    }
+    match marker {
+        '=' => Some(1),
+        '-' => Some(2),
+        '~' | '^' | '"' => Some(3),
+        _ => None,
+    }
+}
+
+fn rst_inline(line: &str) -> String {
+    let mut converted = line.replace("``", "`");
+    while let Some(label_start) = converted.find('`') {
+        let rest = &converted[label_start + 1..];
+        let Some(target_start) = rest.find(" <") else {
+            break;
+        };
+        let Some(end) = rest[target_start + 2..].find(">`_") else {
+            break;
+        };
+        let label = &rest[..target_start];
+        let target_end = target_start + 2 + end;
+        let target = &rest[target_start + 2..target_end];
+        let matched_end = label_start + 1 + target_end + 3;
+        converted.replace_range(label_start..matched_end, &format!("[{label}]({target})"));
+    }
+    converted
+}
+
+fn is_indented(line: &str) -> bool {
+    line.starts_with("   ") || line.starts_with('\t')
+}
+
+fn take_indented_block(lines: &[&str], start: usize) -> (String, usize) {
+    let mut content = String::new();
+    let mut index = start;
+    while let Some(line) = lines.get(index) {
+        if line.trim().is_empty() {
+            content.push('\n');
+            index += 1;
+            continue;
+        }
+        if !is_indented(line) {
+            break;
+        }
+        content.push_str(
+            line.strip_prefix("   ")
+                .unwrap_or_else(|| line.trim_start_matches('\t')),
+        );
+        content.push('\n');
+        index += 1;
+    }
+    (content, index)
+}
+
+fn markdown_fence(code: &str) -> String {
+    let longest = code
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    "`".repeat(longest.saturating_add(1).max(3))
+}
+
 impl TerminalSanitizer {
     fn push(&mut self, input: &str) -> String {
         let mut clean = String::with_capacity(input.len());
@@ -999,5 +1346,63 @@ mod tests {
             ..RenderingConfig::default()
         };
         assert!(RenderOptions::resolve_for(&config, None, None, true, false, 80).is_err());
+    }
+
+    #[test]
+    fn registry_selects_markdown_by_extension_or_explicit_override() {
+        let registry = ViewerRegistry::with_builtins();
+        let markdown = "# Viewer\n\n- one\n- two";
+        let detected = registry
+            .render(
+                &ViewInput {
+                    name: "README.md",
+                    media_type: "text/markdown",
+                    text: markdown,
+                },
+                None,
+                options(true, false, 60),
+            )
+            .unwrap();
+        assert_eq!(detected.viewer_id, "markdown");
+        assert!(
+            String::from_utf8(detected.bytes)
+                .unwrap()
+                .contains("▌ Viewer")
+        );
+
+        let explicit = registry
+            .render(
+                &ViewInput {
+                    name: "README.unknown",
+                    media_type: "text/plain",
+                    text: markdown,
+                },
+                Some("md"),
+                options(true, false, 60),
+            )
+            .unwrap();
+        assert_eq!(explicit.viewer_id, "markdown");
+    }
+
+    #[test]
+    fn rst_viewer_converts_headings_links_and_code_blocks() {
+        let source = "Title\n=====\n\nSee `the docs <https://example.test/docs>`_.\n\n.. code-block:: python\n\n   print('bee')\n";
+        let rendered = ViewerRegistry::with_builtins()
+            .render(
+                &ViewInput {
+                    name: "guide.rst",
+                    media_type: "text/x-rst",
+                    text: source,
+                },
+                None,
+                options(true, false, 72),
+            )
+            .unwrap();
+        let text = String::from_utf8(rendered.bytes).unwrap();
+        assert_eq!(rendered.viewer_id, "rst");
+        assert!(text.contains("▌ Title"));
+        assert!(text.contains("the docs (https://example.test/docs)"));
+        assert!(text.contains("┌ code: python"));
+        assert!(text.contains("│ print('bee')"));
     }
 }

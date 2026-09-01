@@ -13,11 +13,12 @@ use std::time::Duration;
 use uuid::Uuid;
 use xshell_session::{
     ClientRequest, ExecutionCoordinator, PersistenceMode, SESSION_PROTOCOL_VERSION, ServerResponse,
-    SessionConfig, SessionRegistry, complete_shell,
+    SessionConfig, SessionRegistry, complete_shell, load_view_resource,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+const VIEW_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -186,6 +187,7 @@ fn reject_remote_request(
             selector: Some(selector),
         } => Some(selector.as_str()),
         ClientRequest::CompleteShell { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
         _ => None,
     };
     let Some(selector) = selector else {
@@ -452,6 +454,18 @@ fn process_request(
                 result: complete_shell_bounded(line, cursor, cwd)?,
             })
         }
+        ClientRequest::ViewSource { session_id, path } => {
+            require_current(attached_session, &session_id)?;
+            let cwd = registry
+                .lock()
+                .expect("session registry poisoned")
+                .snapshot(&session_id)?
+                .descriptor
+                .cwd;
+            Ok(ServerResponse::ViewSource {
+                resource: load_view_resource_bounded(path, cwd)?,
+            })
+        }
         ClientRequest::Detach => {
             let detached = match attached_session.take() {
                 Some(session_id) => detach_session(registry, execution, client_id, &session_id)?,
@@ -500,6 +514,19 @@ fn complete_shell_bounded(
     receiver
         .recv_timeout(COMPLETION_TIMEOUT)
         .context("shell completion timed out")?
+}
+
+fn load_view_resource_bounded(path: PathBuf, cwd: PathBuf) -> Result<xshell_session::ViewResource> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("xshelld-view-source".into())
+        .spawn(move || {
+            let _ = sender.send(load_view_resource(&path, &cwd));
+        })
+        .context("cannot start view-source worker")?;
+    receiver
+        .recv_timeout(VIEW_TIMEOUT)
+        .context("view-source acquisition timed out")?
 }
 
 fn require_current(attached_session: &Option<String>, session_id: &str) -> Result<()> {
