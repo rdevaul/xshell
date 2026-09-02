@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-pub const SESSION_PROTOCOL_VERSION: u32 = 6;
+pub const SESSION_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -235,4 +235,10 @@ pub struct PtyExchangeResult {
     pub output: Vec<u8>,
     pub input_accepted: usize,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PtyTicket {
+    pub pty_id: String,
+    pub ticket: String,
 }

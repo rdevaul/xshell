@@ -23,7 +23,19 @@ pub struct PtyCoordinator {
 struct ManagedPty {
     owner_client_id: String,
     session_id: String,
+    stream: Mutex<StreamAuthorization>,
     process: Mutex<RemotePtyProcess>,
+}
+
+struct StreamAuthorization {
+    ticket: Option<String>,
+    claimed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyClaim {
+    pub pty_id: String,
+    pub owner_client_id: String,
 }
 
 impl PtyCoordinator {
@@ -35,7 +47,7 @@ impl PtyCoordinator {
         cwd: &Path,
         size: PtySize,
         terminal_type: Option<String>,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         validate_command(&command)?;
         validate_size(size)?;
         validate_terminal_type(terminal_type.as_deref())?;
@@ -59,9 +71,14 @@ impl PtyCoordinator {
             terminal_type.as_deref(),
         )?;
         let pty_id = Uuid::new_v4().to_string();
+        let ticket = Uuid::new_v4().to_string();
         let managed = Arc::new(ManagedPty {
             owner_client_id: owner_client_id.to_owned(),
             session_id: session_id.to_owned(),
+            stream: Mutex::new(StreamAuthorization {
+                ticket: Some(ticket.clone()),
+                claimed: false,
+            }),
             process: Mutex::new(process),
         });
         let mut ptys = self.inner.lock().expect("PTY map poisoned");
@@ -69,12 +86,73 @@ impl PtyCoordinator {
             bail!("session acquired another PTY while this PTY was starting");
         }
         ptys.insert(pty_id.clone(), managed);
-        Ok(pty_id)
+        Ok((pty_id, ticket))
     }
 
     pub fn exchange(
         &self,
         owner_client_id: &str,
+        pty_id: &str,
+        input: Vec<u8>,
+        size: PtySize,
+        wait_ms: u64,
+    ) -> Result<PtyExchangeResult> {
+        let managed = self.get_owned(owner_client_id, pty_id)?;
+        if managed
+            .stream
+            .lock()
+            .expect("PTY stream state poisoned")
+            .claimed
+        {
+            bail!("PTY has switched to its duplex stream");
+        }
+        self.exchange_managed(managed, pty_id, input, size, wait_ms)
+    }
+
+    pub fn claim(&self, ticket: &str) -> Result<PtyClaim> {
+        let entries = self
+            .inner
+            .lock()
+            .expect("PTY map poisoned")
+            .iter()
+            .map(|(id, pty)| (id.clone(), Arc::clone(pty)))
+            .collect::<Vec<_>>();
+        for (pty_id, managed) in entries {
+            let mut stream = managed.stream.lock().expect("PTY stream state poisoned");
+            if stream.ticket.as_deref() == Some(ticket) && !stream.claimed {
+                stream.ticket = None;
+                stream.claimed = true;
+                return Ok(PtyClaim {
+                    pty_id,
+                    owner_client_id: managed.owner_client_id.clone(),
+                });
+            }
+        }
+        bail!("unknown or already claimed PTY stream ticket")
+    }
+
+    pub fn exchange_claimed(
+        &self,
+        claim: &PtyClaim,
+        input: Vec<u8>,
+        size: PtySize,
+        wait_ms: u64,
+    ) -> Result<PtyExchangeResult> {
+        let managed = self.get_owned(&claim.owner_client_id, &claim.pty_id)?;
+        if !managed
+            .stream
+            .lock()
+            .expect("PTY stream state poisoned")
+            .claimed
+        {
+            bail!("PTY stream has not been claimed");
+        }
+        self.exchange_managed(managed, &claim.pty_id, input, size, wait_ms)
+    }
+
+    fn exchange_managed(
+        &self,
+        managed: Arc<ManagedPty>,
         pty_id: &str,
         input: Vec<u8>,
         size: PtySize,
@@ -91,7 +169,6 @@ impl PtyCoordinator {
                 MAX_EXCHANGE_WAIT.as_millis()
             );
         }
-        let managed = self.get_owned(owner_client_id, pty_id)?;
         let chunk = managed
             .process
             .lock()
@@ -114,6 +191,15 @@ impl PtyCoordinator {
             self.inner.lock().expect("PTY map poisoned").remove(pty_id);
         }
         Ok(result)
+    }
+
+    pub fn close_claimed(&self, claim: &PtyClaim) {
+        let removed = self
+            .inner
+            .lock()
+            .expect("PTY map poisoned")
+            .remove(&claim.pty_id);
+        drop(removed);
     }
 
     pub fn close(&self, owner_client_id: &str, pty_id: &str) -> Result<()> {
@@ -223,7 +309,7 @@ mod tests {
             rows: 24,
             columns: 80,
         };
-        let id = coordinator
+        let (id, ticket) = coordinator
             .start(
                 "client-a",
                 "session-a",
@@ -239,11 +325,17 @@ mod tests {
                 .exchange("client-b", &id, Vec::new(), size, 0)
                 .is_err()
         );
+        let claim = coordinator.claim(&ticket).unwrap();
+        assert!(
+            coordinator
+                .exchange("client-a", &id, Vec::new(), size, 0)
+                .is_err()
+        );
         let mut pending = b"hello\n".to_vec();
         let mut output = Vec::new();
         loop {
             let result = coordinator
-                .exchange("client-a", &id, pending.clone(), size, 100)
+                .exchange_claimed(&claim, pending.clone(), size, 100)
                 .unwrap();
             pending.drain(..result.input_accepted);
             output.extend(result.output);

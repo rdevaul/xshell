@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::ffi::CStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -12,9 +13,10 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 use xshell_session::{
-    ClientRequest, ExecutionCoordinator, PersistenceMode, PtyCoordinator, SESSION_PROTOCOL_VERSION,
-    ServerResponse, SessionActivity, SessionConfig, SessionRegistry, complete_shell,
-    load_view_resource,
+    ClientPtyFrame, ClientRequest, ExecutionCoordinator, PersistenceMode, PtyClaim, PtyCoordinator,
+    PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
+    SessionConfig, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
+    write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -50,6 +52,8 @@ struct Args {
 enum DaemonCommand {
     /// Proxy the session protocol between stdin/stdout and the local daemon.
     ServeStdio,
+    /// Claim a PTY ticket and proxy its framed binary stream over stdin/stdout.
+    ServePtyStdio,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -72,6 +76,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| state_directory.join("xshelld.sock"));
     if matches!(args.command, Some(DaemonCommand::ServeStdio)) {
         return serve_stdio(&socket);
+    }
+    if matches!(args.command, Some(DaemonCommand::ServePtyStdio)) {
+        return serve_pty_stdio(&socket);
     }
     let host_alias = args.host_alias.unwrap_or_else(system_hostname);
     let user = args.user.unwrap_or_else(system_user);
@@ -170,11 +177,77 @@ fn serve_stdio(socket: &Path) -> Result<()> {
     Ok(())
 }
 
+fn serve_pty_stdio(socket: &Path) -> Result<()> {
+    let stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "cannot connect PTY transport to xshell session service at {}",
+            socket.display()
+        )
+    })?;
+    let mut daemon_reader = BufReader::new(stream.try_clone()?);
+    let mut daemon_writer = stream;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut client_reader = BufReader::new(stdin);
+    let mut client_writer = stdout.lock();
+
+    let mut ticket = String::new();
+    client_reader
+        .read_line(&mut ticket)
+        .context("cannot read PTY stream ticket")?;
+    let ticket = ticket.trim_end_matches(['\r', '\n']);
+    if ticket.is_empty() || ticket.len() > 128 {
+        bail!("invalid PTY stream ticket");
+    }
+    send_request(
+        &mut daemon_writer,
+        &ClientRequest::open(env!("CARGO_PKG_VERSION")),
+    )?;
+    match receive_response(&mut daemon_reader)? {
+        ServerResponse::Opened { .. } => {}
+        response => bail!("PTY proxy could not open daemon connection: {response:?}"),
+    }
+    send_request(
+        &mut daemon_writer,
+        &ClientRequest::PtyClaim {
+            ticket: ticket.to_owned(),
+        },
+    )?;
+    match receive_response(&mut daemon_reader)? {
+        ServerResponse::PtyClaimed => {
+            write_server_frame(&mut client_writer, &ServerPtyFrame::Ready)?;
+        }
+        ServerResponse::Error { message, .. } => {
+            write_server_frame(&mut client_writer, &ServerPtyFrame::Error(message))?;
+            return Ok(());
+        }
+        response => bail!("unexpected PTY claim response: {response:?}"),
+    }
+
+    let upload = thread::spawn(move || std::io::copy(&mut client_reader, &mut daemon_writer));
+    std::io::copy(&mut daemon_reader, &mut client_writer)?;
+    client_writer.flush()?;
+    drop(client_writer);
+    let _ = upload.join();
+    Ok(())
+}
+
+fn receive_response(reader: &mut impl BufRead) -> Result<ServerResponse> {
+    let line = read_request_line(reader)?.context("session daemon closed the connection")?;
+    serde_json::from_str(&line).context("invalid session daemon response")
+}
+
 fn reject_remote_request(
     request: &ClientRequest,
     daemon_reader: &mut BufReader<UnixStream>,
     daemon_writer: &mut UnixStream,
 ) -> Result<Option<ServerResponse>> {
+    if matches!(request, ClientRequest::PtyClaim { .. }) {
+        return Ok(Some(ServerResponse::Error {
+            code: "dedicated_pty_connection_required".into(),
+            message: "PTY tickets may only be claimed through serve-pty-stdio".into(),
+        }));
+    }
     if matches!(
         request,
         ClientRequest::Create { session }
@@ -299,6 +372,26 @@ fn handle_client(
                 continue;
             }
         };
+        if let ClientRequest::PtyClaim { ticket } = request {
+            let claim = match ptys.claim(&ticket) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    if let Err(error) =
+                        send_error(&mut writer, "pty_claim_failed", &format!("{error:#}"))
+                    {
+                        break Err(error);
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) = send(&mut writer, &ServerResponse::PtyClaimed) {
+                ptys.close_claimed(&claim);
+                break Err(error);
+            }
+            let served = serve_claimed_pty(&mut reader, &mut writer, &ptys, &claim);
+            ptys.close_claimed(&claim);
+            break served;
+        }
         let response = process_request(
             request,
             &registry,
@@ -323,6 +416,63 @@ fn handle_client(
         attached_session.as_deref(),
     );
     result
+}
+
+fn serve_claimed_pty(
+    reader: &mut BufReader<UnixStream>,
+    writer: &mut UnixStream,
+    ptys: &PtyCoordinator,
+    claim: &PtyClaim,
+) -> Result<()> {
+    let mut pending = Vec::new();
+    let mut size = PtySize {
+        rows: 24,
+        columns: 80,
+    };
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if polled < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error).context("PTY stream poll failed");
+            }
+        } else if !reader.buffer().is_empty() || descriptor.revents & libc::POLLIN != 0 {
+            match read_client_frame(reader)? {
+                ClientPtyFrame::Input(bytes) => {
+                    if pending.len() + bytes.len() > 64 * 1024 {
+                        bail!("PTY pending input exceeds 65536 bytes");
+                    }
+                    pending.extend_from_slice(&bytes);
+                }
+                ClientPtyFrame::Resize(updated) => size = updated,
+                ClientPtyFrame::Close => return Ok(()),
+            }
+        } else if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Ok(());
+        }
+
+        let result = match ptys.exchange_claimed(claim, pending.clone(), size, 40) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = format!("{error:#}");
+                let _ = write_server_frame(writer, &ServerPtyFrame::Error(message));
+                return Ok(());
+            }
+        };
+        pending.drain(..result.input_accepted);
+        if !result.output.is_empty() {
+            write_server_frame(writer, &ServerPtyFrame::Output(result.output))?;
+        }
+        if let Some(status) = result.status {
+            write_server_frame(writer, &ServerPtyFrame::Exit(status))?;
+            return Ok(());
+        }
+    }
 }
 
 fn process_request(
@@ -508,8 +658,11 @@ fn process_request(
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
-            let pty_id = ptys.start(client_id, &session_id, command, &cwd, size, terminal_type)?;
-            Ok(ServerResponse::PtyStarted { pty_id })
+            let (pty_id, ticket) =
+                ptys.start(client_id, &session_id, command, &cwd, size, terminal_type)?;
+            Ok(ServerResponse::PtyStarted {
+                ticket: PtyTicket { pty_id, ticket },
+            })
         }
         ClientRequest::PtyExchange {
             pty_id,
@@ -523,6 +676,7 @@ fn process_request(
             ptys.close(client_id, &pty_id)?;
             Ok(ServerResponse::PtyClosed)
         }
+        ClientRequest::PtyClaim { .. } => bail!("PTY claims require a dedicated connection"),
         ClientRequest::Detach => {
             ptys.close_owner(client_id);
             let detached = match attached_session.take() {
@@ -682,6 +836,12 @@ fn send(writer: &mut impl Write, response: &ServerResponse) -> Result<()> {
     serde_json::to_writer(&mut *writer, response)?;
     writer.write_all(b"\n")?;
     writer.flush().context("cannot flush session response")
+}
+
+fn send_request(writer: &mut impl Write, request: &ClientRequest) -> Result<()> {
+    serde_json::to_writer(&mut *writer, request)?;
+    writer.write_all(b"\n")?;
+    writer.flush().context("cannot flush session request")
 }
 
 fn send_error(writer: &mut UnixStream, code: &str, message: &str) -> Result<()> {

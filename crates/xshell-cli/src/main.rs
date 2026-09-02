@@ -1550,7 +1550,7 @@ fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<String> {
 
 fn run_remote_pty(sessions: &mut SessionRuntime, command: &str) -> Result<String> {
     let initial = xshell_pty::controller_size().unwrap_or_default();
-    let pty_id = sessions.pty_start(
+    let (pty_id, mut stream) = sessions.pty_start_stream(
         command.to_owned(),
         xshell_session::PtySize {
             rows: initial.rows,
@@ -1558,22 +1558,7 @@ fn run_remote_pty(sessions: &mut SessionRuntime, command: &str) -> Result<String
         },
         env::var("TERM").ok(),
     )?;
-    let result = xshell_pty::relay_remote(|input, size, wait| {
-        let result = sessions.pty_exchange(
-            &pty_id,
-            input.to_vec(),
-            xshell_session::PtySize {
-                rows: size.rows,
-                columns: size.columns,
-            },
-            u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
-        )?;
-        Ok(xshell_pty::RemotePtyChunk {
-            output: result.output,
-            input_accepted: result.input_accepted,
-            status: result.status,
-        })
-    });
+    let result = stream.relay();
     if result.is_err() {
         let _ = sessions.pty_close(&pty_id);
     }
