@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -344,10 +344,7 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 fn ensure_state_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("cannot create session state directory {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    xshell_platform::ensure_secure_directory(path, "session state")
 }
 
 fn timestamp_ms() -> Result<u64> {

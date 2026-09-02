@@ -2005,6 +2005,7 @@ dependencies = [
  "tempfile",
  "toml",
  "uuid",
+ "xshell-platform",
 ]
 
 [[package]]
@@ -2055,6 +2056,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xshell-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "xshell-pty"
 version = "0.1.0"
 dependencies = [
@@ -2081,6 +2091,7 @@ dependencies = [
  "uuid",
  "xshell-core",
  "xshell-execution",
+ "xshell-platform",
  "xshell-pty",
 ]
 

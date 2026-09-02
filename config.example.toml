@@ -10,14 +10,18 @@ color = "auto"
 # width = 100
 
 # Auditing is disabled until xshell-auditd has been installed and started.
-# Development paths are shown here. A tamper-resistant deployment uses a
-# dedicated service account and protected paths under /var/db (macOS) or
-# /var/lib (Linux).
+# Single-user development paths are shown here; both daemons refuse to use a
+# directory they do not own or that is group/world writable, so avoid shared
+# locations such as /tmp. A tamper-resistant deployment uses a dedicated
+# service account and protected paths under /var/db (macOS) or /var/lib (Linux).
 [audit]
 enabled = false
 required = true
-socket = "/tmp/xshell-audit.sock"
-directory = "/tmp/xshell-audit"
+# Paths are not tilde-expanded; use absolute paths under your home directory,
+# for example /home/USER/.local/state/xshell/audit on Linux or
+# /Users/USER/Library/Application Support/xshell/audit on macOS.
+socket = "/ABSOLUTE/PATH/TO/xshell-audit/audit.sock"
+directory = "/ABSOLUTE/PATH/TO/xshell-audit"
 checkpoint_interval = 16
 
 [models.local-qwen]
@@ -38,11 +42,15 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 # The local session service is opt-in while the fabric is under development.
 # Start it with: xshelld --config ~/.config/xshell/config.toml
+# When socket and state_directory are omitted, xshell uses $XDG_STATE_HOME or
+# ~/.local/state/xshell/sessions (Linux) and
+# ~/Library/Application Support/xshell/sessions (macOS). Only the owning user
+# may connect; the daemon checks the peer UID on every connection.
 [session_fabric]
 enabled = false
 required = true
-socket = "/tmp/xshell-session-state/xshelld.sock"
-state_directory = "/tmp/xshell-session-state"
+# socket = "/custom/private/dir/xshelld.sock"
+# state_directory = "/custom/private/dir"
 default_session = "default"
 # Prefix for terminal-job commands: d detach, s switch, l last, n/p cycle,
 # q terminate, ? help, or repeat the prefix to send it literally.

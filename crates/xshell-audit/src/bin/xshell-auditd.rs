@@ -113,7 +113,7 @@ fn handle_client(
     identity: SigningIdentity,
     checkpoint_interval: u64,
 ) -> Result<()> {
-    let client_uid = peer_uid(&stream)?;
+    let client_uid = xshell_platform::peer_uid(&stream)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let Some(mut line) = read_request_line(&mut reader)? else {
@@ -213,39 +213,4 @@ fn send_error(stream: &mut UnixStream, message: &str) -> Result<()> {
             message: message.into(),
         },
     )
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> Result<u32> {
-    use std::mem::{size_of, zeroed};
-    use std::os::fd::AsRawFd;
-
-    let mut credentials: libc::ucred = unsafe { zeroed() };
-    let mut length = size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("cannot identify audit client");
-    }
-    Ok(credentials.uid)
-}
-
-#[cfg(target_os = "macos")]
-fn peer_uid(stream: &UnixStream) -> Result<u32> {
-    use std::os::fd::AsRawFd;
-
-    let mut uid = 0;
-    let mut gid = 0;
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("cannot identify audit client");
-    }
-    Ok(uid)
 }

@@ -35,7 +35,10 @@ the controller and every connected remote host before a v8 CLI can attach.
 - Unexpected socket disconnect has detach semantics.
 
 The daemon socket is mode `0600`; the state directory and host ID are mode
-`0700` and `0600`. No API key values cross the session protocol. A model
+`0700` and `0600`. The daemon additionally refuses to start if the socket's
+parent directory or the state directory is a symlink, is not owned by the
+daemon's user, or is group/world writable, and it rejects any connection whose
+peer UID (`SO_PEERCRED` / `getpeereid`) differs from its own. No API key values cross the session protocol. A model
 binding stores only the name of the credential environment variable.
 
 ## Lifecycle modes

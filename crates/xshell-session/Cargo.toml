@@ -23,6 +23,7 @@ tokio.workspace = true
 uuid.workspace = true
 xshell-core = { path = "../xshell-core" }
 xshell-execution = { path = "../xshell-execution" }
+xshell-platform = { path = "../xshell-platform" }
 xshell-pty = { path = "../xshell-pty" }
 
 [dev-dependencies]

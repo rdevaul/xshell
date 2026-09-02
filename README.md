@@ -269,11 +269,15 @@ For a local functional test, enable the `[audit]` section in
 
 ```sh
 cargo run -p xshell-audit --bin xshell-auditd -- \
-  --directory /tmp/xshell-audit \
-  --socket /tmp/xshell-audit.sock
+  --directory "$HOME/.local/state/xshell/audit" \
+  --socket "$HOME/.local/state/xshell/audit/audit.sock"
 
 cargo run -p xshell-cli -- --config config.example.toml
 ```
+
+Both daemons refuse directories they do not own or that are group/world
+writable, so avoid shared locations such as `/tmp`, where another local user
+could pre-create the path.
 
 This same-user development setup is not protected from shell commands. A
 tamper-resistant installation must run the daemon under a dedicated OS account

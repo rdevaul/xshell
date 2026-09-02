@@ -108,6 +108,13 @@ fn main() -> Result<()> {
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
+                // The daemon runs commands as the invoking user. Socket mode
+                // is not a sufficient control on every platform, so verify
+                // the peer explicitly before reading a single request byte.
+                if let Err(error) = xshell_platform::require_same_user(&stream, "session") {
+                    eprintln!("xshelld: {error:#}");
+                    continue;
+                }
                 let registry = Arc::clone(&registry);
                 let execution = execution.clone();
                 let ptys = ptys.clone();
@@ -902,8 +909,10 @@ fn prepare_socket(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("session socket must have a parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("cannot create socket directory {}", parent.display()))?;
+    // The socket's parent must be ours and private; otherwise another local
+    // user could pre-create the directory (for example under /tmp) and
+    // replace or redirect the socket.
+    xshell_platform::ensure_secure_directory(parent, "session socket")?;
     if path.exists() {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.file_type().is_socket() {
@@ -916,8 +925,7 @@ fn prepare_socket(path: &Path) -> Result<()> {
 }
 
 fn load_or_create_host_id(state_directory: &Path) -> Result<String> {
-    fs::create_dir_all(state_directory)?;
-    fs::set_permissions(state_directory, fs::Permissions::from_mode(0o700))?;
+    xshell_platform::ensure_secure_directory(state_directory, "session state")?;
     let path = state_directory.join("host-id");
     if path.exists() {
         let value = fs::read_to_string(&path)?;
