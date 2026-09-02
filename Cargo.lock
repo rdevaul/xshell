@@ -2080,6 +2080,7 @@ dependencies = [
  "uuid",
  "xshell-core",
  "xshell-execution",
+ "xshell-pty",
 ]
 
 [[package]]

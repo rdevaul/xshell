@@ -64,6 +64,6 @@ content-addressed derived artifacts with render manifests. xshell will not load
 untrusted Rust dynamic libraries into its own process. F3D and future CAD
 renderers should use this process boundary.
 
-Binary transport, content-addressed staging, external processes, inline image
-protocols, multimodal attachment, and plugin installation are not implemented
-in protocol v5.
+Binary viewer transport, content-addressed staging, external processes, inline
+image protocols, multimodal attachment, and plugin installation remain
+unimplemented as of protocol v6.

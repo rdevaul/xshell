@@ -223,6 +223,24 @@ async fn main() -> Result<()> {
             InputRoute::Empty => {}
             InputRoute::Shell(command) => {
                 if sessions.enabled() && !sessions.active_host_is_local() {
+                    if xshell_pty::controller_is_terminal() && !is_simple_cd(&command) {
+                        let outcome = match run_remote_pty(&mut sessions, &command) {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                eprintln!("xshell: {error:#}");
+                                format!("error: {error:#}")
+                            }
+                        };
+                        if outcome != "exit status: 0" && !outcome.starts_with("error:") {
+                            eprintln!("xshell: command finished with {outcome}");
+                        }
+                        audit.append(AuditEvent::ShellFinished {
+                            command,
+                            outcome,
+                            cwd: cwd.display().to_string(),
+                        })?;
+                        continue;
+                    }
                     match run_daemon_turn(
                         &mut sessions,
                         TurnInput::Shell {
@@ -1530,6 +1548,43 @@ fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<String> {
     Ok(format!("exit status: {status}"))
 }
 
+fn run_remote_pty(sessions: &mut SessionRuntime, command: &str) -> Result<String> {
+    let initial = xshell_pty::controller_size().unwrap_or_default();
+    let pty_id = sessions.pty_start(
+        command.to_owned(),
+        xshell_session::PtySize {
+            rows: initial.rows,
+            columns: initial.columns,
+        },
+        env::var("TERM").ok(),
+    )?;
+    let result = xshell_pty::relay_remote(|input, size, wait| {
+        let result = sessions.pty_exchange(
+            &pty_id,
+            input.to_vec(),
+            xshell_session::PtySize {
+                rows: size.rows,
+                columns: size.columns,
+            },
+            u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        )?;
+        Ok(xshell_pty::RemotePtyChunk {
+            output: result.output,
+            input_accepted: result.input_accepted,
+            status: result.status,
+        })
+    });
+    if result.is_err() {
+        let _ = sessions.pty_close(&pty_id);
+    }
+    result
+}
+
+fn is_simple_cd(command: &str) -> bool {
+    shell_words::split(command)
+        .is_ok_and(|words| words.len() <= 2 && words.first().map(String::as_str) == Some("cd"))
+}
+
 fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -1668,5 +1723,13 @@ mod tests {
         assert_eq!(options.viewer.as_deref(), Some("markdown"));
         assert!(parse_view_options("").is_err());
         assert!(parse_view_options("one.md two.md").is_err());
+    }
+
+    #[test]
+    fn only_simple_cd_commands_use_session_cwd_updates() {
+        assert!(is_simple_cd("cd"));
+        assert!(is_simple_cd("cd 'design files'"));
+        assert!(!is_simple_cd("cd /tmp && pwd"));
+        assert!(!is_simple_cd("printf cd"));
     }
 }

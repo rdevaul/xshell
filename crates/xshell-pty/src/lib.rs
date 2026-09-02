@@ -12,10 +12,194 @@ use std::time::Duration;
 
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const REMOTE_INPUT_BYTES: usize = 16 * 1024;
+const REMOTE_WAIT: Duration = Duration::from_millis(40);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtySize {
+    pub rows: u16,
+    pub columns: u16,
+}
+
+impl Default for PtySize {
+    fn default() -> Self {
+        Self {
+            rows: 24,
+            columns: 80,
+        }
+    }
+}
+
+impl From<PtySize> for Winsize {
+    fn from(size: PtySize) -> Self {
+        Self {
+            ws_row: size.rows,
+            ws_col: size.columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }
+    }
+}
+
+impl From<Winsize> for PtySize {
+    fn from(size: Winsize) -> Self {
+        Self {
+            rows: size.ws_row,
+            columns: size.ws_col,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePtyChunk {
+    pub output: Vec<u8>,
+    pub input_accepted: usize,
+    pub status: Option<String>,
+}
+
+/// A daemon-owned transient PTY. The caller supplies bounded input and drains
+/// bounded output through `exchange`; dropping it terminates the child.
+pub struct RemotePtyProcess {
+    master: OwnedFd,
+    child: Child,
+    exit_status: Option<String>,
+    master_closed: bool,
+}
+
+impl RemotePtyProcess {
+    pub fn spawn(
+        command: &str,
+        cwd: &Path,
+        size: PtySize,
+        terminal_type: Option<&str>,
+    ) -> Result<Self> {
+        if command.trim().is_empty() {
+            bail!("PTY command is empty");
+        }
+        let (master, mut child) = spawn_child(command, cwd, None, size.into(), terminal_type)?;
+        if let Err(error) = set_nonblocking(master.as_raw_fd()) {
+            terminate(&mut child);
+            return Err(error);
+        }
+        Ok(Self {
+            master,
+            child,
+            exit_status: None,
+            master_closed: false,
+        })
+    }
+
+    pub fn exchange(
+        &mut self,
+        input: &[u8],
+        size: PtySize,
+        wait: Duration,
+        output_limit: usize,
+    ) -> Result<RemotePtyChunk> {
+        if output_limit == 0 {
+            bail!("PTY output limit must be positive");
+        }
+        set_pty_size(self.master.as_raw_fd(), size.into())?;
+        let input_accepted = write_available(self.master.as_raw_fd(), input)?;
+        let mut output = vec![0_u8; output_limit];
+        let count = read_available(
+            self.master.as_raw_fd(),
+            &mut output,
+            wait,
+            &mut self.master_closed,
+        )?;
+        output.truncate(count);
+        if self.exit_status.is_none()
+            && let Some(status) = self
+                .child
+                .try_wait()
+                .context("cannot inspect PTY command")?
+        {
+            self.exit_status = Some(status.to_string());
+        }
+        let status = self
+            .master_closed
+            .then(|| self.exit_status.clone())
+            .flatten();
+        Ok(RemotePtyChunk {
+            output,
+            input_accepted,
+            status,
+        })
+    }
+
+    pub fn terminate(&mut self) {
+        terminate(&mut self.child);
+        self.master_closed = true;
+        if self.exit_status.is_none() {
+            self.exit_status = Some("terminated".into());
+        }
+    }
+}
+
+impl Drop for RemotePtyProcess {
+    fn drop(&mut self) {
+        if !self.master_closed || self.exit_status.is_none() {
+            self.terminate();
+        }
+    }
+}
+
+/// Relay the controller terminal through a request/response transport. The
+/// callback must return the number of leading input bytes accepted by the
+/// remote PTY, any output bytes, and the final status when the PTY closes.
+pub fn relay_remote(
+    mut exchange: impl FnMut(&[u8], PtySize, Duration) -> Result<RemotePtyChunk>,
+) -> Result<String> {
+    if !controller_is_terminal() {
+        bail!("remote PTY execution requires terminal stdin and stdout");
+    }
+    let terminal = io::stdin();
+    let terminal_fd = terminal.as_raw_fd();
+    let original = tcgetattr(terminal.as_fd()).context("cannot read terminal attributes")?;
+    let mut guard = TerminalGuard::enter(terminal_fd, original)?;
+    let result = relay_remote_inner(terminal_fd, io::stdout(), &mut exchange);
+    guard.restore()?;
+    result
+}
+
+fn relay_remote_inner(
+    terminal_fd: RawFd,
+    mut output: impl Write,
+    exchange: &mut impl FnMut(&[u8], PtySize, Duration) -> Result<RemotePtyChunk>,
+) -> Result<String> {
+    let mut pending = Vec::new();
+    loop {
+        if pending.len() < REMOTE_INPUT_BYTES {
+            let mut input = vec![0_u8; REMOTE_INPUT_BYTES - pending.len()];
+            let count = read_terminal_available(terminal_fd, &mut input)?;
+            pending.extend_from_slice(&input[..count]);
+        }
+        let size = terminal_size(terminal_fd)
+            .map(PtySize::from)
+            .unwrap_or_default();
+        let chunk = exchange(&pending, size, REMOTE_WAIT)?;
+        if chunk.input_accepted > pending.len() {
+            bail!("remote PTY accepted an invalid input length");
+        }
+        pending.drain(..chunk.input_accepted);
+        output.write_all(&chunk.output)?;
+        output.flush()?;
+        if let Some(status) = chunk.status {
+            return Ok(status);
+        }
+    }
+}
 
 /// Whether an interactive PTY can be attached to the controller's terminal.
 pub fn controller_is_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+pub fn controller_size() -> Option<PtySize> {
+    controller_is_terminal()
+        .then(|| terminal_size(io::stdin().as_raw_fd()).map(PtySize::from))
+        .flatten()
 }
 
 /// Run a user-entered shell command in a transient pseudoterminal and relay the
@@ -37,7 +221,7 @@ pub fn run(command: &str, cwd: &Path) -> Result<ExitStatus> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     });
-    let (master, mut child) = spawn(command, cwd, Some(&original), initial_size)?;
+    let (master, mut child) = spawn_child(command, cwd, Some(&original), initial_size, None)?;
     let mut guard = match TerminalGuard::enter(terminal_fd, original) {
         Ok(guard) => guard,
         Err(error) => {
@@ -50,11 +234,12 @@ pub fn run(command: &str, cwd: &Path) -> Result<ExitStatus> {
     result
 }
 
-fn spawn(
+fn spawn_child(
     command: &str,
     cwd: &Path,
     terminal: Option<&Termios>,
     size: Winsize,
+    terminal_type: Option<&str>,
 ) -> Result<(OwnedFd, Child)> {
     let OpenptyResult { master, slave } =
         openpty(Some(&size), terminal).context("cannot allocate pseudoterminal")?;
@@ -70,9 +255,13 @@ fn spawn(
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    if let Some(terminal_type) = terminal_type {
+        process.env("TERM", terminal_type);
+    }
     // Command performs its stdio duplication before this callback. Creating a
     // new session and claiming fd 0 makes the PTY slave the controlling
-    // terminal, so its line discipline delivers Ctrl-C/Ctrl-Z and SIGWINCH to
+    // terminal, so its line discipline delivers terminal-generated signals
+    // and SIGWINCH to
     // the foreground command rather than xshell.
     unsafe {
         process.pre_exec(|| {
@@ -220,8 +409,117 @@ fn write_all_fd(descriptor: RawFd, mut bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn set_nonblocking(descriptor: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error()).context("cannot inspect PTY flags");
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error()).context("cannot set PTY nonblocking mode");
+    }
+    Ok(())
+}
+
+fn write_available(descriptor: RawFd, bytes: &[u8]) -> Result<usize> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let count = unsafe { libc::write(descriptor, bytes.as_ptr().cast(), bytes.len()) };
+    if count >= 0 {
+        return Ok(count as usize);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::Interrupted || error.kind() == io::ErrorKind::WouldBlock {
+        return Ok(0);
+    }
+    Err(error).context("cannot write remote PTY input")
+}
+
+fn read_available(
+    descriptor: RawFd,
+    output: &mut [u8],
+    wait: Duration,
+    closed: &mut bool,
+) -> Result<usize> {
+    if *closed {
+        return Ok(0);
+    }
+    let timeout = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+    let mut poll = libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll, 1, timeout) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(0);
+        }
+        return Err(error).context("cannot poll remote PTY output");
+    }
+    if poll.revents & libc::POLLNVAL != 0 {
+        bail!("remote PTY descriptor became invalid");
+    }
+    if result == 0 || poll.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+        return Ok(0);
+    }
+    let count = unsafe { libc::read(descriptor, output.as_mut_ptr().cast(), output.len()) };
+    if count > 0 {
+        return Ok(count as usize);
+    }
+    if count == 0 {
+        *closed = true;
+        return Ok(0);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EIO) {
+        *closed = true;
+        return Ok(0);
+    }
+    if error.kind() == io::ErrorKind::Interrupted || error.kind() == io::ErrorKind::WouldBlock {
+        return Ok(0);
+    }
+    Err(error).context("cannot read remote PTY output")
+}
+
+fn read_terminal_available(descriptor: RawFd, output: &mut [u8]) -> Result<usize> {
+    let mut poll = libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    if result <= 0 || poll.revents & libc::POLLIN == 0 {
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error).context("cannot poll controller terminal");
+            }
+        }
+        return Ok(0);
+    }
+    let count = unsafe { libc::read(descriptor, output.as_mut_ptr().cast(), output.len()) };
+    if count >= 0 {
+        return Ok(count as usize);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::Interrupted || error.kind() == io::ErrorKind::WouldBlock {
+        return Ok(0);
+    }
+    Err(error).context("cannot read controller terminal")
+}
+
 fn terminate(child: &mut Child) {
-    let _ = child.kill();
+    let killed_group = i32::try_from(child.id()).is_ok_and(|pid| {
+        // `spawn_child` calls setsid(), so the shell leader is also the PTY
+        // process-group leader. Kill the group so a pager or pipeline cannot
+        // survive after its controller disconnects.
+        (unsafe { libc::kill(-pid, libc::SIGKILL) }) == 0
+    });
+    if !killed_group {
+        let _ = child.kill();
+    }
     let _ = child.wait();
 }
 
@@ -273,11 +571,12 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let (master, mut child) = spawn(
+        let (master, mut child) = spawn_child(
             "test -t 0 && printf 'tty\\n'; read value; printf 'got:%s\\n' \"$value\"; stty size; pwd",
             temporary.path(),
             None,
             size,
+            None,
         )
         .unwrap();
         let mut reader = File::from(master);
@@ -292,5 +591,84 @@ mod tests {
         assert!(output.contains("got:hello"));
         assert!(output.contains("24 80"));
         assert!(output.contains(temporary.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn remote_process_exchanges_bounded_binary_chunks() {
+        let temporary = TempDir::new().unwrap();
+        let mut process = RemotePtyProcess::spawn(
+            "read value; printf 'got:%s\\n' \"$value\"; stty size",
+            temporary.path(),
+            PtySize {
+                rows: 25,
+                columns: 90,
+            },
+            Some("xterm-256color"),
+        )
+        .unwrap();
+        let mut pending = b"remote\n".to_vec();
+        let mut output = Vec::new();
+        let status = loop {
+            let chunk = process
+                .exchange(
+                    &pending,
+                    PtySize {
+                        rows: 30,
+                        columns: 100,
+                    },
+                    Duration::from_millis(100),
+                    64 * 1024,
+                )
+                .unwrap();
+            pending.drain(..chunk.input_accepted);
+            output.extend_from_slice(&chunk.output);
+            if let Some(status) = chunk.status {
+                break status;
+            }
+        };
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("got:remote"));
+        assert!(output.contains("30 100"));
+        assert_eq!(status, "exit status: 0");
+    }
+
+    #[test]
+    fn controller_relay_forwards_pending_input_and_output() {
+        let size = Winsize {
+            ws_row: 27,
+            ws_col: 91,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let OpenptyResult { master, slave } = openpty(Some(&size), None).unwrap();
+        let mut controller = File::from(master);
+        controller.write_all(b"answer\n").unwrap();
+        let mut output = Vec::new();
+        let mut called = false;
+        let status = relay_remote_inner(
+            slave.as_raw_fd(),
+            &mut output,
+            &mut |input, observed_size, wait| {
+                assert_eq!(input, b"answer\n");
+                assert_eq!(
+                    observed_size,
+                    PtySize {
+                        rows: 27,
+                        columns: 91
+                    }
+                );
+                assert_eq!(wait, REMOTE_WAIT);
+                called = true;
+                Ok(RemotePtyChunk {
+                    output: b"rendered".to_vec(),
+                    input_accepted: input.len(),
+                    status: Some("exit status: 0".into()),
+                })
+            },
+        )
+        .unwrap();
+        assert!(called);
+        assert_eq!(output, b"rendered");
+        assert_eq!(status, "exit status: 0");
     }
 }

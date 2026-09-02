@@ -15,9 +15,12 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 5. The daemon
+with protocol version 6. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
+Protocol versions are exact rather than negotiated across incompatible
+schemas. Protocol v6 therefore requires upgrading and restarting `xshelld` on
+the controller and every connected remote host before a v6 CLI can attach.
 
 ## Identity and attachment
 
@@ -97,12 +100,22 @@ work.
 - `complete_shell`: return bounded executable/path candidates for a session.
 - `view_source`: return a bounded UTF-8 resource resolved against the attached
   session cwd, with media type, length, and SHA-256 metadata.
+- `pty_start`: start one transient daemon-owned PTY for the attached session.
+- `pty_exchange`: send bounded input and dimensions and receive bounded binary
+  output plus final status for a PTY owned by this connection.
+- `pty_close`: terminate and reap an owned PTY.
 
 `view_source` requires the requesting connection to own the active session.
 The SSH proxy additionally rejects requests for `host_only` sessions. The
 daemon reads only regular files, enforces a 4 MiB limit and three-second
 deadline, and returns text through the existing authenticated stdio tunnel.
 Rendering remains local to the controller.
+
+PTY creation requires the current attachment, and the SSH proxy applies the
+same `fabric` visibility check used for completion and viewing. PTY IDs are
+connection-owned and cannot be used by another daemon client. Disconnect,
+detach, switch, or close terminates transient PTYs. Protocol bounds and the
+terminal escape trust policy are documented in [the PTY design](pty.md).
 
 The CLI keeps a per-connection navigation history. After `//close` deletes the
 current session, it first attempts to attach the previously visited session,

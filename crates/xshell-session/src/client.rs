@@ -1,7 +1,7 @@
 use crate::{
-    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding,
-    SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot,
-    ShellCompletionResult, TurnInput, ViewResource,
+    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding, PtyExchangeResult,
+    PtySize, SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor,
+    SessionSnapshot, ShellCompletionResult, TurnInput, ViewResource,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -285,6 +285,52 @@ impl SessionClient {
         match self.receive()? {
             ServerResponse::ViewSource { resource } => Ok(resource),
             response => response_error("view source", response),
+        }
+    }
+
+    pub fn pty_start(
+        &mut self,
+        session_id: String,
+        command: String,
+        size: PtySize,
+        terminal_type: Option<String>,
+    ) -> Result<String> {
+        self.send(&ClientRequest::PtyStart {
+            session_id,
+            command,
+            size,
+            terminal_type,
+        })?;
+        match self.receive()? {
+            ServerResponse::PtyStarted { pty_id } => Ok(pty_id),
+            response => response_error("PTY start", response),
+        }
+    }
+
+    pub fn pty_exchange(
+        &mut self,
+        pty_id: String,
+        input: Vec<u8>,
+        size: PtySize,
+        wait_ms: u64,
+    ) -> Result<PtyExchangeResult> {
+        self.send(&ClientRequest::PtyExchange {
+            pty_id,
+            input,
+            size,
+            wait_ms,
+        })?;
+        match self.receive()? {
+            ServerResponse::PtyExchange { result } => Ok(result),
+            response => response_error("PTY exchange", response),
+        }
+    }
+
+    pub fn pty_close(&mut self, pty_id: String) -> Result<()> {
+        self.send(&ClientRequest::PtyClose { pty_id })?;
+        match self.receive()? {
+            ServerResponse::PtyClosed => Ok(()),
+            response => response_error("PTY close", response),
         }
     }
 

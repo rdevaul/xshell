@@ -1,7 +1,7 @@
 use crate::{
-    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, SESSION_PROTOCOL_VERSION,
-    SessionCreation, SessionDescriptor, SessionSnapshot, ShellCompletionResult, TurnInput,
-    ViewResource,
+    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtyExchangeResult, PtySize,
+    SESSION_PROTOCOL_VERSION, SessionCreation, SessionDescriptor, SessionSnapshot,
+    ShellCompletionResult, TurnInput, ViewResource,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -63,6 +63,21 @@ pub enum ClientRequest {
         session_id: String,
         path: PathBuf,
     },
+    PtyStart {
+        session_id: String,
+        command: String,
+        size: PtySize,
+        terminal_type: Option<String>,
+    },
+    PtyExchange {
+        pty_id: String,
+        input: Vec<u8>,
+        size: PtySize,
+        wait_ms: u64,
+    },
+    PtyClose {
+        pty_id: String,
+    },
     Detach,
     Close {
         selector: Option<String>,
@@ -118,6 +133,13 @@ pub enum ServerResponse {
     ViewSource {
         resource: ViewResource,
     },
+    PtyStarted {
+        pty_id: String,
+    },
+    PtyExchange {
+        result: PtyExchangeResult,
+    },
+    PtyClosed,
     Detached {
         session_id: Option<String>,
     },
@@ -147,6 +169,24 @@ mod tests {
         assert!(encoded.contains("\"request\":\"submit\""));
         assert_eq!(
             serde_json::from_str::<ClientRequest>(&encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn pty_exchange_preserves_binary_input() {
+        let request = ClientRequest::PtyExchange {
+            pty_id: "pty-1".into(),
+            input: vec![0, 3, 0xff],
+            size: PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            wait_ms: 40,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ClientRequest>(&encoded).unwrap(),
             request
         );
     }

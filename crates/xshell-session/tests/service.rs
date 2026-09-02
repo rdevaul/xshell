@@ -8,9 +8,9 @@ use tempfile::TempDir;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 use xshell_session::{
-    AttachmentRole, ClientRequest, ModelBinding, PersistenceMode, SESSION_PROTOCOL_VERSION,
-    ServerResponse, SessionActivity, SessionClient, SessionCreation, SessionEventKind, TurnInput,
-    Visibility,
+    AttachmentRole, ClientRequest, ModelBinding, PersistenceMode, PtySize,
+    SESSION_PROTOCOL_VERSION, ServerResponse, SessionActivity, SessionClient, SessionCreation,
+    SessionEventKind, TurnInput, Visibility,
 };
 
 struct Daemon(Child);
@@ -232,6 +232,22 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     ));
     send_request(
         &mut writer,
+        &ClientRequest::PtyStart {
+            session_id: private.descriptor.id.clone(),
+            command: "printf private".into(),
+            size: PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            terminal_type: Some("xterm-256color".into()),
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Error { code, .. } if code == "remote_session_not_visible"
+    ));
+    send_request(
+        &mut writer,
         &ClientRequest::ViewSource {
             session_id: private.descriptor.id.clone(),
             path: "remote-view.md".into(),
@@ -266,10 +282,64 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
                 && resource.media_type == "text/markdown"
                 && resource.sha256.len() == 64
     ));
+    let size = PtySize {
+        rows: 31,
+        columns: 101,
+    };
+    send_request(
+        &mut writer,
+        &ClientRequest::PtyStart {
+            session_id: shared.descriptor.id.clone(),
+            command: "read value; printf 'pty:%s\\n' \"$value\"; stty size".into(),
+            size,
+            terminal_type: Some("xterm-256color".into()),
+        },
+    );
+    let pty_id = match receive_response(&mut reader) {
+        ServerResponse::PtyStarted { pty_id } => pty_id,
+        response => panic!("unexpected PTY start response: {response:?}"),
+    };
+    send_request(&mut writer, &ClientRequest::List);
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Catalog { sessions }
+            if sessions.iter().any(|session| {
+                session.id == shared.descriptor.id && session.activity == SessionActivity::Running
+            })
+    ));
+    let mut pending = b"fabric\n".to_vec();
+    let mut pty_output = Vec::new();
+    let mut pty_status = None;
+    for _ in 0..50 {
+        send_request(
+            &mut writer,
+            &ClientRequest::PtyExchange {
+                pty_id: pty_id.clone(),
+                input: pending.clone(),
+                size,
+                wait_ms: 100,
+            },
+        );
+        match receive_response(&mut reader) {
+            ServerResponse::PtyExchange { result } => {
+                pending.drain(..result.input_accepted);
+                pty_output.extend(result.output);
+                if result.status.is_some() {
+                    pty_status = result.status;
+                    break;
+                }
+            }
+            response => panic!("unexpected PTY exchange response: {response:?}"),
+        }
+    }
+    assert_eq!(pty_status.as_deref(), Some("exit status: 0"));
+    let pty_output = String::from_utf8_lossy(&pty_output);
+    assert!(pty_output.contains("pty:fabric"));
+    assert!(pty_output.contains("31 101"));
     send_request(
         &mut writer,
         &ClientRequest::CompleteShell {
-            session_id: shared.descriptor.id,
+            session_id: shared.descriptor.id.clone(),
             line: "$cat remote".into(),
             cursor: 11,
         },
@@ -304,17 +374,45 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             },
         },
     );
-    match receive_response(&mut reader) {
-        ServerResponse::Created { session } => assert_eq!(
-            session.descriptor.cwd,
-            Path::new(&std::env::var_os("HOME").unwrap())
-                .canonicalize()
-                .unwrap()
-        ),
+    let remote_home_id = match receive_response(&mut reader) {
+        ServerResponse::Created { session } => {
+            assert_eq!(
+                session.descriptor.cwd,
+                Path::new(&std::env::var_os("HOME").unwrap())
+                    .canonicalize()
+                    .unwrap()
+            );
+            session.descriptor.id
+        }
         response => panic!("unexpected create response: {response:?}"),
-    }
+    };
+    send_request(
+        &mut writer,
+        &ClientRequest::PtyStart {
+            session_id: remote_home_id.clone(),
+            command: "sleep 60".into(),
+            size,
+            terminal_type: Some("xterm-256color".into()),
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::PtyStarted { .. }
+    ));
     drop(writer);
     assert!(proxy.wait().unwrap().success());
+
+    let mut after_disconnect = connect_when_ready(&socket);
+    after_disconnect.attach(remote_home_id.clone()).unwrap();
+    let replacement = after_disconnect
+        .pty_start(
+            remote_home_id,
+            "sleep 60".into(),
+            size,
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+    after_disconnect.pty_close(replacement).unwrap();
 }
 
 #[test]

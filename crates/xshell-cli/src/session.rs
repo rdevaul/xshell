@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
-    EventBatch, PersistenceMode, SessionClient, SessionConfig, SessionCreation, SessionDescriptor,
-    SessionSnapshot, SessionStatus, TurnInput, ViewResource, Visibility,
+    EventBatch, PersistenceMode, PtyExchangeResult, PtySize, SessionClient, SessionConfig,
+    SessionCreation, SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput, ViewResource,
+    Visibility,
 };
 
 struct HostConnection {
@@ -333,6 +334,32 @@ impl SessionRuntime {
     pub fn view_source(&mut self, path: PathBuf) -> Result<ViewResource> {
         let session_id = self.active_session_id()?;
         self.client_mut()?.view_source(session_id, path)
+    }
+
+    pub fn pty_start(
+        &mut self,
+        command: String,
+        size: PtySize,
+        terminal_type: Option<String>,
+    ) -> Result<String> {
+        let session_id = self.active_session_id()?;
+        self.client_mut()?
+            .pty_start(session_id, command, size, terminal_type)
+    }
+
+    pub fn pty_exchange(
+        &mut self,
+        pty_id: &str,
+        input: Vec<u8>,
+        size: PtySize,
+        wait_ms: u64,
+    ) -> Result<PtyExchangeResult> {
+        self.client_mut()?
+            .pty_exchange(pty_id.to_owned(), input, size, wait_ms)
+    }
+
+    pub fn pty_close(&mut self, pty_id: &str) -> Result<()> {
+        self.client_mut()?.pty_close(pty_id.to_owned())
     }
 
     pub fn events(&mut self, wait_ms: u64) -> Result<EventBatch> {
