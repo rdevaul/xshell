@@ -130,6 +130,9 @@ async fn main() -> Result<()> {
     }
     let mut agent = build_adapter(&active_model, !sessions.enabled())?;
     let mut audit = AuditRuntime::start(&model_config.audit)?;
+    if sessions.enabled() {
+        audit.delegate_execution_events();
+    }
     audit.append(AuditEvent::SessionStarted {
         client_version: env!("CARGO_PKG_VERSION").into(),
         cwd: cwd.display().to_string(),
@@ -205,10 +208,19 @@ async fn main() -> Result<()> {
 
         let route = apply_sticky_shell_mode(classify_input(&line), &mut sticky_shell);
         if !matches!(route, InputRoute::Empty) {
-            audit.append(AuditEvent::Input {
-                route: input_route_name(&route).into(),
-                text: line.clone(),
-            })?;
+            // Control commands never reach the daemon; always record them.
+            // Agent and shell input is recorded by whichever process runs it.
+            if matches!(route, InputRoute::Control(_)) {
+                audit.append(AuditEvent::Input {
+                    route: input_route_name(&route).into(),
+                    text: line.clone(),
+                })?;
+            } else {
+                audit.append_execution(AuditEvent::Input {
+                    route: input_route_name(&route).into(),
+                    text: line.clone(),
+                })?;
+            }
         }
 
         match route {
@@ -216,6 +228,14 @@ async fn main() -> Result<()> {
             InputRoute::Shell(command) => {
                 if sessions.enabled() {
                     if xshell_pty::controller_is_terminal() && !is_simple_cd(&command) {
+                        // Terminal jobs are started through the PTY protocol,
+                        // which the daemon does not yet audit (see
+                        // docs/auditing.md). Record the input and completion
+                        // from the controller so the trail stays complete.
+                        audit.append(AuditEvent::Input {
+                            route: "shell_terminal".into(),
+                            text: line.clone(),
+                        })?;
                         let previous_session = sessions.active().map(|session| session.id.clone());
                         let result = match run_session_pty(&mut sessions, &command, pty_escape) {
                             Ok(outcome) => outcome,
@@ -582,7 +602,7 @@ async fn main() -> Result<()> {
                             true,
                         )?,
                         Err(error) => {
-                            let _ = audit.append(AuditEvent::AgentError {
+                            let _ = audit.append_execution(AuditEvent::AgentError {
                                 message: format!("{error:#}"),
                             });
                             eprintln!("xshell agent error: {error:#}");
@@ -685,7 +705,7 @@ fn follow_daemon_turn(
                         }
                         renderer.finish(&mut stdout)?;
                         renderer = AgentRenderer::new(render_options);
-                        audit.append(AuditEvent::AgentResponse {
+                        audit.append_execution(AuditEvent::AgentResponse {
                             content,
                             tool_call_count,
                             partial,
@@ -696,7 +716,7 @@ fn follow_daemon_turn(
                             "agent requests: {}",
                             escape_for_prompt(&tool_summary(&call))
                         );
-                        audit.append(AuditEvent::ToolRequested {
+                        audit.append_execution(AuditEvent::ToolRequested {
                             call_id: call.id,
                             name: call.name,
                             arguments: call.arguments,
@@ -707,13 +727,13 @@ fn follow_daemon_turn(
                         sessions.approve(record.turn_id.clone(), call.id.clone(), decision)?;
                     }
                     ExecutionEvent::ToolDecision { call_id, decision } => {
-                        audit.append(AuditEvent::ToolDecision {
+                        audit.append_execution(AuditEvent::ToolDecision {
                             call_id,
                             decision: approval_decision_name(decision).into(),
                         })?;
                     }
                     ExecutionEvent::ToolSkipped { call_id, .. } => {
-                        audit.append(AuditEvent::ToolDecision {
+                        audit.append_execution(AuditEvent::ToolDecision {
                             call_id,
                             decision: "skipped_after_abort".into(),
                         })?;
@@ -723,7 +743,7 @@ fn follow_daemon_turn(
                         name,
                         result,
                     } => {
-                        audit.append(AuditEvent::ToolResult {
+                        audit.append_execution(AuditEvent::ToolResult {
                             call_id,
                             name,
                             result: result.clone(),
@@ -744,7 +764,7 @@ fn follow_daemon_turn(
                     }
                 }
                 SessionEventKind::WorkingDirectoryChanged { cwd } => {
-                    audit.append(AuditEvent::WorkingDirectoryChanged {
+                    audit.append_execution(AuditEvent::WorkingDirectoryChanged {
                         cwd: cwd.display().to_string(),
                     })?;
                 }
@@ -759,7 +779,7 @@ fn follow_daemon_turn(
                     renderer.finish(&mut stdout)?;
                     let snapshot = sessions.refresh_snapshot()?;
                     if let Some((command, status)) = shell_finished.take() {
-                        audit.append(AuditEvent::ShellFinished {
+                        audit.append_execution(AuditEvent::ShellFinished {
                             command,
                             outcome: status,
                             cwd: snapshot.descriptor.cwd.display().to_string(),

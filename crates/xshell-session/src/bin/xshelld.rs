@@ -13,9 +13,10 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 use xshell_session::{
-    ClientPtyFrame, ClientRequest, ExecutionCoordinator, PersistenceMode, PtyClaim, PtyCoordinator,
-    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionConfig,
-    SessionRegistry, complete_shell, load_view_resource, read_client_frame, write_server_frame,
+    ClientPtyFrame, ClientRequest, DaemonAudit, ExecutionCoordinator, PersistenceMode, PtyClaim,
+    PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
+    SessionConfig, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
+    write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -33,6 +34,12 @@ struct Args {
 
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Ignore XSHELL_CONFIG and ~/.config/xshell/config.toml; use only
+    /// command-line flags and built-in defaults. Intended for tests and
+    /// hermetic deployments.
+    #[arg(long, global = true, conflicts_with = "config")]
+    no_user_config: bool,
 
     #[arg(long, global = true)]
     state_directory: Option<PathBuf>,
@@ -59,12 +66,18 @@ enum DaemonCommand {
 struct ConfigFile {
     #[serde(default)]
     session_fabric: SessionConfig,
+    #[serde(default)]
+    audit: xshell_audit::AuditConfig,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let config_path = resolve_config_path(args.config)?;
-    let config = load_config(config_path.as_deref())?;
+    let config_path = if args.no_user_config {
+        None
+    } else {
+        resolve_config_path(args.config)?
+    };
+    let (config, audit_config) = load_config(config_path.as_deref())?;
     let state_directory = args
         .state_directory
         .or_else(|| config.resolved_state_directory())
@@ -88,7 +101,8 @@ fn main() -> Result<()> {
         host_alias,
         user,
     )?));
-    let execution = ExecutionCoordinator::new(Arc::clone(&registry));
+    let audit = DaemonAudit::from_config(&audit_config)?;
+    let execution = ExecutionCoordinator::with_audit(Arc::clone(&registry), audit);
     let ptys = PtyCoordinator::default();
 
     prepare_socket(&socket)?;
@@ -104,6 +118,16 @@ fn main() -> Result<()> {
         identity.user()
     );
     drop(identity);
+    println!(
+        "audit: {}",
+        match (execution.audit().enabled(), execution.audit().required()) {
+            (false, _) => "disabled".to_owned(),
+            (true, true) => "required (execution-boundary)".to_owned(),
+            (true, false) => "best-effort (execution-boundary)".to_owned(),
+        }
+    );
+
+    install_shutdown_handler(execution.audit().clone());
 
     for connection in listener.incoming() {
         match connection {
@@ -128,6 +152,32 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// On SIGINT/SIGTERM, finalize open audit sessions with signed checkpoints and
+/// exit. Without this, `launchctl stop` or Ctrl-C would leave every daemon
+/// audit log without a final checkpoint, which the verifier reports as
+/// possibly truncated.
+fn install_shutdown_handler(audit: DaemonAudit) {
+    thread::Builder::new()
+        .name("xshelld-shutdown".into())
+        .spawn(move || {
+            let mut signals = match signal_hook::iterator::Signals::new([
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+            ]) {
+                Ok(signals) => signals,
+                Err(error) => {
+                    eprintln!("xshelld: cannot install shutdown handler: {error}");
+                    return;
+                }
+            };
+            if signals.forever().next().is_some() {
+                audit.close_all("xshelld shutdown");
+                std::process::exit(0);
+            }
+        })
+        .expect("cannot spawn shutdown handler thread");
 }
 
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
@@ -330,15 +380,18 @@ fn remote_visibility_error() -> ServerResponse {
     }
 }
 
-fn load_config(path: Option<&Path>) -> Result<SessionConfig> {
+fn load_config(path: Option<&Path>) -> Result<(SessionConfig, xshell_audit::AuditConfig)> {
     let Some(path) = path else {
-        return Ok(SessionConfig::default());
+        return Ok((
+            SessionConfig::default(),
+            xshell_audit::AuditConfig::default(),
+        ));
     };
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read configuration file {}", path.display()))?;
     let config: ConfigFile = toml::from_str(&source)
         .with_context(|| format!("invalid configuration file {}", path.display()))?;
-    Ok(config.session_fabric)
+    Ok((config.session_fabric, config.audit))
 }
 
 fn handle_client(
@@ -753,6 +806,7 @@ fn process_request(
                 .expect("session registry poisoned")
                 .close(client_id, &selector)?;
             execution.cancel_and_remove(&resolved);
+            execution.audit().close_session(&resolved, "session closed");
             if attached_session.as_deref() == Some(session_id.as_str()) {
                 *attached_session = None;
             }

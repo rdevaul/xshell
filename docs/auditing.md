@@ -50,6 +50,33 @@ When `required = true`, xshell refuses to start if the daemon is unavailable.
 It also refuses to execute an input that the daemon has not acknowledged.
 Events are flushed and synchronized before the daemon acknowledges them.
 
+## Who records what
+
+Audit events are recorded by the process that performs the action, so the
+record cannot be skipped by disconnecting a client or lost to a bounded replay
+journal.
+
+- **Standalone CLI** (session fabric disabled): the CLI executes everything and
+  records everything.
+- **Session fabric enabled**: `xshelld` reads the same `[audit]` section,
+  opens one audit session per xshell session on first use, and records the
+  execution-boundary events itself — agent and `$` input, model responses and
+  errors, tool requests, approval decisions, tool results, working-directory
+  changes, and direct shell completion. A detached turn is audited exactly as
+  an attached one. With `required = true`, `xshelld` refuses to start without
+  a reachable audit service, refuses to accept a turn whose input cannot be
+  recorded, and stops an in-flight turn at the next tool boundary if an append
+  fails. The attached CLI records only what the daemon cannot see: its own
+  startup configuration, `//` control commands, logical session attach and
+  detach, model profile switches, view operations, and terminal-job (PTY)
+  start and completion. Daemon-recorded events are not duplicated by the CLI
+  on replay.
+
+The daemon's audit session for an xshell session is finalized with a signed
+checkpoint when that session is closed with `//close`. A daemon that exits
+without closing its sessions leaves verifiable chains without final
+checkpoints, which the verifier reports.
+
 ## Log format
 
 Each session is stored as `sessions/<session-id>.jsonl`. Record bodies contain:

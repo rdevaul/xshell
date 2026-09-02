@@ -1,3 +1,4 @@
+mod audit;
 mod client;
 mod completion;
 mod execution;
@@ -8,6 +9,7 @@ mod pty_stream;
 mod registry;
 mod view;
 
+pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
 pub use client::SessionClient;
 pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;

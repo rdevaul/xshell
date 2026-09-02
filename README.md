@@ -205,7 +205,9 @@ daemon restart, but an in-flight turn does not yet survive daemon restart.
 Credential environment variables named by a model profile must be available
 to the `xshelld` process. They are not sent to or resolved by an attached CLI.
 This distinction becomes important once the CLI and daemon are on different
-hosts.
+hosts. Likewise, when auditing is enabled, `xshelld` records execution events
+(input, model output, tool calls, approvals, shell completion) itself at the
+point of execution; see [the audit design](docs/auditing.md#who-records-what).
 
 To connect another macOS or Linux host, install `xshelld` somewhere on that
 host's non-interactive SSH `PATH`, configure and start its per-user daemon, then

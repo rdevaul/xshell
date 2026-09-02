@@ -18,9 +18,11 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+signal-hook = "0.3"
 toml = "0.9"
 tokio.workspace = true
 uuid.workspace = true
+xshell-audit = { path = "../xshell-audit" }
 xshell-core = { path = "../xshell-core" }
 xshell-execution = { path = "../xshell-execution" }
 xshell-platform = { path = "../xshell-platform" }
@@ -28,3 +30,4 @@ xshell-pty = { path = "../xshell-pty" }
 
 [dev-dependencies]
 tempfile = "3.21"
+xshell-audit = { path = "../xshell-audit", features = [] }

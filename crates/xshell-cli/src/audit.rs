@@ -4,6 +4,12 @@ use xshell_audit::{AuditClient, AuditConfig, AuditEvent};
 pub struct AuditRuntime {
     client: Option<AuditClient>,
     required: bool,
+    /// Whether this client records execution events (input, model output,
+    /// tool calls, direct shell completion). When a session daemon owns
+    /// execution it records those at the execution boundary, and the client
+    /// records only what the daemon cannot see: UI attach/detach, model
+    /// profile switches, view operations, and PTY terminal jobs.
+    execution_events: bool,
 }
 
 impl AuditRuntime {
@@ -12,6 +18,7 @@ impl AuditRuntime {
             return Ok(Self {
                 client: None,
                 required: config.required,
+                execution_events: true,
             });
         }
         let socket = config
@@ -22,6 +29,7 @@ impl AuditRuntime {
             Ok(client) => Ok(Self {
                 client: Some(client),
                 required: config.required,
+                execution_events: true,
             }),
             Err(error) if config.required => Err(error).context(
                 "required auditing is unavailable; xshell will not start without an audit trail",
@@ -31,9 +39,25 @@ impl AuditRuntime {
                 Ok(Self {
                     client: None,
                     required: false,
+                    execution_events: true,
                 })
             }
         }
+    }
+
+    /// Hand execution-event recording over to a session daemon. Call this
+    /// when the session fabric is enabled; the daemon audits turns itself.
+    pub fn delegate_execution_events(&mut self) {
+        self.execution_events = false;
+    }
+
+    /// Append an execution event. A no-op when a daemon owns execution, so
+    /// replayed daemon events are never recorded twice.
+    pub fn append_execution(&mut self, event: AuditEvent) -> Result<()> {
+        if !self.execution_events {
+            return Ok(());
+        }
+        self.append(event)
     }
 
     pub fn append(&mut self, event: AuditEvent) -> Result<()> {
