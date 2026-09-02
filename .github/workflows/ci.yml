@@ -30,3 +30,48 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  cross-check:
+    # Type-checks targets that have no hosted runner. Catches libc ABI
+    # differences (for example `c_char` is `u8` on aarch64 Linux).
+    name: check / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-linux-gnu]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+
+  msrv:
+    # Cargo.toml declares rust-version; make sure it is actually true.
+    name: msrv / 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check with the declared minimum supported Rust version
+        run: cargo check --workspace --all-targets
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+

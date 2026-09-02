@@ -935,7 +935,9 @@ fn load_or_create_host_id(state_directory: &Path) -> Result<String> {
 }
 
 fn system_hostname() -> String {
-    let mut buffer = [0_i8; 256];
+    // `c_char` is `i8` on x86_64 but `u8` on aarch64 Linux; spell the element
+    // type through libc so this compiles on every supported target.
+    let mut buffer = [0 as libc::c_char; 256];
     if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } == 0 {
         let hostname = unsafe { CStr::from_ptr(buffer.as_ptr()) };
         if let Ok(hostname) = hostname.to_str() {
