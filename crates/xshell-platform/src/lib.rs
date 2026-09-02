@@ -125,6 +125,35 @@ pub fn ensure_secure_directory(path: &Path, what: &str) -> Result<()> {
     }
 }
 
+/// Lock a `std::sync::Mutex`, recovering the guard if a previous holder
+/// panicked.
+///
+/// The daemons here serve many independent client threads. With the default
+/// `lock().expect(..)` pattern, one panic while holding a lock poisons it and
+/// every later thread that touches the same state panics too: the process
+/// stays alive, accepts connections, and fails each one. The state guarded by
+/// these mutexes is bookkeeping (maps, ring buffers, flags) that remains
+/// self-consistent after any single statement, so continuing with the
+/// recovered guard is safe and keeps the daemon serviceable.
+pub trait LockExt<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for std::sync::Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "warning: recovered a poisoned lock after a panic in another thread; \
+continuing with the last consistent state"
+                );
+            });
+            poisoned.into_inner()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +188,20 @@ mod tests {
         let file = temporary.path().join("file");
         fs::write(&file, b"x").unwrap();
         assert!(ensure_secure_directory(&file, "test").is_err());
+    }
+
+    #[test]
+    fn lock_recover_continues_after_a_poisoning_panic() {
+        use std::sync::{Arc, Mutex};
+        let shared = Arc::new(Mutex::new(vec![1, 2, 3]));
+        let poisoner = Arc::clone(&shared);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(shared.lock().is_err(), "mutex should be poisoned");
+        assert_eq!(shared.lock_recover().len(), 3);
     }
 
     #[test]

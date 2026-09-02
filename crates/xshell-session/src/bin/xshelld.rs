@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use xshell_platform::LockExt;
 use xshell_session::{
     ClientPtyFrame, ClientRequest, DaemonAudit, ExecutionCoordinator, PersistenceMode, PtyClaim,
     PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
@@ -110,7 +111,7 @@ fn main() -> Result<()> {
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("cannot bind session socket {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    let identity = registry.lock().expect("session registry poisoned");
+    let identity = registry.lock_recover();
     println!("xshelld listening on {}", socket.display());
     println!(
         "host: {} ({}) user: {}",
@@ -431,7 +432,7 @@ fn handle_client(
 
     let client_id = Uuid::new_v4().to_string();
     {
-        let registry = registry.lock().expect("session registry poisoned");
+        let registry = registry.lock_recover();
         send(
             &mut writer,
             &ServerResponse::Opened {
@@ -578,7 +579,7 @@ fn process_request(
 ) -> Result<ServerResponse> {
     match request {
         ClientRequest::List => {
-            let mut sessions = registry.lock().expect("session registry poisoned").list();
+            let mut sessions = registry.lock_recover().list();
             for session in &mut sessions {
                 session.activity = session_activity(execution, ptys, &session.id);
             }
@@ -593,10 +594,7 @@ fn process_request(
                     .canonicalize()
                     .context("cannot resolve session host home directory")?;
             }
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .create(client_id, creation)?;
+            let session = registry.lock_recover().create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
                 detach_session(registry, execution, ptys, client_id, &previous)?;
             }
@@ -609,10 +607,7 @@ fn process_request(
             if attached_session.is_some() {
                 bail!("detach the current session before attaching another one");
             }
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .attach(client_id, &selector, role)?;
+            let session = registry.lock_recover().attach(client_id, &selector, role)?;
             *attached_session = Some(session.descriptor.id.clone());
             Ok(ServerResponse::Attached {
                 session: with_activity(session, execution, ptys),
@@ -620,10 +615,7 @@ fn process_request(
             })
         }
         ClientRequest::Switch { selector, role } => {
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .attach(client_id, &selector, role)?;
+            let session = registry.lock_recover().attach(client_id, &selector, role)?;
             if let Some(previous) = attached_session.take()
                 && previous != session.descriptor.id
             {
@@ -648,10 +640,7 @@ fn process_request(
                 bail!("cannot replace session state while a turn is active");
             }
             if ptys.has_session(&session_id) {
-                let snapshot = registry
-                    .lock()
-                    .expect("session registry poisoned")
-                    .snapshot(&session_id)?;
+                let snapshot = registry.lock_recover().snapshot(&session_id)?;
                 if snapshot.descriptor.model == model
                     && snapshot.descriptor.cwd == cwd
                     && snapshot.history == history
@@ -662,23 +651,17 @@ fn process_request(
                 }
                 bail!("cannot replace session state while a PTY is active");
             }
-            let session = registry.lock().expect("session registry poisoned").update(
-                client_id,
-                &session_id,
-                model,
-                cwd,
-                history,
-            )?;
+            let session =
+                registry
+                    .lock_recover()
+                    .update(client_id, &session_id, model, cwd, history)?;
             Ok(ServerResponse::Updated {
                 session: descriptor_with_activity(session, execution, ptys),
             })
         }
         ClientRequest::Snapshot { session_id } => {
             require_current(attached_session, &session_id)?;
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .snapshot(&session_id)?;
+            let session = registry.lock_recover().snapshot(&session_id)?;
             Ok(ServerResponse::Snapshot {
                 session: with_activity(session, execution, ptys),
             })
@@ -724,8 +707,7 @@ fn process_request(
             cursor,
         } => {
             let cwd = registry
-                .lock()
-                .expect("session registry poisoned")
+                .lock_recover()
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
@@ -736,8 +718,7 @@ fn process_request(
         ClientRequest::ViewSource { session_id, path } => {
             require_current(attached_session, &session_id)?;
             let cwd = registry
-                .lock()
-                .expect("session registry poisoned")
+                .lock_recover()
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
@@ -756,8 +737,7 @@ fn process_request(
                 bail!("cannot start a PTY while a turn is active");
             }
             let cwd = registry
-                .lock()
-                .expect("session registry poisoned")
+                .lock_recover()
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
@@ -796,17 +776,9 @@ fn process_request(
             let selector = selector
                 .or_else(|| attached_session.clone())
                 .context("close requires a session selector when detached")?;
-            let resolved = registry
-                .lock()
-                .expect("session registry poisoned")
-                .snapshot(&selector)?
-                .descriptor
-                .id;
+            let resolved = registry.lock_recover().snapshot(&selector)?.descriptor.id;
             ptys.terminate_session(&resolved);
-            let session_id = registry
-                .lock()
-                .expect("session registry poisoned")
-                .close(client_id, &selector)?;
+            let session_id = registry.lock_recover().close(client_id, &selector)?;
             execution.cancel_and_remove(&resolved);
             execution.audit().close_session(&resolved, "session closed");
             if attached_session.as_deref() == Some(session_id.as_str()) {
@@ -907,8 +879,7 @@ fn detach_session(
     session_id: &str,
 ) -> Result<Option<String>> {
     let persistence = registry
-        .lock()
-        .expect("session registry poisoned")
+        .lock_recover()
         .snapshot(session_id)?
         .descriptor
         .persistence;
@@ -916,10 +887,7 @@ fn detach_session(
         execution.cancel_and_remove(session_id);
         ptys.terminate_session(session_id);
     }
-    registry
-        .lock()
-        .expect("session registry poisoned")
-        .detach(client_id, session_id)
+    registry.lock_recover().detach(client_id, session_id)
 }
 
 fn read_request_line(reader: &mut impl BufRead) -> Result<Option<String>> {

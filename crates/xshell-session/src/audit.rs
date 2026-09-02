@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use xshell_audit::{AuditClient, AuditConfig, AuditEvent};
+use xshell_platform::LockExt;
 
 /// Per-daemon audit policy plus one audit-service session per xshell session.
 #[derive(Clone, Default)]
@@ -77,10 +78,7 @@ impl DaemonAudit {
         let Some(inner) = &self.inner else {
             return SessionAuditHandle::disabled();
         };
-        let mut sessions = inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut sessions = inner.sessions.lock_recover();
         if !sessions.contains_key(session_id) {
             let opened = inner
                 .config
@@ -132,10 +130,7 @@ impl DaemonAudit {
     /// The audit-service session ID for an xshell session, if one is open.
     pub fn audit_session_id(&self, session_id: &str) -> Option<String> {
         let inner = self.inner.as_ref()?;
-        let sessions = inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let sessions = inner.sessions.lock_recover();
         sessions
             .get(session_id)
             .filter(|entry| entry.client.is_some())
@@ -147,11 +142,7 @@ impl DaemonAudit {
         let Some(inner) = &self.inner else {
             return;
         };
-        let removed = inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(session_id);
+        let removed = inner.sessions.lock_recover().remove(session_id);
         if let Some(SessionAudit {
             client: Some(mut client),
             ..
@@ -175,12 +166,7 @@ impl DaemonAudit {
         let Some(inner) = &self.inner else {
             return;
         };
-        let drained: Vec<_> = inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .drain()
-            .collect();
+        let drained: Vec<_> = inner.sessions.lock_recover().drain().collect();
         for (_, entry) in drained {
             if let Some(mut client) = entry.client {
                 let _ = client.append(AuditEvent::SessionEnded {
@@ -225,10 +211,7 @@ impl SessionAuditHandle {
         let Some(inner) = &self.inner else {
             return Ok(());
         };
-        let mut sessions = inner
-            .sessions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut sessions = inner.sessions.lock_recover();
         let Some(entry) = sessions.get_mut(&self.session_id) else {
             return Ok(());
         };

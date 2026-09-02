@@ -16,6 +16,7 @@ use xshell_execution::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent,
     TurnObserver, build_adapter, run_agent_turn, run_direct_shell_streaming,
 };
+use xshell_platform::LockExt;
 
 const MAX_JOURNAL_EVENTS: usize = 8_192;
 const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
@@ -103,12 +104,7 @@ impl ExecutionCoordinator {
         // execution it permits. A client may ask for less, never more.
         let approval = requested_approval.clamp_to(self.inner.max_approval);
         let requested_approval = (approval != requested_approval).then_some(requested_approval);
-        let snapshot = self
-            .inner
-            .registry
-            .lock()
-            .expect("session registry poisoned")
-            .snapshot(session_id)?;
+        let snapshot = self.inner.registry.lock_recover().snapshot(session_id)?;
         let execution = self.session(session_id);
         let turn_id = Uuid::new_v4().to_string();
         let cancellation = CancellationFlag::default();
@@ -124,7 +120,7 @@ impl ExecutionCoordinator {
             text,
         })?;
         {
-            let mut state = execution.state.lock().expect("execution state poisoned");
+            let mut state = execution.state.lock_recover();
             if let Some(active) = &state.active {
                 bail!("session already has active turn {}", active.id);
             }
@@ -185,7 +181,7 @@ impl ExecutionCoordinator {
 
     pub fn approve(&self, session_id: &str, reply: ApprovalReply) -> Result<()> {
         let execution = self.session(session_id);
-        let mut state = execution.state.lock().expect("execution state poisoned");
+        let mut state = execution.state.lock_recover();
         if state.active.as_ref().map(|turn| turn.id.as_str()) != Some(reply.turn_id.as_str()) {
             bail!("turn is no longer active");
         }
@@ -200,7 +196,7 @@ impl ExecutionCoordinator {
 
     pub fn cancel(&self, session_id: &str, turn_id: &str) -> Result<()> {
         let execution = self.session(session_id);
-        let state = execution.state.lock().expect("execution state poisoned");
+        let state = execution.state.lock_recover();
         let active = state
             .active
             .as_ref()
@@ -214,18 +210,9 @@ impl ExecutionCoordinator {
     }
 
     pub fn cancel_and_remove(&self, session_id: &str) {
-        let execution = self
-            .inner
-            .sessions
-            .lock()
-            .expect("execution map poisoned")
-            .remove(session_id);
+        let execution = self.inner.sessions.lock_recover().remove(session_id);
         if let Some(execution) = execution
-            && let Some(active) = &execution
-                .state
-                .lock()
-                .expect("execution state poisoned")
-                .active
+            && let Some(active) = &execution.state.lock_recover().active
         {
             active.cancellation.cancel();
             execution.changed.notify_all();
@@ -235,8 +222,7 @@ impl ExecutionCoordinator {
     pub fn active_turn(&self, session_id: &str) -> Option<String> {
         self.session(session_id)
             .state
-            .lock()
-            .expect("execution state poisoned")
+            .lock_recover()
             .active
             .as_ref()
             .map(|turn| turn.id.clone())
@@ -244,7 +230,7 @@ impl ExecutionCoordinator {
 
     pub fn activity(&self, session_id: &str) -> SessionActivity {
         let execution = self.session(session_id);
-        let state = execution.state.lock().expect("execution state poisoned");
+        let state = execution.state.lock_recover();
         if state.active.is_none() {
             SessionActivity::Idle
         } else if state.pending_approvals.is_empty() {
@@ -257,8 +243,7 @@ impl ExecutionCoordinator {
     fn session(&self, session_id: &str) -> Arc<SessionExecution> {
         self.inner
             .sessions
-            .lock()
-            .expect("execution map poisoned")
+            .lock_recover()
             .entry(session_id.to_owned())
             .or_insert_with(|| Arc::new(SessionExecution::new()))
             .clone()
@@ -388,12 +373,11 @@ impl ExecutionCoordinator {
                 },
             );
         } else {
-            let update = self
-                .inner
-                .registry
-                .lock()
-                .expect("session registry poisoned")
-                .update_execution_state(&session_id, snapshot.descriptor.cwd, snapshot.history);
+            let update = self.inner.registry.lock_recover().update_execution_state(
+                &session_id,
+                snapshot.descriptor.cwd,
+                snapshot.history,
+            );
             match update {
                 Ok(_) => execution.append(&turn_id, SessionEventKind::TurnCompleted),
                 Err(error) => execution.append(
@@ -424,7 +408,7 @@ impl SessionExecution {
     }
 
     fn append(&self, turn_id: &str, event: SessionEventKind) {
-        let mut state = self.state.lock().expect("execution state poisoned");
+        let mut state = self.state.lock_recover();
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
         let record = SessionEvent {
@@ -449,7 +433,7 @@ impl SessionExecution {
 
     fn events(&self, after_sequence: u64, wait: Duration) -> EventBatch {
         let deadline = Instant::now() + wait;
-        let mut state = self.state.lock().expect("execution state poisoned");
+        let mut state = self.state.lock_recover();
         while !state
             .events
             .iter()
@@ -461,7 +445,7 @@ impl SessionExecution {
             let waited = self
                 .changed
                 .wait_timeout(state, remaining)
-                .expect("execution state poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = waited.0;
             if waited.1.timed_out() {
                 break;
@@ -483,7 +467,7 @@ impl SessionExecution {
     }
 
     fn finish(&self, turn_id: &str) {
-        let mut state = self.state.lock().expect("execution state poisoned");
+        let mut state = self.state.lock_recover();
         if state.active.as_ref().map(|turn| turn.id.as_str()) == Some(turn_id) {
             state.active = None;
         }
@@ -567,8 +551,7 @@ impl TurnObserver for DaemonObserver {
         if let ExecutionEvent::ApprovalRequested { call } = &event {
             self.execution
                 .state
-                .lock()
-                .expect("execution state poisoned")
+                .lock_recover()
                 .pending_approvals
                 .insert((self.turn_id.clone(), call.id.clone()));
         }
@@ -586,14 +569,7 @@ impl TurnObserver for DaemonObserver {
             if self.cancellation.is_cancelled() {
                 return ApprovalDecision::AbortTurn;
             }
-            if let Some(decision) = self
-                .execution
-                .state
-                .lock()
-                .expect("execution state poisoned")
-                .approvals
-                .remove(&key)
-            {
+            if let Some(decision) = self.execution.state.lock_recover().approvals.remove(&key) {
                 return decision;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
