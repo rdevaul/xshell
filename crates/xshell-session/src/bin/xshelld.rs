@@ -14,9 +14,8 @@ use std::time::Duration;
 use uuid::Uuid;
 use xshell_session::{
     ClientPtyFrame, ClientRequest, ExecutionCoordinator, PersistenceMode, PtyClaim, PtyCoordinator,
-    PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
-    SessionConfig, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
-    write_server_frame,
+    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionConfig,
+    SessionRegistry, complete_shell, load_view_resource, read_client_frame, write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -172,6 +171,23 @@ fn serve_stdio(socket: &Path) -> Result<()> {
         if let ServerResponse::Catalog { sessions } = &mut response {
             sessions.retain(|session| session.visibility == xshell_session::Visibility::Fabric);
         }
+        if let ServerResponse::PtyCatalog { ptys } = &mut response {
+            serde_json::to_writer(&mut daemon_writer, &ClientRequest::List)?;
+            daemon_writer.write_all(b"\n")?;
+            daemon_writer.flush()?;
+            let line = read_request_line(&mut daemon_reader)?
+                .context("local daemon closed while filtering terminal jobs")?;
+            let catalog: ServerResponse = serde_json::from_str(&line)?;
+            let ServerResponse::Catalog { sessions } = catalog else {
+                bail!("local daemon returned an invalid terminal visibility catalog");
+            };
+            ptys.retain(|pty| {
+                sessions.iter().any(|session| {
+                    session.id == pty.session_id
+                        && session.visibility == xshell_session::Visibility::Fabric
+                })
+            });
+        }
         send(&mut client_writer, &response)?;
     }
     Ok(())
@@ -225,11 +241,22 @@ fn serve_pty_stdio(socket: &Path) -> Result<()> {
     }
 
     let upload = thread::spawn(move || std::io::copy(&mut client_reader, &mut daemon_writer));
-    std::io::copy(&mut daemon_reader, &mut client_writer)?;
-    client_writer.flush()?;
+    copy_and_flush(&mut daemon_reader, &mut client_writer)?;
     drop(client_writer);
     let _ = upload.join();
     Ok(())
+}
+
+fn copy_and_flush(reader: &mut impl Read, writer: &mut impl Write) -> Result<()> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buffer[..count])?;
+        writer.flush()?;
+    }
 }
 
 fn receive_response(reader: &mut impl BufRead) -> Result<ServerResponse> {
@@ -265,6 +292,7 @@ fn reject_remote_request(
         ClientRequest::CompleteShell { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyStart { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::PtyAttach { session_id, .. } => Some(session_id.as_str()),
         _ => None,
     };
     let Some(selector) = selector else {
@@ -385,11 +413,11 @@ fn handle_client(
                 }
             };
             if let Err(error) = send(&mut writer, &ServerResponse::PtyClaimed) {
-                ptys.close_claimed(&claim);
+                ptys.release_claim(&claim);
                 break Err(error);
             }
             let served = serve_claimed_pty(&mut reader, &mut writer, &ptys, &claim);
-            ptys.close_claimed(&claim);
+            ptys.release_claim(&claim);
             break served;
         }
         let response = process_request(
@@ -424,11 +452,7 @@ fn serve_claimed_pty(
     ptys: &PtyCoordinator,
     claim: &PtyClaim,
 ) -> Result<()> {
-    let mut pending = Vec::new();
-    let mut size = PtySize {
-        rows: 24,
-        columns: 80,
-    };
+    let mut cursor = claim.cursor;
     loop {
         let mut descriptor = libc::pollfd {
             fd: reader.get_ref().as_raw_fd(),
@@ -444,19 +468,20 @@ fn serve_claimed_pty(
         } else if !reader.buffer().is_empty() || descriptor.revents & libc::POLLIN != 0 {
             match read_client_frame(reader)? {
                 ClientPtyFrame::Input(bytes) => {
-                    if pending.len() + bytes.len() > 64 * 1024 {
-                        bail!("PTY pending input exceeds 65536 bytes");
-                    }
-                    pending.extend_from_slice(&bytes);
+                    ptys.write_claimed(claim, bytes)?;
                 }
-                ClientPtyFrame::Resize(updated) => size = updated,
-                ClientPtyFrame::Close => return Ok(()),
+                ClientPtyFrame::Resize(updated) => ptys.resize_claimed(claim, updated)?,
+                ClientPtyFrame::Close => {
+                    ptys.release_claim(claim);
+                    write_server_frame(writer, &ServerPtyFrame::Detached)?;
+                    return Ok(());
+                }
             }
         } else if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             return Ok(());
         }
 
-        let result = match ptys.exchange_claimed(claim, pending.clone(), size, 40) {
+        let result = match ptys.read_claimed(claim, cursor, 40) {
             Ok(result) => result,
             Err(error) => {
                 let message = format!("{error:#}");
@@ -464,9 +489,15 @@ fn serve_claimed_pty(
                 return Ok(());
             }
         };
-        pending.drain(..result.input_accepted);
+        cursor = result.offset.saturating_add(result.output.len() as u64);
         if !result.output.is_empty() {
-            write_server_frame(writer, &ServerPtyFrame::Output(result.output))?;
+            write_server_frame(
+                writer,
+                &ServerPtyFrame::Output {
+                    offset: result.offset,
+                    bytes: result.output,
+                },
+            )?;
         }
         if let Some(status) = result.status {
             write_server_frame(writer, &ServerPtyFrame::Exit(status))?;
@@ -505,8 +536,7 @@ fn process_request(
                 .expect("session registry poisoned")
                 .create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
-                ptys.close_owner(client_id);
-                detach_session(registry, execution, client_id, &previous)?;
+                detach_session(registry, execution, ptys, client_id, &previous)?;
             }
             *attached_session = Some(session.descriptor.id.clone());
             Ok(ServerResponse::Created {
@@ -528,7 +558,6 @@ fn process_request(
             })
         }
         ClientRequest::Switch { selector, role } => {
-            ptys.close_owner(client_id);
             let session = registry
                 .lock()
                 .expect("session registry poisoned")
@@ -536,7 +565,7 @@ fn process_request(
             if let Some(previous) = attached_session.take()
                 && previous != session.descriptor.id
             {
-                detach_session(registry, execution, client_id, &previous)?;
+                detach_session(registry, execution, ptys, client_id, &previous)?;
             }
             *attached_session = Some(session.descriptor.id.clone());
             Ok(ServerResponse::Attached {
@@ -658,29 +687,31 @@ fn process_request(
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
-            let (pty_id, ticket) =
-                ptys.start(client_id, &session_id, command, &cwd, size, terminal_type)?;
-            Ok(ServerResponse::PtyStarted {
-                ticket: PtyTicket { pty_id, ticket },
+            let ticket = ptys.start(&session_id, command, &cwd, size, terminal_type)?;
+            Ok(ServerResponse::PtyStarted { ticket })
+        }
+        ClientRequest::PtyList => Ok(ServerResponse::PtyCatalog { ptys: ptys.list() }),
+        ClientRequest::PtyAttach {
+            session_id,
+            after_offset,
+        } => {
+            require_current(attached_session, &session_id)?;
+            Ok(ServerResponse::PtyAttached {
+                ticket: ptys.attach(&session_id, after_offset)?,
             })
         }
-        ClientRequest::PtyExchange {
-            pty_id,
-            input,
-            size,
-            wait_ms,
-        } => Ok(ServerResponse::PtyExchange {
-            result: ptys.exchange(client_id, &pty_id, input, size, wait_ms)?,
-        }),
         ClientRequest::PtyClose { pty_id } => {
-            ptys.close(client_id, &pty_id)?;
+            let session_id = ptys.session_id(&pty_id)?;
+            require_current(attached_session, &session_id)?;
+            ptys.terminate(&pty_id)?;
             Ok(ServerResponse::PtyClosed)
         }
         ClientRequest::PtyClaim { .. } => bail!("PTY claims require a dedicated connection"),
         ClientRequest::Detach => {
-            ptys.close_owner(client_id);
             let detached = match attached_session.take() {
-                Some(session_id) => detach_session(registry, execution, client_id, &session_id)?,
+                Some(session_id) => {
+                    detach_session(registry, execution, ptys, client_id, &session_id)?
+                }
                 None => None,
             };
             Ok(ServerResponse::Detached {
@@ -697,7 +728,7 @@ fn process_request(
                 .snapshot(&selector)?
                 .descriptor
                 .id;
-            ptys.close_session(&resolved);
+            ptys.terminate_session(&resolved);
             let session_id = registry
                 .lock()
                 .expect("session registry poisoned")
@@ -786,9 +817,8 @@ fn detach_on_disconnect(
     client_id: &str,
     session_id: Option<&str>,
 ) {
-    ptys.close_owner(client_id);
     if let Some(session_id) = session_id
-        && let Err(error) = detach_session(registry, execution, client_id, session_id)
+        && let Err(error) = detach_session(registry, execution, ptys, client_id, session_id)
     {
         eprintln!("xshelld detach error: {error:#}");
     }
@@ -797,6 +827,7 @@ fn detach_on_disconnect(
 fn detach_session(
     registry: &Arc<Mutex<SessionRegistry>>,
     execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
     client_id: &str,
     session_id: &str,
 ) -> Result<Option<String>> {
@@ -808,6 +839,7 @@ fn detach_session(
         .persistence;
     if persistence == PersistenceMode::Ephemeral {
         execution.cancel_and_remove(session_id);
+        ptys.terminate_session(session_id);
     }
     registry
         .lock()

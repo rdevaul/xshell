@@ -15,12 +15,12 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 7. The daemon
+with protocol version 8. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Protocol versions are exact rather than negotiated across incompatible
-schemas. Protocol v7 therefore requires upgrading and restarting `xshelld` on
-the controller and every connected remote host before a v7 CLI can attach.
+schemas. Protocol v8 therefore requires upgrading and restarting `xshelld` on
+the controller and every connected remote host before a v8 CLI can attach.
 
 ## Identity and attachment
 
@@ -54,9 +54,10 @@ sessions.
 
 ## SSH transport
 
-The client starts `ssh -T -- DEST xshelld serve-stdio` for control traffic. OpenSSH retains control
-of destination parsing, host-key verification, `~/.ssh/config`, agent use, and
-authentication. No agent forwarding is enabled by xshell. The remote helper
+The client starts `ssh -T -- DEST xshelld serve-stdio` for control traffic.
+OpenSSH retains control of destination parsing, host-key verification,
+`~/.ssh/config`, agent use, and authentication. No agent forwarding is enabled
+by xshell. The remote helper
 automatically reads `$XSHELL_CONFIG` or `~/.config/xshell/config.toml` when
 present, resolves the daemon socket, and proxies protocol requests to that
 socket. Stdout contains protocol frames only; diagnostics use stderr.
@@ -100,13 +101,13 @@ work.
 - `complete_shell`: return bounded executable/path candidates for a session.
 - `view_source`: return a bounded UTF-8 resource resolved against the attached
   session cwd, with media type, length, and SHA-256 metadata.
-- `pty_start`: start one transient daemon-owned PTY and return its ID and a
+- `pty_start`: start one session-owned terminal job and return its ID and a
   one-time stream ticket.
+- `pty_list`: list terminal jobs visible through the current transport.
+- `pty_attach`: mint a one-time ticket at a bounded replay offset.
 - `pty_claim`: consume a ticket on a dedicated daemon connection before binary
   framing begins.
-- `pty_exchange`: send bounded input and dimensions and receive bounded binary
-  output plus final status for a PTY owned by this connection.
-- `pty_close`: terminate and reap an owned PTY.
+- `pty_close`: terminate and reap the current session's terminal job.
 
 `view_source` requires the requesting connection to own the active session.
 The SSH proxy additionally rejects requests for `host_only` sessions. The
@@ -117,10 +118,11 @@ Rendering remains local to the controller.
 PTY creation requires the current attachment, and the SSH control proxy applies
 the same `fabric` visibility check used for completion and viewing. The CLI then
 starts `ssh -T -- DEST xshelld serve-pty-stdio`, submits the one-time ticket on
-stdin, and switches to bounded binary frames. PTY IDs remain owned by the
-control connection; a ticket authorizes exactly one stream claim. Disconnecting
-either connection, detaching, switching, or closing terminates transient PTYs.
-Protocol bounds and the terminal escape trust policy are documented in
+stdin, and switches to bounded binary frames. A ticket authorizes exactly one
+stream claim. Stream closure detaches without terminating daemon-lifetime or
+durable jobs; an explicit close, closing the owning session, or detaching an
+ephemeral session terminates them. A 1 MiB per-job ring supports offset-based
+replay. Protocol bounds and the terminal escape trust policy are documented in
 [the PTY design](pty.md).
 
 The CLI keeps a per-connection navigation history. After `//close` deletes the

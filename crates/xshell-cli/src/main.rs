@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
     let (model_config, config_path) = XshellConfig::load(args.config.as_deref())?;
     let render_options =
         RenderOptions::resolve(&model_config.rendering, args.markdown, args.color)?;
+    let pty_escape = xshell_pty::parse_escape_prefix(&model_config.session_fabric.pty_escape)?;
     let viewers = ViewerRegistry::with_builtins();
     let mut active_model = model_config.resolve_startup(
         args.profile.as_deref(),
@@ -222,23 +223,47 @@ async fn main() -> Result<()> {
         match route {
             InputRoute::Empty => {}
             InputRoute::Shell(command) => {
-                if sessions.enabled() && !sessions.active_host_is_local() {
+                if sessions.enabled() {
                     if xshell_pty::controller_is_terminal() && !is_simple_cd(&command) {
-                        let outcome = match run_remote_pty(&mut sessions, &command) {
+                        let previous_session = sessions.active().map(|session| session.id.clone());
+                        let result = match run_session_pty(&mut sessions, &command, pty_escape) {
                             Ok(outcome) => outcome,
                             Err(error) => {
                                 eprintln!("xshell: {error:#}");
-                                format!("error: {error:#}")
+                                TerminalCommandOutcome {
+                                    description: format!("error: {error:#}"),
+                                    command_finished: false,
+                                }
                             }
                         };
-                        if outcome != "exit status: 0" && !outcome.starts_with("error:") {
-                            eprintln!("xshell: command finished with {outcome}");
+                        if result.description != "exit status: 0"
+                            && !result.description.starts_with("error:")
+                        {
+                            eprintln!("xshell: {}", result.description);
                         }
-                        audit.append(AuditEvent::ShellFinished {
-                            command,
-                            outcome,
-                            cwd: cwd.display().to_string(),
-                        })?;
+                        if result.command_finished {
+                            audit.append(AuditEvent::ShellFinished {
+                                command,
+                                outcome: result.description,
+                                cwd: cwd.display().to_string(),
+                            })?;
+                        }
+                        if sessions.active().map(|session| &session.id) != previous_session.as_ref()
+                        {
+                            let snapshot = sessions.refresh_snapshot()?;
+                            apply_runtime_snapshot(
+                                snapshot,
+                                &mut active_model,
+                                &mut agent,
+                                &mut cwd,
+                                &mut history,
+                                &args.system_prompt,
+                                &mut editor,
+                                true,
+                            )?;
+                            refresh_shell_completions(&sessions, &mut editor);
+                            refresh_session_completions(&mut sessions, &mut editor);
+                        }
                         continue;
                     }
                     match run_daemon_turn(
@@ -337,6 +362,68 @@ async fn main() -> Result<()> {
                     eprintln!("xshell: {error:#}");
                 }
                 refresh_session_completions(&mut sessions, &mut editor);
+            }
+            InputRoute::Control(ControlCommand::Terminal(terminal_args)) => {
+                match terminal_args.as_slice() {
+                    [command] if command == "list" => match sessions.terminal_jobs() {
+                        Ok(jobs) if jobs.is_empty() => println!("no terminal jobs"),
+                        Ok(jobs) => {
+                            for (session, terminal) in jobs {
+                                let state = terminal.exit_status.as_deref().unwrap_or(
+                                    if terminal.attached {
+                                        "attached"
+                                    } else {
+                                        "running"
+                                    },
+                                );
+                                println!(
+                                    "{}:{}  {}  {} — {}",
+                                    session.host_alias,
+                                    session.name,
+                                    state,
+                                    session.cwd.display(),
+                                    terminal.command
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("xshell: {error:#}"),
+                    },
+                    [command] if command == "kill" => {
+                        if let Err(error) = sessions.pty_close_current() {
+                            eprintln!("xshell: {error:#}");
+                        } else {
+                            println!("terminal job terminated");
+                        }
+                    }
+                    _ if terminal_args.is_empty() || terminal_args.as_slice() == ["attach"] => {
+                        let previous_session = sessions.active().map(|session| session.id.clone());
+                        let result = run_existing_session_pty(&mut sessions, pty_escape);
+                        match result {
+                            Ok(outcome) if outcome != "exit status: 0" => {
+                                println!("xshell: {outcome}")
+                            }
+                            Ok(_) => {}
+                            Err(error) => eprintln!("xshell: {error:#}"),
+                        }
+                        if sessions.active().map(|session| &session.id) != previous_session.as_ref()
+                        {
+                            let snapshot = sessions.refresh_snapshot()?;
+                            apply_runtime_snapshot(
+                                snapshot,
+                                &mut active_model,
+                                &mut agent,
+                                &mut cwd,
+                                &mut history,
+                                &args.system_prompt,
+                                &mut editor,
+                                true,
+                            )?;
+                            refresh_shell_completions(&sessions, &mut editor);
+                            refresh_session_completions(&mut sessions, &mut editor);
+                        }
+                    }
+                    _ => eprintln!("xshell: usage: //terminal [attach|list|kill]"),
+                }
             }
             InputRoute::Control(ControlCommand::Switch(session_args)) => {
                 let selector = match session_args.as_slice() {
@@ -1415,6 +1502,9 @@ control commands:
   //status          show local session state
   //connect DEST    connect to xshelld on an SSH host
   //sessions        list named sessions on connected hosts
+  //terminal        attach the current session's terminal job
+  //terminal list   list terminal jobs on connected hosts
+  //terminal kill   terminate the current session's terminal job
   //new NAME        create and switch to a daemon-lifetime session
   //switch SESSION  switch locally or across connected hosts
   //detach          detach, preserving a persistent session, and exit
@@ -1452,6 +1542,7 @@ control commands:
         ControlCommand::View(_) => unreachable!("view is handled by the REPL"),
         ControlCommand::Connect(_)
         | ControlCommand::Sessions
+        | ControlCommand::Terminal(_)
         | ControlCommand::New(_)
         | ControlCommand::Switch(_)
         | ControlCommand::Detach
@@ -1548,9 +1639,23 @@ fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<String> {
     Ok(format!("exit status: {status}"))
 }
 
-fn run_remote_pty(sessions: &mut SessionRuntime, command: &str) -> Result<String> {
+struct TerminalCommandOutcome {
+    description: String,
+    command_finished: bool,
+}
+
+struct TerminalFocusOutcome {
+    description: String,
+    finished: bool,
+}
+
+fn run_session_pty(
+    sessions: &mut SessionRuntime,
+    command: &str,
+    escape_prefix: u8,
+) -> Result<TerminalCommandOutcome> {
     let initial = xshell_pty::controller_size().unwrap_or_default();
-    let (pty_id, mut stream) = sessions.pty_start_stream(
+    let (mut pty_id, mut stream) = sessions.pty_start_stream(
         command.to_owned(),
         xshell_session::PtySize {
             rows: initial.rows,
@@ -1558,11 +1663,135 @@ fn run_remote_pty(sessions: &mut SessionRuntime, command: &str) -> Result<String
         },
         env::var("TERM").ok(),
     )?;
-    let result = stream.relay();
-    if result.is_err() {
-        let _ = sessions.pty_close(&pty_id);
+    let original_pty_id = pty_id.clone();
+    let outcome = run_pty_focus_loop(sessions, &mut pty_id, &mut stream, escape_prefix)?;
+    Ok(TerminalCommandOutcome {
+        description: outcome.description,
+        command_finished: outcome.finished && pty_id == original_pty_id,
+    })
+}
+
+fn run_existing_session_pty(sessions: &mut SessionRuntime, escape_prefix: u8) -> Result<String> {
+    let (mut pty_id, mut stream) = sessions.pty_attach_stream()?;
+    Ok(run_pty_focus_loop(sessions, &mut pty_id, &mut stream, escape_prefix)?.description)
+}
+
+fn run_pty_focus_loop(
+    sessions: &mut SessionRuntime,
+    pty_id: &mut String,
+    stream: &mut xshell_session::PtyStreamClient,
+    escape_prefix: u8,
+) -> Result<TerminalFocusOutcome> {
+    let mut last_session_id = None;
+    loop {
+        let result = stream.relay(escape_prefix);
+        sessions.remember_pty_cursor(pty_id, stream.cursor());
+        let action = result?;
+        if !matches!(action, xshell_pty::DuplexPtyOutcome::Exited(_)) {
+            stream.detach()?;
+        }
+        match action {
+            xshell_pty::DuplexPtyOutcome::Exited(status) => {
+                return Ok(TerminalFocusOutcome {
+                    description: status,
+                    finished: true,
+                });
+            }
+            xshell_pty::DuplexPtyOutcome::Detached => {
+                return Ok(TerminalFocusOutcome {
+                    description: "PTY detached".into(),
+                    finished: false,
+                });
+            }
+            xshell_pty::DuplexPtyOutcome::Terminate => {
+                sessions.pty_close(pty_id)?;
+                return Ok(TerminalFocusOutcome {
+                    description: "PTY terminated".into(),
+                    finished: true,
+                });
+            }
+            direction => {
+                let terminals = sessions.terminal_sessions()?;
+                let current_session_id = sessions
+                    .active()
+                    .map(|session| session.id.clone())
+                    .context("there is no active terminal session")?;
+                let target = choose_terminal_target(
+                    &terminals,
+                    &current_session_id,
+                    last_session_id.as_deref(),
+                    direction,
+                )?;
+                if target.id != current_session_id {
+                    last_session_id = Some(current_session_id);
+                    sessions.switch(&target.id)?;
+                }
+                (*pty_id, *stream) = sessions.pty_attach_stream()?;
+            }
+        }
     }
-    result
+}
+
+fn choose_terminal_target(
+    terminals: &[xshell_session::SessionDescriptor],
+    current_session_id: &str,
+    last_session_id: Option<&str>,
+    direction: xshell_pty::DuplexPtyOutcome,
+) -> Result<xshell_session::SessionDescriptor> {
+    if terminals.is_empty() {
+        bail!("there are no terminal jobs to switch to");
+    }
+    let current = terminals
+        .iter()
+        .position(|session| session.id == current_session_id)
+        .unwrap_or(0);
+    let index = match direction {
+        xshell_pty::DuplexPtyOutcome::Next => (current + 1) % terminals.len(),
+        xshell_pty::DuplexPtyOutcome::Previous => (current + terminals.len() - 1) % terminals.len(),
+        xshell_pty::DuplexPtyOutcome::Last => last_session_id
+            .and_then(|id| terminals.iter().position(|session| session.id == id))
+            .unwrap_or((current + terminals.len() - 1) % terminals.len()),
+        xshell_pty::DuplexPtyOutcome::Switcher => {
+            choose_terminal_interactively(terminals, current)?
+        }
+        _ => bail!("invalid terminal-switch action"),
+    };
+    Ok(terminals[index].clone())
+}
+
+fn choose_terminal_interactively(
+    terminals: &[xshell_session::SessionDescriptor],
+    current: usize,
+) -> Result<usize> {
+    println!("\r\nxshell terminal jobs:");
+    for (index, session) in terminals.iter().enumerate() {
+        let marker = if index == current { '*' } else { ' ' };
+        println!(
+            " {marker} {}. {}:{} — {}",
+            index + 1,
+            session.host_alias,
+            session.name,
+            session.cwd.display()
+        );
+    }
+    print!(
+        "select terminal [1-{}] (Enter keeps current): ",
+        terminals.len()
+    );
+    io::stdout().flush()?;
+    let mut selection = String::new();
+    io::stdin().read_line(&mut selection)?;
+    let selection = selection.trim();
+    if selection.is_empty() {
+        return Ok(current);
+    }
+    let selected = selection
+        .parse::<usize>()
+        .context("terminal selection must be a number")?;
+    if !(1..=terminals.len()).contains(&selected) {
+        bail!("terminal selection is out of range");
+    }
+    Ok(selected - 1)
 }
 
 fn is_simple_cd(command: &str) -> bool {
