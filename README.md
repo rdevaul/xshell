@@ -239,9 +239,10 @@ Directly entered commands in local sessions run in a transient pseudoterminal
 when xshell is attached to a terminal. This supports terminal colors, pagers,
 and interactive line-oriented programs; input, output, terminal resizing, and
 terminal-generated signals are relayed byte-for-byte. Agent-requested tools
-remain noninteractive and pipe-backed. Remote session commands still use the
-daemon's noninteractive stream in this increment; remote PTY transport and
-persistent full-screen reattachment are subsequent milestones.
+remain noninteractive and pipe-backed. Protocol v6 provides the same transient
+PTY behavior for remote sessions through the existing authenticated SSH stdio
+transport. A disconnect terminates the transient command; persistent
+full-screen reattachment is the subsequent milestone.
 See [the transient PTY design and trust boundary](docs/pty.md).
 
 See [the session-fabric protocol and current boundary](docs/session-fabric.md).

@@ -12,8 +12,9 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 use xshell_session::{
-    ClientRequest, ExecutionCoordinator, PersistenceMode, SESSION_PROTOCOL_VERSION, ServerResponse,
-    SessionConfig, SessionRegistry, complete_shell, load_view_resource,
+    ClientRequest, ExecutionCoordinator, PersistenceMode, PtyCoordinator, SESSION_PROTOCOL_VERSION,
+    ServerResponse, SessionActivity, SessionConfig, SessionRegistry, complete_shell,
+    load_view_resource,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -82,6 +83,7 @@ fn main() -> Result<()> {
         user,
     )?));
     let execution = ExecutionCoordinator::new(Arc::clone(&registry));
+    let ptys = PtyCoordinator::default();
 
     prepare_socket(&socket)?;
     let listener = UnixListener::bind(&socket)
@@ -102,8 +104,9 @@ fn main() -> Result<()> {
             Ok(stream) => {
                 let registry = Arc::clone(&registry);
                 let execution = execution.clone();
+                let ptys = ptys.clone();
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, registry, execution) {
+                    if let Err(error) = handle_client(stream, registry, execution, ptys) {
                         eprintln!("xshelld client error: {error:#}");
                     }
                 });
@@ -188,6 +191,7 @@ fn reject_remote_request(
         } => Some(selector.as_str()),
         ClientRequest::CompleteShell { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::PtyStart { session_id, .. } => Some(session_id.as_str()),
         _ => None,
     };
     let Some(selector) = selector else {
@@ -233,6 +237,7 @@ fn handle_client(
     stream: UnixStream,
     registry: Arc<Mutex<SessionRegistry>>,
     execution: ExecutionCoordinator,
+    ptys: PtyCoordinator,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -277,20 +282,20 @@ fn handle_client(
     }
 
     let mut attached_session: Option<String> = None;
-    loop {
-        let Some(line) = read_request_line(&mut reader)? else {
-            detach_on_disconnect(
-                &registry,
-                &execution,
-                &client_id,
-                attached_session.as_deref(),
-            );
-            return Ok(());
+    let result = loop {
+        let line = match read_request_line(&mut reader) {
+            Ok(line) => line,
+            Err(error) => break Err(error),
+        };
+        let Some(line) = line else {
+            break Ok(());
         };
         let request: ClientRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                send_error(&mut writer, "invalid_request", &error.to_string())?;
+                if let Err(error) = send_error(&mut writer, "invalid_request", &error.to_string()) {
+                    break Err(error);
+                }
                 continue;
             }
         };
@@ -298,20 +303,33 @@ fn handle_client(
             request,
             &registry,
             &execution,
+            &ptys,
             &client_id,
             &mut attached_session,
         );
-        match response {
-            Ok(response) => send(&mut writer, &response)?,
-            Err(error) => send_error(&mut writer, "request_failed", &format!("{error:#}"))?,
+        let sent = match response {
+            Ok(response) => send(&mut writer, &response),
+            Err(error) => send_error(&mut writer, "request_failed", &format!("{error:#}")),
+        };
+        if let Err(error) = sent {
+            break Err(error);
         }
-    }
+    };
+    detach_on_disconnect(
+        &registry,
+        &execution,
+        &ptys,
+        &client_id,
+        attached_session.as_deref(),
+    );
+    result
 }
 
 fn process_request(
     request: ClientRequest,
     registry: &Arc<Mutex<SessionRegistry>>,
     execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
     client_id: &str,
     attached_session: &mut Option<String>,
 ) -> Result<ServerResponse> {
@@ -319,7 +337,7 @@ fn process_request(
         ClientRequest::List => {
             let mut sessions = registry.lock().expect("session registry poisoned").list();
             for session in &mut sessions {
-                session.activity = execution.activity(&session.id);
+                session.activity = session_activity(execution, ptys, &session.id);
             }
             Ok(ServerResponse::Catalog { sessions })
         }
@@ -337,11 +355,12 @@ fn process_request(
                 .expect("session registry poisoned")
                 .create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
+                ptys.close_owner(client_id);
                 detach_session(registry, execution, client_id, &previous)?;
             }
             *attached_session = Some(session.descriptor.id.clone());
             Ok(ServerResponse::Created {
-                session: with_activity(session, execution),
+                session: with_activity(session, execution, ptys),
             })
         }
         ClientRequest::Attach { selector, role } => {
@@ -354,11 +373,12 @@ fn process_request(
                 .attach(client_id, &selector, role)?;
             *attached_session = Some(session.descriptor.id.clone());
             Ok(ServerResponse::Attached {
-                session: with_activity(session, execution),
+                session: with_activity(session, execution, ptys),
                 role,
             })
         }
         ClientRequest::Switch { selector, role } => {
+            ptys.close_owner(client_id);
             let session = registry
                 .lock()
                 .expect("session registry poisoned")
@@ -370,7 +390,7 @@ fn process_request(
             }
             *attached_session = Some(session.descriptor.id.clone());
             Ok(ServerResponse::Attached {
-                session: with_activity(session, execution),
+                session: with_activity(session, execution, ptys),
                 role,
             })
         }
@@ -386,6 +406,9 @@ fn process_request(
             if execution.active_turn(&session_id).is_some() {
                 bail!("cannot replace session state while a turn is active");
             }
+            if ptys.has_session(&session_id) {
+                bail!("cannot replace session state while a PTY is active");
+            }
             let session = registry.lock().expect("session registry poisoned").update(
                 client_id,
                 &session_id,
@@ -394,7 +417,7 @@ fn process_request(
                 history,
             )?;
             Ok(ServerResponse::Updated {
-                session: descriptor_with_activity(session, execution),
+                session: descriptor_with_activity(session, execution, ptys),
             })
         }
         ClientRequest::Snapshot { session_id } => {
@@ -404,7 +427,7 @@ fn process_request(
                 .expect("session registry poisoned")
                 .snapshot(&session_id)?;
             Ok(ServerResponse::Snapshot {
-                session: with_activity(session, execution),
+                session: with_activity(session, execution, ptys),
             })
         }
         ClientRequest::Submit {
@@ -413,6 +436,9 @@ fn process_request(
             approval,
         } => {
             require_current(attached_session, &session_id)?;
+            if ptys.has_session(&session_id) {
+                bail!("cannot start a turn while a PTY is active");
+            }
             let turn_id = execution.submit(&session_id, input, approval)?;
             Ok(ServerResponse::Accepted { turn_id })
         }
@@ -466,7 +492,39 @@ fn process_request(
                 resource: load_view_resource_bounded(path, cwd)?,
             })
         }
+        ClientRequest::PtyStart {
+            session_id,
+            command,
+            size,
+            terminal_type,
+        } => {
+            require_current(attached_session, &session_id)?;
+            if execution.active_turn(&session_id).is_some() {
+                bail!("cannot start a PTY while a turn is active");
+            }
+            let cwd = registry
+                .lock()
+                .expect("session registry poisoned")
+                .snapshot(&session_id)?
+                .descriptor
+                .cwd;
+            let pty_id = ptys.start(client_id, &session_id, command, &cwd, size, terminal_type)?;
+            Ok(ServerResponse::PtyStarted { pty_id })
+        }
+        ClientRequest::PtyExchange {
+            pty_id,
+            input,
+            size,
+            wait_ms,
+        } => Ok(ServerResponse::PtyExchange {
+            result: ptys.exchange(client_id, &pty_id, input, size, wait_ms)?,
+        }),
+        ClientRequest::PtyClose { pty_id } => {
+            ptys.close(client_id, &pty_id)?;
+            Ok(ServerResponse::PtyClosed)
+        }
         ClientRequest::Detach => {
+            ptys.close_owner(client_id);
             let detached = match attached_session.take() {
                 Some(session_id) => detach_session(registry, execution, client_id, &session_id)?,
                 None => None,
@@ -485,6 +543,7 @@ fn process_request(
                 .snapshot(&selector)?
                 .descriptor
                 .id;
+            ptys.close_session(&resolved);
             let session_id = registry
                 .lock()
                 .expect("session registry poisoned")
@@ -539,25 +598,41 @@ fn require_current(attached_session: &Option<String>, session_id: &str) -> Resul
 fn with_activity(
     mut snapshot: xshell_session::SessionSnapshot,
     execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
 ) -> xshell_session::SessionSnapshot {
-    snapshot.descriptor.activity = execution.activity(&snapshot.descriptor.id);
+    snapshot.descriptor.activity = session_activity(execution, ptys, &snapshot.descriptor.id);
     snapshot
 }
 
 fn descriptor_with_activity(
     mut descriptor: xshell_session::SessionDescriptor,
     execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
 ) -> xshell_session::SessionDescriptor {
-    descriptor.activity = execution.activity(&descriptor.id);
+    descriptor.activity = session_activity(execution, ptys, &descriptor.id);
     descriptor
+}
+
+fn session_activity(
+    execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
+    session_id: &str,
+) -> SessionActivity {
+    if ptys.has_session(session_id) {
+        SessionActivity::Running
+    } else {
+        execution.activity(session_id)
+    }
 }
 
 fn detach_on_disconnect(
     registry: &Arc<Mutex<SessionRegistry>>,
     execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
     client_id: &str,
     session_id: Option<&str>,
 ) {
+    ptys.close_owner(client_id);
     if let Some(session_id) = session_id
         && let Err(error) = detach_session(registry, execution, client_id, session_id)
     {
