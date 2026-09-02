@@ -1,11 +1,11 @@
 use crate::config::ActiveModel;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
-    EventBatch, PersistenceMode, PtyExchangeResult, PtySize, SessionClient, SessionConfig,
+    EventBatch, PersistenceMode, PtySize, PtyStreamClient, PtyTicket, SessionClient, SessionConfig,
     SessionCreation, SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput, ViewResource,
     Visibility,
 };
@@ -341,21 +341,35 @@ impl SessionRuntime {
         command: String,
         size: PtySize,
         terminal_type: Option<String>,
-    ) -> Result<String> {
+    ) -> Result<PtyTicket> {
         let session_id = self.active_session_id()?;
         self.client_mut()?
             .pty_start(session_id, command, size, terminal_type)
     }
 
-    pub fn pty_exchange(
+    pub fn pty_start_stream(
         &mut self,
-        pty_id: &str,
-        input: Vec<u8>,
+        command: String,
         size: PtySize,
-        wait_ms: u64,
-    ) -> Result<PtyExchangeResult> {
-        self.client_mut()?
-            .pty_exchange(pty_id.to_owned(), input, size, wait_ms)
+        terminal_type: Option<String>,
+    ) -> Result<(String, PtyStreamClient)> {
+        let destination = match &self
+            .connection
+            .as_ref()
+            .context("session service is disabled")?
+            .endpoint
+        {
+            ConnectionEndpoint::Ssh(destination) => destination.clone(),
+            ConnectionEndpoint::Local(_) => bail!("PTY stream transport requires a remote host"),
+        };
+        let ticket = self.pty_start(command, size, terminal_type)?;
+        match PtyStreamClient::connect_ssh(&destination, &ticket.ticket) {
+            Ok(stream) => Ok((ticket.pty_id, stream)),
+            Err(error) => {
+                let _ = self.pty_close(&ticket.pty_id);
+                Err(error)
+            }
+        }
     }
 
     pub fn pty_close(&mut self, pty_id: &str) -> Result<()> {

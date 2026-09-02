@@ -23,27 +23,32 @@ be synchronized back to the session service.
 
 ## Remote transport
 
-Session protocol v6 adds `pty_start`, `pty_exchange`, and `pty_close`. The
-active, authenticated session connection starts a PTY against that session's
-cwd, then exchanges bounded binary input and output, terminal dimensions, and
-exit status through the existing SSH stdio proxy. No inbound port or second
-remote service is exposed.
+Session protocol v7 starts a PTY on the active authenticated control connection
+and returns its ID plus a one-time stream ticket. The controller opens a second
+`ssh -T` process running `xshelld serve-pty-stdio`, sends the ticket on stdin,
+and then exchanges framed binary input, output, resize, close, and exit events.
+The ticket is never placed in process arguments. No inbound port or additional
+network service is exposed.
 
 The daemon enforces one PTY per session, 64 active PTYs globally, 64 KiB command
 and input limits, 256 KiB output chunks, dimensions from 1 through 1,000, and a
 maximum 250 ms exchange wait. Terminal type strings are strictly validated.
-The SSH proxy permits PTY creation only for `fabric` sessions, and a PTY ID can
-be operated only by the daemon connection that created it.
+The SSH control proxy permits PTY creation only for `fabric` sessions. Tickets
+are single-use bounded secrets, and a claimed stream remains tied to the daemon
+connection that created the PTY.
 
-Remote exchanges currently use the versioned JSON request/response channel.
-This is binary-safe but intentionally bounded rather than a high-throughput raw
-byte tunnel. PTY IDs and accepted-input counts provide the lifecycle boundary
+The binary channel uses a one-byte directional tag, a four-byte big-endian
+payload length, and a bounded payload. Input is limited to 64 KiB per frame and
+output to 256 KiB. The older bounded `pty_exchange` control operation remains
+available internally during this transition, but the CLI no longer polls it
+over the network. PTY IDs and stream tickets provide the lifecycle boundary
 needed for later replay and reattachment.
 
 ## Current persistence boundary
 
 Local and remote PTYs are transient. A local controller failure or remote
-session-transport disconnect terminates and reaps the command. Disconnect
+control-connection or PTY-stream disconnect terminates and reaps the command.
+Disconnect
 survival, output replay, reattachment, input arbitration, and job-control
 suspension/resumption are the next milestone. PTY activity appears as
 `running` in the session catalog, but transient PTY bytes are not added to the

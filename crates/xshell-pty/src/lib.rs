@@ -57,6 +57,19 @@ pub struct RemotePtyChunk {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplexPtyEvent {
+    Output(Vec<u8>),
+    Exit(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplexPtyCommand {
+    Input(Vec<u8>),
+    Resize(PtySize),
+}
+
 /// A daemon-owned transient PTY. The caller supplies bounded input and drains
 /// bounded output through `exchange`; dropping it terminates the child.
 pub struct RemotePtyProcess {
@@ -161,6 +174,107 @@ pub fn relay_remote(
     let result = relay_remote_inner(terminal_fd, io::stdout(), &mut exchange);
     guard.restore()?;
     result
+}
+
+/// Relay a framed, full-duplex PTY transport while keeping the controller
+/// terminal in raw mode. `transport_fd` must become readable whenever
+/// `receive` can consume one complete event.
+pub fn relay_duplex(
+    transport_fd: RawFd,
+    mut send: impl FnMut(DuplexPtyCommand) -> Result<()>,
+    mut receive: impl FnMut() -> Result<DuplexPtyEvent>,
+) -> Result<String> {
+    if !controller_is_terminal() {
+        bail!("duplex PTY execution requires terminal stdin and stdout");
+    }
+    let terminal = io::stdin();
+    let terminal_fd = terminal.as_raw_fd();
+    let original = tcgetattr(terminal.as_fd()).context("cannot read terminal attributes")?;
+    let mut guard = TerminalGuard::enter(terminal_fd, original)?;
+    let result = relay_duplex_inner(
+        terminal_fd,
+        transport_fd,
+        io::stdout(),
+        &mut send,
+        &mut receive,
+    );
+    guard.restore()?;
+    result
+}
+
+fn relay_duplex_inner(
+    terminal_fd: RawFd,
+    transport_fd: RawFd,
+    mut output: impl Write,
+    send: &mut impl FnMut(DuplexPtyCommand) -> Result<()>,
+    receive: &mut impl FnMut() -> Result<DuplexPtyEvent>,
+) -> Result<String> {
+    let mut size = terminal_size(terminal_fd)
+        .map(PtySize::from)
+        .unwrap_or_default();
+    send(DuplexPtyCommand::Resize(size))?;
+    let mut input = vec![0_u8; REMOTE_INPUT_BYTES];
+    let mut terminal_open = true;
+    loop {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: terminal_fd,
+                events: if terminal_open { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: transport_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+        ];
+        let timeout = i32::try_from(POLL_INTERVAL.as_millis()).unwrap_or(100);
+        let polled = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
+        if polled < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error).context("duplex PTY poll failed");
+            }
+        }
+
+        if descriptors[0].revents & libc::POLLIN != 0 {
+            let count =
+                unsafe { libc::read(terminal_fd, input.as_mut_ptr().cast(), input.len() as _) };
+            if count > 0 {
+                send(DuplexPtyCommand::Input(input[..count as usize].to_vec()))?;
+            } else if count == 0 {
+                terminal_open = false;
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted
+                    && error.kind() != io::ErrorKind::WouldBlock
+                {
+                    return Err(error).context("cannot read controller terminal");
+                }
+            }
+        }
+
+        if descriptors[1].revents & libc::POLLIN != 0 {
+            match receive()? {
+                DuplexPtyEvent::Output(bytes) => {
+                    output.write_all(&bytes)?;
+                    output.flush()?;
+                }
+                DuplexPtyEvent::Exit(status) => return Ok(status),
+                DuplexPtyEvent::Error(message) => bail!("remote PTY failed: {message}"),
+            }
+        } else if descriptors[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            bail!("duplex PTY transport closed before reporting status");
+        }
+
+        let updated = terminal_size(terminal_fd)
+            .map(PtySize::from)
+            .unwrap_or(size);
+        if updated != size {
+            send(DuplexPtyCommand::Resize(updated))?;
+            size = updated;
+        }
+    }
 }
 
 fn relay_remote_inner(

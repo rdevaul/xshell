@@ -1,7 +1,7 @@
 use crate::{
     ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding, PtyExchangeResult,
-    PtySize, SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor,
-    SessionSnapshot, ShellCompletionResult, TurnInput, ViewResource,
+    PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation,
+    SessionDescriptor, SessionSnapshot, ShellCompletionResult, TurnInput, ViewResource,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -294,7 +294,7 @@ impl SessionClient {
         command: String,
         size: PtySize,
         terminal_type: Option<String>,
-    ) -> Result<String> {
+    ) -> Result<PtyTicket> {
         self.send(&ClientRequest::PtyStart {
             session_id,
             command,
@@ -302,7 +302,7 @@ impl SessionClient {
             terminal_type,
         })?;
         match self.receive()? {
-            ServerResponse::PtyStarted { pty_id } => Ok(pty_id),
+            ServerResponse::PtyStarted { ticket } => Ok(ticket),
             response => response_error("PTY start", response),
         }
     }

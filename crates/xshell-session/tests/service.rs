@@ -8,9 +8,10 @@ use tempfile::TempDir;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 use xshell_session::{
-    AttachmentRole, ClientRequest, ModelBinding, PersistenceMode, PtySize,
-    SESSION_PROTOCOL_VERSION, ServerResponse, SessionActivity, SessionClient, SessionCreation,
-    SessionEventKind, TurnInput, Visibility,
+    AttachmentRole, ClientPtyFrame, ClientRequest, ModelBinding, PersistenceMode, PtySize,
+    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionClient,
+    SessionCreation, SessionEventKind, TurnInput, Visibility, read_server_frame,
+    write_client_frame,
 };
 
 struct Daemon(Child);
@@ -40,6 +41,82 @@ fn connect_when_ready(socket: &Path) -> SessionClient {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("xshelld did not become ready at {}", socket.display());
+}
+
+#[test]
+fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .args(["--host-alias", "test-host", "--user", "tester"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut owner = connect_when_ready(&socket);
+    let session = owner
+        .create(SessionCreation {
+            name: "duplex".into(),
+            model: model("local"),
+            cwd: temporary.path().to_owned(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let size = PtySize {
+        rows: 37,
+        columns: 109,
+    };
+    let ticket = owner
+        .pty_start(
+            session.descriptor.id,
+            "read value; printf 'duplex:%s\\n' \"$value\"; stty size".into(),
+            size,
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+
+    let mut proxy = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .arg("serve-pty-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = proxy.stdin.take().unwrap();
+    let mut output = BufReader::new(proxy.stdout.take().unwrap());
+    writeln!(input, "{}", ticket.ticket).unwrap();
+    input.flush().unwrap();
+    assert_eq!(
+        read_server_frame(&mut output).unwrap(),
+        ServerPtyFrame::Ready
+    );
+    write_client_frame(&mut input, &ClientPtyFrame::Resize(size)).unwrap();
+    write_client_frame(&mut input, &ClientPtyFrame::Input(b"fabric\n".to_vec())).unwrap();
+
+    let mut bytes = Vec::new();
+    let status = loop {
+        match read_server_frame(&mut output).unwrap() {
+            ServerPtyFrame::Output(chunk) => bytes.extend(chunk),
+            ServerPtyFrame::Exit(status) => break status,
+            ServerPtyFrame::Error(message) => panic!("PTY stream failed: {message}"),
+            ServerPtyFrame::Ready => panic!("duplicate ready frame"),
+        }
+    };
+    assert_eq!(status, "exit status: 0");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("duplex:fabric"));
+    assert!(text.contains("37 109"));
+    drop(input);
+    assert!(proxy.wait().unwrap().success());
 }
 
 fn send_request(writer: &mut impl Write, request: &ClientRequest) {
@@ -296,7 +373,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
         },
     );
     let pty_id = match receive_response(&mut reader) {
-        ServerResponse::PtyStarted { pty_id } => pty_id,
+        ServerResponse::PtyStarted { ticket } => ticket.pty_id,
         response => panic!("unexpected PTY start response: {response:?}"),
     };
     send_request(&mut writer, &ClientRequest::List);
@@ -412,7 +489,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             Some("xterm-256color".into()),
         )
         .unwrap();
-    after_disconnect.pty_close(replacement).unwrap();
+    after_disconnect.pty_close(replacement.pty_id).unwrap();
 }
 
 #[test]

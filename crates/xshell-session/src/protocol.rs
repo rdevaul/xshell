@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtyExchangeResult, PtySize,
+    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtyExchangeResult, PtySize, PtyTicket,
     SESSION_PROTOCOL_VERSION, SessionCreation, SessionDescriptor, SessionSnapshot,
     ShellCompletionResult, TurnInput, ViewResource,
 };
@@ -78,6 +78,9 @@ pub enum ClientRequest {
     PtyClose {
         pty_id: String,
     },
+    PtyClaim {
+        ticket: String,
+    },
     Detach,
     Close {
         selector: Option<String>,
@@ -134,12 +137,13 @@ pub enum ServerResponse {
         resource: ViewResource,
     },
     PtyStarted {
-        pty_id: String,
+        ticket: PtyTicket,
     },
     PtyExchange {
         result: PtyExchangeResult,
     },
     PtyClosed,
+    PtyClaimed,
     Detached {
         session_id: Option<String>,
     },
