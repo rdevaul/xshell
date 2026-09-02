@@ -447,6 +447,18 @@ async fn main() -> Result<()> {
                         refresh_shell_completions(&sessions, &mut editor);
                         audit_logical_session_attached(&mut audit, &sessions, "switch")?;
                         refresh_session_completions(&mut sessions, &mut editor);
+                        if let Err(error) = resume_active_terminal_if_running(
+                            &mut sessions,
+                            pty_escape,
+                            &mut active_model,
+                            &mut agent,
+                            &mut cwd,
+                            &mut history,
+                            &args.system_prompt,
+                            &mut editor,
+                        ) {
+                            eprintln!("xshell: could not resume terminal job: {error:#}");
+                        }
                     }
                     Err(error) => eprintln!("xshell: {error:#}"),
                 }
@@ -1674,6 +1686,40 @@ fn run_session_pty(
 fn run_existing_session_pty(sessions: &mut SessionRuntime, escape_prefix: u8) -> Result<String> {
     let (mut pty_id, mut stream) = sessions.pty_attach_stream()?;
     Ok(run_pty_focus_loop(sessions, &mut pty_id, &mut stream, escape_prefix)?.description)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_active_terminal_if_running(
+    sessions: &mut SessionRuntime,
+    escape_prefix: u8,
+    active_model: &mut ActiveModel,
+    agent: &mut Box<dyn AgentAdapter>,
+    cwd: &mut PathBuf,
+    history: &mut Vec<ChatMessage>,
+    default_system_prompt: &str,
+    editor: &mut Editor<XshellHelper, DefaultHistory>,
+) -> Result<()> {
+    if !xshell_pty::controller_is_terminal() || !sessions.active_terminal_running()? {
+        return Ok(());
+    }
+    let outcome = run_existing_session_pty(sessions, escape_prefix)?;
+    if outcome != "exit status: 0" {
+        println!("xshell: {outcome}");
+    }
+    let snapshot = sessions.refresh_snapshot()?;
+    apply_runtime_snapshot(
+        snapshot,
+        active_model,
+        agent,
+        cwd,
+        history,
+        default_system_prompt,
+        editor,
+        true,
+    )?;
+    refresh_shell_completions(sessions, editor);
+    refresh_session_completions(sessions, editor);
+    Ok(())
 }
 
 fn run_pty_focus_loop(

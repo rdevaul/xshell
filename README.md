@@ -248,8 +248,9 @@ switcher, `l` selects the last session, `n`/`p` cycle, `q` terminates, `?` shows
 help, and a second `Ctrl-]` sends the prefix literally. Sessions without a
 terminal job appear as `[REPL]` targets; selecting one activates that session
 and returns to its xshell prompt. At the REPL, `//terminal` reattaches the
-current job; `//terminal list` and `//terminal kill` inspect or terminate jobs.
-Configure the prefix with `session_fabric.pty_escape`.
+current job, and `//switch HOST:SESSION` automatically resumes a running job on
+the selected session. `//terminal list` and `//terminal kill` inspect or
+terminate jobs. Configure the prefix with `session_fabric.pty_escape`.
 
 Protocol v8 uses a dedicated authenticated binary stream locally and over SSH.
 See [the terminal-job design and trust boundary](docs/pty.md).

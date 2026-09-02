@@ -1,13 +1,13 @@
 use crate::config::ActiveModel;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
-    EventBatch, PersistenceMode, PtyDescriptor, PtySize, PtyStreamClient, PtyTicket, SessionClient,
-    SessionConfig, SessionCreation, SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput,
-    ViewResource, Visibility,
+    EventBatch, PersistenceMode, PtyDescriptor, PtySize, PtyStreamClient, PtyTicket,
+    SessionActivity, SessionClient, SessionConfig, SessionCreation, SessionDescriptor,
+    SessionSnapshot, SessionStatus, TurnInput, ViewResource, Visibility,
 };
 
 struct HostConnection {
@@ -238,15 +238,38 @@ impl SessionRuntime {
     }
 
     pub fn sync(&mut self, model: &ActiveModel, cwd: &Path, history: &[ChatMessage]) -> Result<()> {
-        let Some(session_id) = self.active.as_ref().map(|session| session.id.clone()) else {
+        let Some((session_id, possibly_running)) = self.active.as_ref().map(|session| {
+            (
+                session.id.clone(),
+                session.activity == SessionActivity::Running,
+            )
+        }) else {
             return Ok(());
         };
-        let descriptor = self.client_mut()?.update(
-            session_id,
-            model.to_session_binding(),
-            cwd.to_owned(),
-            history.to_vec(),
-        )?;
+        let model = model.to_session_binding();
+        let terminal_running = possibly_running
+            && self
+                .client_mut()?
+                .pty_list()?
+                .into_iter()
+                .any(|pty| pty.session_id == session_id && pty.running);
+        if terminal_running {
+            let snapshot = self.client_mut()?.snapshot(session_id)?;
+            let unchanged = snapshot.descriptor.model == model
+                && snapshot.descriptor.cwd == cwd
+                && snapshot.history == history;
+            self.active = Some(snapshot.descriptor);
+            if !unchanged {
+                bail!(
+                    "cannot change the model, working directory, or conversation while the active \
+terminal job is running; terminate it with //terminal kill first"
+                );
+            }
+            return Ok(());
+        }
+        let descriptor =
+            self.client_mut()?
+                .update(session_id, model, cwd.to_owned(), history.to_vec())?;
         self.active = Some(descriptor);
         Ok(())
     }
@@ -340,8 +363,13 @@ impl SessionRuntime {
         terminal_type: Option<String>,
     ) -> Result<PtyTicket> {
         let session_id = self.active_session_id()?;
-        self.client_mut()?
-            .pty_start(session_id, command, size, terminal_type)
+        let ticket = self
+            .client_mut()?
+            .pty_start(session_id, command, size, terminal_type)?;
+        if let Some(active) = &mut self.active {
+            active.activity = SessionActivity::Running;
+        }
+        Ok(ticket)
     }
 
     pub fn pty_start_stream(
@@ -363,6 +391,15 @@ impl SessionRuntime {
     pub fn pty_attach_stream(&mut self) -> Result<(String, PtyStreamClient)> {
         self.pty_attach_stream_if_present()?
             .context("active session has no terminal job")
+    }
+
+    pub fn active_terminal_running(&mut self) -> Result<bool> {
+        let session_id = self.active_session_id()?;
+        Ok(self
+            .client_mut()?
+            .pty_list()?
+            .into_iter()
+            .any(|pty| pty.session_id == session_id && pty.running))
     }
 
     pub fn pty_attach_stream_if_present(&mut self) -> Result<Option<(String, PtyStreamClient)>> {
@@ -446,6 +483,9 @@ impl SessionRuntime {
     pub fn pty_close(&mut self, pty_id: &str) -> Result<()> {
         self.client_mut()?.pty_close(pty_id.to_owned())?;
         self.pty_cursors.remove(pty_id);
+        if let Some(active) = &mut self.active {
+            active.activity = SessionActivity::Idle;
+        }
         Ok(())
     }
 

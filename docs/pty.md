@@ -71,7 +71,9 @@ selecting it leaves raw mode, activates that session, and restores the xshell
 prompt. This means an idle default session remains reachable from a full-screen
 program in another session without creating a dummy PTY. At the REPL,
 `//terminal` reattaches the current session's job, while `//terminal list` and
-`//terminal kill` inspect and terminate jobs.
+`//terminal kill` inspect and terminate jobs. Switching from the REPL with
+`//switch` automatically attaches the destination when it has a running job;
+otherwise the destination opens at its REPL.
 
 ## Persistence and display boundary
 
