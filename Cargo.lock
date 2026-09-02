@@ -2044,6 +2044,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "shell-words",

@@ -289,8 +289,13 @@ run automatically and are shown in the transcript. Every agent-requested shell
 command displays the exact command and, in the default `ask` mode, requires
 explicit confirmation. `--approval auto` removes that confirmation and should
 only be used in a trusted workspace; `--approval off` denies shell tools.
-Shell tools are non-interactive, time out after 60 seconds, and have bounded
-output.
+Shell tools are non-interactive, run in a plain (non-login) shell so the
+user's profile is not sourced for model-authored commands, execute in their
+own process group, and have bounded output. After 60 seconds the entire process
+group is killed, so background jobs and pipelines cannot outlive the timeout.
+The approval prompt shows the command with control characters, newlines, and
+invisible Unicode formatting rendered as visible escapes, so the text you
+approve is exactly the text the shell will receive.
 
 At an approval prompt, `y` executes the requested command, `n` or Enter denies
 that command while allowing the agent turn to continue, and `q` aborts the
