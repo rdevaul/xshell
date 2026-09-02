@@ -1,3 +1,4 @@
+use crate::audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
 use crate::{
     ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind, SessionRegistry,
     TurnInput,
@@ -9,11 +10,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent,
     TurnObserver, build_adapter, run_agent_turn, run_direct_shell_streaming,
 };
+use xshell_platform::LockExt;
 
 const MAX_JOURNAL_EVENTS: usize = 8_192;
 const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
@@ -27,6 +30,8 @@ pub struct ExecutionCoordinator {
 struct CoordinatorInner {
     registry: Arc<Mutex<SessionRegistry>>,
     sessions: Mutex<HashMap<String, Arc<SessionExecution>>>,
+    audit: DaemonAudit,
+    max_approval: ApprovalPolicy,
 }
 
 struct SessionExecution {
@@ -50,31 +55,72 @@ struct ActiveTurn {
 
 impl ExecutionCoordinator {
     pub fn new(registry: Arc<Mutex<SessionRegistry>>) -> Self {
+        Self::with_policy(registry, DaemonAudit::default(), ApprovalPolicy::Ask)
+    }
+
+    pub fn with_policy(
+        registry: Arc<Mutex<SessionRegistry>>,
+        audit: DaemonAudit,
+        max_approval: ApprovalPolicy,
+    ) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
                 registry,
                 sessions: Mutex::new(HashMap::new()),
+                audit,
+                max_approval,
             }),
         }
+    }
+
+    pub fn max_approval(&self) -> ApprovalPolicy {
+        self.inner.max_approval
+    }
+
+    pub fn audit(&self) -> &DaemonAudit {
+        &self.inner.audit
+    }
+
+    fn audit_handle(&self, snapshot: &crate::SessionSnapshot) -> SessionAuditHandle {
+        let descriptor = &snapshot.descriptor;
+        self.inner.audit.session(
+            &descriptor.id,
+            SessionAuditDescriptor {
+                name: descriptor.name.clone(),
+                host_id: descriptor.host_id.clone(),
+                host_alias: descriptor.host_alias.clone(),
+                user: descriptor.user.clone(),
+            },
+        )
     }
 
     pub fn submit(
         &self,
         session_id: &str,
         input: TurnInput,
-        approval: ApprovalPolicy,
+        requested_approval: ApprovalPolicy,
     ) -> Result<String> {
-        let snapshot = self
-            .inner
-            .registry
-            .lock()
-            .expect("session registry poisoned")
-            .snapshot(session_id)?;
+        // The daemon executes; the daemon decides how much unattended
+        // execution it permits. A client may ask for less, never more.
+        let approval = requested_approval.clamp_to(self.inner.max_approval);
+        let requested_approval = (approval != requested_approval).then_some(requested_approval);
+        let snapshot = self.inner.registry.lock_recover().snapshot(session_id)?;
         let execution = self.session(session_id);
         let turn_id = Uuid::new_v4().to_string();
         let cancellation = CancellationFlag::default();
+        // Record the input at the execution boundary before anything runs.
+        // With required auditing, a failure here refuses the turn outright.
+        let audit = self.audit_handle(&snapshot);
+        let (route, text) = match &input {
+            TurnInput::Agent { message } => ("agent", message.clone()),
+            TurnInput::Shell { command } => ("shell", format!("${command}")),
+        };
+        audit.append(AuditEvent::Input {
+            route: route.into(),
+            text,
+        })?;
         {
-            let mut state = execution.state.lock().expect("execution state poisoned");
+            let mut state = execution.state.lock_recover();
             if let Some(active) = &state.active {
                 bail!("session already has active turn {}", active.id);
             }
@@ -92,6 +138,7 @@ impl ExecutionCoordinator {
             SessionEventKind::TurnStarted {
                 input: input.clone(),
                 approval,
+                requested_approval,
             },
         );
 
@@ -108,6 +155,7 @@ impl ExecutionCoordinator {
                     approval,
                     snapshot,
                     cancellation,
+                    audit,
                 );
             })
         {
@@ -133,7 +181,7 @@ impl ExecutionCoordinator {
 
     pub fn approve(&self, session_id: &str, reply: ApprovalReply) -> Result<()> {
         let execution = self.session(session_id);
-        let mut state = execution.state.lock().expect("execution state poisoned");
+        let mut state = execution.state.lock_recover();
         if state.active.as_ref().map(|turn| turn.id.as_str()) != Some(reply.turn_id.as_str()) {
             bail!("turn is no longer active");
         }
@@ -148,7 +196,7 @@ impl ExecutionCoordinator {
 
     pub fn cancel(&self, session_id: &str, turn_id: &str) -> Result<()> {
         let execution = self.session(session_id);
-        let state = execution.state.lock().expect("execution state poisoned");
+        let state = execution.state.lock_recover();
         let active = state
             .active
             .as_ref()
@@ -162,18 +210,9 @@ impl ExecutionCoordinator {
     }
 
     pub fn cancel_and_remove(&self, session_id: &str) {
-        let execution = self
-            .inner
-            .sessions
-            .lock()
-            .expect("execution map poisoned")
-            .remove(session_id);
+        let execution = self.inner.sessions.lock_recover().remove(session_id);
         if let Some(execution) = execution
-            && let Some(active) = &execution
-                .state
-                .lock()
-                .expect("execution state poisoned")
-                .active
+            && let Some(active) = &execution.state.lock_recover().active
         {
             active.cancellation.cancel();
             execution.changed.notify_all();
@@ -183,8 +222,7 @@ impl ExecutionCoordinator {
     pub fn active_turn(&self, session_id: &str) -> Option<String> {
         self.session(session_id)
             .state
-            .lock()
-            .expect("execution state poisoned")
+            .lock_recover()
             .active
             .as_ref()
             .map(|turn| turn.id.clone())
@@ -192,7 +230,7 @@ impl ExecutionCoordinator {
 
     pub fn activity(&self, session_id: &str) -> SessionActivity {
         let execution = self.session(session_id);
-        let state = execution.state.lock().expect("execution state poisoned");
+        let state = execution.state.lock_recover();
         if state.active.is_none() {
             SessionActivity::Idle
         } else if state.pending_approvals.is_empty() {
@@ -205,13 +243,13 @@ impl ExecutionCoordinator {
     fn session(&self, session_id: &str) -> Arc<SessionExecution> {
         self.inner
             .sessions
-            .lock()
-            .expect("execution map poisoned")
+            .lock_recover()
             .entry(session_id.to_owned())
             .or_insert_with(|| Arc::new(SessionExecution::new()))
             .clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_turn(
         &self,
         session_id: String,
@@ -220,6 +258,7 @@ impl ExecutionCoordinator {
         approval: ApprovalPolicy,
         mut snapshot: crate::SessionSnapshot,
         cancellation: CancellationFlag,
+        audit: SessionAuditHandle,
     ) {
         let execution = self.session(&session_id);
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -242,6 +281,8 @@ impl ExecutionCoordinator {
             turn_id: turn_id.clone(),
             execution: Arc::clone(&execution),
             cancellation: cancellation.clone(),
+            audit: audit.clone(),
+            audit_failure: None,
         };
         let result = runtime.block_on(async {
             match input {
@@ -253,7 +294,7 @@ impl ExecutionCoordinator {
                         base_url: model.base_url.clone(),
                         api_key_env: model.api_key_env.clone(),
                     })?;
-                    run_agent_turn(
+                    let outcome = run_agent_turn(
                         agent.as_mut(),
                         &mut snapshot.history,
                         message,
@@ -261,7 +302,13 @@ impl ExecutionCoordinator {
                         approval,
                         &mut observer,
                     )
-                    .await
+                    .await;
+                    if let Err(error) = &outcome {
+                        let _ = audit.append(AuditEvent::AgentError {
+                            message: format!("{error:#}"),
+                        });
+                    }
+                    outcome
                 }
                 TurnInput::Shell { command } => {
                     let result = tokio::select! {
@@ -280,11 +327,19 @@ impl ExecutionCoordinator {
                     };
                     if result.cwd != snapshot.descriptor.cwd {
                         snapshot.descriptor.cwd = result.cwd.clone();
+                        audit.append(AuditEvent::WorkingDirectoryChanged {
+                            cwd: result.cwd.display().to_string(),
+                        })?;
                         execution.append(
                             &turn_id,
                             SessionEventKind::WorkingDirectoryChanged { cwd: result.cwd },
                         );
                     }
+                    audit.append(AuditEvent::ShellFinished {
+                        command: command.clone(),
+                        outcome: result.status.clone(),
+                        cwd: snapshot.descriptor.cwd.display().to_string(),
+                    })?;
                     execution.append(
                         &turn_id,
                         SessionEventKind::ShellFinished {
@@ -297,7 +352,18 @@ impl ExecutionCoordinator {
             }
         });
 
-        if cancellation.is_cancelled() {
+        // A required-audit failure inside the observer cancels the turn so
+        // no further tool runs without a record. Report it as a failure, not
+        // a user cancellation.
+        let audit_failure = observer.audit_failure.take();
+        if let Some(error) = audit_failure {
+            execution.append(
+                &turn_id,
+                SessionEventKind::TurnFailed {
+                    message: format!("{error:#}"),
+                },
+            );
+        } else if cancellation.is_cancelled() {
             execution.append(&turn_id, SessionEventKind::TurnCancelled);
         } else if let Err(error) = result {
             execution.append(
@@ -307,12 +373,11 @@ impl ExecutionCoordinator {
                 },
             );
         } else {
-            let update = self
-                .inner
-                .registry
-                .lock()
-                .expect("session registry poisoned")
-                .update_execution_state(&session_id, snapshot.descriptor.cwd, snapshot.history);
+            let update = self.inner.registry.lock_recover().update_execution_state(
+                &session_id,
+                snapshot.descriptor.cwd,
+                snapshot.history,
+            );
             match update {
                 Ok(_) => execution.append(&turn_id, SessionEventKind::TurnCompleted),
                 Err(error) => execution.append(
@@ -343,7 +408,7 @@ impl SessionExecution {
     }
 
     fn append(&self, turn_id: &str, event: SessionEventKind) {
-        let mut state = self.state.lock().expect("execution state poisoned");
+        let mut state = self.state.lock_recover();
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
         let record = SessionEvent {
@@ -368,7 +433,7 @@ impl SessionExecution {
 
     fn events(&self, after_sequence: u64, wait: Duration) -> EventBatch {
         let deadline = Instant::now() + wait;
-        let mut state = self.state.lock().expect("execution state poisoned");
+        let mut state = self.state.lock_recover();
         while !state
             .events
             .iter()
@@ -380,7 +445,7 @@ impl SessionExecution {
             let waited = self
                 .changed
                 .wait_timeout(state, remaining)
-                .expect("execution state poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = waited.0;
             if waited.1.timed_out() {
                 break;
@@ -402,7 +467,7 @@ impl SessionExecution {
     }
 
     fn finish(&self, turn_id: &str) {
-        let mut state = self.state.lock().expect("execution state poisoned");
+        let mut state = self.state.lock_recover();
         if state.active.as_ref().map(|turn| turn.id.as_str()) == Some(turn_id) {
             state.active = None;
         }
@@ -420,16 +485,73 @@ struct DaemonObserver {
     turn_id: String,
     execution: Arc<SessionExecution>,
     cancellation: CancellationFlag,
+    audit: SessionAuditHandle,
+    audit_failure: Option<anyhow::Error>,
+}
+
+impl DaemonObserver {
+    fn audit(&mut self, event: AuditEvent) {
+        if self.audit_failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.audit.append(event) {
+            // Stop the turn at the next cancellation check so that no tool
+            // executes without an audit record.
+            self.audit_failure = Some(error);
+            self.cancellation.cancel();
+        }
+    }
 }
 
 #[async_trait]
 impl TurnObserver for DaemonObserver {
     fn emit(&mut self, event: ExecutionEvent) {
+        match &event {
+            ExecutionEvent::TextDelta { .. } | ExecutionEvent::ApprovalRequested { .. } => {}
+            ExecutionEvent::AgentResponse {
+                content,
+                tool_call_count,
+                partial,
+            } => self.audit(AuditEvent::AgentResponse {
+                content: content.clone(),
+                tool_call_count: *tool_call_count,
+                partial: *partial,
+            }),
+            ExecutionEvent::ToolRequested { call } => self.audit(AuditEvent::ToolRequested {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            }),
+            ExecutionEvent::ToolDecision { call_id, decision } => {
+                self.audit(AuditEvent::ToolDecision {
+                    call_id: call_id.clone(),
+                    decision: match decision {
+                        ApprovalDecision::Approve => "approve",
+                        ApprovalDecision::Deny => "deny",
+                        ApprovalDecision::AbortTurn => "abort_turn",
+                    }
+                    .into(),
+                })
+            }
+            ExecutionEvent::ToolSkipped { call_id, .. } => self.audit(AuditEvent::ToolDecision {
+                call_id: call_id.clone(),
+                decision: "skipped_after_abort".into(),
+            }),
+            ExecutionEvent::ToolResult {
+                call_id,
+                name,
+                result,
+            } => self.audit(AuditEvent::ToolResult {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                result: result.clone(),
+            }),
+            ExecutionEvent::TurnAborted => {}
+        }
         if let ExecutionEvent::ApprovalRequested { call } = &event {
             self.execution
                 .state
-                .lock()
-                .expect("execution state poisoned")
+                .lock_recover()
                 .pending_approvals
                 .insert((self.turn_id.clone(), call.id.clone()));
         }
@@ -447,14 +569,7 @@ impl TurnObserver for DaemonObserver {
             if self.cancellation.is_cancelled() {
                 return ApprovalDecision::AbortTurn;
             }
-            if let Some(decision) = self
-                .execution
-                .state
-                .lock()
-                .expect("execution state poisoned")
-                .approvals
-                .remove(&key)
-            {
+            if let Some(decision) = self.execution.state.lock_recover().approvals.remove(&key) {
                 return decision;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

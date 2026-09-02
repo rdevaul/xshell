@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use xshell_platform::LockExt;
 use xshell_pty::{PtySize as ProcessSize, RemotePtyProcess};
 
 const MAX_ACTIVE_PTYS: usize = 64;
@@ -32,8 +33,7 @@ impl Drop for PtyCoordinator {
         }
         let managed = self
             .inner
-            .lock()
-            .expect("PTY map poisoned")
+            .lock_recover()
             .values()
             .cloned()
             .collect::<Vec<_>>();
@@ -95,7 +95,7 @@ impl PtyCoordinator {
         validate_terminal_type(terminal_type.as_deref())?;
         self.remove_completed_for_session(session_id);
         {
-            let ptys = self.inner.lock().expect("PTY map poisoned");
+            let ptys = self.inner.lock_recover();
             if ptys.len() >= MAX_ACTIVE_PTYS {
                 bail!("PTY capacity is exhausted");
             }
@@ -134,7 +134,7 @@ impl PtyCoordinator {
             changed: Condvar::new(),
         });
         {
-            let mut ptys = self.inner.lock().expect("PTY map poisoned");
+            let mut ptys = self.inner.lock_recover();
             if ptys.len() >= MAX_ACTIVE_PTYS
                 || ptys.values().any(|pty| pty.session_id == session_id)
             {
@@ -152,8 +152,7 @@ impl PtyCoordinator {
 
     pub fn list(&self) -> Vec<PtyDescriptor> {
         self.inner
-            .lock()
-            .expect("PTY map poisoned")
+            .lock_recover()
             .iter()
             .map(|(pty_id, managed)| descriptor(pty_id, managed))
             .collect()
@@ -166,19 +165,18 @@ impl PtyCoordinator {
     pub fn attach(&self, session_id: &str, after_offset: Option<u64>) -> Result<PtyTicket> {
         let (pty_id, managed) = self
             .inner
-            .lock()
-            .expect("PTY map poisoned")
+            .lock_recover()
             .iter()
             .find(|(_, pty)| pty.session_id == session_id)
             .map(|(id, pty)| (id.clone(), Arc::clone(pty)))
             .context("session has no terminal job")?;
-        let state = managed.state.lock().expect("PTY state poisoned");
+        let state = managed.state.lock_recover();
         let replay_from = after_offset
             .unwrap_or(state.replay_start)
             .clamp(state.replay_start, state.replay_end);
         drop(state);
         let ticket = Uuid::new_v4().to_string();
-        let mut stream = managed.stream.lock().expect("PTY stream state poisoned");
+        let mut stream = managed.stream.lock_recover();
         if stream.claimed.is_some() {
             bail!("terminal job is already attached");
         }
@@ -194,13 +192,12 @@ impl PtyCoordinator {
     pub fn claim(&self, ticket: &str) -> Result<PtyClaim> {
         let entries = self
             .inner
-            .lock()
-            .expect("PTY map poisoned")
+            .lock_recover()
             .iter()
             .map(|(id, pty)| (id.clone(), Arc::clone(pty)))
             .collect::<Vec<_>>();
         for (pty_id, managed) in entries {
-            let mut stream = managed.stream.lock().expect("PTY stream state poisoned");
+            let mut stream = managed.stream.lock_recover();
             if let Some(cursor) = stream.tickets.remove(ticket) {
                 if stream.claimed.is_some() {
                     bail!("terminal job is already attached");
@@ -222,7 +219,7 @@ impl PtyCoordinator {
         let Ok(managed) = self.get(&claim.pty_id) else {
             return;
         };
-        let mut stream = managed.stream.lock().expect("PTY stream state poisoned");
+        let mut stream = managed.stream.lock_recover();
         if stream.claimed.as_deref() == Some(claim.claim_id.as_str()) {
             stream.claimed = None;
         }
@@ -230,7 +227,7 @@ impl PtyCoordinator {
 
     pub fn write_claimed(&self, claim: &PtyClaim, bytes: Vec<u8>) -> Result<()> {
         let managed = self.get_claimed(claim)?;
-        let mut state = managed.state.lock().expect("PTY state poisoned");
+        let mut state = managed.state.lock_recover();
         if state.exit_status.is_some() {
             bail!("terminal job has exited");
         }
@@ -244,7 +241,7 @@ impl PtyCoordinator {
     pub fn resize_claimed(&self, claim: &PtyClaim, size: PtySize) -> Result<()> {
         validate_size(size)?;
         let managed = self.get_claimed(claim)?;
-        managed.state.lock().expect("PTY state poisoned").size = size;
+        managed.state.lock_recover().size = size;
         Ok(())
     }
 
@@ -259,13 +256,13 @@ impl PtyCoordinator {
         if wait > MAX_READ_WAIT {
             bail!("PTY read wait exceeds {} ms", MAX_READ_WAIT.as_millis());
         }
-        let mut state = managed.state.lock().expect("PTY state poisoned");
+        let mut state = managed.state.lock_recover();
         let cursor = cursor.max(state.replay_start).min(state.replay_end);
         if cursor == state.replay_end && state.exit_status.is_none() && !state.shutdown {
             let (updated, _) = managed
                 .changed
                 .wait_timeout(state, wait)
-                .expect("PTY state poisoned while waiting");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = updated;
         }
         let cursor = cursor.max(state.replay_start).min(state.replay_end);
@@ -291,8 +288,7 @@ impl PtyCoordinator {
     pub fn terminate(&self, pty_id: &str) -> Result<()> {
         let managed = self
             .inner
-            .lock()
-            .expect("PTY map poisoned")
+            .lock_recover()
             .remove(pty_id)
             .context("unknown terminal job")?;
         shutdown(&managed);
@@ -301,7 +297,7 @@ impl PtyCoordinator {
 
     pub fn terminate_session(&self, session_id: &str) {
         let removed = {
-            let mut ptys = self.inner.lock().expect("PTY map poisoned");
+            let mut ptys = self.inner.lock_recover();
             let ids = ptys
                 .iter()
                 .filter(|(_, pty)| pty.session_id == session_id)
@@ -317,25 +313,14 @@ impl PtyCoordinator {
     }
 
     pub fn has_session(&self, session_id: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("PTY map poisoned")
-            .values()
-            .any(|pty| {
-                pty.session_id == session_id
-                    && pty
-                        .state
-                        .lock()
-                        .expect("PTY state poisoned")
-                        .exit_status
-                        .is_none()
-            })
+        self.inner.lock_recover().values().any(|pty| {
+            pty.session_id == session_id && pty.state.lock_recover().exit_status.is_none()
+        })
     }
 
     fn get(&self, pty_id: &str) -> Result<Arc<ManagedPty>> {
         self.inner
-            .lock()
-            .expect("PTY map poisoned")
+            .lock_recover()
             .get(pty_id)
             .cloned()
             .context("unknown terminal job")
@@ -343,13 +328,8 @@ impl PtyCoordinator {
 
     fn get_claimed(&self, claim: &PtyClaim) -> Result<Arc<ManagedPty>> {
         let managed = self.get(&claim.pty_id)?;
-        let claimed = managed
-            .stream
-            .lock()
-            .expect("PTY stream state poisoned")
-            .claimed
-            .as_deref()
-            == Some(claim.claim_id.as_str());
+        let claimed =
+            managed.stream.lock_recover().claimed.as_deref() == Some(claim.claim_id.as_str());
         if !claimed {
             bail!("PTY stream claim is no longer active");
         }
@@ -358,16 +338,10 @@ impl PtyCoordinator {
 
     fn remove_completed_for_session(&self, session_id: &str) {
         let completed = {
-            let ptys = self.inner.lock().expect("PTY map poisoned");
+            let ptys = self.inner.lock_recover();
             ptys.iter()
                 .find(|(_, pty)| {
-                    pty.session_id == session_id
-                        && pty
-                            .state
-                            .lock()
-                            .expect("PTY state poisoned")
-                            .exit_status
-                            .is_some()
+                    pty.session_id == session_id && pty.state.lock_recover().exit_status.is_some()
                 })
                 .map(|(id, _)| id.clone())
         };
@@ -381,7 +355,7 @@ fn spawn_worker(managed: Arc<ManagedPty>, mut process: RemotePtyProcess) {
     thread::spawn(move || {
         loop {
             let (input, size, shutdown_requested) = {
-                let state = managed.state.lock().expect("PTY state poisoned");
+                let state = managed.state.lock_recover();
                 (
                     state
                         .input
@@ -409,7 +383,7 @@ fn spawn_worker(managed: Arc<ManagedPty>, mut process: RemotePtyProcess) {
             );
             match result {
                 Ok(chunk) => {
-                    let mut state = managed.state.lock().expect("PTY state poisoned");
+                    let mut state = managed.state.lock_recover();
                     for _ in 0..chunk.input_accepted.min(state.input.len()) {
                         state.input.pop_front();
                     }
@@ -442,19 +416,19 @@ fn append_output(state: &mut PtyState, bytes: Vec<u8>) {
 }
 
 fn finish(managed: &ManagedPty, status: String) {
-    let mut state = managed.state.lock().expect("PTY state poisoned");
+    let mut state = managed.state.lock_recover();
     state.exit_status.get_or_insert(status);
     managed.changed.notify_all();
 }
 
 fn shutdown(managed: &ManagedPty) {
-    managed.state.lock().expect("PTY state poisoned").shutdown = true;
+    managed.state.lock_recover().shutdown = true;
     managed.changed.notify_all();
 }
 
 fn descriptor(pty_id: &str, managed: &ManagedPty) -> PtyDescriptor {
-    let stream = managed.stream.lock().expect("PTY stream state poisoned");
-    let state = managed.state.lock().expect("PTY state poisoned");
+    let stream = managed.stream.lock_recover();
+    let state = managed.state.lock_recover();
     PtyDescriptor {
         pty_id: pty_id.to_owned(),
         session_id: managed.session_id.clone(),

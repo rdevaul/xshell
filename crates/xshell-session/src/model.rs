@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-pub const SESSION_PROTOCOL_VERSION: u32 = 8;
+pub const SESSION_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -15,6 +15,11 @@ pub struct SessionConfig {
     pub state_directory: Option<PathBuf>,
     pub default_session: String,
     pub pty_escape: String,
+    /// Most permissive approval policy this daemon will apply to any turn,
+    /// regardless of what a client requests. Defaults to `ask`, so a client
+    /// on another host cannot turn on unattended shell execution here without
+    /// the daemon's operator opting in.
+    pub max_approval: ApprovalPolicy,
 }
 
 impl Default for SessionConfig {
@@ -26,6 +31,7 @@ impl Default for SessionConfig {
             state_directory: None,
             default_session: "default".into(),
             pty_escape: "ctrl-]".into(),
+            max_approval: ApprovalPolicy::Ask,
         }
     }
 }
@@ -159,7 +165,12 @@ pub enum TurnInput {
 pub enum SessionEventKind {
     TurnStarted {
         input: TurnInput,
+        /// The policy actually applied after clamping to the daemon's
+        /// `max_approval` ceiling.
         approval: ApprovalPolicy,
+        /// The policy the client asked for, when it differed from `approval`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_approval: Option<ApprovalPolicy>,
     },
     Execution {
         event: ExecutionEvent,

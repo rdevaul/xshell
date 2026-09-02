@@ -53,6 +53,7 @@ fn spawn_pty_proxy(
     BufReader<std::process::ChildStdout>,
 ) {
     let mut proxy = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
         .args(["--state-directory", state.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .arg("serve-pty-stdio")
@@ -75,6 +76,7 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
     let socket = state.join("xshelld.sock");
     let _daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
             .args(["--state-directory", state.to_str().unwrap()])
             .args(["--socket", socket.to_str().unwrap()])
             .args(["--host-alias", "test-host", "--user", "tester"])
@@ -189,6 +191,7 @@ fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
     let socket = state.join("xshelld.sock");
     let _daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
             .args(["--state-directory", state.to_str().unwrap()])
             .args(["--socket", socket.to_str().unwrap()])
             .args(["--host-alias", "test-host", "--user", "tester"])
@@ -222,6 +225,7 @@ fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
         .unwrap();
 
     let mut proxy = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
         .args(["--state-directory", state.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .arg("serve-pty-stdio")
@@ -319,6 +323,7 @@ fn daemon_preserves_and_switches_named_sessions() {
     let state = temporary.path().join("state");
     let socket = state.join("xshelld.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
         .args(["--state-directory", state.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .args(["--host-alias", "test-host", "--user", "tester"])
@@ -379,6 +384,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     let state = temporary.path().join("state");
     let socket = state.join("xshelld.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
         .args(["--state-directory", state.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .args(["--host-alias", "remote-test", "--user", "tester"])
@@ -413,7 +419,12 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     drop(readiness);
 
     let mut proxy = Command::new(env!("CARGO_BIN_EXE_xshelld"))
-        .args(["serve-stdio", "--socket", socket.to_str().unwrap()])
+        .args([
+            "serve-stdio",
+            "--no-user-config",
+            "--socket",
+            socket.to_str().unwrap(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -624,6 +635,7 @@ fn shell_turn_continues_after_disconnect_and_replays_on_attach() {
     let state = temporary.path().join("state");
     let socket = state.join("xshelld.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
         .args(["--state-directory", state.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .args(["--host-alias", "test-host", "--user", "tester"])
@@ -692,6 +704,7 @@ fn running_shell_turn_can_be_cancelled() {
     let state = temporary.path().join("state");
     let socket = state.join("xshelld.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
         .args(["--state-directory", state.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .stdout(Stdio::null())
@@ -761,6 +774,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
     let state = temporary.path().join("state");
     let socket = state.join("xshelld.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
         .args(["--state-directory", state.to_str().unwrap()])
         .args(["--socket", socket.to_str().unwrap()])
         .stdout(Stdio::null())
@@ -866,4 +880,262 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             .any(|message| message.content == "finished")
     );
     model_server.join().unwrap();
+}
+
+/// Locate the `xshell-auditd` binary built alongside this test. Cargo only
+/// exposes `CARGO_BIN_EXE_*` for the current package, so derive it from the
+/// known xshelld path.
+fn auditd_binary() -> std::path::PathBuf {
+    let xshelld = std::path::PathBuf::from(env!("CARGO_BIN_EXE_xshelld"));
+    let candidate = xshelld.with_file_name("xshell-auditd");
+    if !candidate.exists() {
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "xshell-audit", "--bin", "xshell-auditd"])
+            .status()
+            .expect("cargo build for xshell-auditd");
+        assert!(status.success(), "could not build xshell-auditd");
+    }
+    assert!(
+        candidate.exists(),
+        "xshell-auditd not found at {}",
+        candidate.display()
+    );
+    candidate
+}
+
+#[test]
+fn daemon_audits_execution_without_an_attached_client() {
+    let temporary = TempDir::new().unwrap();
+    let audit_directory = temporary.path().join("audit");
+    let audit_socket = temporary.path().join("audit.sock");
+    let auditd = Command::new(auditd_binary())
+        .arg("--directory")
+        .arg(&audit_directory)
+        .arg("--socket")
+        .arg(&audit_socket)
+        .args(["--checkpoint-interval", "2"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _auditd = Daemon(auditd);
+    for _ in 0..100 {
+        if audit_socket.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(audit_socket.exists(), "audit daemon did not start");
+
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[audit]\nenabled = true\nrequired = true\nsocket = {:?}\n",
+            audit_socket.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--config", config_path.to_str().unwrap()])
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .args(["--host-alias", "audited-host", "--user", "tester"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "audited".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Shell {
+                command: "sleep 0.1; printf audited".into(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    // Disconnect immediately: nobody is attached while the command runs.
+    drop(client);
+
+    let mut reconnected = connect_when_ready(&socket);
+    for _ in 0..100 {
+        match reconnected.attach("audited".into()) {
+            Ok(_) => break,
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let mut after = 0;
+    let mut completed = false;
+    for _ in 0..100 {
+        let batch = reconnected
+            .events(session.descriptor.id.clone(), after, 100)
+            .unwrap();
+        for event in batch.events {
+            after = event.sequence;
+            if matches!(event.event, SessionEventKind::TurnCompleted) {
+                completed = true;
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    assert!(completed);
+    // Closing the xshell session finalizes its audit log.
+    reconnected.close(Some("audited".into())).unwrap();
+    drop(reconnected);
+
+    // Find the daemon's audit session (not the startup probe) and verify it.
+    let sessions_dir = audit_directory.join("sessions");
+    let public_key = audit_directory.join("signing-key.pub");
+    let mut found = false;
+    for _ in 0..100 {
+        for entry in std::fs::read_dir(&sessions_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            if !text.contains("\"shell_finished\"") {
+                continue;
+            }
+            let report = xshell_audit::verify_log(&path, &public_key).unwrap();
+            assert!(report.final_checkpoint, "audit log lacks final checkpoint");
+            assert!(text.contains("\"logical_session_attached\""));
+            assert!(text.contains("\"route\":\"shell\""));
+            assert!(text.contains("printf audited"));
+            assert!(text.contains("\"outcome\":\"exit status: 0\""));
+            assert!(text.contains("\"session_ended\""));
+            found = true;
+        }
+        if found {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        found,
+        "no daemon-written audit log contained the shell turn"
+    );
+}
+
+#[test]
+fn daemon_clamps_client_approval_to_its_configured_ceiling() {
+    let tool_response = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"id\":\"call_1\",\"function\":{\"name\":\"run_shell\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"printf must-not-run\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let final_response = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"finished\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let (base_url, model_server) = serve_sse(vec![tool_response, final_response]);
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[session_fabric]\nenabled = true\nmax_approval = \"off\"\n",
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--config", config_path.to_str().unwrap()])
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "clamped".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    // The client asks for unattended execution; the daemon must not grant it.
+    client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Agent {
+                message: "run it".into(),
+            },
+            ApprovalPolicy::Auto,
+        )
+        .unwrap();
+
+    let mut after = 0;
+    let mut completed = false;
+    let mut saw_clamp = false;
+    let mut saw_prompt = false;
+    let mut decision = None;
+    let mut result = None;
+    for _ in 0..100 {
+        let batch = client
+            .events(session.descriptor.id.clone(), after, 500)
+            .unwrap();
+        for event in batch.events {
+            after = event.sequence;
+            match event.event {
+                SessionEventKind::TurnStarted {
+                    approval,
+                    requested_approval,
+                    ..
+                } => {
+                    assert_eq!(approval, ApprovalPolicy::Off);
+                    assert_eq!(requested_approval, Some(ApprovalPolicy::Auto));
+                    saw_clamp = true;
+                }
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ApprovalRequested { .. },
+                } => saw_prompt = true,
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ToolDecision { decision: d, .. },
+                } => decision = Some(d),
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ToolResult { result: r, .. },
+                } => result = Some(r),
+                SessionEventKind::TurnCompleted => completed = true,
+                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    model_server.join().unwrap();
+    assert!(completed);
+    assert!(saw_clamp, "TurnStarted did not report the clamped policy");
+    assert!(!saw_prompt, "policy off must not prompt");
+    assert_eq!(decision, Some(ApprovalDecision::Deny));
+    assert_eq!(result.as_deref(), Some("tool denied by user"));
 }

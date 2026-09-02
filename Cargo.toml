@@ -5,6 +5,7 @@ members = [
     "crates/xshell-cli",
     "crates/xshell-core",
     "crates/xshell-execution",
+    "crates/xshell-platform",
     "crates/xshell-pty",
     "crates/xshell-session",
     "crates/xshell-view",

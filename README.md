@@ -205,7 +205,9 @@ daemon restart, but an in-flight turn does not yet survive daemon restart.
 Credential environment variables named by a model profile must be available
 to the `xshelld` process. They are not sent to or resolved by an attached CLI.
 This distinction becomes important once the CLI and daemon are on different
-hosts.
+hosts. Likewise, when auditing is enabled, `xshelld` records execution events
+(input, model output, tool calls, approvals, shell completion) itself at the
+point of execution; see [the audit design](docs/auditing.md#who-records-what).
 
 To connect another macOS or Linux host, install `xshelld` somewhere on that
 host's non-interactive SSH `PATH`, configure and start its per-user daemon, then
@@ -269,11 +271,15 @@ For a local functional test, enable the `[audit]` section in
 
 ```sh
 cargo run -p xshell-audit --bin xshell-auditd -- \
-  --directory /tmp/xshell-audit \
-  --socket /tmp/xshell-audit.sock
+  --directory "$HOME/.local/state/xshell/audit" \
+  --socket "$HOME/.local/state/xshell/audit/audit.sock"
 
 cargo run -p xshell-cli -- --config config.example.toml
 ```
+
+Both daemons refuse directories they do not own or that are group/world
+writable, so avoid shared locations such as `/tmp`, where another local user
+could pre-create the path.
 
 This same-user development setup is not protected from shell commands. A
 tamper-resistant installation must run the daemon under a dedicated OS account
@@ -289,8 +295,16 @@ run automatically and are shown in the transcript. Every agent-requested shell
 command displays the exact command and, in the default `ask` mode, requires
 explicit confirmation. `--approval auto` removes that confirmation and should
 only be used in a trusted workspace; `--approval off` denies shell tools.
-Shell tools are non-interactive, time out after 60 seconds, and have bounded
-output.
+When a session daemon executes turns, its `session_fabric.max_approval`
+setting (default `ask`) caps whatever the CLI requests, so a remote host's
+operator decides whether unattended shell execution is allowed there.
+Shell tools are non-interactive, run in a plain (non-login) shell so the
+user's profile is not sourced for model-authored commands, execute in their
+own process group, and have bounded output. After 60 seconds the entire process
+group is killed, so background jobs and pipelines cannot outlive the timeout.
+The approval prompt shows the command with control characters, newlines, and
+invisible Unicode formatting rendered as visible escapes, so the text you
+approve is exactly the text the shell will receive.
 
 At an approval prompt, `y` executes the requested command, `n` or Enter denies
 that command while allowing the agent turn to continue, and `q` aborts the

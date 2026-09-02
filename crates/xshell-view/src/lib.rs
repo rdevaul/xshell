@@ -816,6 +816,55 @@ struct TerminalSanitizer {
     state: SanitizeState,
 }
 
+/// Remove terminal control sequences from a complete string so it can be
+/// printed to a terminal without altering display state. Newlines and tabs are
+/// preserved; all other control characters, C1 controls, and ESC/CSI/OSC/DCS
+/// sequences are dropped.
+///
+/// Use this for any agent-derived text that bypasses [`AgentRenderer`], such
+/// as tool arguments and tool results.
+pub fn sanitize_terminal_text(input: &str) -> String {
+    let mut sanitizer = TerminalSanitizer::default();
+    let clean = sanitizer.push(input);
+    sanitizer.finish();
+    clean
+}
+
+/// Render agent-derived text for a security-sensitive single-line prompt.
+///
+/// Control sequences are stripped as in [`sanitize_terminal_text`]; in
+/// addition, newlines, tabs, and any remaining non-printable characters are
+/// shown as visible escapes (`\n`, `\t`, `\u{..}`) so that the displayed text
+/// occupies exactly one line and a reviewer sees every byte that will be acted
+/// on. Bidirectional-override and zero-width formatting characters are also
+/// escaped because they can visually reorder or hide text.
+pub fn escape_for_prompt(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for character in sanitize_terminal_text(input).chars() {
+        match character {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\\' => out.push_str("\\\\"),
+            value if value.is_control() || is_invisible_format(value) => {
+                out.push_str(&format!("\\u{{{:x}}}", u32::from(value)));
+            }
+            value => out.push(value),
+        }
+    }
+    out
+}
+
+fn is_invisible_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200b}'..='\u{200f}' // zero-width space/joiners, LRM/RLM
+            | '\u{202a}'..='\u{202e}' // bidi embeddings and overrides
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{feff}' // BOM / zero-width no-break space
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewerDescriptor {
     pub id: &'static str,
@@ -1337,6 +1386,23 @@ mod tests {
             renderer.finish(&mut output).unwrap();
             assert_eq!(String::from_utf8(output).unwrap(), "safe text red\n");
         }
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_sequences_and_keeps_layout() {
+        let input = "echo ok\x1b[2K\rrm -rf /\n\ttab\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\";
+        assert_eq!(sanitize_terminal_text(input), "echo okrm -rf /\n\ttablink");
+    }
+
+    #[test]
+    fn escape_for_prompt_makes_every_byte_visible_on_one_line() {
+        let input = "echo ok\x1b[2K\r\nrm -rf /\t\u{202e}gnp.exe\\";
+        let escaped = escape_for_prompt(input);
+        assert!(!escaped.contains('\n'));
+        assert!(!escaped.contains('\r'));
+        assert!(!escaped.contains('\u{1b}'));
+        assert_eq!(escaped, "echo ok\\nrm -rf /\\t\\u{202e}gnp.exe\\\\");
+        assert_eq!(escape_for_prompt("plain text"), "plain text");
     }
 
     #[test]

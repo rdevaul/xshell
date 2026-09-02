@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -391,27 +391,7 @@ fn unix_timestamp_ms() -> Result<u64> {
 }
 
 pub fn ensure_secure_directory(path: &Path) -> Result<()> {
-    if path.exists() {
-        let metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("cannot inspect audit directory {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!("audit path {} must be a real directory", path.display());
-        }
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            bail!(
-                "audit directory {} is not owned by the daemon user",
-                path.display()
-            );
-        }
-        if metadata.mode() & 0o022 != 0 {
-            bail!("audit directory {} is group/world writable", path.display());
-        }
-    } else {
-        fs::create_dir_all(path)
-            .with_context(|| format!("cannot create audit directory {}", path.display()))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    xshell_platform::ensure_secure_directory(path, "audit")
 }
 
 fn validate_key_file(path: &Path, private: bool) -> Result<()> {

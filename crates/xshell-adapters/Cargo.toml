@@ -12,7 +12,5 @@ futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-xshell-core = { path = "../xshell-core" }
-
-[dev-dependencies]
 tokio.workspace = true
+xshell-core = { path = "../xshell-core" }

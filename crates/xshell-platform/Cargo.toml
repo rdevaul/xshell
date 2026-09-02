@@ -1,0 +1,15 @@
+[package]
+name = "xshell-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared Unix platform helpers: peer credentials and secure directory checks"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3.21"

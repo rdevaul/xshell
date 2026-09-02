@@ -6,4 +6,6 @@ pub use engine::{
     ExecutionEvent, TurnObserver, build_adapter, run_agent_turn, run_direct_shell,
     run_direct_shell_streaming,
 };
-pub use tools::{definitions, execute_tool, requires_approval, tool_summary};
+pub use tools::{
+    definitions, execute_tool, requires_approval, requires_approval_by_name, tool_summary,
+};

@@ -15,12 +15,26 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 8. The daemon
+with protocol version 9. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Protocol versions are exact rather than negotiated across incompatible
-schemas. Protocol v8 therefore requires upgrading and restarting `xshelld` on
-the controller and every connected remote host before a v8 CLI can attach.
+schemas. Any protocol bump therefore requires upgrading and restarting
+`xshelld` on the controller and every connected remote host before the new CLI
+can attach. Protocol v9 adds the `tool_skipped` execution event, emitted for
+each tool call that was never evaluated because the user aborted the turn at an
+earlier call in the same response.
+
+## Approval policy ceiling
+
+The daemon executes agent tools, so the daemon owns the upper bound on how
+much unattended execution it permits. `session_fabric.max_approval` (default
+`ask`) is the most permissive policy applied to any turn. A client requesting
+a more permissive policy is clamped and informed through the `turn_started`
+event's `requested_approval` field; the CLI prints a one-line notice. This
+matters once a controller on one host submits turns to `xshelld` on another:
+the remote operator's configuration, not the controller's flag, decides
+whether shell tools may run without a prompt there.
 
 ## Identity and attachment
 
@@ -35,7 +49,10 @@ the controller and every connected remote host before a v8 CLI can attach.
 - Unexpected socket disconnect has detach semantics.
 
 The daemon socket is mode `0600`; the state directory and host ID are mode
-`0700` and `0600`. No API key values cross the session protocol. A model
+`0700` and `0600`. The daemon additionally refuses to start if the socket's
+parent directory or the state directory is a symlink, is not owned by the
+daemon's user, or is group/world writable, and it rejects any connection whose
+peer UID (`SO_PEERCRED` / `getpeereid`) differs from its own. No API key values cross the session protocol. A model
 binding stores only the name of the credential environment variable.
 
 ## Lifecycle modes

@@ -20,28 +20,19 @@ use std::process::Command;
 use xshell_adapters::AgentAdapter;
 use xshell_audit::AuditEvent;
 use xshell_core::{
-    AgentEvent, ChatMessage, ChatRequest, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute,
-    ToolCall, classify_input,
+    ChatMessage, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute, ToolCall, classify_input,
 };
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, ExecutionEvent,
-    build_adapter as build_execution_adapter, tool_summary,
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent,
+    TurnObserver, build_adapter as build_execution_adapter, tool_summary,
 };
 use xshell_session::{
     PersistenceMode, SessionEventKind, SessionSnapshot, TurnInput, Visibility, load_view_resource,
 };
-use xshell_view::{AgentRenderer, RenderOptions, ViewInput, ViewerRegistry};
-
-/// Maximum number of agent tool-call steps per turn before the loop
-/// aborts. Kept bounded so a misbehaving model cannot loop forever.
-const MAX_AGENT_STEPS: usize = 64;
-
-fn resolve_approval(mode: ApprovalPolicy, gated: bool) -> bool {
-    match mode {
-        ApprovalPolicy::Ask | ApprovalPolicy::Off => !gated,
-        ApprovalPolicy::Auto => true,
-    }
-}
+use xshell_view::{
+    AgentRenderer, RenderOptions, ViewInput, ViewerRegistry, escape_for_prompt,
+    sanitize_terminal_text,
+};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "An agent-first, network-aware interactive shell")]
@@ -139,6 +130,9 @@ async fn main() -> Result<()> {
     }
     let mut agent = build_adapter(&active_model, !sessions.enabled())?;
     let mut audit = AuditRuntime::start(&model_config.audit)?;
+    if sessions.enabled() {
+        audit.delegate_execution_events();
+    }
     audit.append(AuditEvent::SessionStarted {
         client_version: env!("CARGO_PKG_VERSION").into(),
         cwd: cwd.display().to_string(),
@@ -214,10 +208,19 @@ async fn main() -> Result<()> {
 
         let route = apply_sticky_shell_mode(classify_input(&line), &mut sticky_shell);
         if !matches!(route, InputRoute::Empty) {
-            audit.append(AuditEvent::Input {
-                route: input_route_name(&route).into(),
-                text: line.clone(),
-            })?;
+            // Control commands never reach the daemon; always record them.
+            // Agent and shell input is recorded by whichever process runs it.
+            if matches!(route, InputRoute::Control(_)) {
+                audit.append(AuditEvent::Input {
+                    route: input_route_name(&route).into(),
+                    text: line.clone(),
+                })?;
+            } else {
+                audit.append_execution(AuditEvent::Input {
+                    route: input_route_name(&route).into(),
+                    text: line.clone(),
+                })?;
+            }
         }
 
         match route {
@@ -225,6 +228,14 @@ async fn main() -> Result<()> {
             InputRoute::Shell(command) => {
                 if sessions.enabled() {
                     if xshell_pty::controller_is_terminal() && !is_simple_cd(&command) {
+                        // Terminal jobs are started through the PTY protocol,
+                        // which the daemon does not yet audit (see
+                        // docs/auditing.md). Record the input and completion
+                        // from the controller so the trail stays complete.
+                        audit.append(AuditEvent::Input {
+                            route: "shell_terminal".into(),
+                            text: line.clone(),
+                        })?;
                         let previous_session = sessions.active().map(|session| session.id.clone());
                         let result = match run_session_pty(&mut sessions, &command, pty_escape) {
                             Ok(outcome) => outcome,
@@ -591,7 +602,7 @@ async fn main() -> Result<()> {
                             true,
                         )?,
                         Err(error) => {
-                            let _ = audit.append(AuditEvent::AgentError {
+                            let _ = audit.append_execution(AuditEvent::AgentError {
                                 message: format!("{error:#}"),
                             });
                             eprintln!("xshell agent error: {error:#}");
@@ -679,7 +690,18 @@ fn follow_daemon_turn(
         }
         for record in batch.events {
             match record.event {
-                SessionEventKind::TurnStarted { .. } => {}
+                SessionEventKind::TurnStarted {
+                    approval,
+                    requested_approval,
+                    ..
+                } => {
+                    if let Some(requested) = requested_approval {
+                        eprintln!(
+                            "xshell: session host limits approval to \"{approval}\"; \
+requested \"{requested}\" was not applied"
+                        );
+                    }
+                }
                 SessionEventKind::Execution { event } => match event {
                     ExecutionEvent::TextDelta { text } => {
                         renderer.push(&text, &mut stdout)?;
@@ -694,15 +716,18 @@ fn follow_daemon_turn(
                         }
                         renderer.finish(&mut stdout)?;
                         renderer = AgentRenderer::new(render_options);
-                        audit.append(AuditEvent::AgentResponse {
+                        audit.append_execution(AuditEvent::AgentResponse {
                             content,
                             tool_call_count,
                             partial,
                         })?;
                     }
                     ExecutionEvent::ToolRequested { call } => {
-                        println!("agent requests: {}", tool_summary(&call));
-                        audit.append(AuditEvent::ToolRequested {
+                        println!(
+                            "agent requests: {}",
+                            escape_for_prompt(&tool_summary(&call))
+                        );
+                        audit.append_execution(AuditEvent::ToolRequested {
                             call_id: call.id,
                             name: call.name,
                             arguments: call.arguments,
@@ -713,9 +738,15 @@ fn follow_daemon_turn(
                         sessions.approve(record.turn_id.clone(), call.id.clone(), decision)?;
                     }
                     ExecutionEvent::ToolDecision { call_id, decision } => {
-                        audit.append(AuditEvent::ToolDecision {
+                        audit.append_execution(AuditEvent::ToolDecision {
                             call_id,
                             decision: approval_decision_name(decision).into(),
+                        })?;
+                    }
+                    ExecutionEvent::ToolSkipped { call_id, .. } => {
+                        audit.append_execution(AuditEvent::ToolDecision {
+                            call_id,
+                            decision: "skipped_after_abort".into(),
                         })?;
                     }
                     ExecutionEvent::ToolResult {
@@ -723,7 +754,7 @@ fn follow_daemon_turn(
                         name,
                         result,
                     } => {
-                        audit.append(AuditEvent::ToolResult {
+                        audit.append_execution(AuditEvent::ToolResult {
                             call_id,
                             name,
                             result: result.clone(),
@@ -744,7 +775,7 @@ fn follow_daemon_turn(
                     }
                 }
                 SessionEventKind::WorkingDirectoryChanged { cwd } => {
-                    audit.append(AuditEvent::WorkingDirectoryChanged {
+                    audit.append_execution(AuditEvent::WorkingDirectoryChanged {
                         cwd: cwd.display().to_string(),
                     })?;
                 }
@@ -759,7 +790,7 @@ fn follow_daemon_turn(
                     renderer.finish(&mut stdout)?;
                     let snapshot = sessions.refresh_snapshot()?;
                     if let Some((command, status)) = shell_finished.take() {
-                        audit.append(AuditEvent::ShellFinished {
+                        audit.append_execution(AuditEvent::ShellFinished {
                             command,
                             outcome: status,
                             cwd: snapshot.descriptor.cwd.display().to_string(),
@@ -801,6 +832,164 @@ fn apply_runtime_snapshot(
     Ok(())
 }
 
+/// Observer for turns executed in-process (no session daemon). It renders
+/// streamed output, prompts for approvals, and appends audit events exactly
+/// as `follow_daemon_turn` does for daemon-executed turns, so both paths
+/// share `xshell_execution::run_agent_turn` and cannot drift apart.
+struct LocalObserver<'a> {
+    audit: &'a mut AuditRuntime,
+    render_options: RenderOptions,
+    renderer: AgentRenderer,
+    cwd: &'a Path,
+    cancellation: CancellationFlag,
+    /// Whether the most recent `ToolDecision` approved execution, so the
+    /// read-only policy note is printed only for tools that actually ran.
+    last_approved: bool,
+    /// First error raised while rendering or auditing. The engine's observer
+    /// interface is infallible, so failures are captured here and surfaced
+    /// after the turn returns.
+    failure: Option<anyhow::Error>,
+}
+
+impl<'a> LocalObserver<'a> {
+    fn new(audit: &'a mut AuditRuntime, render_options: RenderOptions, cwd: &'a Path) -> Self {
+        Self {
+            audit,
+            render_options,
+            renderer: AgentRenderer::new(render_options),
+            cwd,
+            cancellation: CancellationFlag::default(),
+            last_approved: false,
+            failure: None,
+        }
+    }
+
+    fn record(&mut self, result: Result<()>) {
+        if let Err(error) = result
+            && self.failure.is_none()
+        {
+            self.failure = Some(error);
+        }
+    }
+
+    fn finish(mut self, outcome: Result<()>) -> Result<()> {
+        let flush = self
+            .renderer
+            .finish(&mut io::stdout())
+            .context("could not render agent response");
+        self.record(flush);
+        match (outcome, self.failure) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Some(error)) => Err(error),
+            (Ok(()), None) => Ok(()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnObserver for LocalObserver<'_> {
+    fn emit(&mut self, event: ExecutionEvent) {
+        let mut stdout = io::stdout();
+        let result: Result<()> = match event {
+            ExecutionEvent::TextDelta { text } => self
+                .renderer
+                .push(&text, &mut stdout)
+                .context("could not render agent response"),
+            ExecutionEvent::AgentResponse {
+                content,
+                tool_call_count,
+                partial,
+            } => {
+                let mut result = Ok(());
+                if !self.renderer.received_delta() && !content.is_empty() {
+                    result = self
+                        .renderer
+                        .push(&content, &mut stdout)
+                        .context("could not render agent response");
+                }
+                result = result.and(
+                    self.renderer
+                        .finish(&mut stdout)
+                        .context("could not render agent response"),
+                );
+                self.renderer = AgentRenderer::new(self.render_options);
+                if !partial && tool_call_count == 0 {
+                    println!();
+                }
+                result.and(self.audit.append(AuditEvent::AgentResponse {
+                    content,
+                    tool_call_count,
+                    partial,
+                }))
+            }
+            ExecutionEvent::ToolRequested { call } => {
+                println!(
+                    "\nagent requests: {}",
+                    escape_for_prompt(&tool_summary(&call))
+                );
+                self.audit.append(AuditEvent::ToolRequested {
+                    call_id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                })
+            }
+            // The prompt itself is issued from `approve`; nothing to echo.
+            ExecutionEvent::ApprovalRequested { .. } => Ok(()),
+            ExecutionEvent::ToolDecision { call_id, decision } => {
+                self.last_approved = decision == ApprovalDecision::Approve;
+                self.audit.append(AuditEvent::ToolDecision {
+                    call_id,
+                    decision: approval_decision_name(decision).into(),
+                })
+            }
+            ExecutionEvent::ToolSkipped { call_id, .. } => {
+                self.audit.append(AuditEvent::ToolDecision {
+                    call_id,
+                    decision: "skipped_after_abort".into(),
+                })
+            }
+            ExecutionEvent::ToolResult {
+                call_id,
+                name,
+                result,
+            } => {
+                if self.last_approved && !tools::requires_approval_by_name(&name) {
+                    println!(
+                        "policy: allowed read-only tool within {}",
+                        self.cwd.display()
+                    );
+                }
+                let appended = self.audit.append(AuditEvent::ToolResult {
+                    call_id,
+                    name,
+                    result: result.clone(),
+                });
+                print_tool_result(&result);
+                appended
+            }
+            ExecutionEvent::TurnAborted => {
+                println!("agent turn aborted; no remaining tools were executed\n");
+                Ok(())
+            }
+        };
+        self.record(result);
+    }
+
+    fn cancellation(&self) -> CancellationFlag {
+        self.cancellation.clone()
+    }
+
+    async fn approve(&mut self, call: &ToolCall) -> ApprovalDecision {
+        match confirm_tool(call) {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.record(Err(error));
+                ApprovalDecision::AbortTurn
+            }
+        }
+    }
+}
+
 async fn run_agent_turn(
     agent: &mut dyn AgentAdapter,
     history: &mut Vec<ChatMessage>,
@@ -810,131 +999,11 @@ async fn run_agent_turn(
     audit: &mut AuditRuntime,
     render_options: RenderOptions,
 ) -> Result<()> {
-    let checkpoint = history.len();
-    history.push(ChatMessage::user(message));
-    let definitions = tools::definitions();
-
-    for _ in 0..MAX_AGENT_STEPS {
-        let mut streamed_text = String::new();
-        let mut renderer = AgentRenderer::new(render_options);
-        let mut stdout = io::stdout();
-        let mut render_error = None;
-        let mut emit = |event| match event {
-            AgentEvent::TextDelta(delta) => {
-                streamed_text.push_str(&delta);
-                if render_error.is_none()
-                    && let Err(error) = renderer.push(&delta, &mut stdout)
-                {
-                    render_error = Some(error);
-                }
-            }
-        };
-        let response = match agent
-            .chat_stream(
-                ChatRequest {
-                    messages: history.clone(),
-                    tools: definitions.clone(),
-                },
-                &mut emit,
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                let _ = renderer.finish(&mut stdout);
-                if !streamed_text.is_empty() {
-                    audit.append(AuditEvent::AgentResponse {
-                        content: streamed_text,
-                        tool_call_count: 0,
-                        partial: true,
-                    })?;
-                }
-                history.truncate(checkpoint);
-                return Err(error.into());
-            }
-        };
-        if let Some(error) = render_error {
-            return Err(error).context("could not render agent response");
-        }
-        if !renderer.received_delta() && !response.content.is_empty() {
-            renderer.push(&response.content, &mut stdout)?;
-        }
-        renderer.finish(&mut stdout)?;
-
-        audit.append(AuditEvent::AgentResponse {
-            content: response.content.clone(),
-            tool_call_count: response.tool_calls.len(),
-            partial: false,
-        })?;
-        for call in &response.tool_calls {
-            audit.append(AuditEvent::ToolRequested {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            })?;
-        }
-        history.push(ChatMessage::assistant_with_tools(
-            response.content,
-            response.tool_calls.clone(),
-        ));
-        if response.tool_calls.is_empty() {
-            println!();
-            return Ok(());
-        }
-
-        for (index, call) in response.tool_calls.iter().enumerate() {
-            println!("\nagent requests: {}", tools::summary(call));
-            // Approval policy: `auto` runs every tool, `off` denies
-            // gated (shell) tools, and `ask` (default) prompts for them.
-            let gated = tools::requires_approval(call);
-            let decision = if resolve_approval(approval, gated) {
-                ApprovalDecision::Approve
-            } else if approval == ApprovalPolicy::Ask && gated {
-                confirm_tool(call)?
-            } else {
-                ApprovalDecision::Deny
-            };
-            audit.append(AuditEvent::ToolDecision {
-                call_id: call.id.clone(),
-                decision: approval_decision_name(decision).into(),
-            })?;
-
-            if decision == ApprovalDecision::AbortTurn {
-                for skipped in &response.tool_calls[index..] {
-                    history.push(ChatMessage::tool_result(
-                        skipped,
-                        "tool execution aborted by user; agent turn stopped",
-                    ));
-                }
-                for skipped in &response.tool_calls[index + 1..] {
-                    audit.append(AuditEvent::ToolDecision {
-                        call_id: skipped.id.clone(),
-                        decision: "skipped_after_abort".into(),
-                    })?;
-                }
-                println!("agent turn aborted; no remaining tools were executed\n");
-                return Ok(());
-            }
-
-            let result = if decision == ApprovalDecision::Approve {
-                if !tools::requires_approval(call) {
-                    println!("policy: allowed read-only tool within {}", cwd.display());
-                }
-                tools::execute(call, cwd).await
-            } else {
-                "tool denied by user".into()
-            };
-            audit.append(AuditEvent::ToolResult {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                result: result.clone(),
-            })?;
-            print_tool_result(&result);
-            history.push(ChatMessage::tool_result(call, result));
-        }
-    }
-
-    bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
+    let mut observer = LocalObserver::new(audit, render_options, cwd);
+    let outcome =
+        xshell_execution::run_agent_turn(agent, history, message, cwd, approval, &mut observer)
+            .await;
+    observer.finish(outcome)
 }
 
 fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
@@ -947,7 +1016,13 @@ fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
 
 fn confirm_tool(call: &ToolCall) -> Result<ApprovalDecision> {
     loop {
-        print!("Approve `{}`? [y/N/q] ", tools::summary(call));
+        // Tool arguments are model-controlled. Escape them so the command the
+        // user approves is exactly the command that will run: no control
+        // sequences can redraw the line, and embedded newlines are visible.
+        print!(
+            "Approve `{}`? [y/N/q] ",
+            escape_for_prompt(&tools::summary(call))
+        );
         io::stdout()
             .flush()
             .context("could not flush approval prompt")?;
@@ -977,7 +1052,8 @@ fn parse_approval_response(answer: &str) -> Option<ApprovalDecision> {
 fn print_tool_result(result: &str) {
     const DISPLAY_LIMIT: usize = 4 * 1024;
     let end = floor_char_boundary(result, result.len().min(DISPLAY_LIMIT));
-    println!("tool result:\n{}", &result[..end]);
+    // Tool output (file contents, command stdout) is untrusted terminal text.
+    println!("tool result:\n{}", sanitize_terminal_text(&result[..end]));
     if end < result.len() {
         println!("[terminal display truncated; full result returned to agent]");
     }
@@ -1967,16 +2043,6 @@ mod tests {
             InputRoute::Agent("explain this".into())
         );
         assert!(!sticky);
-    }
-
-    #[test]
-    fn approval_policy_handles_gated_and_read_only_tools() {
-        assert!(!resolve_approval(ApprovalPolicy::Ask, true));
-        assert!(resolve_approval(ApprovalPolicy::Ask, false));
-        assert!(resolve_approval(ApprovalPolicy::Auto, true));
-        assert!(resolve_approval(ApprovalPolicy::Auto, false));
-        assert!(!resolve_approval(ApprovalPolicy::Off, true));
-        assert!(resolve_approval(ApprovalPolicy::Off, false));
     }
 
     #[test]

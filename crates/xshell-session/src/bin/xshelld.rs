@@ -12,10 +12,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use xshell_platform::LockExt;
 use xshell_session::{
-    ClientPtyFrame, ClientRequest, ExecutionCoordinator, PersistenceMode, PtyClaim, PtyCoordinator,
-    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionConfig,
-    SessionRegistry, complete_shell, load_view_resource, read_client_frame, write_server_frame,
+    ClientPtyFrame, ClientRequest, DaemonAudit, ExecutionCoordinator, PersistenceMode, PtyClaim,
+    PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
+    SessionConfig, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
+    write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -33,6 +35,12 @@ struct Args {
 
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Ignore XSHELL_CONFIG and ~/.config/xshell/config.toml; use only
+    /// command-line flags and built-in defaults. Intended for tests and
+    /// hermetic deployments.
+    #[arg(long, global = true, conflicts_with = "config")]
+    no_user_config: bool,
 
     #[arg(long, global = true)]
     state_directory: Option<PathBuf>,
@@ -59,12 +67,18 @@ enum DaemonCommand {
 struct ConfigFile {
     #[serde(default)]
     session_fabric: SessionConfig,
+    #[serde(default)]
+    audit: xshell_audit::AuditConfig,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let config_path = resolve_config_path(args.config)?;
-    let config = load_config(config_path.as_deref())?;
+    let config_path = if args.no_user_config {
+        None
+    } else {
+        resolve_config_path(args.config)?
+    };
+    let (config, audit_config) = load_config(config_path.as_deref())?;
     let state_directory = args
         .state_directory
         .or_else(|| config.resolved_state_directory())
@@ -88,14 +102,16 @@ fn main() -> Result<()> {
         host_alias,
         user,
     )?));
-    let execution = ExecutionCoordinator::new(Arc::clone(&registry));
+    let audit = DaemonAudit::from_config(&audit_config)?;
+    let execution =
+        ExecutionCoordinator::with_policy(Arc::clone(&registry), audit, config.max_approval);
     let ptys = PtyCoordinator::default();
 
     prepare_socket(&socket)?;
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("cannot bind session socket {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    let identity = registry.lock().expect("session registry poisoned");
+    let identity = registry.lock_recover();
     println!("xshelld listening on {}", socket.display());
     println!(
         "host: {} ({}) user: {}",
@@ -104,10 +120,28 @@ fn main() -> Result<()> {
         identity.user()
     );
     drop(identity);
+    println!("max approval: {}", execution.max_approval());
+    println!(
+        "audit: {}",
+        match (execution.audit().enabled(), execution.audit().required()) {
+            (false, _) => "disabled".to_owned(),
+            (true, true) => "required (execution-boundary)".to_owned(),
+            (true, false) => "best-effort (execution-boundary)".to_owned(),
+        }
+    );
+
+    install_shutdown_handler(execution.audit().clone());
 
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
+                // The daemon runs commands as the invoking user. Socket mode
+                // is not a sufficient control on every platform, so verify
+                // the peer explicitly before reading a single request byte.
+                if let Err(error) = xshell_platform::require_same_user(&stream, "session") {
+                    eprintln!("xshelld: {error:#}");
+                    continue;
+                }
                 let registry = Arc::clone(&registry);
                 let execution = execution.clone();
                 let ptys = ptys.clone();
@@ -121,6 +155,32 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// On SIGINT/SIGTERM, finalize open audit sessions with signed checkpoints and
+/// exit. Without this, `launchctl stop` or Ctrl-C would leave every daemon
+/// audit log without a final checkpoint, which the verifier reports as
+/// possibly truncated.
+fn install_shutdown_handler(audit: DaemonAudit) {
+    thread::Builder::new()
+        .name("xshelld-shutdown".into())
+        .spawn(move || {
+            let mut signals = match signal_hook::iterator::Signals::new([
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+            ]) {
+                Ok(signals) => signals,
+                Err(error) => {
+                    eprintln!("xshelld: cannot install shutdown handler: {error}");
+                    return;
+                }
+            };
+            if signals.forever().next().is_some() {
+                audit.close_all("xshelld shutdown");
+                std::process::exit(0);
+            }
+        })
+        .expect("cannot spawn shutdown handler thread");
 }
 
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
@@ -323,15 +383,18 @@ fn remote_visibility_error() -> ServerResponse {
     }
 }
 
-fn load_config(path: Option<&Path>) -> Result<SessionConfig> {
+fn load_config(path: Option<&Path>) -> Result<(SessionConfig, xshell_audit::AuditConfig)> {
     let Some(path) = path else {
-        return Ok(SessionConfig::default());
+        return Ok((
+            SessionConfig::default(),
+            xshell_audit::AuditConfig::default(),
+        ));
     };
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read configuration file {}", path.display()))?;
     let config: ConfigFile = toml::from_str(&source)
         .with_context(|| format!("invalid configuration file {}", path.display()))?;
-    Ok(config.session_fabric)
+    Ok((config.session_fabric, config.audit))
 }
 
 fn handle_client(
@@ -369,7 +432,7 @@ fn handle_client(
 
     let client_id = Uuid::new_v4().to_string();
     {
-        let registry = registry.lock().expect("session registry poisoned");
+        let registry = registry.lock_recover();
         send(
             &mut writer,
             &ServerResponse::Opened {
@@ -516,7 +579,7 @@ fn process_request(
 ) -> Result<ServerResponse> {
     match request {
         ClientRequest::List => {
-            let mut sessions = registry.lock().expect("session registry poisoned").list();
+            let mut sessions = registry.lock_recover().list();
             for session in &mut sessions {
                 session.activity = session_activity(execution, ptys, &session.id);
             }
@@ -531,10 +594,7 @@ fn process_request(
                     .canonicalize()
                     .context("cannot resolve session host home directory")?;
             }
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .create(client_id, creation)?;
+            let session = registry.lock_recover().create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
                 detach_session(registry, execution, ptys, client_id, &previous)?;
             }
@@ -547,10 +607,7 @@ fn process_request(
             if attached_session.is_some() {
                 bail!("detach the current session before attaching another one");
             }
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .attach(client_id, &selector, role)?;
+            let session = registry.lock_recover().attach(client_id, &selector, role)?;
             *attached_session = Some(session.descriptor.id.clone());
             Ok(ServerResponse::Attached {
                 session: with_activity(session, execution, ptys),
@@ -558,10 +615,7 @@ fn process_request(
             })
         }
         ClientRequest::Switch { selector, role } => {
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .attach(client_id, &selector, role)?;
+            let session = registry.lock_recover().attach(client_id, &selector, role)?;
             if let Some(previous) = attached_session.take()
                 && previous != session.descriptor.id
             {
@@ -586,10 +640,7 @@ fn process_request(
                 bail!("cannot replace session state while a turn is active");
             }
             if ptys.has_session(&session_id) {
-                let snapshot = registry
-                    .lock()
-                    .expect("session registry poisoned")
-                    .snapshot(&session_id)?;
+                let snapshot = registry.lock_recover().snapshot(&session_id)?;
                 if snapshot.descriptor.model == model
                     && snapshot.descriptor.cwd == cwd
                     && snapshot.history == history
@@ -600,23 +651,17 @@ fn process_request(
                 }
                 bail!("cannot replace session state while a PTY is active");
             }
-            let session = registry.lock().expect("session registry poisoned").update(
-                client_id,
-                &session_id,
-                model,
-                cwd,
-                history,
-            )?;
+            let session =
+                registry
+                    .lock_recover()
+                    .update(client_id, &session_id, model, cwd, history)?;
             Ok(ServerResponse::Updated {
                 session: descriptor_with_activity(session, execution, ptys),
             })
         }
         ClientRequest::Snapshot { session_id } => {
             require_current(attached_session, &session_id)?;
-            let session = registry
-                .lock()
-                .expect("session registry poisoned")
-                .snapshot(&session_id)?;
+            let session = registry.lock_recover().snapshot(&session_id)?;
             Ok(ServerResponse::Snapshot {
                 session: with_activity(session, execution, ptys),
             })
@@ -662,8 +707,7 @@ fn process_request(
             cursor,
         } => {
             let cwd = registry
-                .lock()
-                .expect("session registry poisoned")
+                .lock_recover()
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
@@ -674,8 +718,7 @@ fn process_request(
         ClientRequest::ViewSource { session_id, path } => {
             require_current(attached_session, &session_id)?;
             let cwd = registry
-                .lock()
-                .expect("session registry poisoned")
+                .lock_recover()
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
@@ -694,8 +737,7 @@ fn process_request(
                 bail!("cannot start a PTY while a turn is active");
             }
             let cwd = registry
-                .lock()
-                .expect("session registry poisoned")
+                .lock_recover()
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
@@ -734,18 +776,11 @@ fn process_request(
             let selector = selector
                 .or_else(|| attached_session.clone())
                 .context("close requires a session selector when detached")?;
-            let resolved = registry
-                .lock()
-                .expect("session registry poisoned")
-                .snapshot(&selector)?
-                .descriptor
-                .id;
+            let resolved = registry.lock_recover().snapshot(&selector)?.descriptor.id;
             ptys.terminate_session(&resolved);
-            let session_id = registry
-                .lock()
-                .expect("session registry poisoned")
-                .close(client_id, &selector)?;
+            let session_id = registry.lock_recover().close(client_id, &selector)?;
             execution.cancel_and_remove(&resolved);
+            execution.audit().close_session(&resolved, "session closed");
             if attached_session.as_deref() == Some(session_id.as_str()) {
                 *attached_session = None;
             }
@@ -844,8 +879,7 @@ fn detach_session(
     session_id: &str,
 ) -> Result<Option<String>> {
     let persistence = registry
-        .lock()
-        .expect("session registry poisoned")
+        .lock_recover()
         .snapshot(session_id)?
         .descriptor
         .persistence;
@@ -853,10 +887,7 @@ fn detach_session(
         execution.cancel_and_remove(session_id);
         ptys.terminate_session(session_id);
     }
-    registry
-        .lock()
-        .expect("session registry poisoned")
-        .detach(client_id, session_id)
+    registry.lock_recover().detach(client_id, session_id)
 }
 
 fn read_request_line(reader: &mut impl BufRead) -> Result<Option<String>> {
@@ -902,8 +933,10 @@ fn prepare_socket(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("session socket must have a parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("cannot create socket directory {}", parent.display()))?;
+    // The socket's parent must be ours and private; otherwise another local
+    // user could pre-create the directory (for example under /tmp) and
+    // replace or redirect the socket.
+    xshell_platform::ensure_secure_directory(parent, "session socket")?;
     if path.exists() {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.file_type().is_socket() {
@@ -916,8 +949,7 @@ fn prepare_socket(path: &Path) -> Result<()> {
 }
 
 fn load_or_create_host_id(state_directory: &Path) -> Result<String> {
-    fs::create_dir_all(state_directory)?;
-    fs::set_permissions(state_directory, fs::Permissions::from_mode(0o700))?;
+    xshell_platform::ensure_secure_directory(state_directory, "session state")?;
     let path = state_directory.join("host-id");
     if path.exists() {
         let value = fs::read_to_string(&path)?;
@@ -935,7 +967,9 @@ fn load_or_create_host_id(state_directory: &Path) -> Result<String> {
 }
 
 fn system_hostname() -> String {
-    let mut buffer = [0_i8; 256];
+    // `c_char` is `i8` on x86_64 but `u8` on aarch64 Linux; spell the element
+    // type through libc so this compiles on every supported target.
+    let mut buffer = [0 as libc::c_char; 256];
     if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } == 0 {
         let hostname = unsafe { CStr::from_ptr(buffer.as_ptr()) };
         if let Ok(hostname) = hostname.to_str() {
