@@ -17,7 +17,7 @@ pub struct OllamaAdapter {
 impl OllamaAdapter {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
         }
@@ -213,6 +213,29 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.tool_calls[0].arguments["path"], "README.md");
         assert!(request.contains("\"stream\":true"));
+    }
+
+    #[tokio::test]
+    async fn rejects_unterminated_lines_beyond_the_buffer_cap() {
+        // A single line larger than the cap, never terminated by '\n'.
+        let body = "x".repeat(crate::MAX_PENDING_LINE_BYTES + 1);
+        let (base_url, server) = serve_once("application/x-ndjson", body);
+        let mut adapter = OllamaAdapter::new(base_url, "test-model");
+        let error = adapter
+            .chat_stream(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    tools: Vec::new(),
+                },
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        let _ = server.join();
+        assert!(
+            matches!(error, AdapterError::InvalidResponse(ref message) if message.contains("without a line terminator")),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

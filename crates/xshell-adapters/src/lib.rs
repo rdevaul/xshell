@@ -3,10 +3,32 @@ mod openai;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use std::time::Duration;
 use xshell_core::{AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatRequest};
 
 pub use ollama::OllamaAdapter;
 pub use openai::OpenAiCompatibleAdapter;
+
+/// Time allowed to establish a TCP/TLS connection to the provider.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Time allowed between consecutive bytes of a streamed response. Applies to
+/// waiting for response headers as well. Generous enough for slow local models
+/// to produce the first token after prompt processing, but bounded so that a
+/// stalled provider cannot wedge a detached daemon turn forever.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Maximum bytes buffered while waiting for a line terminator from the
+/// provider. Streamed JSON chunks and SSE events are far smaller than this.
+const MAX_PENDING_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Build the HTTP client shared by all adapters. Every provider request goes
+/// through this so the timeout policy is defined in exactly one place.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(STREAM_IDLE_TIMEOUT)
+        .build()
+        .expect("static reqwest client configuration is valid")
+}
 
 #[async_trait]
 pub trait AgentAdapter: Send {
@@ -37,9 +59,27 @@ async fn stream_lines(
 
     let mut stream = response.bytes_stream();
     let mut pending = Vec::<u8>::new();
-    while let Some(chunk) = stream.next().await {
-        pending
-            .extend_from_slice(&chunk.map_err(|error| AdapterError::Transport(error.to_string()))?);
+    loop {
+        // `read_timeout` on the client covers socket-level stalls; this guard
+        // additionally bounds the wait for the next frame at the stream layer
+        // so HTTP/2 or proxy keepalives cannot hold the turn open indefinitely.
+        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(AdapterError::Transport(format!(
+                    "no data received from the agent endpoint for {} seconds",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        let chunk = chunk.map_err(|error| AdapterError::Transport(error.to_string()))?;
+        if pending.len().saturating_add(chunk.len()) > MAX_PENDING_LINE_BYTES {
+            return Err(AdapterError::InvalidResponse(format!(
+                "the agent endpoint sent more than {MAX_PENDING_LINE_BYTES} bytes without a line terminator"
+            )));
+        }
+        pending.extend_from_slice(&chunk);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let mut line = pending.drain(..=newline).collect::<Vec<_>>();
             line.pop();

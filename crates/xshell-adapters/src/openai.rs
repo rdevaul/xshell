@@ -23,7 +23,7 @@ impl OpenAiCompatibleAdapter {
         api_key: Option<String>,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             api_key,
