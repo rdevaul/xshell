@@ -102,7 +102,8 @@ fn main() -> Result<()> {
         user,
     )?));
     let audit = DaemonAudit::from_config(&audit_config)?;
-    let execution = ExecutionCoordinator::with_audit(Arc::clone(&registry), audit);
+    let execution =
+        ExecutionCoordinator::with_policy(Arc::clone(&registry), audit, config.max_approval);
     let ptys = PtyCoordinator::default();
 
     prepare_socket(&socket)?;
@@ -118,6 +119,7 @@ fn main() -> Result<()> {
         identity.user()
     );
     drop(identity);
+    println!("max approval: {}", execution.max_approval());
     println!(
         "audit: {}",
         match (execution.audit().enabled(), execution.audit().required()) {

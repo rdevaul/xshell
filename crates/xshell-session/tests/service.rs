@@ -1030,3 +1030,112 @@ fn daemon_audits_execution_without_an_attached_client() {
         "no daemon-written audit log contained the shell turn"
     );
 }
+
+#[test]
+fn daemon_clamps_client_approval_to_its_configured_ceiling() {
+    let tool_response = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"id\":\"call_1\",\"function\":{\"name\":\"run_shell\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"printf must-not-run\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let final_response = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"finished\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let (base_url, model_server) = serve_sse(vec![tool_response, final_response]);
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[session_fabric]\nenabled = true\nmax_approval = \"off\"\n",
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--config", config_path.to_str().unwrap()])
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "clamped".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    // The client asks for unattended execution; the daemon must not grant it.
+    client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Agent {
+                message: "run it".into(),
+            },
+            ApprovalPolicy::Auto,
+        )
+        .unwrap();
+
+    let mut after = 0;
+    let mut completed = false;
+    let mut saw_clamp = false;
+    let mut saw_prompt = false;
+    let mut decision = None;
+    let mut result = None;
+    for _ in 0..100 {
+        let batch = client
+            .events(session.descriptor.id.clone(), after, 500)
+            .unwrap();
+        for event in batch.events {
+            after = event.sequence;
+            match event.event {
+                SessionEventKind::TurnStarted {
+                    approval,
+                    requested_approval,
+                    ..
+                } => {
+                    assert_eq!(approval, ApprovalPolicy::Off);
+                    assert_eq!(requested_approval, Some(ApprovalPolicy::Auto));
+                    saw_clamp = true;
+                }
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ApprovalRequested { .. },
+                } => saw_prompt = true,
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ToolDecision { decision: d, .. },
+                } => decision = Some(d),
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ToolResult { result: r, .. },
+                } => result = Some(r),
+                SessionEventKind::TurnCompleted => completed = true,
+                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    model_server.join().unwrap();
+    assert!(completed);
+    assert!(saw_clamp, "TurnStarted did not report the clamped policy");
+    assert!(!saw_prompt, "policy off must not prompt");
+    assert_eq!(decision, Some(ApprovalDecision::Deny));
+    assert_eq!(result.as_deref(), Some("tool denied by user"));
+}

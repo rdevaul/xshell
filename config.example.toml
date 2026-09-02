@@ -52,6 +52,12 @@ required = true
 # socket = "/custom/private/dir/xshelld.sock"
 # state_directory = "/custom/private/dir"
 default_session = "default"
+# Most permissive approval policy this daemon will honour for any client,
+# local or remote: "off" (deny agent shell tools), "ask" (prompt), or "auto"
+# (run agent shell tools unattended). A client asking for more is clamped to
+# this value and told so. Raise to "auto" only on a host where you would run
+# `xshell --approval auto` yourself.
+max_approval = "ask"
 # Prefix for terminal-job commands: d detach, s switch, l last, n/p cycle,
 # q terminate, ? help, or repeat the prefix to send it literally.
 pty_escape = "ctrl-]"

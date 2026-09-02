@@ -30,6 +30,7 @@ struct CoordinatorInner {
     registry: Arc<Mutex<SessionRegistry>>,
     sessions: Mutex<HashMap<String, Arc<SessionExecution>>>,
     audit: DaemonAudit,
+    max_approval: ApprovalPolicy,
 }
 
 struct SessionExecution {
@@ -53,17 +54,26 @@ struct ActiveTurn {
 
 impl ExecutionCoordinator {
     pub fn new(registry: Arc<Mutex<SessionRegistry>>) -> Self {
-        Self::with_audit(registry, DaemonAudit::default())
+        Self::with_policy(registry, DaemonAudit::default(), ApprovalPolicy::Ask)
     }
 
-    pub fn with_audit(registry: Arc<Mutex<SessionRegistry>>, audit: DaemonAudit) -> Self {
+    pub fn with_policy(
+        registry: Arc<Mutex<SessionRegistry>>,
+        audit: DaemonAudit,
+        max_approval: ApprovalPolicy,
+    ) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
                 registry,
                 sessions: Mutex::new(HashMap::new()),
                 audit,
+                max_approval,
             }),
         }
+    }
+
+    pub fn max_approval(&self) -> ApprovalPolicy {
+        self.inner.max_approval
     }
 
     pub fn audit(&self) -> &DaemonAudit {
@@ -87,8 +97,12 @@ impl ExecutionCoordinator {
         &self,
         session_id: &str,
         input: TurnInput,
-        approval: ApprovalPolicy,
+        requested_approval: ApprovalPolicy,
     ) -> Result<String> {
+        // The daemon executes; the daemon decides how much unattended
+        // execution it permits. A client may ask for less, never more.
+        let approval = requested_approval.clamp_to(self.inner.max_approval);
+        let requested_approval = (approval != requested_approval).then_some(requested_approval);
         let snapshot = self
             .inner
             .registry
@@ -128,6 +142,7 @@ impl ExecutionCoordinator {
             SessionEventKind::TurnStarted {
                 input: input.clone(),
                 approval,
+                requested_approval,
             },
         );
 

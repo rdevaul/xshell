@@ -25,6 +25,17 @@ can attach. Protocol v9 adds the `tool_skipped` execution event, emitted for
 each tool call that was never evaluated because the user aborted the turn at an
 earlier call in the same response.
 
+## Approval policy ceiling
+
+The daemon executes agent tools, so the daemon owns the upper bound on how
+much unattended execution it permits. `session_fabric.max_approval` (default
+`ask`) is the most permissive policy applied to any turn. A client requesting
+a more permissive policy is clamped and informed through the `turn_started`
+event's `requested_approval` field; the CLI prints a one-line notice. This
+matters once a controller on one host submits turns to `xshelld` on another:
+the remote operator's configuration, not the controller's flag, decides
+whether shell tools may run without a prompt there.
+
 ## Identity and attachment
 
 - A session has a stable UUID. Its display name is unique within one daemon's

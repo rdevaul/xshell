@@ -31,6 +31,28 @@ pub enum ApprovalPolicy {
     Off,
 }
 
+impl ApprovalPolicy {
+    /// How much a policy lets an agent do without a human decision.
+    /// `Off` (deny shell) < `Ask` (prompt) < `Auto` (run everything).
+    fn permissiveness(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Ask => 1,
+            Self::Auto => 2,
+        }
+    }
+
+    /// Return the less permissive of `self` and `ceiling`. Used by a session
+    /// daemon to bound whatever a client requests.
+    pub fn clamp_to(self, ceiling: Self) -> Self {
+        if self.permissiveness() <= ceiling.permissiveness() {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
 impl std::fmt::Display for ApprovalPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -509,6 +531,17 @@ mod tests {
                 ExecutionEvent::TurnAborted => "aborted",
             })
             .collect()
+    }
+
+    #[test]
+    fn approval_clamp_never_exceeds_the_ceiling() {
+        use ApprovalPolicy::{Ask, Auto, Off};
+        assert_eq!(Auto.clamp_to(Off), Off);
+        assert_eq!(Auto.clamp_to(Ask), Ask);
+        assert_eq!(Auto.clamp_to(Auto), Auto);
+        assert_eq!(Ask.clamp_to(Off), Off);
+        assert_eq!(Ask.clamp_to(Auto), Ask);
+        assert_eq!(Off.clamp_to(Auto), Off);
     }
 
     #[tokio::test]

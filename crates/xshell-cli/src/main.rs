@@ -690,7 +690,18 @@ fn follow_daemon_turn(
         }
         for record in batch.events {
             match record.event {
-                SessionEventKind::TurnStarted { .. } => {}
+                SessionEventKind::TurnStarted {
+                    approval,
+                    requested_approval,
+                    ..
+                } => {
+                    if let Some(requested) = requested_approval {
+                        eprintln!(
+                            "xshell: session host limits approval to \"{approval}\"; \
+requested \"{requested}\" was not applied"
+                        );
+                    }
+                }
                 SessionEventKind::Execution { event } => match event {
                     ExecutionEvent::TextDelta { text } => {
                         renderer.push(&text, &mut stdout)?;
