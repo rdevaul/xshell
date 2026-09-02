@@ -106,6 +106,25 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
             Some("xterm-256color".into()),
         )
         .unwrap();
+    owner
+        .update(
+            session.descriptor.id.clone(),
+            model("local"),
+            temporary.path().to_owned(),
+            Vec::new(),
+        )
+        .expect("an unchanged update should be idempotent while the terminal is running");
+    assert!(
+        owner
+            .update(
+                session.descriptor.id.clone(),
+                model("local"),
+                temporary.path().to_owned(),
+                vec![ChatMessage::user("state replacement")],
+            )
+            .is_err(),
+        "a state-changing update must remain blocked while the terminal is running"
+    );
     let (mut first_proxy, mut first_input, mut first_output) =
         spawn_pty_proxy(&state, &socket, &ticket.ticket);
     assert_eq!(

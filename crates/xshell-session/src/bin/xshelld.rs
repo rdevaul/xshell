@@ -586,6 +586,18 @@ fn process_request(
                 bail!("cannot replace session state while a turn is active");
             }
             if ptys.has_session(&session_id) {
+                let snapshot = registry
+                    .lock()
+                    .expect("session registry poisoned")
+                    .snapshot(&session_id)?;
+                if snapshot.descriptor.model == model
+                    && snapshot.descriptor.cwd == cwd
+                    && snapshot.history == history
+                {
+                    return Ok(ServerResponse::Updated {
+                        session: descriptor_with_activity(snapshot.descriptor, execution, ptys),
+                    });
+                }
                 bail!("cannot replace session state while a PTY is active");
             }
             let session = registry.lock().expect("session registry poisoned").update(
