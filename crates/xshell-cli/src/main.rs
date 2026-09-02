@@ -30,7 +30,10 @@ use xshell_execution::{
 use xshell_session::{
     PersistenceMode, SessionEventKind, SessionSnapshot, TurnInput, Visibility, load_view_resource,
 };
-use xshell_view::{AgentRenderer, RenderOptions, ViewInput, ViewerRegistry};
+use xshell_view::{
+    AgentRenderer, RenderOptions, ViewInput, ViewerRegistry, escape_for_prompt,
+    sanitize_terminal_text,
+};
 
 /// Maximum number of agent tool-call steps per turn before the loop
 /// aborts. Kept bounded so a misbehaving model cannot loop forever.
@@ -701,7 +704,10 @@ fn follow_daemon_turn(
                         })?;
                     }
                     ExecutionEvent::ToolRequested { call } => {
-                        println!("agent requests: {}", tool_summary(&call));
+                        println!(
+                            "agent requests: {}",
+                            escape_for_prompt(&tool_summary(&call))
+                        );
                         audit.append(AuditEvent::ToolRequested {
                             call_id: call.id,
                             name: call.name,
@@ -883,7 +889,10 @@ async fn run_agent_turn(
         }
 
         for (index, call) in response.tool_calls.iter().enumerate() {
-            println!("\nagent requests: {}", tools::summary(call));
+            println!(
+                "\nagent requests: {}",
+                escape_for_prompt(&tools::summary(call))
+            );
             // Approval policy: `auto` runs every tool, `off` denies
             // gated (shell) tools, and `ask` (default) prompts for them.
             let gated = tools::requires_approval(call);
@@ -947,7 +956,13 @@ fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
 
 fn confirm_tool(call: &ToolCall) -> Result<ApprovalDecision> {
     loop {
-        print!("Approve `{}`? [y/N/q] ", tools::summary(call));
+        // Tool arguments are model-controlled. Escape them so the command the
+        // user approves is exactly the command that will run: no control
+        // sequences can redraw the line, and embedded newlines are visible.
+        print!(
+            "Approve `{}`? [y/N/q] ",
+            escape_for_prompt(&tools::summary(call))
+        );
         io::stdout()
             .flush()
             .context("could not flush approval prompt")?;
@@ -977,7 +992,8 @@ fn parse_approval_response(answer: &str) -> Option<ApprovalDecision> {
 fn print_tool_result(result: &str) {
     const DISPLAY_LIMIT: usize = 4 * 1024;
     let end = floor_char_boundary(result, result.len().min(DISPLAY_LIMIT));
-    println!("tool result:\n{}", &result[..end]);
+    // Tool output (file contents, command stdout) is untrusted terminal text.
+    println!("tool result:\n{}", sanitize_terminal_text(&result[..end]));
     if end < result.len() {
         println!("[terminal display truncated; full result returned to agent]");
     }
