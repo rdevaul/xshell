@@ -70,6 +70,12 @@ pub enum ExecutionEvent {
         call_id: String,
         decision: ApprovalDecision,
     },
+    /// A tool call that was never evaluated because the user aborted the
+    /// turn at an earlier call in the same response.
+    ToolSkipped {
+        call_id: String,
+        name: String,
+    },
     ToolResult {
         call_id: String,
         name: String,
@@ -235,6 +241,12 @@ pub async fn run_agent_turn(
                         skipped,
                         "tool execution aborted by user; agent turn stopped",
                     ));
+                }
+                for skipped in &response.tool_calls[index + 1..] {
+                    observer.emit(ExecutionEvent::ToolSkipped {
+                        call_id: skipped.id.clone(),
+                        name: skipped.name.clone(),
+                    });
                 }
                 observer.emit(ExecutionEvent::TurnAborted);
                 return Ok(());
@@ -406,7 +418,268 @@ fn expand_tilde(path: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::VecDeque;
     use tempfile::TempDir;
+    use xshell_core::{AdapterError, AgentDescriptor, AssistantResponse};
+
+    /// Replays a fixed script of assistant responses.
+    struct ScriptedAdapter {
+        responses: VecDeque<AssistantResponse>,
+        requests: Vec<ChatRequest>,
+    }
+
+    #[async_trait]
+    impl AgentAdapter for ScriptedAdapter {
+        fn descriptor(&self) -> AgentDescriptor {
+            AgentDescriptor {
+                id: "scripted".into(),
+                display_name: "scripted".into(),
+                model: "test".into(),
+                capabilities: Vec::new(),
+            }
+        }
+
+        async fn chat_stream(
+            &mut self,
+            request: ChatRequest,
+            events: &mut (dyn FnMut(AgentEvent) + Send),
+        ) -> Result<AssistantResponse, AdapterError> {
+            self.requests.push(request);
+            let response = self
+                .responses
+                .pop_front()
+                .ok_or_else(|| AdapterError::Transport("script exhausted".into()))?;
+            if !response.content.is_empty() {
+                events(AgentEvent::TextDelta(response.content.clone()));
+            }
+            Ok(response)
+        }
+    }
+
+    /// Records every event and answers approvals from a script.
+    struct RecordingObserver {
+        events: Vec<ExecutionEvent>,
+        decisions: VecDeque<ApprovalDecision>,
+        cancellation: CancellationFlag,
+    }
+
+    #[async_trait]
+    impl TurnObserver for RecordingObserver {
+        fn emit(&mut self, event: ExecutionEvent) {
+            self.events.push(event);
+        }
+
+        fn cancellation(&self) -> CancellationFlag {
+            self.cancellation.clone()
+        }
+
+        async fn approve(&mut self, _call: &ToolCall) -> ApprovalDecision {
+            self.decisions.pop_front().expect("unscripted approval")
+        }
+    }
+
+    fn shell_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": command}),
+        }
+    }
+
+    fn list_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "list_directory".into(),
+            arguments: json!({}),
+        }
+    }
+
+    fn kinds(events: &[ExecutionEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|event| match event {
+                ExecutionEvent::TextDelta { .. } => "delta",
+                ExecutionEvent::AgentResponse { .. } => "response",
+                ExecutionEvent::ToolRequested { .. } => "requested",
+                ExecutionEvent::ApprovalRequested { .. } => "approval",
+                ExecutionEvent::ToolDecision { .. } => "decision",
+                ExecutionEvent::ToolSkipped { .. } => "skipped",
+                ExecutionEvent::ToolResult { .. } => "result",
+                ExecutionEvent::TurnAborted => "aborted",
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_run_without_approval_and_shell_tools_prompt() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    content: "looking".into(),
+                    tool_calls: vec![list_call("a"), shell_call("b", "printf hi")],
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    tool_calls: Vec::new(),
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::from([ApprovalDecision::Deny]),
+            cancellation: CancellationFlag::default(),
+        };
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            ApprovalPolicy::Ask,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            kinds(&observer.events),
+            [
+                "delta",
+                "response",
+                "requested",
+                "requested",
+                "decision",
+                "result",
+                "approval",
+                "decision",
+                "result",
+                "delta",
+                "response",
+            ]
+        );
+        let results: Vec<_> = observer
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id.as_str(), result.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results[0].0, "a");
+        assert!(!results[0].1.starts_with("tool error"));
+        assert_eq!(results[1], ("b", "tool denied by user"));
+        // user, assistant(2 tools), tool, tool, assistant
+        assert_eq!(history.len(), 5);
+        assert_eq!(adapter.requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn abort_skips_remaining_tools_and_stubs_history() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: String::new(),
+                tool_calls: vec![
+                    shell_call("a", "true"),
+                    shell_call("b", "true"),
+                    list_call("c"),
+                ],
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::from([ApprovalDecision::AbortTurn]),
+            cancellation: CancellationFlag::default(),
+        };
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            ApprovalPolicy::Ask,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            kinds(&observer.events),
+            [
+                "response",
+                "requested",
+                "requested",
+                "requested",
+                "approval",
+                "decision",
+                "skipped",
+                "skipped",
+                "aborted",
+            ]
+        );
+        let skipped: Vec<_> = observer
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::ToolSkipped { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skipped, ["b", "c"]);
+        // Every tool call has a result stub so the transcript stays valid.
+        assert_eq!(history.len(), 5);
+        assert!(history[2..].iter().all(|message| {
+            message.content == "tool execution aborted by user; agent turn stopped"
+        }));
+    }
+
+    #[tokio::test]
+    async fn policy_off_denies_shell_without_prompting() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    content: String::new(),
+                    tool_calls: vec![shell_call("a", "true")],
+                },
+                AssistantResponse {
+                    content: "ok".into(),
+                    tool_calls: Vec::new(),
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+        };
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            ApprovalPolicy::Off,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert!(!kinds(&observer.events).contains(&"approval"));
+        assert!(observer.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::ToolDecision {
+                decision: ApprovalDecision::Deny,
+                ..
+            }
+        )));
+    }
 
     #[tokio::test]
     async fn direct_shell_streams_output_and_tracks_cd() {

@@ -56,7 +56,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
 }
 
 pub fn requires_approval(call: &ToolCall) -> bool {
-    call.name == "run_shell"
+    requires_approval_by_name(&call.name)
+}
+
+pub fn requires_approval_by_name(name: &str) -> bool {
+    name == "run_shell"
 }
 
 pub fn tool_summary(call: &ToolCall) -> String {

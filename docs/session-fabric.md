@@ -15,12 +15,15 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 8. The daemon
+with protocol version 9. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Protocol versions are exact rather than negotiated across incompatible
-schemas. Protocol v8 therefore requires upgrading and restarting `xshelld` on
-the controller and every connected remote host before a v8 CLI can attach.
+schemas. Any protocol bump therefore requires upgrading and restarting
+`xshelld` on the controller and every connected remote host before the new CLI
+can attach. Protocol v9 adds the `tool_skipped` execution event, emitted for
+each tool call that was never evaluated because the user aborted the turn at an
+earlier call in the same response.
 
 ## Identity and attachment
 
