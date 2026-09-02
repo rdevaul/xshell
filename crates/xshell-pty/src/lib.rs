@@ -30,6 +30,21 @@ impl Default for PtySize {
     }
 }
 
+pub fn parse_escape_prefix(value: &str) -> Result<u8> {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(key) = value.strip_prefix("ctrl-") {
+        let bytes = key.as_bytes();
+        if bytes.len() == 1 && (b'@'..=b'_').contains(&bytes[0].to_ascii_uppercase()) {
+            return Ok(bytes[0].to_ascii_uppercase() & 0x1f);
+        }
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() == 1 && bytes[0].is_ascii_graphic() {
+        return Ok(bytes[0]);
+    }
+    bail!("PTY escape must be a single ASCII key or ctrl-KEY (for example ctrl-])")
+}
+
 impl From<PtySize> for Winsize {
     fn from(size: PtySize) -> Self {
         Self {
@@ -70,7 +85,18 @@ pub enum DuplexPtyCommand {
     Resize(PtySize),
 }
 
-/// A daemon-owned transient PTY. The caller supplies bounded input and drains
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplexPtyOutcome {
+    Exited(String),
+    Detached,
+    Last,
+    Next,
+    Previous,
+    Switcher,
+    Terminate,
+}
+
+/// An exchange-driven PTY process. The caller supplies bounded input and drains
 /// bounded output through `exchange`; dropping it terminates the child.
 pub struct RemotePtyProcess {
     master: OwnedFd,
@@ -181,9 +207,10 @@ pub fn relay_remote(
 /// `receive` can consume one complete event.
 pub fn relay_duplex(
     transport_fd: RawFd,
+    escape_prefix: u8,
     mut send: impl FnMut(DuplexPtyCommand) -> Result<()>,
     mut receive: impl FnMut() -> Result<DuplexPtyEvent>,
-) -> Result<String> {
+) -> Result<DuplexPtyOutcome> {
     if !controller_is_terminal() {
         bail!("duplex PTY execution requires terminal stdin and stdout");
     }
@@ -194,6 +221,7 @@ pub fn relay_duplex(
     let result = relay_duplex_inner(
         terminal_fd,
         transport_fd,
+        escape_prefix,
         io::stdout(),
         &mut send,
         &mut receive,
@@ -205,16 +233,18 @@ pub fn relay_duplex(
 fn relay_duplex_inner(
     terminal_fd: RawFd,
     transport_fd: RawFd,
+    escape_prefix: u8,
     mut output: impl Write,
     send: &mut impl FnMut(DuplexPtyCommand) -> Result<()>,
     receive: &mut impl FnMut() -> Result<DuplexPtyEvent>,
-) -> Result<String> {
+) -> Result<DuplexPtyOutcome> {
     let mut size = terminal_size(terminal_fd)
         .map(PtySize::from)
         .unwrap_or_default();
-    send(DuplexPtyCommand::Resize(size))?;
+    let mut size_sent = false;
     let mut input = vec![0_u8; REMOTE_INPUT_BYTES];
     let mut terminal_open = true;
+    let mut prefix_pending = false;
     loop {
         let mut descriptors = [
             libc::pollfd {
@@ -228,7 +258,11 @@ fn relay_duplex_inner(
                 revents: 0,
             },
         ];
-        let timeout = i32::try_from(POLL_INTERVAL.as_millis()).unwrap_or(100);
+        let timeout = if size_sent {
+            i32::try_from(POLL_INTERVAL.as_millis()).unwrap_or(100)
+        } else {
+            0
+        };
         let polled = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
         if polled < 0 {
             let error = io::Error::last_os_error();
@@ -237,11 +271,56 @@ fn relay_duplex_inner(
             }
         }
 
+        // Read a queued exit before sending the initial resize. A completed job
+        // can close its write side between attachment and entering this relay;
+        // treating the resize write as authoritative would surface EPIPE and
+        // discard the valid exit frame already waiting in the read buffer.
+        if descriptors[1].revents & libc::POLLIN != 0 {
+            match receive()? {
+                DuplexPtyEvent::Output(bytes) => {
+                    output.write_all(&bytes)?;
+                    output.flush()?;
+                }
+                DuplexPtyEvent::Exit(status) => return Ok(DuplexPtyOutcome::Exited(status)),
+                DuplexPtyEvent::Error(message) => bail!("remote PTY failed: {message}"),
+            }
+        } else if descriptors[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            bail!("duplex PTY transport closed before reporting status");
+        }
+
+        if !size_sent {
+            if !send_duplex_command(send, DuplexPtyCommand::Resize(size))? {
+                continue;
+            }
+            size_sent = true;
+        }
+
         if descriptors[0].revents & libc::POLLIN != 0 {
             let count =
                 unsafe { libc::read(terminal_fd, input.as_mut_ptr().cast(), input.len() as _) };
             if count > 0 {
-                send(DuplexPtyCommand::Input(input[..count as usize].to_vec()))?;
+                let (bytes, action) = route_escape_input(
+                    &input[..count as usize],
+                    escape_prefix,
+                    &mut prefix_pending,
+                );
+                if !bytes.is_empty() && !send_duplex_command(send, DuplexPtyCommand::Input(bytes))?
+                {
+                    continue;
+                }
+                if let Some(action) = action {
+                    if action == EscapeAction::Help {
+                        output.write_all(
+                            b"\r\n[xshell: d detach | s switch | l last | n/p next/previous | q terminate | ? help]\r\n",
+                        )?;
+                        output.flush()?;
+                        if !send_duplex_command(send, DuplexPtyCommand::Resize(size))? {
+                            continue;
+                        }
+                    } else {
+                        return Ok(action.into());
+                    }
+                }
             } else if count == 0 {
                 terminal_open = false;
             } else {
@@ -254,27 +333,104 @@ fn relay_duplex_inner(
             }
         }
 
-        if descriptors[1].revents & libc::POLLIN != 0 {
-            match receive()? {
-                DuplexPtyEvent::Output(bytes) => {
-                    output.write_all(&bytes)?;
-                    output.flush()?;
-                }
-                DuplexPtyEvent::Exit(status) => return Ok(status),
-                DuplexPtyEvent::Error(message) => bail!("remote PTY failed: {message}"),
-            }
-        } else if descriptors[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            bail!("duplex PTY transport closed before reporting status");
-        }
-
         let updated = terminal_size(terminal_fd)
             .map(PtySize::from)
             .unwrap_or(size);
         if updated != size {
-            send(DuplexPtyCommand::Resize(updated))?;
+            if !send_duplex_command(send, DuplexPtyCommand::Resize(updated))? {
+                continue;
+            }
             size = updated;
         }
     }
+}
+
+fn send_duplex_command(
+    send: &mut impl FnMut(DuplexPtyCommand) -> Result<()>,
+    command: DuplexPtyCommand,
+) -> Result<bool> {
+    match send(command) {
+        Ok(()) => Ok(true),
+        Err(error) if is_closed_transport(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_closed_transport(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+            )
+        })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeAction {
+    Detach,
+    Last,
+    Next,
+    Previous,
+    Switcher,
+    Terminate,
+    Help,
+}
+
+impl From<EscapeAction> for DuplexPtyOutcome {
+    fn from(action: EscapeAction) -> Self {
+        match action {
+            EscapeAction::Detach => Self::Detached,
+            EscapeAction::Last => Self::Last,
+            EscapeAction::Next => Self::Next,
+            EscapeAction::Previous => Self::Previous,
+            EscapeAction::Switcher => Self::Switcher,
+            EscapeAction::Terminate => Self::Terminate,
+            EscapeAction::Help => unreachable!("help does not leave the PTY relay"),
+        }
+    }
+}
+
+fn route_escape_input(
+    input: &[u8],
+    prefix: u8,
+    prefix_pending: &mut bool,
+) -> (Vec<u8>, Option<EscapeAction>) {
+    let mut forwarded = Vec::with_capacity(input.len() + 1);
+    for &byte in input {
+        if !*prefix_pending {
+            if byte == prefix {
+                *prefix_pending = true;
+            } else {
+                forwarded.push(byte);
+            }
+            continue;
+        }
+        *prefix_pending = false;
+        if byte == prefix {
+            forwarded.push(prefix);
+            continue;
+        }
+        let action = match byte.to_ascii_lowercase() {
+            b'd' => Some(EscapeAction::Detach),
+            b'l' => Some(EscapeAction::Last),
+            b'n' => Some(EscapeAction::Next),
+            b'p' => Some(EscapeAction::Previous),
+            b's' => Some(EscapeAction::Switcher),
+            b'q' => Some(EscapeAction::Terminate),
+            b'?' => Some(EscapeAction::Help),
+            _ => None,
+        };
+        if let Some(action) = action {
+            return (forwarded, Some(action));
+        }
+        forwarded.extend_from_slice(&[prefix, byte]);
+    }
+    (forwarded, None)
 }
 
 fn relay_remote_inner(
@@ -674,7 +830,66 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::os::unix::net::UnixStream;
     use tempfile::TempDir;
+
+    #[test]
+    fn parses_and_routes_configurable_escape_prefix() {
+        let prefix = parse_escape_prefix("Ctrl-]").unwrap();
+        assert_eq!(prefix, 0x1d);
+        let mut pending = false;
+        assert_eq!(
+            route_escape_input(b"abc", prefix, &mut pending),
+            (b"abc".to_vec(), None)
+        );
+        assert_eq!(
+            route_escape_input(&[prefix], prefix, &mut pending),
+            (Vec::new(), None)
+        );
+        assert!(pending);
+        assert_eq!(
+            route_escape_input(b"d", prefix, &mut pending),
+            (Vec::new(), Some(EscapeAction::Detach))
+        );
+        assert_eq!(
+            route_escape_input(&[prefix, prefix], prefix, &mut pending),
+            (vec![prefix], None)
+        );
+        assert!(parse_escape_prefix("not-a-key").is_err());
+    }
+
+    #[test]
+    fn completed_transport_is_read_before_the_initial_resize() {
+        let OpenptyResult { master, slave } = openpty(None, None).unwrap();
+        let (transport, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"exit-ready").unwrap();
+        let mut sent = false;
+        let outcome = relay_duplex_inner(
+            slave.as_raw_fd(),
+            transport.as_raw_fd(),
+            0x1d,
+            Vec::new(),
+            &mut |_| {
+                sent = true;
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed").into())
+            },
+            &mut || Ok(DuplexPtyEvent::Exit("exit status: 0".into())),
+        )
+        .unwrap();
+        drop(master);
+        assert_eq!(outcome, DuplexPtyOutcome::Exited("exit status: 0".into()));
+        assert!(!sent);
+    }
+
+    #[test]
+    fn recognizes_wrapped_closed_transport_errors() {
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed",
+        ))
+        .context("cannot send resize");
+        assert!(is_closed_transport(&error));
+    }
 
     #[test]
     fn spawned_command_has_a_tty_and_requested_cwd() {

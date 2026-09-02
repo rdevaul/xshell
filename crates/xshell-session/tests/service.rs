@@ -43,6 +43,126 @@ fn connect_when_ready(socket: &Path) -> SessionClient {
     panic!("xshelld did not become ready at {}", socket.display());
 }
 
+fn spawn_pty_proxy(
+    state: &Path,
+    socket: &Path,
+    ticket: &str,
+) -> (
+    Child,
+    std::process::ChildStdin,
+    BufReader<std::process::ChildStdout>,
+) {
+    let mut proxy = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .arg("serve-pty-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = proxy.stdin.take().unwrap();
+    let output = BufReader::new(proxy.stdout.take().unwrap());
+    writeln!(input, "{ticket}").unwrap();
+    input.flush().unwrap();
+    (proxy, input, output)
+}
+
+#[test]
+fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .args(["--host-alias", "test-host", "--user", "tester"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut owner = connect_when_ready(&socket);
+    let session = owner
+        .create(SessionCreation {
+            name: "persistent-terminal".into(),
+            model: model("local"),
+            cwd: temporary.path().to_owned(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let size = PtySize {
+        rows: 24,
+        columns: 80,
+    };
+    let ticket = owner
+        .pty_start(
+            session.descriptor.id.clone(),
+            "printf ready; read value; printf 'done:%s' \"$value\"".into(),
+            size,
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+    let (mut first_proxy, mut first_input, mut first_output) =
+        spawn_pty_proxy(&state, &socket, &ticket.ticket);
+    assert_eq!(
+        read_server_frame(&mut first_output).unwrap(),
+        ServerPtyFrame::Ready
+    );
+    let cursor = loop {
+        if let ServerPtyFrame::Output { offset, bytes } =
+            read_server_frame(&mut first_output).unwrap()
+        {
+            assert!(String::from_utf8_lossy(&bytes).contains("ready"));
+            break offset + bytes.len() as u64;
+        }
+    };
+    write_client_frame(&mut first_input, &ClientPtyFrame::Close).unwrap();
+    assert_eq!(
+        read_server_frame(&mut first_output).unwrap(),
+        ServerPtyFrame::Detached
+    );
+    drop(first_input);
+    assert!(first_proxy.wait().unwrap().success());
+
+    let descriptor = owner
+        .pty_list()
+        .unwrap()
+        .into_iter()
+        .find(|pty| pty.pty_id == ticket.pty_id)
+        .unwrap();
+    assert!(descriptor.running);
+    assert!(!descriptor.attached);
+    let ticket = owner
+        .pty_attach(session.descriptor.id, Some(cursor))
+        .unwrap();
+    let (mut second_proxy, mut second_input, mut second_output) =
+        spawn_pty_proxy(&state, &socket, &ticket.ticket);
+    assert_eq!(
+        read_server_frame(&mut second_output).unwrap(),
+        ServerPtyFrame::Ready
+    );
+    write_client_frame(
+        &mut second_input,
+        &ClientPtyFrame::Input(b"reattached\n".to_vec()),
+    )
+    .unwrap();
+    let mut replay = Vec::new();
+    loop {
+        match read_server_frame(&mut second_output).unwrap() {
+            ServerPtyFrame::Exit(_) => break,
+            ServerPtyFrame::Output { bytes, .. } => replay.extend(bytes),
+            frame => panic!("unexpected reattached PTY frame: {frame:?}"),
+        }
+    }
+    assert!(String::from_utf8_lossy(&replay).contains("done:reattached"));
+    drop(second_input);
+    assert!(second_proxy.wait().unwrap().success());
+}
+
 #[test]
 fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
     let temporary = TempDir::new().unwrap();
@@ -105,10 +225,14 @@ fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
     let mut bytes = Vec::new();
     let status = loop {
         match read_server_frame(&mut output).unwrap() {
-            ServerPtyFrame::Output(chunk) => bytes.extend(chunk),
+            ServerPtyFrame::Output {
+                offset: _,
+                bytes: chunk,
+            } => bytes.extend(chunk),
             ServerPtyFrame::Exit(status) => break status,
             ServerPtyFrame::Error(message) => panic!("PTY stream failed: {message}"),
             ServerPtyFrame::Ready => panic!("duplicate ready frame"),
+            ServerPtyFrame::Detached => panic!("unexpected detach frame"),
         }
     };
     assert_eq!(status, "exit status: 0");
@@ -384,35 +508,19 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
                 session.id == shared.descriptor.id && session.activity == SessionActivity::Running
             })
     ));
-    let mut pending = b"fabric\n".to_vec();
-    let mut pty_output = Vec::new();
-    let mut pty_status = None;
-    for _ in 0..50 {
-        send_request(
-            &mut writer,
-            &ClientRequest::PtyExchange {
-                pty_id: pty_id.clone(),
-                input: pending.clone(),
-                size,
-                wait_ms: 100,
-            },
-        );
-        match receive_response(&mut reader) {
-            ServerResponse::PtyExchange { result } => {
-                pending.drain(..result.input_accepted);
-                pty_output.extend(result.output);
-                if result.status.is_some() {
-                    pty_status = result.status;
-                    break;
-                }
-            }
-            response => panic!("unexpected PTY exchange response: {response:?}"),
-        }
-    }
-    assert_eq!(pty_status.as_deref(), Some("exit status: 0"));
-    let pty_output = String::from_utf8_lossy(&pty_output);
-    assert!(pty_output.contains("pty:fabric"));
-    assert!(pty_output.contains("31 101"));
+    send_request(&mut writer, &ClientRequest::PtyList);
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::PtyCatalog { ptys }
+            if ptys.iter().any(|pty| pty.pty_id == pty_id && pty.running)
+    ));
+    send_request(
+        &mut writer,
+        &ClientRequest::PtyClose {
+            pty_id: pty_id.clone(),
+        },
+    );
+    assert_eq!(receive_response(&mut reader), ServerResponse::PtyClosed);
     send_request(
         &mut writer,
         &ClientRequest::CompleteShell {
@@ -481,15 +589,14 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
 
     let mut after_disconnect = connect_when_ready(&socket);
     after_disconnect.attach(remote_home_id.clone()).unwrap();
-    let replacement = after_disconnect
-        .pty_start(
-            remote_home_id,
-            "sleep 60".into(),
-            size,
-            Some("xterm-256color".into()),
-        )
-        .unwrap();
-    after_disconnect.pty_close(replacement.pty_id).unwrap();
+    let persistent = after_disconnect
+        .pty_list()
+        .unwrap()
+        .into_iter()
+        .find(|pty| pty.session_id == remote_home_id)
+        .expect("terminal job should survive control disconnect");
+    assert!(persistent.running);
+    after_disconnect.pty_close(persistent.pty_id).unwrap();
 }
 
 #[test]

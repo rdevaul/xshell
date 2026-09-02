@@ -13,13 +13,13 @@ pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;
 pub use model::{
     AccessMode, ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PersistenceMode,
-    PtyExchangeResult, PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, SessionActivity,
-    SessionConfig, SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind,
-    SessionSnapshot, SessionStatus, ShellCompletionCandidate, ShellCompletionResult, TurnInput,
-    ViewResource, Visibility,
+    PtyDescriptor, PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, SessionActivity, SessionConfig,
+    SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind, SessionSnapshot,
+    SessionStatus, ShellCompletionCandidate, ShellCompletionResult, TurnInput, ViewResource,
+    Visibility,
 };
 pub use protocol::{ClientRequest, ServerResponse};
-pub use pty::{PtyClaim, PtyCoordinator};
+pub use pty::{PtyClaim, PtyCoordinator, PtyReadResult};
 pub use pty_stream::{
     ClientPtyFrame, PtyStreamClient, ServerPtyFrame, read_client_frame, read_server_frame,
     write_client_frame, write_server_frame,
