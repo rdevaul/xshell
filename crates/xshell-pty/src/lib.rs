@@ -241,7 +241,7 @@ fn relay_duplex_inner(
     let mut size = terminal_size(terminal_fd)
         .map(PtySize::from)
         .unwrap_or_default();
-    send(DuplexPtyCommand::Resize(size))?;
+    let mut size_sent = false;
     let mut input = vec![0_u8; REMOTE_INPUT_BYTES];
     let mut terminal_open = true;
     let mut prefix_pending = false;
@@ -258,13 +258,41 @@ fn relay_duplex_inner(
                 revents: 0,
             },
         ];
-        let timeout = i32::try_from(POLL_INTERVAL.as_millis()).unwrap_or(100);
+        let timeout = if size_sent {
+            i32::try_from(POLL_INTERVAL.as_millis()).unwrap_or(100)
+        } else {
+            0
+        };
         let polled = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
         if polled < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error).context("duplex PTY poll failed");
             }
+        }
+
+        // Read a queued exit before sending the initial resize. A completed job
+        // can close its write side between attachment and entering this relay;
+        // treating the resize write as authoritative would surface EPIPE and
+        // discard the valid exit frame already waiting in the read buffer.
+        if descriptors[1].revents & libc::POLLIN != 0 {
+            match receive()? {
+                DuplexPtyEvent::Output(bytes) => {
+                    output.write_all(&bytes)?;
+                    output.flush()?;
+                }
+                DuplexPtyEvent::Exit(status) => return Ok(DuplexPtyOutcome::Exited(status)),
+                DuplexPtyEvent::Error(message) => bail!("remote PTY failed: {message}"),
+            }
+        } else if descriptors[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            bail!("duplex PTY transport closed before reporting status");
+        }
+
+        if !size_sent {
+            if !send_duplex_command(send, DuplexPtyCommand::Resize(size))? {
+                continue;
+            }
+            size_sent = true;
         }
 
         if descriptors[0].revents & libc::POLLIN != 0 {
@@ -276,8 +304,9 @@ fn relay_duplex_inner(
                     escape_prefix,
                     &mut prefix_pending,
                 );
-                if !bytes.is_empty() {
-                    send(DuplexPtyCommand::Input(bytes))?;
+                if !bytes.is_empty() && !send_duplex_command(send, DuplexPtyCommand::Input(bytes))?
+                {
+                    continue;
                 }
                 if let Some(action) = action {
                     if action == EscapeAction::Help {
@@ -285,7 +314,9 @@ fn relay_duplex_inner(
                             b"\r\n[xshell: d detach | s switch | l last | n/p next/previous | q terminate | ? help]\r\n",
                         )?;
                         output.flush()?;
-                        send(DuplexPtyCommand::Resize(size))?;
+                        if !send_duplex_command(send, DuplexPtyCommand::Resize(size))? {
+                            continue;
+                        }
                     } else {
                         return Ok(action.into());
                     }
@@ -302,27 +333,41 @@ fn relay_duplex_inner(
             }
         }
 
-        if descriptors[1].revents & libc::POLLIN != 0 {
-            match receive()? {
-                DuplexPtyEvent::Output(bytes) => {
-                    output.write_all(&bytes)?;
-                    output.flush()?;
-                }
-                DuplexPtyEvent::Exit(status) => return Ok(DuplexPtyOutcome::Exited(status)),
-                DuplexPtyEvent::Error(message) => bail!("remote PTY failed: {message}"),
-            }
-        } else if descriptors[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            bail!("duplex PTY transport closed before reporting status");
-        }
-
         let updated = terminal_size(terminal_fd)
             .map(PtySize::from)
             .unwrap_or(size);
         if updated != size {
-            send(DuplexPtyCommand::Resize(updated))?;
+            if !send_duplex_command(send, DuplexPtyCommand::Resize(updated))? {
+                continue;
+            }
             size = updated;
         }
     }
+}
+
+fn send_duplex_command(
+    send: &mut impl FnMut(DuplexPtyCommand) -> Result<()>,
+    command: DuplexPtyCommand,
+) -> Result<bool> {
+    match send(command) {
+        Ok(()) => Ok(true),
+        Err(error) if is_closed_transport(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_closed_transport(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+            )
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,6 +830,7 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::os::unix::net::UnixStream;
     use tempfile::TempDir;
 
     #[test]
@@ -810,6 +856,39 @@ mod tests {
             (vec![prefix], None)
         );
         assert!(parse_escape_prefix("not-a-key").is_err());
+    }
+
+    #[test]
+    fn completed_transport_is_read_before_the_initial_resize() {
+        let OpenptyResult { master, slave } = openpty(None, None).unwrap();
+        let (transport, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(b"exit-ready").unwrap();
+        let mut sent = false;
+        let outcome = relay_duplex_inner(
+            slave.as_raw_fd(),
+            transport.as_raw_fd(),
+            0x1d,
+            Vec::new(),
+            &mut |_| {
+                sent = true;
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed").into())
+            },
+            &mut || Ok(DuplexPtyEvent::Exit("exit status: 0".into())),
+        )
+        .unwrap();
+        drop(master);
+        assert_eq!(outcome, DuplexPtyOutcome::Exited("exit status: 0".into()));
+        assert!(!sent);
+    }
+
+    #[test]
+    fn recognizes_wrapped_closed_transport_errors() {
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed",
+        ))
+        .context("cannot send resize");
+        assert!(is_closed_transport(&error));
     }
 
     #[test]

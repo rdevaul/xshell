@@ -361,29 +361,52 @@ impl SessionRuntime {
     }
 
     pub fn pty_attach_stream(&mut self) -> Result<(String, PtyStreamClient)> {
+        self.pty_attach_stream_if_present()?
+            .context("active session has no terminal job")
+    }
+
+    pub fn pty_attach_stream_if_present(&mut self) -> Result<Option<(String, PtyStreamClient)>> {
         let session_id = self.active_session_id()?;
-        let descriptor = self
+        let Some(descriptor) = self
             .client_mut()?
             .pty_list()?
             .into_iter()
             .find(|pty| pty.session_id == session_id)
-            .context("active session has no terminal job")?;
+        else {
+            return Ok(None);
+        };
         let after_offset = self.pty_cursors.get(&descriptor.pty_id).copied();
         let ticket = self.client_mut()?.pty_attach(session_id, after_offset)?;
         let stream = self.open_pty_ticket(&ticket)?;
-        Ok((ticket.pty_id, stream))
+        Ok(Some((ticket.pty_id, stream)))
     }
 
     pub fn remember_pty_cursor(&mut self, pty_id: &str, cursor: u64) {
         self.pty_cursors.insert(pty_id.to_owned(), cursor);
     }
 
-    pub fn terminal_sessions(&mut self) -> Result<Vec<SessionDescriptor>> {
-        Ok(self
+    pub fn terminal_targets(&mut self) -> Result<Vec<(SessionDescriptor, bool)>> {
+        let terminal_session_ids = self
             .terminal_jobs()?
             .into_iter()
-            .map(|(session, _)| session)
-            .collect())
+            .map(|(session, _)| session.id)
+            .collect::<HashSet<_>>();
+        let mut sessions = self
+            .list()?
+            .into_iter()
+            .map(|session| {
+                let has_terminal = terminal_session_ids.contains(&session.id);
+                (session, has_terminal)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|(left, _), (right, _)| {
+            (&left.host_alias, &left.name).cmp(&(&right.host_alias, &right.name))
+        });
+        Ok(sessions)
+    }
+
+    pub fn previous_session_id(&self) -> Option<&str> {
+        self.navigation_history.last().map(String::as_str)
     }
 
     pub fn terminal_jobs(&mut self) -> Result<Vec<(SessionDescriptor, PtyDescriptor)>> {

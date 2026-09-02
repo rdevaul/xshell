@@ -149,11 +149,27 @@ impl PtyStreamClient {
     }
 
     pub fn detach(&mut self) -> Result<()> {
-        write_client_frame(&mut self.writer, &ClientPtyFrame::Close)?;
-        match read_server_frame(&mut self.reader)? {
-            ServerPtyFrame::Detached => Ok(()),
-            ServerPtyFrame::Error(message) => bail!("PTY detach failed: {message}"),
-            frame => bail!("unexpected PTY detach response: {frame:?}"),
+        if let Err(error) = write_client_frame(&mut self.writer, &ClientPtyFrame::Close) {
+            if transport_is_closed(&error) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        loop {
+            let frame = match read_server_frame(&mut self.reader) {
+                Ok(frame) => frame,
+                Err(error) if transport_is_closed(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            match frame {
+                ServerPtyFrame::Detached | ServerPtyFrame::Exit(_) => return Ok(()),
+                // Output may already have been in flight when Close was sent.
+                // Do not advance the cursor: the next attachment should replay
+                // bytes that were never rendered to the controller.
+                ServerPtyFrame::Output { .. } => {}
+                ServerPtyFrame::Error(message) => bail!("PTY detach failed: {message}"),
+                ServerPtyFrame::Ready => bail!("PTY sent a duplicate ready frame while detaching"),
+            }
         }
     }
 
@@ -283,6 +299,21 @@ fn text(payload: Vec<u8>) -> Result<String> {
     String::from_utf8(payload).context("PTY status frame is not UTF-8")
 }
 
+fn transport_is_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +351,15 @@ mod tests {
         let mut bytes = vec![TAG_INPUT];
         bytes.extend_from_slice(&((MAX_FRAME_BYTES + 1) as u32).to_be_bytes());
         assert!(read_client_frame(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn recognizes_closed_stream_errors_during_detach() {
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "closed",
+        ))
+        .context("PTY stream closed");
+        assert!(transport_is_closed(&error));
     }
 }

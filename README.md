@@ -243,11 +243,13 @@ running for daemon-lifetime and durable sessions, with up to 1 MiB of output
 available for replay. Ephemeral sessions still terminate their jobs on detach.
 
 While a terminal job has focus, `Ctrl-]` is the default configurable command
-prefix: `d` detaches to the REPL, `s` opens the switcher, `l` selects the last
-job, `n`/`p` cycle, `q` terminates, `?` shows help, and a second `Ctrl-]` sends
-the prefix literally. At the REPL, `//terminal` reattaches the current job;
-`//terminal list` and `//terminal kill` inspect or terminate jobs. Configure the
-prefix with `session_fabric.pty_escape`.
+prefix: `d` detaches to the current session's REPL, `s` opens the session
+switcher, `l` selects the last session, `n`/`p` cycle, `q` terminates, `?` shows
+help, and a second `Ctrl-]` sends the prefix literally. Sessions without a
+terminal job appear as `[REPL]` targets; selecting one activates that session
+and returns to its xshell prompt. At the REPL, `//terminal` reattaches the
+current job; `//terminal list` and `//terminal kill` inspect or terminate jobs.
+Configure the prefix with `session_fabric.pty_escape`.
 
 Protocol v8 uses a dedicated authenticated binary stream locally and over SSH.
 See [the terminal-job design and trust boundary](docs/pty.md).

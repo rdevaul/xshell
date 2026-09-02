@@ -1682,7 +1682,7 @@ fn run_pty_focus_loop(
     stream: &mut xshell_session::PtyStreamClient,
     escape_prefix: u8,
 ) -> Result<TerminalFocusOutcome> {
-    let mut last_session_id = None;
+    let mut last_session_id = sessions.previous_session_id().map(str::to_owned);
     loop {
         let result = stream.relay(escape_prefix);
         sessions.remember_pty_cursor(pty_id, stream.cursor());
@@ -1711,20 +1711,29 @@ fn run_pty_focus_loop(
                 });
             }
             direction => {
-                let terminals = sessions.terminal_sessions()?;
+                let targets = sessions.terminal_targets()?;
                 let current_session_id = sessions
                     .active()
                     .map(|session| session.id.clone())
                     .context("there is no active terminal session")?;
                 let target = choose_terminal_target(
-                    &terminals,
+                    &targets,
                     &current_session_id,
                     last_session_id.as_deref(),
                     direction,
                 )?;
-                if target.id != current_session_id {
+                if target.0.id != current_session_id {
                     last_session_id = Some(current_session_id);
-                    sessions.switch(&target.id)?;
+                    sessions.switch(&target.0.id)?;
+                }
+                if !target.1 {
+                    return Ok(TerminalFocusOutcome {
+                        description: format!(
+                            "switched to {}:{} REPL",
+                            target.0.host_alias, target.0.name
+                        ),
+                        finished: false,
+                    });
                 }
                 (*pty_id, *stream) = sessions.pty_attach_stream()?;
             }
@@ -1733,41 +1742,40 @@ fn run_pty_focus_loop(
 }
 
 fn choose_terminal_target(
-    terminals: &[xshell_session::SessionDescriptor],
+    targets: &[(xshell_session::SessionDescriptor, bool)],
     current_session_id: &str,
     last_session_id: Option<&str>,
     direction: xshell_pty::DuplexPtyOutcome,
-) -> Result<xshell_session::SessionDescriptor> {
-    if terminals.is_empty() {
-        bail!("there are no terminal jobs to switch to");
+) -> Result<(xshell_session::SessionDescriptor, bool)> {
+    if targets.is_empty() {
+        bail!("there are no sessions to switch to");
     }
-    let current = terminals
+    let current = targets
         .iter()
-        .position(|session| session.id == current_session_id)
+        .position(|(session, _)| session.id == current_session_id)
         .unwrap_or(0);
     let index = match direction {
-        xshell_pty::DuplexPtyOutcome::Next => (current + 1) % terminals.len(),
-        xshell_pty::DuplexPtyOutcome::Previous => (current + terminals.len() - 1) % terminals.len(),
+        xshell_pty::DuplexPtyOutcome::Next => (current + 1) % targets.len(),
+        xshell_pty::DuplexPtyOutcome::Previous => (current + targets.len() - 1) % targets.len(),
         xshell_pty::DuplexPtyOutcome::Last => last_session_id
-            .and_then(|id| terminals.iter().position(|session| session.id == id))
-            .unwrap_or((current + terminals.len() - 1) % terminals.len()),
-        xshell_pty::DuplexPtyOutcome::Switcher => {
-            choose_terminal_interactively(terminals, current)?
-        }
+            .and_then(|id| targets.iter().position(|(session, _)| session.id == id))
+            .unwrap_or((current + targets.len() - 1) % targets.len()),
+        xshell_pty::DuplexPtyOutcome::Switcher => choose_terminal_interactively(targets, current)?,
         _ => bail!("invalid terminal-switch action"),
     };
-    Ok(terminals[index].clone())
+    Ok(targets[index].clone())
 }
 
 fn choose_terminal_interactively(
-    terminals: &[xshell_session::SessionDescriptor],
+    targets: &[(xshell_session::SessionDescriptor, bool)],
     current: usize,
 ) -> Result<usize> {
-    println!("\r\nxshell terminal jobs:");
-    for (index, session) in terminals.iter().enumerate() {
+    println!("\r\nxshell session targets:");
+    for (index, (session, has_terminal)) in targets.iter().enumerate() {
         let marker = if index == current { '*' } else { ' ' };
+        let target_type = if *has_terminal { "terminal" } else { "REPL" };
         println!(
-            " {marker} {}. {}:{} — {}",
+            " {marker} {}. {}:{} [{target_type}] — {}",
             index + 1,
             session.host_alias,
             session.name,
@@ -1775,8 +1783,8 @@ fn choose_terminal_interactively(
         );
     }
     print!(
-        "select terminal [1-{}] (Enter keeps current): ",
-        terminals.len()
+        "select session [1-{}] (Enter keeps current): ",
+        targets.len()
     );
     io::stdout().flush()?;
     let mut selection = String::new();
@@ -1788,7 +1796,7 @@ fn choose_terminal_interactively(
     let selected = selection
         .parse::<usize>()
         .context("terminal selection must be a number")?;
-    if !(1..=terminals.len()).contains(&selected) {
+    if !(1..=targets.len()).contains(&selected) {
         bail!("terminal selection is out of range");
     }
     Ok(selected - 1)
@@ -1829,10 +1837,53 @@ mod tests {
     use super::*;
     use clap::ValueEnum;
 
+    fn session_descriptor(id: &str, name: &str) -> xshell_session::SessionDescriptor {
+        xshell_session::SessionDescriptor {
+            id: id.into(),
+            name: name.into(),
+            host_id: "local-host".into(),
+            host_alias: "local".into(),
+            user: "tester".into(),
+            model: xshell_session::ModelBinding {
+                profile_name: None,
+                provider: "ollama".into(),
+                model: "test".into(),
+                base_url: "http://localhost".into(),
+                api_key_env: None,
+            },
+            cwd: PathBuf::from("/tmp"),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            access_mode: xshell_session::AccessMode::SingleUser,
+            status: xshell_session::SessionStatus::Detached,
+            activity: xshell_session::SessionActivity::Idle,
+            attached_clients: 0,
+            created_at_unix_ms: 0,
+            last_active_at_unix_ms: 0,
+        }
+    }
+
     #[test]
     fn compact_path_leaves_non_home_paths_alone() {
         let path = Path::new("/not-the-home-directory/project");
         assert_eq!(compact_path(path), path.display().to_string());
+    }
+
+    #[test]
+    fn terminal_switching_can_target_a_session_repl_without_a_job() {
+        let targets = vec![
+            (session_descriptor("default-id", "default"), false),
+            (session_descriptor("emacs-id", "emacs"), true),
+        ];
+        let target = choose_terminal_target(
+            &targets,
+            "emacs-id",
+            Some("default-id"),
+            xshell_pty::DuplexPtyOutcome::Last,
+        )
+        .unwrap();
+        assert_eq!(target.0.id, "default-id");
+        assert!(!target.1);
     }
 
     #[test]

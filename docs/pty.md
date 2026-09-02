@@ -56,18 +56,22 @@ under `[session_fabric]`.
 | Sequence | Action |
 |---|---|
 | `Ctrl-] d` | Detach to the xshell REPL |
-| `Ctrl-] s` | Select a terminal job interactively |
-| `Ctrl-] l` | Return to the previously focused job |
-| `Ctrl-] n` / `Ctrl-] p` | Cycle to the next/previous job |
+| `Ctrl-] s` | Select a session target interactively |
+| `Ctrl-] l` | Return to the previously focused session |
+| `Ctrl-] n` / `Ctrl-] p` | Cycle to the next/previous session |
 | `Ctrl-] q` | Terminate the focused job |
 | `Ctrl-] ?` | Show key help |
 | `Ctrl-] Ctrl-]` | Send a literal prefix byte |
 
 The keystroke is a local data-plane escape; listing, switching sessions,
 minting a fresh ticket, and claiming the selected stream remain authenticated
-control-plane operations. At the REPL, `//terminal` reattaches the current
-session's job, while `//terminal list` and `//terminal kill` inspect and
-terminate jobs.
+control-plane operations. Every visible session is a switch target. A session
+with a job is marked `[terminal]`; one without a job is marked `[REPL]`, and
+selecting it leaves raw mode, activates that session, and restores the xshell
+prompt. This means an idle default session remains reachable from a full-screen
+program in another session without creating a dummy PTY. At the REPL,
+`//terminal` reattaches the current session's job, while `//terminal list` and
+`//terminal kill` inspect and terminate jobs.
 
 ## Persistence and display boundary
 
