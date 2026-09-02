@@ -235,16 +235,22 @@ its inherited `PATH` and the active session cwd. It intentionally does not
 source native zsh/bash completion frameworks, startup scripts, aliases, or
 functions.
 
-Directly entered commands in local sessions run in a transient pseudoterminal
-when xshell is attached to a terminal. This supports terminal colors, pagers,
-and interactive line-oriented programs; input, output, terminal resizing, and
-terminal-generated signals are relayed byte-for-byte. Agent-requested tools
-remain noninteractive and pipe-backed. Protocol v7 provides the same transient
-PTY behavior for remote sessions through a dedicated, authenticated SSH binary
-stream alongside the control connection. A disconnect terminates the transient
-command; persistent
-full-screen reattachment is the subsequent milestone.
-See [the transient PTY design and trust boundary](docs/pty.md).
+Directly entered commands in daemon-backed local and remote sessions run as
+session-owned terminal jobs. This supports colors, pagers, and full-screen
+programs; input, output, resize events, and terminal-generated signals are
+relayed byte-for-byte. Closing a controller or PTY stream leaves a terminal job
+running for daemon-lifetime and durable sessions, with up to 1 MiB of output
+available for replay. Ephemeral sessions still terminate their jobs on detach.
+
+While a terminal job has focus, `Ctrl-]` is the default configurable command
+prefix: `d` detaches to the REPL, `s` opens the switcher, `l` selects the last
+job, `n`/`p` cycle, `q` terminates, `?` shows help, and a second `Ctrl-]` sends
+the prefix literally. At the REPL, `//terminal` reattaches the current job;
+`//terminal list` and `//terminal kill` inspect or terminate jobs. Configure the
+prefix with `session_fabric.pty_escape`.
+
+Protocol v8 uses a dedicated authenticated binary stream locally and over SSH.
+See [the terminal-job design and trust boundary](docs/pty.md).
 
 See [the session-fabric protocol and current boundary](docs/session-fabric.md).
 

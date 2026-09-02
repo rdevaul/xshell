@@ -109,12 +109,14 @@ Audit logs contain prompts, source text, commands, and tool output. They should
 be treated as sensitive. At-rest encryption and retention policy are planned
 but are not in the initial format.
 
-Direct `$` commands currently inherit the terminal's stdout and stderr. Their
-input and exit outcome are logged, but their byte-for-byte terminal output is
-not yet captured. Complete capture without breaking interactive terminal
-programs requires durable PTY stream capture. The transient local and remote
-PTY relays record the command and outcome but deliberately do not duplicate
-their mixed byte stream; see [the PTY trust boundary](pty.md).
+Direct `$` command input is logged before execution, but the byte-for-byte
+terminal stream is not yet captured. An exit outcome is recorded when the job
+finishes or is terminated while the originating command remains focused. If a
+controller detaches or switches away first, the job remains in progress and a
+later exit is not yet emitted as a separate audit event. Complete lifecycle and
+stream capture without breaking interactive terminal programs requires
+integrating the terminal-job replay journal with the audit service; see
+[the PTY trust boundary](pty.md).
 
 An unclean client or daemon crash leaves a verifiable hash chain but no final
 checkpoint. The verifier reports this explicitly rather than claiming the log

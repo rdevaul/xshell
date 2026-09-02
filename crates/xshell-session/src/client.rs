@@ -1,7 +1,7 @@
 use crate::{
-    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding, PtyExchangeResult,
-    PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation,
-    SessionDescriptor, SessionSnapshot, ShellCompletionResult, TurnInput, ViewResource,
+    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding, PtyDescriptor, PtySize,
+    PtyTicket, SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor,
+    SessionSnapshot, ShellCompletionResult, TurnInput, ViewResource,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -307,22 +307,26 @@ impl SessionClient {
         }
     }
 
-    pub fn pty_exchange(
+    pub fn pty_list(&mut self) -> Result<Vec<PtyDescriptor>> {
+        self.send(&ClientRequest::PtyList)?;
+        match self.receive()? {
+            ServerResponse::PtyCatalog { ptys } => Ok(ptys),
+            response => response_error("PTY list", response),
+        }
+    }
+
+    pub fn pty_attach(
         &mut self,
-        pty_id: String,
-        input: Vec<u8>,
-        size: PtySize,
-        wait_ms: u64,
-    ) -> Result<PtyExchangeResult> {
-        self.send(&ClientRequest::PtyExchange {
-            pty_id,
-            input,
-            size,
-            wait_ms,
+        session_id: String,
+        after_offset: Option<u64>,
+    ) -> Result<PtyTicket> {
+        self.send(&ClientRequest::PtyAttach {
+            session_id,
+            after_offset,
         })?;
         match self.receive()? {
-            ServerResponse::PtyExchange { result } => Ok(result),
-            response => response_error("PTY exchange", response),
+            ServerResponse::PtyAttached { ticket } => Ok(ticket),
+            response => response_error("PTY attach", response),
         }
     }
 

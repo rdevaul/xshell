@@ -44,3 +44,6 @@ required = true
 socket = "/tmp/xshell-session-state/xshelld.sock"
 state_directory = "/tmp/xshell-session-state"
 default_session = "default"
+# Prefix for terminal-job commands: d detach, s switch, l last, n/p cycle,
+# q terminate, ? help, or repeat the prefix to send it literally.
+pty_escape = "ctrl-]"

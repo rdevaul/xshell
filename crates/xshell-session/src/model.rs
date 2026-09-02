@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-pub const SESSION_PROTOCOL_VERSION: u32 = 7;
+pub const SESSION_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -14,6 +14,7 @@ pub struct SessionConfig {
     pub socket: Option<PathBuf>,
     pub state_directory: Option<PathBuf>,
     pub default_session: String,
+    pub pty_escape: String,
 }
 
 impl Default for SessionConfig {
@@ -24,6 +25,7 @@ impl Default for SessionConfig {
             socket: None,
             state_directory: None,
             default_session: "default".into(),
+            pty_escape: "ctrl-]".into(),
         }
     }
 }
@@ -231,14 +233,20 @@ pub struct PtySize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PtyExchangeResult {
-    pub output: Vec<u8>,
-    pub input_accepted: usize,
-    pub status: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PtyTicket {
     pub pty_id: String,
     pub ticket: String,
+    pub replay_from: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PtyDescriptor {
+    pub pty_id: String,
+    pub session_id: String,
+    pub command: String,
+    pub attached: bool,
+    pub running: bool,
+    pub exit_status: Option<String>,
+    pub replay_start: u64,
+    pub replay_end: u64,
 }

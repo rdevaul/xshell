@@ -30,6 +30,21 @@ impl Default for PtySize {
     }
 }
 
+pub fn parse_escape_prefix(value: &str) -> Result<u8> {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(key) = value.strip_prefix("ctrl-") {
+        let bytes = key.as_bytes();
+        if bytes.len() == 1 && (b'@'..=b'_').contains(&bytes[0].to_ascii_uppercase()) {
+            return Ok(bytes[0].to_ascii_uppercase() & 0x1f);
+        }
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() == 1 && bytes[0].is_ascii_graphic() {
+        return Ok(bytes[0]);
+    }
+    bail!("PTY escape must be a single ASCII key or ctrl-KEY (for example ctrl-])")
+}
+
 impl From<PtySize> for Winsize {
     fn from(size: PtySize) -> Self {
         Self {
@@ -70,7 +85,18 @@ pub enum DuplexPtyCommand {
     Resize(PtySize),
 }
 
-/// A daemon-owned transient PTY. The caller supplies bounded input and drains
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplexPtyOutcome {
+    Exited(String),
+    Detached,
+    Last,
+    Next,
+    Previous,
+    Switcher,
+    Terminate,
+}
+
+/// An exchange-driven PTY process. The caller supplies bounded input and drains
 /// bounded output through `exchange`; dropping it terminates the child.
 pub struct RemotePtyProcess {
     master: OwnedFd,
@@ -181,9 +207,10 @@ pub fn relay_remote(
 /// `receive` can consume one complete event.
 pub fn relay_duplex(
     transport_fd: RawFd,
+    escape_prefix: u8,
     mut send: impl FnMut(DuplexPtyCommand) -> Result<()>,
     mut receive: impl FnMut() -> Result<DuplexPtyEvent>,
-) -> Result<String> {
+) -> Result<DuplexPtyOutcome> {
     if !controller_is_terminal() {
         bail!("duplex PTY execution requires terminal stdin and stdout");
     }
@@ -194,6 +221,7 @@ pub fn relay_duplex(
     let result = relay_duplex_inner(
         terminal_fd,
         transport_fd,
+        escape_prefix,
         io::stdout(),
         &mut send,
         &mut receive,
@@ -205,16 +233,18 @@ pub fn relay_duplex(
 fn relay_duplex_inner(
     terminal_fd: RawFd,
     transport_fd: RawFd,
+    escape_prefix: u8,
     mut output: impl Write,
     send: &mut impl FnMut(DuplexPtyCommand) -> Result<()>,
     receive: &mut impl FnMut() -> Result<DuplexPtyEvent>,
-) -> Result<String> {
+) -> Result<DuplexPtyOutcome> {
     let mut size = terminal_size(terminal_fd)
         .map(PtySize::from)
         .unwrap_or_default();
     send(DuplexPtyCommand::Resize(size))?;
     let mut input = vec![0_u8; REMOTE_INPUT_BYTES];
     let mut terminal_open = true;
+    let mut prefix_pending = false;
     loop {
         let mut descriptors = [
             libc::pollfd {
@@ -241,7 +271,25 @@ fn relay_duplex_inner(
             let count =
                 unsafe { libc::read(terminal_fd, input.as_mut_ptr().cast(), input.len() as _) };
             if count > 0 {
-                send(DuplexPtyCommand::Input(input[..count as usize].to_vec()))?;
+                let (bytes, action) = route_escape_input(
+                    &input[..count as usize],
+                    escape_prefix,
+                    &mut prefix_pending,
+                );
+                if !bytes.is_empty() {
+                    send(DuplexPtyCommand::Input(bytes))?;
+                }
+                if let Some(action) = action {
+                    if action == EscapeAction::Help {
+                        output.write_all(
+                            b"\r\n[xshell: d detach | s switch | l last | n/p next/previous | q terminate | ? help]\r\n",
+                        )?;
+                        output.flush()?;
+                        send(DuplexPtyCommand::Resize(size))?;
+                    } else {
+                        return Ok(action.into());
+                    }
+                }
             } else if count == 0 {
                 terminal_open = false;
             } else {
@@ -260,7 +308,7 @@ fn relay_duplex_inner(
                     output.write_all(&bytes)?;
                     output.flush()?;
                 }
-                DuplexPtyEvent::Exit(status) => return Ok(status),
+                DuplexPtyEvent::Exit(status) => return Ok(DuplexPtyOutcome::Exited(status)),
                 DuplexPtyEvent::Error(message) => bail!("remote PTY failed: {message}"),
             }
         } else if descriptors[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
@@ -275,6 +323,69 @@ fn relay_duplex_inner(
             size = updated;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeAction {
+    Detach,
+    Last,
+    Next,
+    Previous,
+    Switcher,
+    Terminate,
+    Help,
+}
+
+impl From<EscapeAction> for DuplexPtyOutcome {
+    fn from(action: EscapeAction) -> Self {
+        match action {
+            EscapeAction::Detach => Self::Detached,
+            EscapeAction::Last => Self::Last,
+            EscapeAction::Next => Self::Next,
+            EscapeAction::Previous => Self::Previous,
+            EscapeAction::Switcher => Self::Switcher,
+            EscapeAction::Terminate => Self::Terminate,
+            EscapeAction::Help => unreachable!("help does not leave the PTY relay"),
+        }
+    }
+}
+
+fn route_escape_input(
+    input: &[u8],
+    prefix: u8,
+    prefix_pending: &mut bool,
+) -> (Vec<u8>, Option<EscapeAction>) {
+    let mut forwarded = Vec::with_capacity(input.len() + 1);
+    for &byte in input {
+        if !*prefix_pending {
+            if byte == prefix {
+                *prefix_pending = true;
+            } else {
+                forwarded.push(byte);
+            }
+            continue;
+        }
+        *prefix_pending = false;
+        if byte == prefix {
+            forwarded.push(prefix);
+            continue;
+        }
+        let action = match byte.to_ascii_lowercase() {
+            b'd' => Some(EscapeAction::Detach),
+            b'l' => Some(EscapeAction::Last),
+            b'n' => Some(EscapeAction::Next),
+            b'p' => Some(EscapeAction::Previous),
+            b's' => Some(EscapeAction::Switcher),
+            b'q' => Some(EscapeAction::Terminate),
+            b'?' => Some(EscapeAction::Help),
+            _ => None,
+        };
+        if let Some(action) = action {
+            return (forwarded, Some(action));
+        }
+        forwarded.extend_from_slice(&[prefix, byte]);
+    }
+    (forwarded, None)
 }
 
 fn relay_remote_inner(
@@ -675,6 +786,31 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::TempDir;
+
+    #[test]
+    fn parses_and_routes_configurable_escape_prefix() {
+        let prefix = parse_escape_prefix("Ctrl-]").unwrap();
+        assert_eq!(prefix, 0x1d);
+        let mut pending = false;
+        assert_eq!(
+            route_escape_input(b"abc", prefix, &mut pending),
+            (b"abc".to_vec(), None)
+        );
+        assert_eq!(
+            route_escape_input(&[prefix], prefix, &mut pending),
+            (Vec::new(), None)
+        );
+        assert!(pending);
+        assert_eq!(
+            route_escape_input(b"d", prefix, &mut pending),
+            (Vec::new(), Some(EscapeAction::Detach))
+        );
+        assert_eq!(
+            route_escape_input(&[prefix, prefix], prefix, &mut pending),
+            (vec![prefix], None)
+        );
+        assert!(parse_escape_prefix("not-a-key").is_err());
+    }
 
     #[test]
     fn spawned_command_has_a_tty_and_requested_cwd() {

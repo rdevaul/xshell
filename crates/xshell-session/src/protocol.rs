@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtyExchangeResult, PtySize, PtyTicket,
+    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtyDescriptor, PtySize, PtyTicket,
     SESSION_PROTOCOL_VERSION, SessionCreation, SessionDescriptor, SessionSnapshot,
     ShellCompletionResult, TurnInput, ViewResource,
 };
@@ -69,11 +69,10 @@ pub enum ClientRequest {
         size: PtySize,
         terminal_type: Option<String>,
     },
-    PtyExchange {
-        pty_id: String,
-        input: Vec<u8>,
-        size: PtySize,
-        wait_ms: u64,
+    PtyList,
+    PtyAttach {
+        session_id: String,
+        after_offset: Option<u64>,
     },
     PtyClose {
         pty_id: String,
@@ -139,8 +138,11 @@ pub enum ServerResponse {
     PtyStarted {
         ticket: PtyTicket,
     },
-    PtyExchange {
-        result: PtyExchangeResult,
+    PtyCatalog {
+        ptys: Vec<PtyDescriptor>,
+    },
+    PtyAttached {
+        ticket: PtyTicket,
     },
     PtyClosed,
     PtyClaimed,
@@ -178,15 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn pty_exchange_preserves_binary_input() {
-        let request = ClientRequest::PtyExchange {
-            pty_id: "pty-1".into(),
-            input: vec![0, 3, 0xff],
-            size: PtySize {
-                rows: 24,
-                columns: 80,
-            },
-            wait_ms: 40,
+    fn pty_attach_round_trips() {
+        let request = ClientRequest::PtyAttach {
+            session_id: "session-1".into(),
+            after_offset: Some(42),
         };
         let encoded = serde_json::to_vec(&request).unwrap();
         assert_eq!(

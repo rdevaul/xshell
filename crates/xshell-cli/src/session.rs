@@ -1,13 +1,13 @@
 use crate::config::ActiveModel;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
-    EventBatch, PersistenceMode, PtySize, PtyStreamClient, PtyTicket, SessionClient, SessionConfig,
-    SessionCreation, SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput, ViewResource,
-    Visibility,
+    EventBatch, PersistenceMode, PtyDescriptor, PtySize, PtyStreamClient, PtyTicket, SessionClient,
+    SessionConfig, SessionCreation, SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput,
+    ViewResource, Visibility,
 };
 
 struct HostConnection {
@@ -27,6 +27,7 @@ pub struct SessionRuntime {
     navigation_history: Vec<String>,
     event_cursors: HashMap<String, u64>,
     active_turns: HashMap<String, Option<String>>,
+    pty_cursors: HashMap<String, u64>,
 }
 
 impl SessionRuntime {
@@ -81,6 +82,7 @@ impl SessionRuntime {
                 navigation_history: Vec::new(),
                 event_cursors,
                 active_turns,
+                pty_cursors: HashMap::new(),
             },
             Some(snapshot),
         ))
@@ -94,6 +96,7 @@ impl SessionRuntime {
             navigation_history: Vec::new(),
             event_cursors: HashMap::new(),
             active_turns: HashMap::new(),
+            pty_cursors: HashMap::new(),
         }
     }
 
@@ -110,12 +113,6 @@ impl SessionRuntime {
 
     pub fn enabled(&self) -> bool {
         self.connection.is_some()
-    }
-
-    pub fn active_host_is_local(&self) -> bool {
-        self.connection
-            .as_ref()
-            .is_some_and(|connection| matches!(connection.endpoint, ConnectionEndpoint::Local(_)))
     }
 
     pub fn remote_completion_client(&self) -> Result<Option<(SessionClient, String)>> {
@@ -353,17 +350,8 @@ impl SessionRuntime {
         size: PtySize,
         terminal_type: Option<String>,
     ) -> Result<(String, PtyStreamClient)> {
-        let destination = match &self
-            .connection
-            .as_ref()
-            .context("session service is disabled")?
-            .endpoint
-        {
-            ConnectionEndpoint::Ssh(destination) => destination.clone(),
-            ConnectionEndpoint::Local(_) => bail!("PTY stream transport requires a remote host"),
-        };
         let ticket = self.pty_start(command, size, terminal_type)?;
-        match PtyStreamClient::connect_ssh(&destination, &ticket.ticket) {
+        match self.open_pty_ticket(&ticket) {
             Ok(stream) => Ok((ticket.pty_id, stream)),
             Err(error) => {
                 let _ = self.pty_close(&ticket.pty_id);
@@ -372,8 +360,82 @@ impl SessionRuntime {
         }
     }
 
+    pub fn pty_attach_stream(&mut self) -> Result<(String, PtyStreamClient)> {
+        let session_id = self.active_session_id()?;
+        let descriptor = self
+            .client_mut()?
+            .pty_list()?
+            .into_iter()
+            .find(|pty| pty.session_id == session_id)
+            .context("active session has no terminal job")?;
+        let after_offset = self.pty_cursors.get(&descriptor.pty_id).copied();
+        let ticket = self.client_mut()?.pty_attach(session_id, after_offset)?;
+        let stream = self.open_pty_ticket(&ticket)?;
+        Ok((ticket.pty_id, stream))
+    }
+
+    pub fn remember_pty_cursor(&mut self, pty_id: &str, cursor: u64) {
+        self.pty_cursors.insert(pty_id.to_owned(), cursor);
+    }
+
+    pub fn terminal_sessions(&mut self) -> Result<Vec<SessionDescriptor>> {
+        Ok(self
+            .terminal_jobs()?
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect())
+    }
+
+    pub fn terminal_jobs(&mut self) -> Result<Vec<(SessionDescriptor, PtyDescriptor)>> {
+        let mut ptys = self.client_mut()?.pty_list()?;
+        let host_ids = self.parked_connections.keys().cloned().collect::<Vec<_>>();
+        for host_id in host_ids {
+            let result = self
+                .parked_connections
+                .get_mut(&host_id)
+                .expect("parked host exists")
+                .client
+                .pty_list();
+            match result {
+                Ok(remote_ptys) => ptys.extend(remote_ptys),
+                Err(error) => {
+                    eprintln!("xshell: cannot list terminal jobs on parked host: {error:#}");
+                }
+            }
+        }
+        let sessions = self.list()?;
+        let mut jobs = ptys
+            .into_iter()
+            .filter_map(|pty| {
+                sessions
+                    .iter()
+                    .find(|session| session.id == pty.session_id)
+                    .cloned()
+                    .map(|session| (session, pty))
+            })
+            .collect::<Vec<_>>();
+        jobs.sort_by(|(left, _), (right, _)| {
+            (&left.host_alias, &left.name).cmp(&(&right.host_alias, &right.name))
+        });
+        Ok(jobs)
+    }
+
     pub fn pty_close(&mut self, pty_id: &str) -> Result<()> {
-        self.client_mut()?.pty_close(pty_id.to_owned())
+        self.client_mut()?.pty_close(pty_id.to_owned())?;
+        self.pty_cursors.remove(pty_id);
+        Ok(())
+    }
+
+    pub fn pty_close_current(&mut self) -> Result<()> {
+        let session_id = self.active_session_id()?;
+        let pty_id = self
+            .client_mut()?
+            .pty_list()?
+            .into_iter()
+            .find(|pty| pty.session_id == session_id)
+            .map(|pty| pty.pty_id)
+            .context("active session has no terminal job")?;
+        self.pty_close(&pty_id)
     }
 
     pub fn events(&mut self, wait_ms: u64) -> Result<EventBatch> {
@@ -456,6 +518,22 @@ impl SessionRuntime {
             .as_mut()
             .map(|connection| &mut connection.client)
             .context("session fabric is disabled; enable [session_fabric] and start xshelld")
+    }
+
+    fn open_pty_ticket(&self, ticket: &PtyTicket) -> Result<PtyStreamClient> {
+        match &self
+            .connection
+            .as_ref()
+            .context("session service is disabled")?
+            .endpoint
+        {
+            ConnectionEndpoint::Local(socket) => {
+                PtyStreamClient::connect_local(socket, &ticket.ticket, ticket.replay_from)
+            }
+            ConnectionEndpoint::Ssh(destination) => {
+                PtyStreamClient::connect_ssh(destination, &ticket.ticket, ticket.replay_from)
+            }
+        }
     }
 
     fn resolve_target(&mut self, selector: &str) -> Result<(String, String)> {
