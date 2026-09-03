@@ -19,7 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 signal-hook = "0.4"
-toml = "0.9"
+toml = "1.1"
 tokio.workspace = true
 uuid.workspace = true
 xshell-audit = { path = "../xshell-audit" }
