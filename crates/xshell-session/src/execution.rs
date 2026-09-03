@@ -38,7 +38,13 @@ struct CoordinatorInner {
 
 struct SessionExecution {
     state: Mutex<ExecutionState>,
+    /// Wakes synchronous waiters: client request threads blocked in
+    /// `events()` long-polls.
     changed: Condvar,
+    /// Wakes the asynchronous waiter: the turn task blocked in `approve()`
+    /// waiting for a client decision. Separate from `changed` because a
+    /// Condvar cannot be awaited from a future.
+    approvals_ready: tokio::sync::Notify,
 }
 
 struct ExecutionState {
@@ -208,6 +214,7 @@ impl ExecutionCoordinator {
         }
         state.approvals.insert(key, reply.decision);
         execution.changed.notify_all();
+        execution.approvals_ready.notify_waiters();
         Ok(())
     }
 
@@ -423,6 +430,7 @@ impl SessionExecution {
                 pending_approvals: HashSet::new(),
             }),
             changed: Condvar::new(),
+            approvals_ready: tokio::sync::Notify::new(),
         }
     }
 
@@ -588,10 +596,16 @@ impl TurnObserver for DaemonObserver {
             if self.cancellation.is_cancelled() {
                 return ApprovalDecision::AbortTurn;
             }
+            // Register for the wake-up before checking, so a reply that
+            // arrives between the check and the await is not missed.
+            let notified = self.execution.approvals_ready.notified();
             if let Some(decision) = self.execution.state.lock_recover().approvals.remove(&key) {
                 return decision;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::select! {
+                () = notified => {}
+                () = self.cancellation.wait() => {}
+            }
         }
     }
 }

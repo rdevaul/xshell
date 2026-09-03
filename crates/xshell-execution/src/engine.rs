@@ -13,8 +13,8 @@ use std::sync::{
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::sync::{Notify, mpsc};
+use tokio::time::timeout;
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{AgentEvent, ChatMessage, ChatRequest, ToolCall};
 
@@ -118,21 +118,46 @@ pub struct AdapterConfig {
     pub api_key_env: Option<String>,
 }
 
+/// A one-way "stop" signal shared between a running turn and whoever may
+/// cancel it (a client request, an audit failure, daemon shutdown).
+///
+/// `cancel` may be called from any thread, including plain std threads that
+/// have no tokio context; `wait` is a future that resolves promptly without
+/// polling.
 #[derive(Debug, Clone, Default)]
-pub struct CancellationFlag(Arc<AtomicBool>);
+pub struct CancellationFlag(Arc<CancellationInner>);
+
+#[derive(Debug, Default)]
+struct CancellationInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
 
 impl CancellationFlag {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        // Wake every current waiter. Futures that start waiting later see the
+        // flag first (see `wait`) so no wake-up can be missed.
+        self.0.notify.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
     }
 
     pub async fn wait(&self) {
-        while !self.is_cancelled() {
-            sleep(Duration::from_millis(20)).await;
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            // Register interest before re-checking so a `cancel` that lands
+            // between the check above and the await below is not lost:
+            // `notified()` captures the wake-up as soon as it is created.
+            let notified = self.0.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -754,6 +779,35 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_wakes_promptly_from_another_thread() {
+        let flag = CancellationFlag::default();
+        let remote = flag.clone();
+        // A plain std thread with no tokio context, as the daemon's request
+        // handler threads are.
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            remote.cancel();
+        });
+        tokio::time::timeout(Duration::from_secs(2), flag.wait())
+            .await
+            .expect("wait must resolve after cancel");
+        assert!(flag.is_cancelled());
+        // Well under any polling interval would have allowed; proves we are
+        // event-driven rather than sleeping in a loop.
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_wait_resolves_immediately() {
+        let flag = CancellationFlag::default();
+        flag.cancel();
+        tokio::time::timeout(Duration::from_millis(10), flag.wait())
+            .await
+            .expect("already-cancelled flag must not block");
     }
 
     #[tokio::test]
