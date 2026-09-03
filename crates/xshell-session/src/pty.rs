@@ -1,4 +1,4 @@
-use crate::{PtyDescriptor, PtySize, PtyTicket};
+use crate::{PtyDescriptor, PtySize, PtyTicket, SessionAuditHandle};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use xshell_audit::AuditEvent;
 use xshell_platform::LockExt;
 use xshell_pty::{PtySize as ProcessSize, RemotePtyProcess};
 
@@ -46,6 +47,8 @@ impl Drop for PtyCoordinator {
 struct ManagedPty {
     session_id: String,
     command: String,
+    cwd: String,
+    audit: Option<SessionAuditHandle>,
     stream: Mutex<StreamAuthorization>,
     state: Mutex<PtyState>,
     changed: Condvar,
@@ -90,6 +93,30 @@ impl PtyCoordinator {
         size: PtySize,
         terminal_type: Option<String>,
     ) -> Result<PtyTicket> {
+        self.start_inner(session_id, command, cwd, size, terminal_type, None)
+    }
+
+    pub fn start_audited(
+        &self,
+        session_id: &str,
+        command: String,
+        cwd: &Path,
+        size: PtySize,
+        terminal_type: Option<String>,
+        audit: SessionAuditHandle,
+    ) -> Result<PtyTicket> {
+        self.start_inner(session_id, command, cwd, size, terminal_type, Some(audit))
+    }
+
+    fn start_inner(
+        &self,
+        session_id: &str,
+        command: String,
+        cwd: &Path,
+        size: PtySize,
+        terminal_type: Option<String>,
+        audit: Option<SessionAuditHandle>,
+    ) -> Result<PtyTicket> {
         validate_command(&command)?;
         validate_size(size)?;
         validate_terminal_type(terminal_type.as_deref())?;
@@ -102,6 +129,14 @@ impl PtyCoordinator {
             if ptys.values().any(|pty| pty.session_id == session_id) {
                 bail!("session already has a terminal job");
             }
+        }
+        if let Some(audit) = &audit {
+            // This is the final boundary before process creation. In required
+            // mode a failed append returns here and the command never starts.
+            audit.append(AuditEvent::Input {
+                route: "shell_terminal".into(),
+                text: format!("${command}"),
+            })?;
         }
 
         let process = RemotePtyProcess::spawn(
@@ -118,6 +153,8 @@ impl PtyCoordinator {
         let managed = Arc::new(ManagedPty {
             session_id: session_id.to_owned(),
             command,
+            cwd: cwd.display().to_string(),
+            audit,
             stream: Mutex::new(StreamAuthorization {
                 tickets: HashMap::from([(ticket.clone(), 0)]),
                 claimed: None,
@@ -388,12 +425,11 @@ fn spawn_worker(managed: Arc<ManagedPty>, mut process: RemotePtyProcess) {
                         state.input.pop_front();
                     }
                     append_output(&mut state, chunk.output);
-                    if let Some(status) = chunk.status {
-                        state.exit_status = Some(status);
-                    }
-                    let finished = state.exit_status.is_some();
+                    let status = chunk.status;
                     managed.changed.notify_all();
-                    if finished {
+                    drop(state);
+                    if let Some(status) = status {
+                        finish(&managed, status);
                         return;
                     }
                 }
@@ -416,14 +452,33 @@ fn append_output(state: &mut PtyState, bytes: Vec<u8>) {
 }
 
 fn finish(managed: &ManagedPty, status: String) {
-    let mut state = managed.state.lock_recover();
-    state.exit_status.get_or_insert(status);
-    managed.changed.notify_all();
+    let should_audit = {
+        let mut state = managed.state.lock_recover();
+        let should_audit = state.exit_status.is_none();
+        state.exit_status.get_or_insert_with(|| status.clone());
+        managed.changed.notify_all();
+        should_audit
+    };
+    if should_audit
+        && let Some(audit) = &managed.audit
+        && let Err(error) = audit.append(AuditEvent::ShellFinished {
+            command: managed.command.clone(),
+            outcome: status,
+            cwd: managed.cwd.clone(),
+        })
+    {
+        eprintln!("xshelld audit warning: cannot record terminal completion: {error:#}");
+    }
 }
 
 fn shutdown(managed: &ManagedPty) {
-    managed.state.lock_recover().shutdown = true;
-    managed.changed.notify_all();
+    {
+        managed.state.lock_recover().shutdown = true;
+        managed.changed.notify_all();
+    }
+    // Record termination synchronously so session closure cannot finalize and
+    // remove the audit stream before the worker observes the shutdown flag.
+    finish(managed, "terminated".into());
 }
 
 fn descriptor(pty_id: &str, managed: &ManagedPty) -> PtyDescriptor {

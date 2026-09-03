@@ -832,15 +832,15 @@ pub fn sanitize_terminal_text(input: &str) -> String {
 
 /// Render agent-derived text for a security-sensitive single-line prompt.
 ///
-/// Control sequences are stripped as in [`sanitize_terminal_text`]; in
-/// addition, newlines, tabs, and any remaining non-printable characters are
-/// shown as visible escapes (`\n`, `\t`, `\u{..}`) so that the displayed text
-/// occupies exactly one line and a reviewer sees every byte that will be acted
-/// on. Bidirectional-override and zero-width formatting characters are also
-/// escaped because they can visually reorder or hide text.
+/// Every control character is rendered as a visible escape rather than parsing
+/// terminal sequences. This distinction is security-sensitive: printable bytes
+/// inside an OSC/DCS sequence can still be shell syntax, so removing the whole
+/// sequence would make the prompt differ from the command that is executed.
+/// Newlines, tabs, bidirectional overrides, and zero-width formatting characters
+/// are escaped as well so the displayed text occupies exactly one line.
 pub fn escape_for_prompt(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    for character in sanitize_terminal_text(input).chars() {
+    for character in input.chars() {
         match character {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
@@ -1401,8 +1401,20 @@ mod tests {
         assert!(!escaped.contains('\n'));
         assert!(!escaped.contains('\r'));
         assert!(!escaped.contains('\u{1b}'));
-        assert_eq!(escaped, "echo ok\\nrm -rf /\\t\\u{202e}gnp.exe\\\\");
+        assert_eq!(
+            escaped,
+            "echo ok\\u{1b}[2K\\u{d}\\nrm -rf /\\t\\u{202e}gnp.exe\\\\"
+        );
         assert_eq!(escape_for_prompt("plain text"), "plain text");
+    }
+
+    #[test]
+    fn approval_escaping_preserves_printable_shell_syntax_inside_osc() {
+        let input = ": \x1b]0; printf HIDDEN; #\x07";
+        assert_eq!(
+            escape_for_prompt(input),
+            ": \\u{1b}]0; printf HIDDEN; #\\u{7}"
+        );
     }
 
     #[test]

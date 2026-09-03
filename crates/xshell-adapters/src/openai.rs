@@ -177,6 +177,7 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
 
         let mut content = String::new();
         let mut partial_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
+        let mut tool_argument_bytes = 0_usize;
         stream_lines(response, |line| {
             let Some(data) = line.trim().strip_prefix("data:") else {
                 return Ok(());
@@ -193,6 +194,14 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
                     events(AgentEvent::TextDelta(delta));
                 }
                 for delta in choice.delta.tool_calls {
+                    if !partial_calls.contains_key(&delta.index)
+                        && partial_calls.len() >= crate::MAX_TOOL_CALLS
+                    {
+                        return Err(AdapterError::InvalidResponse(format!(
+                            "the agent endpoint returned more than {} tool calls",
+                            crate::MAX_TOOL_CALLS
+                        )));
+                    }
                     let call = partial_calls.entry(delta.index).or_default();
                     if let Some(id) = delta.id {
                         call.id.push_str(&id);
@@ -202,6 +211,15 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
                             call.name.push_str(&name);
                         }
                         if let Some(arguments) = function.arguments {
+                            tool_argument_bytes = tool_argument_bytes
+                                .checked_add(arguments.len())
+                                .filter(|size| *size <= crate::MAX_TOOL_ARGUMENT_BYTES)
+                                .ok_or_else(|| {
+                                    AdapterError::InvalidResponse(format!(
+                                        "streamed tool arguments exceed {} bytes",
+                                        crate::MAX_TOOL_ARGUMENT_BYTES
+                                    ))
+                                })?;
                             call.arguments.push_str(&arguments);
                         }
                     }

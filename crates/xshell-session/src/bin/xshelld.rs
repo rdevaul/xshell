@@ -741,7 +741,9 @@ fn process_request(
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
-            let ticket = ptys.start(&session_id, command, &cwd, size, terminal_type)?;
+            let audit = execution.audit_handle(&session_id)?;
+            let ticket =
+                ptys.start_audited(&session_id, command, &cwd, size, terminal_type, audit)?;
             Ok(ServerResponse::PtyStarted { ticket })
         }
         ClientRequest::PtyList => Ok(ServerResponse::PtyCatalog { ptys: ptys.list() }),
