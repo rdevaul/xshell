@@ -108,6 +108,7 @@ fn main() -> Result<()> {
         audit,
         config.max_approval,
         config.sensitive_paths(),
+        config.compaction.clone(),
     );
     let ptys = PtyCoordinator::default();
 

@@ -97,7 +97,10 @@ async fn main() -> Result<()> {
     let render_options =
         RenderOptions::resolve(&model_config.rendering, args.markdown, args.color)?;
     let pty_escape = xshell_pty::parse_escape_prefix(&model_config.session_fabric.pty_escape)?;
-    let turn_policy = TurnPolicy::new(args.approval)
+    // Approval and sensitive paths are fixed for the process; the history
+    // budget is resolved per turn from the active model so `//model` switches
+    // are honoured (see `turn_policy_for`).
+    let base_policy = TurnPolicy::new(args.approval)
         .with_sensitive_paths(model_config.session_fabric.sensitive_paths());
     let viewers = ViewerRegistry::with_builtins();
     let mut active_model = model_config.resolve_startup(
@@ -596,6 +599,11 @@ async fn main() -> Result<()> {
                     }
                     continue;
                 }
+                let turn_policy = turn_policy_for(
+                    &base_policy,
+                    &model_config.session_fabric.compaction,
+                    &active_model,
+                );
                 if let Err(error) = run_agent_turn(
                     agent.as_mut(),
                     &mut history,
@@ -750,6 +758,10 @@ requested \"{requested}\" was not applied"
                     }
                     ExecutionEvent::TurnAborted => {
                         println!("agent turn aborted; no remaining tools were executed");
+                    }
+                    ExecutionEvent::HistoryCompacted { report } => {
+                        print_compaction(&report);
+                        audit.append_execution(compaction_audit_event(&report))?;
                     }
                 },
                 SessionEventKind::ShellOutput { stream, text } => {
@@ -970,6 +982,10 @@ impl TurnObserver for LocalObserver<'_> {
                 println!("agent turn aborted; no remaining tools were executed\n");
                 Ok(())
             }
+            ExecutionEvent::HistoryCompacted { report } => {
+                print_compaction(&report);
+                self.audit.append(compaction_audit_event(&report))
+            }
         };
         self.record(result);
     }
@@ -1002,6 +1018,40 @@ async fn run_agent_turn(
     let outcome =
         xshell_execution::run_agent_turn(agent, history, message, cwd, policy, &mut observer).await;
     observer.finish(outcome)
+}
+
+/// The session-wide compaction default, overridden by the active model's own
+/// budget when its profile sets one.
+fn turn_policy_for(
+    base: &TurnPolicy,
+    session_default: &xshell_execution::CompactionConfig,
+    active: &ActiveModel,
+) -> TurnPolicy {
+    base.clone()
+        .with_compaction(&session_default.for_model(active.max_history_bytes))
+}
+
+fn print_compaction(report: &xshell_execution::CompactionReport) {
+    eprintln!(
+        "xshell: history compacted ({}): dropped {} older turn(s), {} -> {} messages, {} -> {} bytes",
+        report.compactor,
+        report.turns_removed,
+        report.messages_before,
+        report.messages_after,
+        report.bytes_before,
+        report.bytes_after
+    );
+}
+
+fn compaction_audit_event(report: &xshell_execution::CompactionReport) -> AuditEvent {
+    AuditEvent::HistoryCompacted {
+        compactor: report.compactor.clone(),
+        messages_before: report.messages_before,
+        messages_after: report.messages_after,
+        bytes_before: report.bytes_before,
+        bytes_after: report.bytes_after,
+        turns_removed: report.turns_removed,
+    }
 }
 
 fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
@@ -1177,6 +1227,11 @@ fn print_model(active: &ActiveModel, daemon_owned: bool) {
     println!("provider: {:?}", active.provider);
     println!("model: {}", active.model);
     println!("endpoint: {}", active.base_url);
+    match active.max_history_bytes {
+        Some(0) => println!("history budget: unlimited (profile)"),
+        Some(bytes) => println!("history budget: {bytes} bytes (profile)"),
+        None => println!("history budget: session default"),
+    }
     if active.provider == Provider::Openai {
         if daemon_owned {
             println!("credentials: resolved by xshelld");
@@ -1959,6 +2014,7 @@ mod tests {
                 model: "test".into(),
                 base_url: "http://localhost".into(),
                 api_key_env: None,
+                max_history_bytes: None,
             },
             cwd: PathBuf::from("/tmp"),
             persistence: PersistenceMode::Daemon,

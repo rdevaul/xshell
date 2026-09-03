@@ -1,4 +1,7 @@
-use crate::{GateReason, SensitivePaths, definitions, execute_tool, requires_approval};
+use crate::{
+    CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, definitions,
+    execute_tool, requires_approval,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -108,6 +111,11 @@ pub enum ExecutionEvent {
         result: String,
     },
     TurnAborted,
+    /// Older turns were removed from the conversation after this turn
+    /// completed, to keep the history within the configured budget.
+    HistoryCompacted {
+        report: CompactionReport,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -196,10 +204,33 @@ fn resolve_api_key(config: &AdapterConfig) -> Result<Option<String>> {
 }
 
 /// Everything that governs what an agent may do during one turn.
-#[derive(Debug, Clone)]
 pub struct TurnPolicy {
     pub approval: ApprovalPolicy,
     pub sensitive_paths: SensitivePaths,
+    /// Applied to the history after a turn completes successfully. Never
+    /// applied mid-turn or after a failed/cancelled turn, whose messages are
+    /// rolled back anyway.
+    pub compactor: Arc<dyn Compactor>,
+}
+
+impl std::fmt::Debug for TurnPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnPolicy")
+            .field("approval", &self.approval)
+            .field("sensitive_paths", &self.sensitive_paths)
+            .field("compactor", &self.compactor.name())
+            .finish()
+    }
+}
+
+impl Clone for TurnPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            approval: self.approval,
+            sensitive_paths: self.sensitive_paths.clone(),
+            compactor: Arc::clone(&self.compactor),
+        }
+    }
 }
 
 impl TurnPolicy {
@@ -207,12 +238,31 @@ impl TurnPolicy {
         Self {
             approval,
             sensitive_paths: SensitivePaths::default(),
+            compactor: Arc::from(CompactionConfig::default().build()),
         }
     }
 
     pub fn with_sensitive_paths(mut self, sensitive_paths: SensitivePaths) -> Self {
         self.sensitive_paths = sensitive_paths;
         self
+    }
+
+    pub fn with_compaction(mut self, config: &CompactionConfig) -> Self {
+        self.compactor = Arc::from(config.build());
+        self
+    }
+}
+
+/// Run the policy's compactor and report what it did. Called by the engine
+/// after a successful turn; exposed so callers that restore a durable history
+/// can also bring it within budget before the first request.
+pub fn compact_history(
+    policy: &TurnPolicy,
+    history: &mut Vec<ChatMessage>,
+    observer: &mut dyn TurnObserver,
+) {
+    if let Some(report) = policy.compactor.compact(history) {
+        observer.emit(ExecutionEvent::HistoryCompacted { report });
     }
 }
 
@@ -283,6 +333,7 @@ pub async fn run_agent_turn(
             response.tool_calls.clone(),
         ));
         if response.tool_calls.is_empty() {
+            compact_history(policy, history, observer);
             return Ok(());
         }
 
@@ -593,6 +644,7 @@ mod tests {
                 ExecutionEvent::ToolSkipped { .. } => "skipped",
                 ExecutionEvent::ToolResult { .. } => "result",
                 ExecutionEvent::TurnAborted => "aborted",
+                ExecutionEvent::HistoryCompacted { .. } => "compacted",
             })
             .collect()
     }
@@ -779,6 +831,85 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn history_is_compacted_after_a_successful_turn_only() {
+        let temporary = TempDir::new().unwrap();
+        let big = "z".repeat(400);
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    content: big.clone(),
+                    tool_calls: Vec::new(),
+                },
+                AssistantResponse {
+                    content: big.clone(),
+                    tool_calls: Vec::new(),
+                },
+                AssistantResponse {
+                    content: big.clone(),
+                    tool_calls: Vec::new(),
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(1000),
+        });
+        let mut history = vec![ChatMessage::system("sys")];
+        for n in 0..3 {
+            run_agent_turn(
+                &mut adapter,
+                &mut history,
+                format!("q{n}"),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .unwrap();
+        }
+        // Three 400-byte answers exceed 1000; the oldest turn(s) must go, the
+        // system prompt and the latest turn must stay.
+        assert!(crate::history_bytes(&history) <= 1000);
+        assert_eq!(history[0].role, xshell_core::MessageRole::System);
+        assert!(history.iter().any(|m| m.content == "q2"));
+        assert!(!history.iter().any(|m| m.content == "q0"));
+        let compactions = observer
+            .events
+            .iter()
+            .filter(|e| matches!(e, ExecutionEvent::HistoryCompacted { .. }))
+            .count();
+        assert!(compactions >= 1);
+
+        // A failing turn (script exhausted) rolls back and does not compact.
+        let events_before = observer.events.len();
+        let history_before = history.clone();
+        assert!(
+            run_agent_turn(
+                &mut adapter,
+                &mut history,
+                "q3".into(),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(history, history_before);
+        assert!(
+            !observer.events[events_before..]
+                .iter()
+                .any(|e| matches!(e, ExecutionEvent::HistoryCompacted { .. }))
+        );
     }
 
     #[tokio::test]

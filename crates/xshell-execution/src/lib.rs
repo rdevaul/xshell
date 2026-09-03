@@ -1,7 +1,12 @@
+mod compaction;
 mod engine;
 mod sensitive;
 mod tools;
 
+pub use compaction::{
+    CompactionConfig, CompactionReport, Compactor, MaxBytesCompactor, NoCompaction, history_bytes,
+    message_bytes,
+};
 pub use engine::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, DirectShellResult,
     ExecutionEvent, TurnObserver, TurnPolicy, build_adapter, run_agent_turn, run_direct_shell,

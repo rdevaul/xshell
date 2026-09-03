@@ -62,7 +62,8 @@ journal.
   opens one audit session per xshell session on first use, and records the
   execution-boundary events itself — agent and `$` input, model responses and
   errors, tool requests, approval decisions, tool results, working-directory
-  changes, direct shell completion, and terminal-job (PTY) start and completion.
+  changes, direct shell completion, terminal-job (PTY) start and completion,
+  and history compaction (which turns the model could no longer see).
   A detached turn is audited exactly as an attached one. With `required = true`,
   `xshelld` refuses to start without a reachable audit service, refuses to accept
   a turn whose input cannot be recorded, and stops an in-flight turn at the next

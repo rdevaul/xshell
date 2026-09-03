@@ -47,6 +47,39 @@ cannot dodge it. A match is reported through `approval_requested` with
 follows the turn's approval policy exactly like a shell tool. Omitting the key
 selects the built-in defaults; an empty list disables the check.
 
+## History compaction
+
+Every provider request carries the full conversation, so an unbounded history
+costs tokens on every step and eventually exceeds the model's context window.
+`session_fabric.compaction` selects a compaction strategy that runs after each
+successfully completed turn (never mid-turn, and never after a failed or
+cancelled turn, whose messages are rolled back anyway).
+
+Strategies implement the `Compactor` trait in `xshell-execution` and operate
+on whole turns — a `user` message through its final `assistant` reply,
+including any tool calls and results — because OpenAI-compatible APIs reject a
+`tool` result whose calling `assistant` message is missing. The leading
+`system` message is always preserved, as is the most recent turn.
+
+The built-in strategy is `max_history_bytes`: drop the oldest whole turns until
+content plus tool-call arguments fit the budget. Bytes are a deliberate proxy
+for tokens; exact counts are model-specific and not worth a tokenizer
+dependency. Progressive summarization is a planned second implementation and
+plugs in behind the same trait and config surface.
+
+The budget is resolved per model. `session_fabric.compaction.max_history_bytes`
+is the session-wide default; a model profile's own `max_history_bytes` takes
+precedence because the appropriate depth follows that model's context window.
+The value travels with the session's model binding, so `//model` switches and
+remote daemons apply the budget of the model actually in use. A profile may
+set `0` to disable compaction for that model.
+
+Each compaction is reported to the client as a `history_compacted` execution
+event and recorded in the audit log, so a reader of the trail can see from
+which point the model no longer had the full transcript. A durable session
+restored with a smaller budget than it was saved under is brought within
+budget after its next completed turn.
+
 ## Identity and attachment
 
 - A session has a stable UUID. Its display name is unique within one daemon's

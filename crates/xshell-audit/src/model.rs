@@ -99,6 +99,17 @@ pub enum AuditEvent {
         outcome: String,
         cwd: String,
     },
+    /// Older conversation turns were dropped (or summarized) to stay within
+    /// the configured history budget. Recorded so a reader of the trail knows
+    /// the model did not see the full transcript from this point on.
+    HistoryCompacted {
+        compactor: String,
+        messages_before: usize,
+        messages_after: usize,
+        bytes_before: usize,
+        bytes_after: usize,
+        turns_removed: usize,
+    },
     SessionEnded {
         reason: String,
     },

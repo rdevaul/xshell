@@ -30,6 +30,7 @@ fn model(name: &str) -> ModelBinding {
         model: "qwen3:8b".into(),
         base_url: "http://127.0.0.1:11434".into(),
         api_key_env: None,
+        max_history_bytes: None,
     }
 }
 
@@ -808,6 +809,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
                 model: "fake-model".into(),
                 base_url,
                 api_key_env: None,
+                max_history_bytes: None,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -1196,6 +1198,7 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
                 model: "fake-model".into(),
                 base_url,
                 api_key_env: None,
+                max_history_bytes: None,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,

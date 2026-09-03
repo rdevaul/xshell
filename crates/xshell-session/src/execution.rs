@@ -13,9 +13,9 @@ use uuid::Uuid;
 use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent, GateReason,
-    SensitivePaths, TurnObserver, TurnPolicy, build_adapter, run_agent_turn,
-    run_direct_shell_streaming,
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, CompactionConfig,
+    ExecutionEvent, GateReason, SensitivePaths, TurnObserver, TurnPolicy, build_adapter,
+    run_agent_turn, run_direct_shell_streaming,
 };
 use xshell_platform::LockExt;
 
@@ -34,6 +34,7 @@ struct CoordinatorInner {
     audit: DaemonAudit,
     max_approval: ApprovalPolicy,
     sensitive_paths: SensitivePaths,
+    compaction: CompactionConfig,
 }
 
 struct SessionExecution {
@@ -68,6 +69,7 @@ impl ExecutionCoordinator {
             DaemonAudit::default(),
             ApprovalPolicy::Ask,
             SensitivePaths::default(),
+            CompactionConfig::default(),
         )
     }
 
@@ -76,6 +78,7 @@ impl ExecutionCoordinator {
         audit: DaemonAudit,
         max_approval: ApprovalPolicy,
         sensitive_paths: SensitivePaths,
+        compaction: CompactionConfig,
     ) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
@@ -84,6 +87,7 @@ impl ExecutionCoordinator {
                 audit,
                 max_approval,
                 sensitive_paths,
+                compaction,
             }),
         }
     }
@@ -319,7 +323,8 @@ impl ExecutionCoordinator {
                         api_key_env: model.api_key_env.clone(),
                     })?;
                     let policy = TurnPolicy::new(approval)
-                        .with_sensitive_paths(self.inner.sensitive_paths.clone());
+                        .with_sensitive_paths(self.inner.sensitive_paths.clone())
+                        .with_compaction(&self.inner.compaction.for_model(model.max_history_bytes));
                     let outcome = run_agent_turn(
                         agent.as_mut(),
                         &mut snapshot.history,
@@ -574,6 +579,16 @@ impl TurnObserver for DaemonObserver {
                 result: result.clone(),
             }),
             ExecutionEvent::TurnAborted => {}
+            ExecutionEvent::HistoryCompacted { report } => {
+                self.audit(AuditEvent::HistoryCompacted {
+                    compactor: report.compactor.clone(),
+                    messages_before: report.messages_before,
+                    messages_after: report.messages_after,
+                    bytes_before: report.bytes_before,
+                    bytes_after: report.bytes_after,
+                    turns_removed: report.turns_removed,
+                })
+            }
         }
         if let ExecutionEvent::ApprovalRequested { call, .. } = &event {
             self.execution

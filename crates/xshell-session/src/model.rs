@@ -25,6 +25,10 @@ pub struct SessionConfig {
     /// otherwise read-only. `None` uses the built-in defaults; an empty list
     /// disables the check.
     pub sensitive_paths: Option<Vec<String>>,
+    /// Session-wide default for conversation-history compaction, applied
+    /// after each completed turn. A model profile's own `max_history_bytes`
+    /// takes precedence. Omit to keep full history.
+    pub compaction: xshell_execution::CompactionConfig,
 }
 
 impl SessionConfig {
@@ -47,6 +51,7 @@ impl Default for SessionConfig {
             pty_escape: "ctrl-]".into(),
             max_approval: ApprovalPolicy::Ask,
             sensitive_paths: None,
+            compaction: xshell_execution::CompactionConfig::default(),
         }
     }
 }
@@ -130,6 +135,11 @@ pub struct ModelBinding {
     pub model: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    /// Per-model history budget, overriding `session_fabric.compaction`.
+    /// Travels with the binding so a session switched to a small-context
+    /// model is compacted for that model, wherever the daemon runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_history_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
