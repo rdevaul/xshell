@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 use xshell_core::{ToolCall, ToolDefinition};
@@ -163,19 +164,31 @@ async fn run_shell(arguments: &Value, root: &Path) -> Result<String> {
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    let child = process
+    let mut child = process
         .spawn()
         .with_context(|| format!("could not launch shell {shell}"))?;
     let group = child.id().and_then(|pid| i32::try_from(pid).ok());
-    match timeout(SHELL_TOOL_TIMEOUT, child.wait_with_output()).await {
-        Ok(output) => {
-            let output = output.context("could not collect shell tool output")?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Ok(format!(
-                "exit status: {}\nstdout:\n{}\nstderr:\n{}",
-                output.status, stdout, stderr
-            ))
+    let stdout = child.stdout.take().context("cannot capture shell stdout")?;
+    let stderr = child.stderr.take().context("cannot capture shell stderr")?;
+    match timeout(SHELL_TOOL_TIMEOUT, async move {
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_bounded_output(stdout),
+            read_bounded_output(stderr),
+            child.wait()
+        )?;
+        Ok::<_, std::io::Error>((stdout, stderr, status))
+    })
+    .await
+    {
+        Ok(Ok((stdout, stderr, status))) => Ok(format!(
+            "exit status: {}\nstdout:\n{}\nstderr:\n{}",
+            status,
+            stdout.render(),
+            stderr.render()
+        )),
+        Ok(Err(error)) => {
+            kill_process_group(group);
+            Err(error).context("could not collect shell tool output")
         }
         Err(_) => {
             kill_process_group(group);
@@ -184,6 +197,40 @@ async fn run_shell(arguments: &Value, root: &Path) -> Result<String> {
                 SHELL_TOOL_TIMEOUT.as_secs()
             )
         }
+    }
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedOutput {
+    fn render(&self) -> String {
+        let mut output = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.truncated {
+            output.push_str("\n[stream output truncated]");
+        }
+        output
+    }
+}
+
+/// Drain a pipe to EOF while retaining only a bounded prefix. Continuing to
+/// drain is important: stopping at the limit would block the child on a full
+/// pipe and turn a memory bound into a deadlock.
+async fn read_bounded_output(mut reader: impl AsyncRead + Unpin) -> std::io::Result<BoundedOutput> {
+    let mut bytes = Vec::with_capacity(MAX_TOOL_OUTPUT_BYTES);
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(BoundedOutput { bytes, truncated });
+        }
+        let remaining = MAX_TOOL_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let retained = count.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < count;
     }
 }
 
@@ -253,6 +300,14 @@ mod tests {
         let output = truncate("é".repeat(MAX_TOOL_OUTPUT_BYTES));
         assert!(output.ends_with("[tool output truncated]"));
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn shell_stream_collection_drains_but_retains_only_the_limit() {
+        let input = vec![b'x'; MAX_TOOL_OUTPUT_BYTES * 3];
+        let output = read_bounded_output(input.as_slice()).await.unwrap();
+        assert_eq!(output.bytes.len(), MAX_TOOL_OUTPUT_BYTES);
+        assert!(output.truncated);
     }
 
     #[test]

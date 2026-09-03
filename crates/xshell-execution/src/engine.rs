@@ -257,6 +257,13 @@ pub async fn run_agent_turn(
                 call_id: call.id.clone(),
                 decision,
             });
+            // A decision is the last audit boundary before the action. An
+            // observer can cancel when recording it fails; honor that before
+            // executing the exact tool whose audit record is unavailable.
+            if observer.cancellation().is_cancelled() {
+                history.truncate(checkpoint);
+                bail!("agent turn cancelled before tool execution");
+            }
             if decision == ApprovalDecision::AbortTurn {
                 for skipped in &response.tool_calls[index..] {
                     history.push(ChatMessage::tool_result(
@@ -484,11 +491,15 @@ mod tests {
         events: Vec<ExecutionEvent>,
         decisions: VecDeque<ApprovalDecision>,
         cancellation: CancellationFlag,
+        cancel_on_decision: bool,
     }
 
     #[async_trait]
     impl TurnObserver for RecordingObserver {
         fn emit(&mut self, event: ExecutionEvent) {
+            if self.cancel_on_decision && matches!(event, ExecutionEvent::ToolDecision { .. }) {
+                self.cancellation.cancel();
+            }
             self.events.push(event);
         }
 
@@ -564,6 +575,7 @@ mod tests {
             events: Vec::new(),
             decisions: VecDeque::from([ApprovalDecision::Deny]),
             cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
         };
         let mut history = Vec::new();
         run_agent_turn(
@@ -629,6 +641,7 @@ mod tests {
             events: Vec::new(),
             decisions: VecDeque::from([ApprovalDecision::AbortTurn]),
             cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
         };
         let mut history = Vec::new();
         run_agent_turn(
@@ -692,6 +705,7 @@ mod tests {
             events: Vec::new(),
             decisions: VecDeque::new(),
             cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
         };
         let mut history = Vec::new();
         run_agent_turn(
@@ -712,6 +726,44 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_recording_a_decision_prevents_tool_execution() {
+        let temporary = TempDir::new().unwrap();
+        let marker = temporary.path().join("must-not-exist");
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: String::new(),
+                tool_calls: vec![shell_call(
+                    "a",
+                    &format!("touch {}", marker.to_string_lossy()),
+                )],
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: true,
+        };
+        let mut history = Vec::new();
+
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            ApprovalPolicy::Auto,
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("before tool execution"));
+        assert!(!marker.exists());
+        assert!(history.is_empty(), "cancelled turn must roll back history");
     }
 
     #[tokio::test]

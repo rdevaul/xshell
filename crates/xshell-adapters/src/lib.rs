@@ -16,9 +16,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// to produce the first token after prompt processing, but bounded so that a
 /// stalled provider cannot wedge a detached daemon turn forever.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Absolute ceiling for one streamed model response, even if the endpoint
+/// keeps sending bytes often enough to avoid the idle timeout.
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
 /// Maximum bytes buffered while waiting for a line terminator from the
 /// provider. Streamed JSON chunks and SSE events are far smaller than this.
 const MAX_PENDING_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum wire bytes accepted for one successful streamed response. This
+/// bounds accumulated model text and tool-call data even when every event is
+/// individually well formed and newline terminated.
+const MAX_STREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Error pages are diagnostic only and should never consume arbitrary memory.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TOOL_CALLS: usize = 256;
+pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 /// Build the HTTP client shared by all adapters. Every provider request goes
 /// through this so the timeout policy is defined in exactly one place.
@@ -47,10 +58,7 @@ async fn stream_lines(
 ) -> Result<(), AdapterError> {
     let status = response.status();
     if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .map_err(|error| AdapterError::Transport(error.to_string()))?;
+        let body = read_bounded_error(response).await?;
         return Err(AdapterError::Http {
             status: status.as_u16(),
             body,
@@ -59,21 +67,32 @@ async fn stream_lines(
 
     let mut stream = response.bytes_stream();
     let mut pending = Vec::<u8>::new();
+    let mut total_bytes = 0_usize;
+    let deadline = tokio::time::Instant::now() + MAX_STREAM_DURATION;
     loop {
         // `read_timeout` on the client covers socket-level stalls; this guard
         // additionally bounds the wait for the next frame at the stream layer
         // so HTTP/2 or proxy keepalives cannot hold the turn open indefinitely.
-        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(_) => {
-                return Err(AdapterError::Transport(format!(
-                    "no data received from the agent endpoint for {} seconds",
-                    STREAM_IDLE_TIMEOUT.as_secs()
-                )));
-            }
-        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(stream_duration_error());
+        }
+        let chunk =
+            match tokio::time::timeout(remaining.min(STREAM_IDLE_TIMEOUT), stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(stream_duration_error());
+                    }
+                    return Err(AdapterError::Transport(format!(
+                        "no data received from the agent endpoint for {} seconds",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    )));
+                }
+            };
         let chunk = chunk.map_err(|error| AdapterError::Transport(error.to_string()))?;
+        account_response_bytes(&mut total_bytes, chunk.len())?;
         if pending.len().saturating_add(chunk.len()) > MAX_PENDING_LINE_BYTES {
             return Err(AdapterError::InvalidResponse(format!(
                 "the agent endpoint sent more than {MAX_PENDING_LINE_BYTES} bytes without a line terminator"
@@ -98,6 +117,56 @@ async fn stream_lines(
         consume(line)?;
     }
     Ok(())
+}
+
+fn stream_duration_error() -> AdapterError {
+    AdapterError::Transport(format!(
+        "the agent endpoint response exceeded {} seconds",
+        MAX_STREAM_DURATION.as_secs()
+    ))
+}
+
+fn account_response_bytes(total: &mut usize, chunk: usize) -> Result<(), AdapterError> {
+    *total = total.saturating_add(chunk);
+    if *total > MAX_STREAM_RESPONSE_BYTES {
+        return Err(AdapterError::InvalidResponse(format!(
+            "the agent endpoint response exceeds {MAX_STREAM_RESPONSE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+async fn read_bounded_error(response: reqwest::Response) -> Result<String, AdapterError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(MAX_ERROR_BODY_BYTES.min(8 * 1024));
+    let mut truncated = false;
+    while let Some(chunk) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| {
+            AdapterError::Transport(format!(
+                "no error-response data received for {} seconds",
+                STREAM_IDLE_TIMEOUT.as_secs()
+            ))
+        })?
+    {
+        let chunk = chunk.map_err(|error| AdapterError::Transport(error.to_string()))?;
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let retained = remaining.min(chunk.len());
+        body.extend_from_slice(&chunk[..retained]);
+        if retained < chunk.len() {
+            truncated = true;
+            break;
+        }
+    }
+    let mut body = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        body.push_str("\n[error body truncated]");
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -146,5 +215,18 @@ mod test_support {
             String::from_utf8(request[header_end..header_end + content_length].to_vec()).unwrap()
         });
         (format!("http://{address}"), handle)
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    #[test]
+    fn total_response_budget_applies_across_newline_terminated_chunks() {
+        let mut total = 0;
+        account_response_bytes(&mut total, MAX_STREAM_RESPONSE_BYTES).unwrap();
+        let error = account_response_bytes(&mut total, 1).unwrap_err();
+        assert!(matches!(error, AdapterError::InvalidResponse(_)));
     }
 }

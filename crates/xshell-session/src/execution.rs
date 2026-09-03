@@ -81,7 +81,7 @@ impl ExecutionCoordinator {
         &self.inner.audit
     }
 
-    fn audit_handle(&self, snapshot: &crate::SessionSnapshot) -> SessionAuditHandle {
+    fn audit_handle_for_snapshot(&self, snapshot: &crate::SessionSnapshot) -> SessionAuditHandle {
         let descriptor = &snapshot.descriptor;
         self.inner.audit.session(
             &descriptor.id,
@@ -92,6 +92,14 @@ impl ExecutionCoordinator {
                 user: descriptor.user.clone(),
             },
         )
+    }
+
+    /// Open or retrieve the daemon-owned audit stream for a session. PTY jobs
+    /// use the same stream as agent and direct-shell turns so protocol clients
+    /// cannot bypass execution-boundary auditing.
+    pub fn audit_handle(&self, session_id: &str) -> Result<SessionAuditHandle> {
+        let snapshot = self.inner.registry.lock_recover().snapshot(session_id)?;
+        Ok(self.audit_handle_for_snapshot(&snapshot))
     }
 
     pub fn submit(
@@ -110,7 +118,7 @@ impl ExecutionCoordinator {
         let cancellation = CancellationFlag::default();
         // Record the input at the execution boundary before anything runs.
         // With required auditing, a failure here refuses the turn outright.
-        let audit = self.audit_handle(&snapshot);
+        let audit = self.audit_handle_for_snapshot(&snapshot);
         let (route, text) = match &input {
             TurnInput::Agent { message } => ("agent", message.clone()),
             TurnInput::Shell { command } => ("shell", format!("${command}")),

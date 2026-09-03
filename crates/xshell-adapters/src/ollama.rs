@@ -148,6 +148,7 @@ impl AgentAdapter for OllamaAdapter {
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let mut tool_argument_bytes = 0_usize;
         stream_lines(response, |line| {
             if line.trim().is_empty() {
                 return Ok(());
@@ -159,6 +160,22 @@ impl AgentAdapter for OllamaAdapter {
                 events(AgentEvent::TextDelta(chunk.message.content));
             }
             for call in chunk.message.tool_calls {
+                if tool_calls.len() >= crate::MAX_TOOL_CALLS {
+                    return Err(AdapterError::InvalidResponse(format!(
+                        "the agent endpoint returned more than {} tool calls",
+                        crate::MAX_TOOL_CALLS
+                    )));
+                }
+                let argument_bytes = call.function.arguments.to_string().len();
+                tool_argument_bytes = tool_argument_bytes
+                    .checked_add(argument_bytes)
+                    .filter(|size| *size <= crate::MAX_TOOL_ARGUMENT_BYTES)
+                    .ok_or_else(|| {
+                        AdapterError::InvalidResponse(format!(
+                            "streamed tool arguments exceed {} bytes",
+                            crate::MAX_TOOL_ARGUMENT_BYTES
+                        ))
+                    })?;
                 tool_calls.push(ToolCall {
                     id: format!("ollama-call-{}", tool_calls.len()),
                     name: call.function.name,

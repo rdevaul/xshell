@@ -62,15 +62,14 @@ journal.
   opens one audit session per xshell session on first use, and records the
   execution-boundary events itself — agent and `$` input, model responses and
   errors, tool requests, approval decisions, tool results, working-directory
-  changes, and direct shell completion. A detached turn is audited exactly as
-  an attached one. With `required = true`, `xshelld` refuses to start without
-  a reachable audit service, refuses to accept a turn whose input cannot be
-  recorded, and stops an in-flight turn at the next tool boundary if an append
-  fails. The attached CLI records only what the daemon cannot see: its own
-  startup configuration, `//` control commands, logical session attach and
-  detach, model profile switches, view operations, and terminal-job (PTY)
-  start and completion. Daemon-recorded events are not duplicated by the CLI
-  on replay.
+  changes, direct shell completion, and terminal-job (PTY) start and completion.
+  A detached turn is audited exactly as an attached one. With `required = true`,
+  `xshelld` refuses to start without a reachable audit service, refuses to accept
+  a turn whose input cannot be recorded, and stops an in-flight turn at the next
+  tool boundary if an append fails. The attached CLI records only what the
+  daemon cannot see: its own startup configuration, `//` control commands,
+  logical session attach and detach, model profile switches, and view
+  operations. Daemon-recorded events are not duplicated by the CLI on replay.
 
 The daemon's audit session for an xshell session is finalized with a signed
 checkpoint when that session is closed with `//close`. A daemon that exits
@@ -136,14 +135,12 @@ Audit logs contain prompts, source text, commands, and tool output. They should
 be treated as sensitive. At-rest encryption and retention policy are planned
 but are not in the initial format.
 
-Direct `$` command input is logged before execution, but the byte-for-byte
-terminal stream is not yet captured. An exit outcome is recorded when the job
-finishes or is terminated while the originating command remains focused. If a
-controller detaches or switches away first, the job remains in progress and a
-later exit is not yet emitted as a separate audit event. Complete lifecycle and
-stream capture without breaking interactive terminal programs requires
-integrating the terminal-job replay journal with the audit service; see
-[the PTY trust boundary](pty.md).
+Direct `$` command input is logged by `xshelld` before execution, and the daemon
+records the exit outcome even when the controller has detached or switched
+away. The byte-for-byte terminal stream is not yet captured. Stream capture
+without breaking interactive terminal programs requires integrating the
+terminal-job replay journal with the audit service; see [the PTY trust
+boundary](pty.md).
 
 An unclean client or daemon crash leaves a verifiable hash chain but no final
 checkpoint. The verifier reports this explicitly rather than claiming the log

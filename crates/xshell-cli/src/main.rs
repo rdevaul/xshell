@@ -228,22 +228,13 @@ async fn main() -> Result<()> {
             InputRoute::Shell(command) => {
                 if sessions.enabled() {
                     if xshell_pty::controller_is_terminal() && !is_simple_cd(&command) {
-                        // Terminal jobs are started through the PTY protocol,
-                        // which the daemon does not yet audit (see
-                        // docs/auditing.md). Record the input and completion
-                        // from the controller so the trail stays complete.
-                        audit.append(AuditEvent::Input {
-                            route: "shell_terminal".into(),
-                            text: line.clone(),
-                        })?;
                         let previous_session = sessions.active().map(|session| session.id.clone());
                         let result = match run_session_pty(&mut sessions, &command, pty_escape) {
                             Ok(outcome) => outcome,
                             Err(error) => {
                                 eprintln!("xshell: {error:#}");
-                                TerminalCommandOutcome {
+                                TerminalFocusOutcome {
                                     description: format!("error: {error:#}"),
-                                    command_finished: false,
                                 }
                             }
                         };
@@ -251,13 +242,6 @@ async fn main() -> Result<()> {
                             && !result.description.starts_with("error:")
                         {
                             eprintln!("xshell: {}", result.description);
-                        }
-                        if result.command_finished {
-                            audit.append(AuditEvent::ShellFinished {
-                                command,
-                                outcome: result.description,
-                                cwd: cwd.display().to_string(),
-                            })?;
                         }
                         if sessions.active().map(|session| &session.id) != previous_session.as_ref()
                         {
@@ -869,6 +853,7 @@ impl<'a> LocalObserver<'a> {
             && self.failure.is_none()
         {
             self.failure = Some(error);
+            self.cancellation.cancel();
         }
     }
 
@@ -879,8 +864,8 @@ impl<'a> LocalObserver<'a> {
             .context("could not render agent response");
         self.record(flush);
         match (outcome, self.failure) {
-            (Err(error), _) => Err(error),
-            (Ok(()), Some(error)) => Err(error),
+            (_, Some(error)) => Err(error),
+            (Err(error), None) => Err(error),
             (Ok(()), None) => Ok(()),
         }
     }
@@ -1727,21 +1712,15 @@ fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<String> {
     Ok(format!("exit status: {status}"))
 }
 
-struct TerminalCommandOutcome {
-    description: String,
-    command_finished: bool,
-}
-
 struct TerminalFocusOutcome {
     description: String,
-    finished: bool,
 }
 
 fn run_session_pty(
     sessions: &mut SessionRuntime,
     command: &str,
     escape_prefix: u8,
-) -> Result<TerminalCommandOutcome> {
+) -> Result<TerminalFocusOutcome> {
     let initial = xshell_pty::controller_size().unwrap_or_default();
     let (mut pty_id, mut stream) = sessions.pty_start_stream(
         command.to_owned(),
@@ -1751,12 +1730,7 @@ fn run_session_pty(
         },
         env::var("TERM").ok(),
     )?;
-    let original_pty_id = pty_id.clone();
-    let outcome = run_pty_focus_loop(sessions, &mut pty_id, &mut stream, escape_prefix)?;
-    Ok(TerminalCommandOutcome {
-        description: outcome.description,
-        command_finished: outcome.finished && pty_id == original_pty_id,
-    })
+    run_pty_focus_loop(sessions, &mut pty_id, &mut stream, escape_prefix)
 }
 
 fn run_existing_session_pty(sessions: &mut SessionRuntime, escape_prefix: u8) -> Result<String> {
@@ -1816,20 +1790,17 @@ fn run_pty_focus_loop(
             xshell_pty::DuplexPtyOutcome::Exited(status) => {
                 return Ok(TerminalFocusOutcome {
                     description: status,
-                    finished: true,
                 });
             }
             xshell_pty::DuplexPtyOutcome::Detached => {
                 return Ok(TerminalFocusOutcome {
                     description: "PTY detached".into(),
-                    finished: false,
                 });
             }
             xshell_pty::DuplexPtyOutcome::Terminate => {
                 sessions.pty_close(pty_id)?;
                 return Ok(TerminalFocusOutcome {
                     description: "PTY terminated".into(),
-                    finished: true,
                 });
             }
             direction => {
@@ -1854,7 +1825,6 @@ fn run_pty_focus_loop(
                             "switched to {}:{} REPL",
                             target.0.host_alias, target.0.name
                         ),
-                        finished: false,
                     });
                 }
                 (*pty_id, *stream) = sessions.pty_attach_stream()?;

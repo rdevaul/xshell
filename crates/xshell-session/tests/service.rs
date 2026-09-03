@@ -43,6 +43,22 @@ fn connect_when_ready(socket: &Path) -> SessionClient {
     panic!("xshelld did not become ready at {}", socket.display());
 }
 
+fn wait_for_audit_service(socket: &Path) {
+    for _ in 0..100 {
+        if let Ok(mut client) = xshell_audit::AuditClient::connect(socket, "test") {
+            client
+                .append(xshell_audit::AuditEvent::SessionEnded {
+                    reason: "readiness probe".into(),
+                })
+                .unwrap();
+            client.close().unwrap();
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("audit daemon did not become ready at {}", socket.display());
+}
+
 fn spawn_pty_proxy(
     state: &Path,
     socket: &Path,
@@ -919,12 +935,7 @@ fn daemon_audits_execution_without_an_attached_client() {
         .spawn()
         .unwrap();
     let _auditd = Daemon(auditd);
-    for _ in 0..100 {
-        if audit_socket.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_audit_service(&audit_socket);
     assert!(audit_socket.exists(), "audit daemon did not start");
 
     let state = temporary.path().join("state");
@@ -996,6 +1007,37 @@ fn daemon_audits_execution_without_an_attached_client() {
         }
     }
     assert!(completed);
+    let pty_command = "printf pty-audited";
+    reconnected
+        .pty_start(
+            session.descriptor.id.clone(),
+            pty_command.into(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+    for _ in 0..100 {
+        let finished = reconnected
+            .pty_list()
+            .unwrap()
+            .iter()
+            .any(|pty| pty.command == pty_command && !pty.running);
+        if finished {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        reconnected
+            .pty_list()
+            .unwrap()
+            .iter()
+            .any(|pty| pty.command == pty_command && !pty.running),
+        "terminal job did not finish"
+    );
     // Closing the xshell session finalizes its audit log.
     reconnected.close(Some("audited".into())).unwrap();
     drop(reconnected);
@@ -1017,6 +1059,8 @@ fn daemon_audits_execution_without_an_attached_client() {
             assert!(text.contains("\"route\":\"shell\""));
             assert!(text.contains("printf audited"));
             assert!(text.contains("\"outcome\":\"exit status: 0\""));
+            assert!(text.contains("\"route\":\"shell_terminal\""));
+            assert!(text.contains(pty_command));
             assert!(text.contains("\"session_ended\""));
             found = true;
         }
@@ -1028,6 +1072,84 @@ fn daemon_audits_execution_without_an_attached_client() {
     assert!(
         found,
         "no daemon-written audit log contained the shell turn"
+    );
+}
+
+#[test]
+fn required_audit_failure_prevents_pty_process_creation() {
+    let temporary = TempDir::new().unwrap();
+    let audit_directory = temporary.path().join("audit");
+    let audit_socket = temporary.path().join("audit.sock");
+    let mut auditd = Daemon(
+        Command::new(auditd_binary())
+            .arg("--directory")
+            .arg(&audit_directory)
+            .arg("--socket")
+            .arg(&audit_socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_audit_service(&audit_socket);
+
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[audit]\nenabled = true\nrequired = true\nsocket = {:?}\n",
+            audit_socket.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .args(["--config", config_path.to_str().unwrap()])
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "audit-fail-closed".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+
+    auditd.0.kill().unwrap();
+    auditd.0.wait().unwrap();
+    let marker = temporary.path().join("must-not-exist");
+    let command = format!("touch {}", marker.display());
+    let error = client
+        .pty_start(
+            session.descriptor.id,
+            command.clone(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("required audit"));
+    assert!(!marker.exists());
+    assert!(
+        !client
+            .pty_list()
+            .unwrap()
+            .iter()
+            .any(|pty| pty.command == command)
     );
 }
 
