@@ -835,7 +835,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             after = event.sequence;
             match event.event {
                 SessionEventKind::Execution {
-                    event: ExecutionEvent::ApprovalRequested { call },
+                    event: ExecutionEvent::ApprovalRequested { call, .. },
                 } => requested = Some(call.id),
                 SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
                 _ => {}

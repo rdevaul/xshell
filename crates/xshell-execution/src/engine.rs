@@ -1,4 +1,4 @@
-use crate::{definitions, execute_tool, requires_approval};
+use crate::{GateReason, SensitivePaths, definitions, execute_tool, requires_approval};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -87,6 +87,10 @@ pub enum ExecutionEvent {
     },
     ApprovalRequested {
         call: ToolCall,
+        /// Why this call is gated. Absent in journals written before the
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<GateReason>,
     },
     ToolDecision {
         call_id: String,
@@ -137,7 +141,7 @@ impl CancellationFlag {
 pub trait TurnObserver: Send {
     fn emit(&mut self, event: ExecutionEvent);
     fn cancellation(&self) -> CancellationFlag;
-    async fn approve(&mut self, call: &ToolCall) -> ApprovalDecision;
+    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalDecision;
 }
 
 pub fn build_adapter(config: &AdapterConfig) -> Result<Box<dyn AgentAdapter>> {
@@ -166,14 +170,36 @@ fn resolve_api_key(config: &AdapterConfig) -> Result<Option<String>> {
     Ok(Some(value))
 }
 
+/// Everything that governs what an agent may do during one turn.
+#[derive(Debug, Clone)]
+pub struct TurnPolicy {
+    pub approval: ApprovalPolicy,
+    pub sensitive_paths: SensitivePaths,
+}
+
+impl TurnPolicy {
+    pub fn new(approval: ApprovalPolicy) -> Self {
+        Self {
+            approval,
+            sensitive_paths: SensitivePaths::default(),
+        }
+    }
+
+    pub fn with_sensitive_paths(mut self, sensitive_paths: SensitivePaths) -> Self {
+        self.sensitive_paths = sensitive_paths;
+        self
+    }
+}
+
 pub async fn run_agent_turn(
     agent: &mut dyn AgentAdapter,
     history: &mut Vec<ChatMessage>,
     message: String,
     cwd: &Path,
-    approval: ApprovalPolicy,
+    policy: &TurnPolicy,
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
+    let approval = policy.approval;
     let checkpoint = history.len();
     history.push(ChatMessage::user(message));
     let tools = definitions();
@@ -240,18 +266,20 @@ pub async fn run_agent_turn(
                 history.truncate(checkpoint);
                 bail!("agent turn cancelled");
             }
-            let gated = requires_approval(call);
-            let decision = if !gated {
-                ApprovalDecision::Approve
-            } else {
-                match approval {
+            let gate = requires_approval(call, cwd, &policy.sensitive_paths);
+            let decision = match gate {
+                None => ApprovalDecision::Approve,
+                Some(reason) => match approval {
                     ApprovalPolicy::Auto => ApprovalDecision::Approve,
                     ApprovalPolicy::Off => ApprovalDecision::Deny,
                     ApprovalPolicy::Ask => {
-                        observer.emit(ExecutionEvent::ApprovalRequested { call: call.clone() });
-                        observer.approve(call).await
+                        observer.emit(ExecutionEvent::ApprovalRequested {
+                            call: call.clone(),
+                            reason: Some(reason),
+                        });
+                        observer.approve(call, reason).await
                     }
-                }
+                },
             };
             observer.emit(ExecutionEvent::ToolDecision {
                 call_id: call.id.clone(),
@@ -507,7 +535,7 @@ mod tests {
             self.cancellation.clone()
         }
 
-        async fn approve(&mut self, _call: &ToolCall) -> ApprovalDecision {
+        async fn approve(&mut self, _call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
             self.decisions.pop_front().expect("unscripted approval")
         }
     }
@@ -583,7 +611,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Ask,
+            &TurnPolicy::new(ApprovalPolicy::Ask),
             &mut observer,
         )
         .await
@@ -649,7 +677,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Ask,
+            &TurnPolicy::new(ApprovalPolicy::Ask),
             &mut observer,
         )
         .await
@@ -713,7 +741,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Off,
+            &TurnPolicy::new(ApprovalPolicy::Off),
             &mut observer,
         )
         .await
@@ -755,7 +783,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Auto,
+            &TurnPolicy::new(ApprovalPolicy::Auto),
             &mut observer,
         )
         .await

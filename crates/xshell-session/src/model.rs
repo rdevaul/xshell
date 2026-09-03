@@ -20,6 +20,20 @@ pub struct SessionConfig {
     /// on another host cannot turn on unattended shell execution here without
     /// the daemon's operator opting in.
     pub max_approval: ApprovalPolicy,
+    /// Glob patterns (relative to the session cwd, or bare file names) for
+    /// paths whose reads and listings need approval even though the tool is
+    /// otherwise read-only. `None` uses the built-in defaults; an empty list
+    /// disables the check.
+    pub sensitive_paths: Option<Vec<String>>,
+}
+
+impl SessionConfig {
+    pub fn sensitive_paths(&self) -> xshell_execution::SensitivePaths {
+        match &self.sensitive_paths {
+            None => xshell_execution::SensitivePaths::default(),
+            Some(patterns) => xshell_execution::SensitivePaths::new(patterns.iter().cloned()),
+        }
+    }
 }
 
 impl Default for SessionConfig {
@@ -32,6 +46,7 @@ impl Default for SessionConfig {
             default_session: "default".into(),
             pty_escape: "ctrl-]".into(),
             max_approval: ApprovalPolicy::Ask,
+            sensitive_paths: None,
         }
     }
 }

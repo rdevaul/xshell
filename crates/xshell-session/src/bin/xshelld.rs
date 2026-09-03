@@ -85,7 +85,7 @@ fn main() -> Result<()> {
         .context("session state directory is required")?;
     let socket = args
         .socket
-        .or(config.socket)
+        .or(config.socket.clone())
         .unwrap_or_else(|| state_directory.join("xshelld.sock"));
     if matches!(args.command, Some(DaemonCommand::ServeStdio)) {
         return serve_stdio(&socket);
@@ -103,8 +103,12 @@ fn main() -> Result<()> {
         user,
     )?));
     let audit = DaemonAudit::from_config(&audit_config)?;
-    let execution =
-        ExecutionCoordinator::with_policy(Arc::clone(&registry), audit, config.max_approval);
+    let execution = ExecutionCoordinator::with_policy(
+        Arc::clone(&registry),
+        audit,
+        config.max_approval,
+        config.sensitive_paths(),
+    );
     let ptys = PtyCoordinator::default();
 
     prepare_socket(&socket)?;

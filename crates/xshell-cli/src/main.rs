@@ -23,8 +23,8 @@ use xshell_core::{
     ChatMessage, ControlCommand, DEFAULT_SYSTEM_PROMPT, InputRoute, ToolCall, classify_input,
 };
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent,
-    TurnObserver, build_adapter as build_execution_adapter, tool_summary,
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent, GateReason,
+    TurnObserver, TurnPolicy, build_adapter as build_execution_adapter, tool_summary,
 };
 use xshell_session::{
     PersistenceMode, SessionEventKind, SessionSnapshot, TurnInput, Visibility, load_view_resource,
@@ -97,6 +97,8 @@ async fn main() -> Result<()> {
     let render_options =
         RenderOptions::resolve(&model_config.rendering, args.markdown, args.color)?;
     let pty_escape = xshell_pty::parse_escape_prefix(&model_config.session_fabric.pty_escape)?;
+    let turn_policy = TurnPolicy::new(args.approval)
+        .with_sensitive_paths(model_config.session_fabric.sensitive_paths());
     let viewers = ViewerRegistry::with_builtins();
     let mut active_model = model_config.resolve_startup(
         args.profile.as_deref(),
@@ -599,7 +601,7 @@ async fn main() -> Result<()> {
                     &mut history,
                     message,
                     &cwd,
-                    args.approval,
+                    &turn_policy,
                     &mut audit,
                     render_options,
                 )
@@ -717,8 +719,9 @@ requested \"{requested}\" was not applied"
                             arguments: call.arguments,
                         })?;
                     }
-                    ExecutionEvent::ApprovalRequested { call } => {
-                        let decision = confirm_tool(&call)?;
+                    ExecutionEvent::ApprovalRequested { call, reason } => {
+                        let decision =
+                            confirm_tool(&call, reason.unwrap_or(GateReason::ShellExecution))?;
                         sessions.approve(record.turn_id.clone(), call.id.clone(), decision)?;
                     }
                     ExecutionEvent::ToolDecision { call_id, decision } => {
@@ -829,6 +832,9 @@ struct LocalObserver<'a> {
     /// Whether the most recent `ToolDecision` approved execution, so the
     /// read-only policy note is printed only for tools that actually ran.
     last_approved: bool,
+    /// Whether the most recent tool call went through an approval prompt;
+    /// the automatic-policy note is only printed when it did not.
+    last_prompted: bool,
     /// First error raised while rendering or auditing. The engine's observer
     /// interface is infallible, so failures are captured here and surfaced
     /// after the turn returns.
@@ -844,6 +850,7 @@ impl<'a> LocalObserver<'a> {
             cwd,
             cancellation: CancellationFlag::default(),
             last_approved: false,
+            last_prompted: false,
             failure: None,
         }
     }
@@ -908,6 +915,7 @@ impl TurnObserver for LocalObserver<'_> {
                 }))
             }
             ExecutionEvent::ToolRequested { call } => {
+                self.last_prompted = false;
                 println!(
                     "\nagent requests: {}",
                     escape_for_prompt(&tool_summary(&call))
@@ -919,7 +927,10 @@ impl TurnObserver for LocalObserver<'_> {
                 })
             }
             // The prompt itself is issued from `approve`; nothing to echo.
-            ExecutionEvent::ApprovalRequested { .. } => Ok(()),
+            ExecutionEvent::ApprovalRequested { .. } => {
+                self.last_prompted = true;
+                Ok(())
+            }
             ExecutionEvent::ToolDecision { call_id, decision } => {
                 self.last_approved = decision == ApprovalDecision::Approve;
                 self.audit.append(AuditEvent::ToolDecision {
@@ -938,7 +949,10 @@ impl TurnObserver for LocalObserver<'_> {
                 name,
                 result,
             } => {
-                if self.last_approved && !tools::requires_approval_by_name(&name) {
+                if self.last_approved
+                    && !self.last_prompted
+                    && !tools::requires_approval_by_name(&name)
+                {
                     println!(
                         "policy: allowed read-only tool within {}",
                         self.cwd.display()
@@ -964,8 +978,8 @@ impl TurnObserver for LocalObserver<'_> {
         self.cancellation.clone()
     }
 
-    async fn approve(&mut self, call: &ToolCall) -> ApprovalDecision {
-        match confirm_tool(call) {
+    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalDecision {
+        match confirm_tool(call, reason) {
             Ok(decision) => decision,
             Err(error) => {
                 self.record(Err(error));
@@ -980,14 +994,13 @@ async fn run_agent_turn(
     history: &mut Vec<ChatMessage>,
     message: String,
     cwd: &Path,
-    approval: ApprovalPolicy,
+    policy: &TurnPolicy,
     audit: &mut AuditRuntime,
     render_options: RenderOptions,
 ) -> Result<()> {
     let mut observer = LocalObserver::new(audit, render_options, cwd);
     let outcome =
-        xshell_execution::run_agent_turn(agent, history, message, cwd, approval, &mut observer)
-            .await;
+        xshell_execution::run_agent_turn(agent, history, message, cwd, policy, &mut observer).await;
     observer.finish(outcome)
 }
 
@@ -999,13 +1012,17 @@ fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
     }
 }
 
-fn confirm_tool(call: &ToolCall) -> Result<ApprovalDecision> {
+fn confirm_tool(call: &ToolCall, reason: GateReason) -> Result<ApprovalDecision> {
     loop {
         // Tool arguments are model-controlled. Escape them so the command the
         // user approves is exactly the command that will run: no control
         // sequences can redraw the line, and embedded newlines are visible.
+        let why = match reason {
+            GateReason::ShellExecution => String::new(),
+            GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
+        };
         print!(
-            "Approve `{}`? [y/N/q] ",
+            "Approve `{}`{why}? [y/N/q] ",
             escape_for_prompt(&tools::summary(call))
         );
         io::stdout()

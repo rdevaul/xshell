@@ -13,8 +13,9 @@ use uuid::Uuid;
 use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent,
-    TurnObserver, build_adapter, run_agent_turn, run_direct_shell_streaming,
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent, GateReason,
+    SensitivePaths, TurnObserver, TurnPolicy, build_adapter, run_agent_turn,
+    run_direct_shell_streaming,
 };
 use xshell_platform::LockExt;
 
@@ -32,6 +33,7 @@ struct CoordinatorInner {
     sessions: Mutex<HashMap<String, Arc<SessionExecution>>>,
     audit: DaemonAudit,
     max_approval: ApprovalPolicy,
+    sensitive_paths: SensitivePaths,
 }
 
 struct SessionExecution {
@@ -55,13 +57,19 @@ struct ActiveTurn {
 
 impl ExecutionCoordinator {
     pub fn new(registry: Arc<Mutex<SessionRegistry>>) -> Self {
-        Self::with_policy(registry, DaemonAudit::default(), ApprovalPolicy::Ask)
+        Self::with_policy(
+            registry,
+            DaemonAudit::default(),
+            ApprovalPolicy::Ask,
+            SensitivePaths::default(),
+        )
     }
 
     pub fn with_policy(
         registry: Arc<Mutex<SessionRegistry>>,
         audit: DaemonAudit,
         max_approval: ApprovalPolicy,
+        sensitive_paths: SensitivePaths,
     ) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
@@ -69,6 +77,7 @@ impl ExecutionCoordinator {
                 sessions: Mutex::new(HashMap::new()),
                 audit,
                 max_approval,
+                sensitive_paths,
             }),
         }
     }
@@ -302,12 +311,14 @@ impl ExecutionCoordinator {
                         base_url: model.base_url.clone(),
                         api_key_env: model.api_key_env.clone(),
                     })?;
+                    let policy = TurnPolicy::new(approval)
+                        .with_sensitive_paths(self.inner.sensitive_paths.clone());
                     let outcome = run_agent_turn(
                         agent.as_mut(),
                         &mut snapshot.history,
                         message,
                         &snapshot.descriptor.cwd,
-                        approval,
+                        &policy,
                         &mut observer,
                     )
                     .await;
@@ -556,7 +567,7 @@ impl TurnObserver for DaemonObserver {
             }),
             ExecutionEvent::TurnAborted => {}
         }
-        if let ExecutionEvent::ApprovalRequested { call } = &event {
+        if let ExecutionEvent::ApprovalRequested { call, .. } = &event {
             self.execution
                 .state
                 .lock_recover()
@@ -571,7 +582,7 @@ impl TurnObserver for DaemonObserver {
         self.cancellation.clone()
     }
 
-    async fn approve(&mut self, call: &ToolCall) -> ApprovalDecision {
+    async fn approve(&mut self, call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
         let key = (self.turn_id.clone(), call.id.clone());
         loop {
             if self.cancellation.is_cancelled() {

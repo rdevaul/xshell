@@ -312,7 +312,12 @@ entire agent turn and returns to the xshell prompt.
 
 The working directory is therefore a meaningful trust boundary. Avoid starting
 xshell in a directory containing secrets you do not want the configured model
-provider to receive.
+provider to receive. As a backstop, reads and listings of paths that match
+`session_fabric.sensitive_paths` (defaults cover `.env`, private keys,
+`.ssh/`, `.aws/`, `.git/config`, Terraform state, and similar) are promoted
+from automatic to approval-gated: `ask` prompts with the reason, `off` denies,
+and `auto` still runs them. Matching uses the resolved path, so a symlink
+with an innocent name does not bypass it.
 
 This is an early prototype; review tool requests and use it only on data you
 can recover.

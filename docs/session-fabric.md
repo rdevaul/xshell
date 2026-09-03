@@ -36,6 +36,17 @@ matters once a controller on one host submits turns to `xshelld` on another:
 the remote operator's configuration, not the controller's flag, decides
 whether shell tools may run without a prompt there.
 
+## Sensitive-path policy
+
+`session_fabric.sensitive_paths` lists glob patterns for files an agent must
+not read or list without a human decision, even though `read_file` and
+`list_directory` are otherwise automatic. The daemon evaluates the policy
+against the canonical path relative to the session cwd, so symlinks and `..`
+cannot dodge it. A match is reported through `approval_requested` with
+`reason = "sensitive_path"` (shell tools report `"shell_execution"`) and then
+follows the turn's approval policy exactly like a shell tool. Omitting the key
+selects the built-in defaults; an empty list disables the check.
+
 ## Identity and attachment
 
 - A session has a stable UUID. Its display name is unique within one daemon's
