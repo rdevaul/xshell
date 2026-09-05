@@ -147,6 +147,7 @@ An unclean client or daemon crash leaves a verifiable hash chain but no final
 checkpoint. The verifier reports this explicitly rather than claiming the log
 is complete.
 
-View-operation events advance the audit client/daemon protocol to version 2.
-Upgrade and restart `xshell-auditd` together with the CLI; the on-disk audit
-format remains version 1.
+History-compaction events advance the audit client/daemon protocol to version
+3 and the on-disk audit format to version 2. Upgrade and restart
+`xshell-auditd` together with the CLI. The verifier remains able to read
+version 1 logs.

@@ -2,8 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
-pub const AUDIT_FORMAT_VERSION: u32 = 1;
-pub const AUDIT_PROTOCOL_VERSION: u32 = 2;
+/// Format written by new audit logs. The verifier continues to accept version
+/// 1 so existing signed logs remain readable after upgrading.
+pub const AUDIT_FORMAT_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
+// Version 3 adds `AuditEvent::HistoryCompacted`. Tagged enum variants are not
+// forward-compatible in serde, so mixed-version peers must fail at handshake.
+pub const AUDIT_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]

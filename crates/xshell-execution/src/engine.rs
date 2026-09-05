@@ -207,9 +207,8 @@ fn resolve_api_key(config: &AdapterConfig) -> Result<Option<String>> {
 pub struct TurnPolicy {
     pub approval: ApprovalPolicy,
     pub sensitive_paths: SensitivePaths,
-    /// Applied to the history after a turn completes successfully. Never
-    /// applied mid-turn or after a failed/cancelled turn, whose messages are
-    /// rolled back anyway.
+    /// Applied before the first provider request and after a turn completes.
+    /// Failed and cancelled turns restore the pre-turn history.
     pub compactor: Arc<dyn Compactor>,
 }
 
@@ -253,9 +252,9 @@ impl TurnPolicy {
     }
 }
 
-/// Run the policy's compactor and report what it did. Called by the engine
-/// after a successful turn; exposed so callers that restore a durable history
-/// can also bring it within budget before the first request.
+/// Run the policy's compactor and report what it did. Used after a successful
+/// turn; the pre-request pass is staged separately in [`run_agent_turn`] so it
+/// can be rolled back if the provider rejects or the turn is cancelled.
 pub fn compact_history(
     policy: &TurnPolicy,
     history: &mut Vec<ChatMessage>,
@@ -275,8 +274,12 @@ pub async fn run_agent_turn(
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
     let approval = policy.approval;
-    let checkpoint = history.len();
+    // Compact after staging the new user message so the compactor can discard
+    // every older turn when necessary while preserving the prompt about to be
+    // sent. Keep the exact prior history for failed/cancelled-turn rollback.
+    let rollback_history = history.clone();
     history.push(ChatMessage::user(message));
+    let mut request_compaction = policy.compactor.compact(history);
     let tools = definitions();
 
     for _ in 0..MAX_AGENT_STEPS {
@@ -302,7 +305,7 @@ pub async fn run_agent_turn(
             }
         };
         let Some(response) = response else {
-            history.truncate(checkpoint);
+            *history = rollback_history.clone();
             bail!("agent turn cancelled");
         };
         let response = match response {
@@ -315,10 +318,17 @@ pub async fn run_agent_turn(
                         partial: true,
                     });
                 }
-                history.truncate(checkpoint);
+                *history = rollback_history.clone();
                 return Err(error.into());
             }
         };
+
+        // Do not claim that durable history changed until the provider has
+        // accepted the compacted request. If this was a restored oversized
+        // session, this event records exactly what the provider first saw.
+        if let Some(report) = request_compaction.take() {
+            observer.emit(ExecutionEvent::HistoryCompacted { report });
+        }
 
         observer.emit(ExecutionEvent::AgentResponse {
             content: response.content.clone(),
@@ -339,7 +349,7 @@ pub async fn run_agent_turn(
 
         for (index, call) in response.tool_calls.iter().enumerate() {
             if observer.cancellation().is_cancelled() {
-                history.truncate(checkpoint);
+                *history = rollback_history.clone();
                 bail!("agent turn cancelled");
             }
             let gate = requires_approval(call, cwd, &policy.sensitive_paths);
@@ -365,7 +375,7 @@ pub async fn run_agent_turn(
             // observer can cancel when recording it fails; honor that before
             // executing the exact tool whose audit record is unavailable.
             if observer.cancellation().is_cancelled() {
-                history.truncate(checkpoint);
+                *history = rollback_history.clone();
                 bail!("agent turn cancelled before tool execution");
             }
             if decision == ApprovalDecision::AbortTurn {
@@ -398,6 +408,7 @@ pub async fn run_agent_turn(
             history.push(ChatMessage::tool_result(call, result));
         }
     }
+    *history = rollback_history;
     bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
 }
 
@@ -909,6 +920,106 @@ mod tests {
             !observer.events[events_before..]
                 .iter()
                 .any(|e| matches!(e, ExecutionEvent::HistoryCompacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_restored_history_is_compacted_before_the_first_request() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: "recovered".into(),
+                tool_calls: Vec::new(),
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(100),
+        });
+        let mut history = vec![ChatMessage::system("sys")];
+        for n in 0..3 {
+            history.push(ChatMessage::user(format!("old question {n}")));
+            history.push(ChatMessage::assistant_with_tools(
+                format!("old answer {n} {}", "x".repeat(200)),
+                Vec::new(),
+            ));
+        }
+
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "new question".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        let sent = &adapter.requests[0].messages;
+        assert!(crate::history_bytes(sent) <= 100);
+        assert!(sent.iter().any(|message| message.content == "new question"));
+        assert!(
+            !sent
+                .iter()
+                .any(|message| message.content.starts_with("old question"))
+        );
+        assert!(
+            observer
+                .events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::HistoryCompacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_first_request_restores_history_after_request_compaction() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::new(),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(10),
+        });
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant_with_tools("x".repeat(200), Vec::new()),
+        ];
+        let before = history.clone();
+
+        assert!(
+            run_agent_turn(
+                &mut adapter,
+                &mut history,
+                "new question".into(),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .is_err()
+        );
+
+        assert_eq!(history, before);
+        assert!(
+            !observer
+                .events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::HistoryCompacted { .. }))
         );
     }
 

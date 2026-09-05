@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -42,6 +43,45 @@ fn connect_when_ready(socket: &Path) -> SessionClient {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("xshelld did not become ready at {}", socket.display());
+}
+
+#[test]
+fn daemon_rejects_the_previous_protocol_during_handshake() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stream = (0..100)
+        .find_map(|_| match UnixStream::connect(&socket) {
+            Ok(stream) => Some(stream),
+            Err(_) => {
+                thread::sleep(Duration::from_millis(10));
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("xshelld did not become ready at {}", socket.display()));
+    writeln!(
+        stream,
+        "{{\"request\":\"open\",\"protocol_version\":{},\"client_version\":\"old\"}}",
+        SESSION_PROTOCOL_VERSION - 1
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    assert!(matches!(
+        serde_json::from_str::<ServerResponse>(&response).unwrap(),
+        ServerResponse::Error { code, .. } if code == "protocol_version"
+    ));
 }
 
 fn wait_for_audit_service(socket: &Path) {

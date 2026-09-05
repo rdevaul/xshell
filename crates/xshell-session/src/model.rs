@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-pub const SESSION_PROTOCOL_VERSION: u32 = 9;
+// Version 10 adds `ExecutionEvent::HistoryCompacted`. Tagged enum variants are
+// not forward-compatible in serde, so older peers must be rejected during the
+// handshake instead of failing partway through an event stream.
+pub const SESSION_PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -26,8 +29,8 @@ pub struct SessionConfig {
     /// disables the check.
     pub sensitive_paths: Option<Vec<String>>,
     /// Session-wide default for conversation-history compaction, applied
-    /// after each completed turn. A model profile's own `max_history_bytes`
-    /// takes precedence. Omit to keep full history.
+    /// before provider requests and after completed turns. A model profile's
+    /// own `max_history_bytes` takes precedence. Omit to keep full history.
     pub compaction: xshell_execution::CompactionConfig,
 }
 

@@ -3,9 +3,9 @@
 //! Every provider request carries the whole history, so an unbounded history
 //! costs tokens on every step and eventually exceeds the model's context. A
 //! [`Compactor`] decides what to drop (or, in future implementations, what to
-//! summarize) once a turn has completed.
+//! summarize) before a provider request and after a turn has completed.
 //!
-//! Compaction runs **between** turns, never inside one. A turn's messages
+//! Compaction never splits an existing turn. A turn's messages
 //! (`user`, `assistant` with tool calls, the matching `tool` results, further
 //! `assistant` steps) form a unit that OpenAI-compatible APIs require to be
 //! internally consistent: a `tool` result whose calling `assistant` message

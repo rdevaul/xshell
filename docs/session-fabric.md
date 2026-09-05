@@ -15,15 +15,16 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 9. The daemon
+with protocol version 10. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Protocol versions are exact rather than negotiated across incompatible
 schemas. Any protocol bump therefore requires upgrading and restarting
 `xshelld` on the controller and every connected remote host before the new CLI
-can attach. Protocol v9 adds the `tool_skipped` execution event, emitted for
-each tool call that was never evaluated because the user aborted the turn at an
-earlier call in the same response.
+can attach. Protocol v10 adds the `history_compacted` execution event. Protocol
+v9 added the `tool_skipped` event, emitted for each tool call that was never
+evaluated because the user aborted the turn at an earlier call in the same
+response.
 
 ## Approval policy ceiling
 
@@ -51,9 +52,11 @@ selects the built-in defaults; an empty list disables the check.
 
 Every provider request carries the full conversation, so an unbounded history
 costs tokens on every step and eventually exceeds the model's context window.
-`session_fabric.compaction` selects a compaction strategy that runs after each
-successfully completed turn (never mid-turn, and never after a failed or
-cancelled turn, whose messages are rolled back anyway).
+`session_fabric.compaction` selects a compaction strategy. It runs before the
+first provider request, after staging the new user prompt, and again after a
+successfully completed turn. The pre-request pass lets a restored session or a
+newly selected smaller-context model recover immediately. A failed or
+cancelled turn restores the exact history from before that turn.
 
 Strategies implement the `Compactor` trait in `xshell-execution` and operate
 on whole turns — a `user` message through its final `assistant` reply,
@@ -78,7 +81,7 @@ Each compaction is reported to the client as a `history_compacted` execution
 event and recorded in the audit log, so a reader of the trail can see from
 which point the model no longer had the full transcript. A durable session
 restored with a smaller budget than it was saved under is brought within
-budget after its next completed turn.
+budget before its first provider request.
 
 ## Identity and attachment
 
