@@ -13,8 +13,9 @@ use uuid::Uuid;
 use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent,
-    TurnObserver, build_adapter, run_agent_turn, run_direct_shell_streaming,
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, CompactionConfig,
+    ExecutionEvent, GateReason, SensitivePaths, TurnObserver, TurnPolicy, build_adapter,
+    run_agent_turn, run_direct_shell_streaming,
 };
 use xshell_platform::LockExt;
 
@@ -32,11 +33,19 @@ struct CoordinatorInner {
     sessions: Mutex<HashMap<String, Arc<SessionExecution>>>,
     audit: DaemonAudit,
     max_approval: ApprovalPolicy,
+    sensitive_paths: SensitivePaths,
+    compaction: CompactionConfig,
 }
 
 struct SessionExecution {
     state: Mutex<ExecutionState>,
+    /// Wakes synchronous waiters: client request threads blocked in
+    /// `events()` long-polls.
     changed: Condvar,
+    /// Wakes the asynchronous waiter: the turn task blocked in `approve()`
+    /// waiting for a client decision. Separate from `changed` because a
+    /// Condvar cannot be awaited from a future.
+    approvals_ready: tokio::sync::Notify,
 }
 
 struct ExecutionState {
@@ -55,13 +64,21 @@ struct ActiveTurn {
 
 impl ExecutionCoordinator {
     pub fn new(registry: Arc<Mutex<SessionRegistry>>) -> Self {
-        Self::with_policy(registry, DaemonAudit::default(), ApprovalPolicy::Ask)
+        Self::with_policy(
+            registry,
+            DaemonAudit::default(),
+            ApprovalPolicy::Ask,
+            SensitivePaths::default(),
+            CompactionConfig::default(),
+        )
     }
 
     pub fn with_policy(
         registry: Arc<Mutex<SessionRegistry>>,
         audit: DaemonAudit,
         max_approval: ApprovalPolicy,
+        sensitive_paths: SensitivePaths,
+        compaction: CompactionConfig,
     ) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
@@ -69,6 +86,8 @@ impl ExecutionCoordinator {
                 sessions: Mutex::new(HashMap::new()),
                 audit,
                 max_approval,
+                sensitive_paths,
+                compaction,
             }),
         }
     }
@@ -199,6 +218,7 @@ impl ExecutionCoordinator {
         }
         state.approvals.insert(key, reply.decision);
         execution.changed.notify_all();
+        execution.approvals_ready.notify_waiters();
         Ok(())
     }
 
@@ -302,12 +322,15 @@ impl ExecutionCoordinator {
                         base_url: model.base_url.clone(),
                         api_key_env: model.api_key_env.clone(),
                     })?;
+                    let policy = TurnPolicy::new(approval)
+                        .with_sensitive_paths(self.inner.sensitive_paths.clone())
+                        .with_compaction(&self.inner.compaction.for_model(model.max_history_bytes));
                     let outcome = run_agent_turn(
                         agent.as_mut(),
                         &mut snapshot.history,
                         message,
                         &snapshot.descriptor.cwd,
-                        approval,
+                        &policy,
                         &mut observer,
                     )
                     .await;
@@ -412,6 +435,7 @@ impl SessionExecution {
                 pending_approvals: HashSet::new(),
             }),
             changed: Condvar::new(),
+            approvals_ready: tokio::sync::Notify::new(),
         }
     }
 
@@ -555,8 +579,18 @@ impl TurnObserver for DaemonObserver {
                 result: result.clone(),
             }),
             ExecutionEvent::TurnAborted => {}
+            ExecutionEvent::HistoryCompacted { report } => {
+                self.audit(AuditEvent::HistoryCompacted {
+                    compactor: report.compactor.clone(),
+                    messages_before: report.messages_before,
+                    messages_after: report.messages_after,
+                    bytes_before: report.bytes_before,
+                    bytes_after: report.bytes_after,
+                    turns_removed: report.turns_removed,
+                })
+            }
         }
-        if let ExecutionEvent::ApprovalRequested { call } = &event {
+        if let ExecutionEvent::ApprovalRequested { call, .. } = &event {
             self.execution
                 .state
                 .lock_recover()
@@ -571,16 +605,22 @@ impl TurnObserver for DaemonObserver {
         self.cancellation.clone()
     }
 
-    async fn approve(&mut self, call: &ToolCall) -> ApprovalDecision {
+    async fn approve(&mut self, call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
         let key = (self.turn_id.clone(), call.id.clone());
         loop {
             if self.cancellation.is_cancelled() {
                 return ApprovalDecision::AbortTurn;
             }
+            // Register for the wake-up before checking, so a reply that
+            // arrives between the check and the await is not missed.
+            let notified = self.execution.approvals_ready.notified();
             if let Some(decision) = self.execution.state.lock_recover().approvals.remove(&key) {
                 return decision;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::select! {
+                () = notified => {}
+                () = self.cancellation.wait() => {}
+            }
         }
     }
 }

@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-pub const SESSION_PROTOCOL_VERSION: u32 = 9;
+// Version 10 adds `ExecutionEvent::HistoryCompacted`. Tagged enum variants are
+// not forward-compatible in serde, so older peers must be rejected during the
+// handshake instead of failing partway through an event stream.
+pub const SESSION_PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -20,6 +23,24 @@ pub struct SessionConfig {
     /// on another host cannot turn on unattended shell execution here without
     /// the daemon's operator opting in.
     pub max_approval: ApprovalPolicy,
+    /// Glob patterns (relative to the session cwd, or bare file names) for
+    /// paths whose reads and listings need approval even though the tool is
+    /// otherwise read-only. `None` uses the built-in defaults; an empty list
+    /// disables the check.
+    pub sensitive_paths: Option<Vec<String>>,
+    /// Session-wide default for conversation-history compaction, applied
+    /// before provider requests and after completed turns. A model profile's
+    /// own `max_history_bytes` takes precedence. Omit to keep full history.
+    pub compaction: xshell_execution::CompactionConfig,
+}
+
+impl SessionConfig {
+    pub fn sensitive_paths(&self) -> xshell_execution::SensitivePaths {
+        match &self.sensitive_paths {
+            None => xshell_execution::SensitivePaths::default(),
+            Some(patterns) => xshell_execution::SensitivePaths::new(patterns.iter().cloned()),
+        }
+    }
 }
 
 impl Default for SessionConfig {
@@ -32,6 +53,8 @@ impl Default for SessionConfig {
             default_session: "default".into(),
             pty_escape: "ctrl-]".into(),
             max_approval: ApprovalPolicy::Ask,
+            sensitive_paths: None,
+            compaction: xshell_execution::CompactionConfig::default(),
         }
     }
 }
@@ -115,6 +138,11 @@ pub struct ModelBinding {
     pub model: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    /// Per-model history budget, overriding `session_fabric.compaction`.
+    /// Travels with the binding so a session switched to a small-context
+    /// model is compacted for that model, wherever the daemon runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_history_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

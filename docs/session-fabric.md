@@ -15,15 +15,16 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 9. The daemon
+with protocol version 10. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Protocol versions are exact rather than negotiated across incompatible
 schemas. Any protocol bump therefore requires upgrading and restarting
 `xshelld` on the controller and every connected remote host before the new CLI
-can attach. Protocol v9 adds the `tool_skipped` execution event, emitted for
-each tool call that was never evaluated because the user aborted the turn at an
-earlier call in the same response.
+can attach. Protocol v10 adds the `history_compacted` execution event. Protocol
+v9 added the `tool_skipped` event, emitted for each tool call that was never
+evaluated because the user aborted the turn at an earlier call in the same
+response.
 
 ## Approval policy ceiling
 
@@ -35,6 +36,52 @@ event's `requested_approval` field; the CLI prints a one-line notice. This
 matters once a controller on one host submits turns to `xshelld` on another:
 the remote operator's configuration, not the controller's flag, decides
 whether shell tools may run without a prompt there.
+
+## Sensitive-path policy
+
+`session_fabric.sensitive_paths` lists glob patterns for files an agent must
+not read or list without a human decision, even though `read_file` and
+`list_directory` are otherwise automatic. The daemon evaluates the policy
+against the canonical path relative to the session cwd, so symlinks and `..`
+cannot dodge it. A match is reported through `approval_requested` with
+`reason = "sensitive_path"` (shell tools report `"shell_execution"`) and then
+follows the turn's approval policy exactly like a shell tool. Omitting the key
+selects the built-in defaults; an empty list disables the check.
+
+## History compaction
+
+Every provider request carries the full conversation, so an unbounded history
+costs tokens on every step and eventually exceeds the model's context window.
+`session_fabric.compaction` selects a compaction strategy. It runs before the
+first provider request, after staging the new user prompt, and again after a
+successfully completed turn. The pre-request pass lets a restored session or a
+newly selected smaller-context model recover immediately. A failed or
+cancelled turn restores the exact history from before that turn.
+
+Strategies implement the `Compactor` trait in `xshell-execution` and operate
+on whole turns — a `user` message through its final `assistant` reply,
+including any tool calls and results — because OpenAI-compatible APIs reject a
+`tool` result whose calling `assistant` message is missing. The leading
+`system` message is always preserved, as is the most recent turn.
+
+The built-in strategy is `max_history_bytes`: drop the oldest whole turns until
+content plus tool-call arguments fit the budget. Bytes are a deliberate proxy
+for tokens; exact counts are model-specific and not worth a tokenizer
+dependency. Progressive summarization is a planned second implementation and
+plugs in behind the same trait and config surface.
+
+The budget is resolved per model. `session_fabric.compaction.max_history_bytes`
+is the session-wide default; a model profile's own `max_history_bytes` takes
+precedence because the appropriate depth follows that model's context window.
+The value travels with the session's model binding, so `//model` switches and
+remote daemons apply the budget of the model actually in use. A profile may
+set `0` to disable compaction for that model.
+
+Each compaction is reported to the client as a `history_compacted` execution
+event and recorded in the audit log, so a reader of the trail can see from
+which point the model no longer had the full transcript. A durable session
+restored with a smaller budget than it was saved under is brought within
+budget before its first provider request.
 
 ## Identity and attachment
 

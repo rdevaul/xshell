@@ -1,4 +1,7 @@
-use crate::{definitions, execute_tool, requires_approval};
+use crate::{
+    CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, definitions,
+    execute_tool, requires_approval,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -13,8 +16,8 @@ use std::sync::{
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::sync::{Notify, mpsc};
+use tokio::time::timeout;
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{AgentEvent, ChatMessage, ChatRequest, ToolCall};
 
@@ -87,6 +90,10 @@ pub enum ExecutionEvent {
     },
     ApprovalRequested {
         call: ToolCall,
+        /// Why this call is gated. Absent in journals written before the
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<GateReason>,
     },
     ToolDecision {
         call_id: String,
@@ -104,6 +111,11 @@ pub enum ExecutionEvent {
         result: String,
     },
     TurnAborted,
+    /// Older turns were removed from the conversation after this turn
+    /// completed, to keep the history within the configured budget.
+    HistoryCompacted {
+        report: CompactionReport,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -114,21 +126,46 @@ pub struct AdapterConfig {
     pub api_key_env: Option<String>,
 }
 
+/// A one-way "stop" signal shared between a running turn and whoever may
+/// cancel it (a client request, an audit failure, daemon shutdown).
+///
+/// `cancel` may be called from any thread, including plain std threads that
+/// have no tokio context; `wait` is a future that resolves promptly without
+/// polling.
 #[derive(Debug, Clone, Default)]
-pub struct CancellationFlag(Arc<AtomicBool>);
+pub struct CancellationFlag(Arc<CancellationInner>);
+
+#[derive(Debug, Default)]
+struct CancellationInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
 
 impl CancellationFlag {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        // Wake every current waiter. Futures that start waiting later see the
+        // flag first (see `wait`) so no wake-up can be missed.
+        self.0.notify.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
     }
 
     pub async fn wait(&self) {
-        while !self.is_cancelled() {
-            sleep(Duration::from_millis(20)).await;
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            // Register interest before re-checking so a `cancel` that lands
+            // between the check above and the await below is not lost:
+            // `notified()` captures the wake-up as soon as it is created.
+            let notified = self.0.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -137,7 +174,7 @@ impl CancellationFlag {
 pub trait TurnObserver: Send {
     fn emit(&mut self, event: ExecutionEvent);
     fn cancellation(&self) -> CancellationFlag;
-    async fn approve(&mut self, call: &ToolCall) -> ApprovalDecision;
+    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalDecision;
 }
 
 pub fn build_adapter(config: &AdapterConfig) -> Result<Box<dyn AgentAdapter>> {
@@ -166,16 +203,83 @@ fn resolve_api_key(config: &AdapterConfig) -> Result<Option<String>> {
     Ok(Some(value))
 }
 
+/// Everything that governs what an agent may do during one turn.
+pub struct TurnPolicy {
+    pub approval: ApprovalPolicy,
+    pub sensitive_paths: SensitivePaths,
+    /// Applied before the first provider request and after a turn completes.
+    /// Failed and cancelled turns restore the pre-turn history.
+    pub compactor: Arc<dyn Compactor>,
+}
+
+impl std::fmt::Debug for TurnPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnPolicy")
+            .field("approval", &self.approval)
+            .field("sensitive_paths", &self.sensitive_paths)
+            .field("compactor", &self.compactor.name())
+            .finish()
+    }
+}
+
+impl Clone for TurnPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            approval: self.approval,
+            sensitive_paths: self.sensitive_paths.clone(),
+            compactor: Arc::clone(&self.compactor),
+        }
+    }
+}
+
+impl TurnPolicy {
+    pub fn new(approval: ApprovalPolicy) -> Self {
+        Self {
+            approval,
+            sensitive_paths: SensitivePaths::default(),
+            compactor: Arc::from(CompactionConfig::default().build()),
+        }
+    }
+
+    pub fn with_sensitive_paths(mut self, sensitive_paths: SensitivePaths) -> Self {
+        self.sensitive_paths = sensitive_paths;
+        self
+    }
+
+    pub fn with_compaction(mut self, config: &CompactionConfig) -> Self {
+        self.compactor = Arc::from(config.build());
+        self
+    }
+}
+
+/// Run the policy's compactor and report what it did. Used after a successful
+/// turn; the pre-request pass is staged separately in [`run_agent_turn`] so it
+/// can be rolled back if the provider rejects or the turn is cancelled.
+pub fn compact_history(
+    policy: &TurnPolicy,
+    history: &mut Vec<ChatMessage>,
+    observer: &mut dyn TurnObserver,
+) {
+    if let Some(report) = policy.compactor.compact(history) {
+        observer.emit(ExecutionEvent::HistoryCompacted { report });
+    }
+}
+
 pub async fn run_agent_turn(
     agent: &mut dyn AgentAdapter,
     history: &mut Vec<ChatMessage>,
     message: String,
     cwd: &Path,
-    approval: ApprovalPolicy,
+    policy: &TurnPolicy,
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
-    let checkpoint = history.len();
+    let approval = policy.approval;
+    // Compact after staging the new user message so the compactor can discard
+    // every older turn when necessary while preserving the prompt about to be
+    // sent. Keep the exact prior history for failed/cancelled-turn rollback.
+    let rollback_history = history.clone();
     history.push(ChatMessage::user(message));
+    let mut request_compaction = policy.compactor.compact(history);
     let tools = definitions();
 
     for _ in 0..MAX_AGENT_STEPS {
@@ -201,7 +305,7 @@ pub async fn run_agent_turn(
             }
         };
         let Some(response) = response else {
-            history.truncate(checkpoint);
+            *history = rollback_history.clone();
             bail!("agent turn cancelled");
         };
         let response = match response {
@@ -214,10 +318,17 @@ pub async fn run_agent_turn(
                         partial: true,
                     });
                 }
-                history.truncate(checkpoint);
+                *history = rollback_history.clone();
                 return Err(error.into());
             }
         };
+
+        // Do not claim that durable history changed until the provider has
+        // accepted the compacted request. If this was a restored oversized
+        // session, this event records exactly what the provider first saw.
+        if let Some(report) = request_compaction.take() {
+            observer.emit(ExecutionEvent::HistoryCompacted { report });
+        }
 
         observer.emit(ExecutionEvent::AgentResponse {
             content: response.content.clone(),
@@ -232,26 +343,29 @@ pub async fn run_agent_turn(
             response.tool_calls.clone(),
         ));
         if response.tool_calls.is_empty() {
+            compact_history(policy, history, observer);
             return Ok(());
         }
 
         for (index, call) in response.tool_calls.iter().enumerate() {
             if observer.cancellation().is_cancelled() {
-                history.truncate(checkpoint);
+                *history = rollback_history.clone();
                 bail!("agent turn cancelled");
             }
-            let gated = requires_approval(call);
-            let decision = if !gated {
-                ApprovalDecision::Approve
-            } else {
-                match approval {
+            let gate = requires_approval(call, cwd, &policy.sensitive_paths);
+            let decision = match gate {
+                None => ApprovalDecision::Approve,
+                Some(reason) => match approval {
                     ApprovalPolicy::Auto => ApprovalDecision::Approve,
                     ApprovalPolicy::Off => ApprovalDecision::Deny,
                     ApprovalPolicy::Ask => {
-                        observer.emit(ExecutionEvent::ApprovalRequested { call: call.clone() });
-                        observer.approve(call).await
+                        observer.emit(ExecutionEvent::ApprovalRequested {
+                            call: call.clone(),
+                            reason: Some(reason),
+                        });
+                        observer.approve(call, reason).await
                     }
-                }
+                },
             };
             observer.emit(ExecutionEvent::ToolDecision {
                 call_id: call.id.clone(),
@@ -261,7 +375,7 @@ pub async fn run_agent_turn(
             // observer can cancel when recording it fails; honor that before
             // executing the exact tool whose audit record is unavailable.
             if observer.cancellation().is_cancelled() {
-                history.truncate(checkpoint);
+                *history = rollback_history.clone();
                 bail!("agent turn cancelled before tool execution");
             }
             if decision == ApprovalDecision::AbortTurn {
@@ -294,6 +408,7 @@ pub async fn run_agent_turn(
             history.push(ChatMessage::tool_result(call, result));
         }
     }
+    *history = rollback_history;
     bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
 }
 
@@ -507,7 +622,7 @@ mod tests {
             self.cancellation.clone()
         }
 
-        async fn approve(&mut self, _call: &ToolCall) -> ApprovalDecision {
+        async fn approve(&mut self, _call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
             self.decisions.pop_front().expect("unscripted approval")
         }
     }
@@ -540,6 +655,7 @@ mod tests {
                 ExecutionEvent::ToolSkipped { .. } => "skipped",
                 ExecutionEvent::ToolResult { .. } => "result",
                 ExecutionEvent::TurnAborted => "aborted",
+                ExecutionEvent::HistoryCompacted { .. } => "compacted",
             })
             .collect()
     }
@@ -583,7 +699,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Ask,
+            &TurnPolicy::new(ApprovalPolicy::Ask),
             &mut observer,
         )
         .await
@@ -649,7 +765,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Ask,
+            &TurnPolicy::new(ApprovalPolicy::Ask),
             &mut observer,
         )
         .await
@@ -713,7 +829,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Off,
+            &TurnPolicy::new(ApprovalPolicy::Off),
             &mut observer,
         )
         .await
@@ -726,6 +842,214 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn history_is_compacted_after_a_successful_turn_only() {
+        let temporary = TempDir::new().unwrap();
+        let big = "z".repeat(400);
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    content: big.clone(),
+                    tool_calls: Vec::new(),
+                },
+                AssistantResponse {
+                    content: big.clone(),
+                    tool_calls: Vec::new(),
+                },
+                AssistantResponse {
+                    content: big.clone(),
+                    tool_calls: Vec::new(),
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(1000),
+        });
+        let mut history = vec![ChatMessage::system("sys")];
+        for n in 0..3 {
+            run_agent_turn(
+                &mut adapter,
+                &mut history,
+                format!("q{n}"),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .unwrap();
+        }
+        // Three 400-byte answers exceed 1000; the oldest turn(s) must go, the
+        // system prompt and the latest turn must stay.
+        assert!(crate::history_bytes(&history) <= 1000);
+        assert_eq!(history[0].role, xshell_core::MessageRole::System);
+        assert!(history.iter().any(|m| m.content == "q2"));
+        assert!(!history.iter().any(|m| m.content == "q0"));
+        let compactions = observer
+            .events
+            .iter()
+            .filter(|e| matches!(e, ExecutionEvent::HistoryCompacted { .. }))
+            .count();
+        assert!(compactions >= 1);
+
+        // A failing turn (script exhausted) rolls back and does not compact.
+        let events_before = observer.events.len();
+        let history_before = history.clone();
+        assert!(
+            run_agent_turn(
+                &mut adapter,
+                &mut history,
+                "q3".into(),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(history, history_before);
+        assert!(
+            !observer.events[events_before..]
+                .iter()
+                .any(|e| matches!(e, ExecutionEvent::HistoryCompacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_restored_history_is_compacted_before_the_first_request() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: "recovered".into(),
+                tool_calls: Vec::new(),
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(100),
+        });
+        let mut history = vec![ChatMessage::system("sys")];
+        for n in 0..3 {
+            history.push(ChatMessage::user(format!("old question {n}")));
+            history.push(ChatMessage::assistant_with_tools(
+                format!("old answer {n} {}", "x".repeat(200)),
+                Vec::new(),
+            ));
+        }
+
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "new question".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        let sent = &adapter.requests[0].messages;
+        assert!(crate::history_bytes(sent) <= 100);
+        assert!(sent.iter().any(|message| message.content == "new question"));
+        assert!(
+            !sent
+                .iter()
+                .any(|message| message.content.starts_with("old question"))
+        );
+        assert!(
+            observer
+                .events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::HistoryCompacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_first_request_restores_history_after_request_compaction() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::new(),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(10),
+        });
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant_with_tools("x".repeat(200), Vec::new()),
+        ];
+        let before = history.clone();
+
+        assert!(
+            run_agent_turn(
+                &mut adapter,
+                &mut history,
+                "new question".into(),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .is_err()
+        );
+
+        assert_eq!(history, before);
+        assert!(
+            !observer
+                .events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::HistoryCompacted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_wakes_promptly_from_another_thread() {
+        let flag = CancellationFlag::default();
+        let remote = flag.clone();
+        // A plain std thread with no tokio context, as the daemon's request
+        // handler threads are.
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            remote.cancel();
+        });
+        tokio::time::timeout(Duration::from_secs(2), flag.wait())
+            .await
+            .expect("wait must resolve after cancel");
+        assert!(flag.is_cancelled());
+        // Well under any polling interval would have allowed; proves we are
+        // event-driven rather than sleeping in a loop.
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_wait_resolves_immediately() {
+        let flag = CancellationFlag::default();
+        flag.cancel();
+        tokio::time::timeout(Duration::from_millis(10), flag.wait())
+            .await
+            .expect("already-cancelled flag must not block");
     }
 
     #[tokio::test]
@@ -755,7 +1079,7 @@ mod tests {
             &mut history,
             "hello".into(),
             temporary.path(),
-            ApprovalPolicy::Auto,
+            &TurnPolicy::new(ApprovalPolicy::Auto),
             &mut observer,
         )
         .await

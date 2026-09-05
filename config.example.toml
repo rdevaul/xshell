@@ -28,6 +28,11 @@ checkpoint_interval = 16
 provider = "ollama"
 model = "qwen3:8b"
 base_url = "http://127.0.0.1:11434"
+# Per-model history budget (bytes of content + tool arguments). Size to the
+# model's context window; a small local model needs a much tighter budget than
+# a 200K-context cloud model. Overrides session_fabric.compaction. 0 = never
+# compact for this model.
+max_history_bytes = 32768
 
 [models.openrouter-free]
 provider = "openai"
@@ -58,6 +63,22 @@ default_session = "default"
 # this value and told so. Raise to "auto" only on a host where you would run
 # `xshell --approval auto` yourself.
 max_approval = "ask"
+# Read-only agent tools (read_file, list_directory) normally run without a
+# prompt. Paths matching these globs are promoted to approval-gated so a model
+# cannot silently read credentials. Patterns without "/" match a file name at
+# any depth; patterns with "/" are anchored at the session cwd; "**" spans
+# directories. Omit to use the built-in defaults (.env, *.pem, *.key, id_*,
+# .ssh/**, .aws/**, .git/config, *.tfstate, ...); set to [] to disable.
+# sensitive_paths = [".env", ".env.*", "*.pem", "*.key", ".ssh/**", "secrets.*"]
+# Session-wide default conversation-history budget. Every model request
+# carries the whole history; once its content plus tool-call arguments exceed
+# this many bytes, the oldest whole turns are dropped after the turn completes
+# (the system prompt and the most recent turn are always kept). A model
+# profile's own max_history_bytes overrides this, since the right depth depends
+# on that model's context window. Omit to keep full history. Compaction is
+# reported in the transcript and recorded in the audit log.
+# [session_fabric.compaction]
+# max_history_bytes = 262144
 # Prefix for terminal-job commands: d detach, s switch, l last, n/p cycle,
 # q terminate, ? help, or repeat the prefix to send it literally.
 pty_escape = "ctrl-]"

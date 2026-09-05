@@ -22,6 +22,10 @@ pub struct ModelProfile {
     pub model: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// History budget for this model, overriding `session_fabric.compaction`.
+    /// Size it to the model's context window; 0 disables compaction.
+    #[serde(default)]
+    pub max_history_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -50,6 +54,7 @@ impl ActiveModel {
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
+            max_history_bytes: self.max_history_bytes,
         }
     }
 
@@ -69,6 +74,7 @@ impl ActiveModel {
             model: binding.model,
             base_url: binding.base_url,
             api_key_env,
+            max_history_bytes: binding.max_history_bytes,
         })
     }
 }
@@ -88,6 +94,7 @@ pub struct ActiveModel {
     pub model: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    pub max_history_bytes: Option<usize>,
 }
 
 impl XshellConfig {
@@ -149,6 +156,7 @@ impl XshellConfig {
             model,
             base_url,
             api_key_env,
+            max_history_bytes: selected.and_then(|profile| profile.max_history_bytes),
         })
     }
 
@@ -167,6 +175,7 @@ impl XshellConfig {
                 .clone()
                 .map(|value| validate_api_key_env(value, Some(name)))
                 .transpose()?,
+            max_history_bytes: profile.max_history_bytes,
         })
     }
 
@@ -259,6 +268,45 @@ api_key_env = "OPENROUTER_API_KEY"
         assert_eq!(sample().rendering.markdown, OutputMode::Always);
         assert_eq!(sample().rendering.color, OutputMode::Never);
         assert_eq!(sample().rendering.width, Some(100));
+    }
+
+    #[test]
+    fn per_model_history_budget_travels_with_the_binding() {
+        let config: XshellConfig = toml::from_str(
+            r#"
+            [session_fabric.compaction]
+            max_history_bytes = 1000000
+            [models.small]
+            provider = "ollama"
+            model = "qwen3:4b"
+            max_history_bytes = 8192
+            [models.big]
+            provider = "ollama"
+            model = "qwen3:235b"
+            "#,
+        )
+        .unwrap();
+        let small = config.resolve_profile("small").unwrap();
+        let big = config.resolve_profile("big").unwrap();
+        assert_eq!(small.max_history_bytes, Some(8192));
+        assert_eq!(big.max_history_bytes, None);
+
+        // Round-trip through the session protocol type.
+        let binding = small.to_session_binding();
+        assert_eq!(binding.max_history_bytes, Some(8192));
+        let restored = ActiveModel::from_session_binding(binding).unwrap();
+        assert_eq!(restored.max_history_bytes, Some(8192));
+
+        // Resolution: profile overrides the session default; absent falls back.
+        let session = &config.session_fabric.compaction;
+        assert_eq!(
+            session.for_model(small.max_history_bytes).max_history_bytes,
+            Some(8192)
+        );
+        assert_eq!(
+            session.for_model(big.max_history_bytes).max_history_bytes,
+            Some(1_000_000)
+        );
     }
 
     #[test]

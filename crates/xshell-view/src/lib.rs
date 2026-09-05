@@ -1408,6 +1408,42 @@ mod tests {
         assert_eq!(escape_for_prompt("plain text"), "plain text");
     }
 
+    /// The property the approval prompt must satisfy: two different inputs
+    /// never render identically, and the printable payload survives verbatim.
+    /// Stripping terminal sequences (as `sanitize_terminal_text` does for
+    /// display) violates this, because a shell does not parse them.
+    #[test]
+    fn approval_escaping_is_injective_and_never_drops_printable_bytes() {
+        let payload = "printf HIDDEN; #";
+        let wrappers: [(&str, &str); 6] = [
+            ("", ""),
+            ("\x1b]0;", "\x07"),    // OSC ... BEL
+            ("\x1b]8;;", "\x1b\\"), // OSC hyperlink ... ST
+            ("\x1bP", "\x1b\\"),    // DCS ... ST
+            ("\x1b[", "m"),         // CSI
+            ("\u{9d}", "\u{9c}"),   // C1 OSC ... C1 ST
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (open, close) in wrappers {
+            let input = format!(": {open}{payload}{close}");
+            let escaped = escape_for_prompt(&input);
+            assert!(
+                escaped.contains(payload),
+                "payload lost inside {open:?}..{close:?}: {escaped:?}"
+            );
+            assert!(
+                escaped
+                    .chars()
+                    .all(|c| !c.is_control() && !is_invisible_format(c)),
+                "unescaped control in {escaped:?}"
+            );
+            assert!(seen.insert(escaped.clone()), "collision for {input:?}");
+        }
+        // And the sanitizer, by contrast, DOES drop the payload — which is why
+        // it must never be used for the approval prompt.
+        assert!(!sanitize_terminal_text(": \x1b]0;printf HIDDEN; #\x07").contains("HIDDEN"));
+    }
+
     #[test]
     fn approval_escaping_preserves_printable_shell_syntax_inside_osc() {
         let input = ": \x1b]0; printf HIDDEN; #\x07";

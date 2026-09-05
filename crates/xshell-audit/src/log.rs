@@ -1,6 +1,6 @@
 use crate::model::{
     AUDIT_FORMAT_VERSION, AuditCheckpoint, AuditEvent, AuditLogEntry, AuditRecord, AuditRecordBody,
-    CheckpointBody, WitnessCommitment,
+    CheckpointBody, MIN_SUPPORTED_AUDIT_FORMAT_VERSION, WitnessCommitment,
 };
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -89,6 +89,7 @@ impl SigningIdentity {
 }
 
 pub struct AuditLogWriter {
+    format_version: u32,
     session_id: String,
     client_uid: u32,
     sequence: u64,
@@ -108,6 +109,22 @@ impl AuditLogWriter {
         identity: SigningIdentity,
         client_uid: u32,
         checkpoint_interval: u64,
+    ) -> Result<Self> {
+        Self::create_with_format(
+            directory,
+            identity,
+            client_uid,
+            checkpoint_interval,
+            AUDIT_FORMAT_VERSION,
+        )
+    }
+
+    fn create_with_format(
+        directory: &Path,
+        identity: SigningIdentity,
+        client_uid: u32,
+        checkpoint_interval: u64,
+        format_version: u32,
     ) -> Result<Self> {
         ensure_secure_directory(directory)?;
         if checkpoint_interval == 0 {
@@ -131,6 +148,7 @@ impl AuditLogWriter {
             .context("cannot open audit checkpoint index")?;
 
         Ok(Self {
+            format_version,
             session_id,
             client_uid,
             sequence: 0,
@@ -160,7 +178,7 @@ impl AuditLogWriter {
     pub fn append(&mut self, event: AuditEvent) -> Result<AuditRecord> {
         self.sequence += 1;
         let body = AuditRecordBody {
-            format_version: AUDIT_FORMAT_VERSION,
+            format_version: self.format_version,
             session_id: self.session_id.clone(),
             sequence: self.sequence,
             daemon_timestamp_unix_ms: unix_timestamp_ms()?,
@@ -189,7 +207,7 @@ impl AuditLogWriter {
     fn write_checkpoint(&mut self, final_checkpoint: bool) -> Result<AuditCheckpoint> {
         self.checkpoint_sequence += 1;
         let body = CheckpointBody {
-            format_version: AUDIT_FORMAT_VERSION,
+            format_version: self.format_version,
             session_id: self.session_id.clone(),
             checkpoint_sequence: self.checkpoint_sequence,
             previous_checkpoint_hash: self.checkpoint_head.clone(),
@@ -268,7 +286,7 @@ pub fn verify_log(path: &Path, public_key_path: &Path) -> Result<VerificationRep
             .with_context(|| format!("invalid audit entry on line {}", line_number + 1))?;
         match entry {
             AuditLogEntry::Record(record) => {
-                if record.body.format_version != AUDIT_FORMAT_VERSION {
+                if !supported_format(record.body.format_version) {
                     bail!("unsupported audit format on line {}", line_number + 1);
                 }
                 match &session_id {
@@ -292,6 +310,9 @@ pub fn verify_log(path: &Path, public_key_path: &Path) -> Result<VerificationRep
                 expected_sequence += 1;
             }
             AuditLogEntry::Checkpoint(checkpoint) => {
+                if !supported_format(checkpoint.body.format_version) {
+                    bail!("unsupported audit format on line {}", line_number + 1);
+                }
                 let expected_session = session_id
                     .get_or_insert_with(|| checkpoint.body.session_id.clone())
                     .clone();
@@ -320,6 +341,10 @@ pub fn verify_log(path: &Path, public_key_path: &Path) -> Result<VerificationRep
         final_checkpoint,
         chain_head,
     })
+}
+
+fn supported_format(version: u32) -> bool {
+    (MIN_SUPPORTED_AUDIT_FORMAT_VERSION..=AUDIT_FORMAT_VERSION).contains(&version)
 }
 
 fn verify_checkpoint(checkpoint: &AuditCheckpoint, key: &VerifyingKey) -> Result<()> {
@@ -465,6 +490,22 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         fs::write(&path, contents.replacen("first", "altered", 1)).unwrap();
         assert!(verify_log(&path, &public_key).is_err());
+    }
+
+    #[test]
+    fn verifier_remains_backward_compatible_with_format_one() {
+        let temp = TempDir::new().unwrap();
+        let identity = SigningIdentity::load_or_create(temp.path()).unwrap();
+        let public_key = temp.path().join("signing-key.pub");
+        let mut writer =
+            AuditLogWriter::create_with_format(temp.path(), identity, 501, 2, 1).unwrap();
+        let path = writer.path().to_owned();
+        writer.append(event("pre-upgrade record")).unwrap();
+        writer.close().unwrap();
+
+        let report = verify_log(&path, &public_key).unwrap();
+        assert_eq!(report.records, 1);
+        assert!(report.final_checkpoint);
     }
 
     #[test]

@@ -2,8 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
-pub const AUDIT_FORMAT_VERSION: u32 = 1;
-pub const AUDIT_PROTOCOL_VERSION: u32 = 2;
+/// Format written by new audit logs. The verifier continues to accept version
+/// 1 so existing signed logs remain readable after upgrading.
+pub const AUDIT_FORMAT_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
+// Version 3 adds `AuditEvent::HistoryCompacted`. Tagged enum variants are not
+// forward-compatible in serde, so mixed-version peers must fail at handshake.
+pub const AUDIT_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -98,6 +103,17 @@ pub enum AuditEvent {
         command: String,
         outcome: String,
         cwd: String,
+    },
+    /// Older conversation turns were dropped (or summarized) to stay within
+    /// the configured history budget. Recorded so a reader of the trail knows
+    /// the model did not see the full transcript from this point on.
+    HistoryCompacted {
+        compactor: String,
+        messages_before: usize,
+        messages_after: usize,
+        bytes_before: usize,
+        bytes_after: usize,
+        turns_removed: usize,
     },
     SessionEnded {
         reason: String,

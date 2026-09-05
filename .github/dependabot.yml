@@ -1,13 +1,51 @@
-# Keeps the SHA-pinned actions in ci.yml current. Dependabot rewrites the
-# SHA and the trailing "# vN" comment together.
+# Dependabot performs two distinct jobs:
+#
+#   * Security updates: opened whenever a published advisory (RustSec / GitHub
+#     Advisory Database) affects a locked version. These ignore the schedule
+#     below and arrive immediately, labeled "security".
+#   * Version updates: routine "a newer release exists" bumps on the schedule
+#     below. They carry no security claim; `cargo audit` in CI is the signal
+#     for that.
+#
+# Version updates are batched so a one-maintainer repository sees one digest
+# PR per ecosystem per month instead of a PR per crate.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      # The SHA pins in ci.yml; Dependabot rewrites the SHA and the trailing
+      # "# vN" comment together.
+      actions:
+        patterns: ["*"]
+
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      # Non-breaking bumps in one PR; CI proves them, review is a skim.
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      # Breaking bumps still get their own PRs so each can be assessed, with
+      # the crypto stack held out entirely: those touch the audit log's
+      # on-disk key and signature encoding and are upgraded deliberately.
+      cargo-major:
+        patterns: ["*"]
+        update-types: ["major"]
+        exclude-patterns:
+          - "ed25519-dalek"
+          - "sha2"
+          - "digest"
+          - "rand_core"
+    ignore:
+      # Upgraded together, by hand, with an audit-format compatibility test.
+      # See closed PRs #22 and #24.
+      - dependency-name: "ed25519-dalek"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major"]

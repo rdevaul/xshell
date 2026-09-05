@@ -62,7 +62,8 @@ journal.
   opens one audit session per xshell session on first use, and records the
   execution-boundary events itself — agent and `$` input, model responses and
   errors, tool requests, approval decisions, tool results, working-directory
-  changes, direct shell completion, and terminal-job (PTY) start and completion.
+  changes, direct shell completion, terminal-job (PTY) start and completion,
+  and history compaction (which turns the model could no longer see).
   A detached turn is audited exactly as an attached one. With `required = true`,
   `xshelld` refuses to start without a reachable audit service, refuses to accept
   a turn whose input cannot be recorded, and stops an in-flight turn at the next
@@ -146,6 +147,7 @@ An unclean client or daemon crash leaves a verifiable hash chain but no final
 checkpoint. The verifier reports this explicitly rather than claiming the log
 is complete.
 
-View-operation events advance the audit client/daemon protocol to version 2.
-Upgrade and restart `xshell-auditd` together with the CLI; the on-disk audit
-format remains version 1.
+History-compaction events advance the audit client/daemon protocol to version
+3 and the on-disk audit format to version 2. Upgrade and restart
+`xshell-auditd` together with the CLI. The verifier remains able to read
+version 1 logs.

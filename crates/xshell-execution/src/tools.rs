@@ -1,4 +1,6 @@
+use crate::SensitivePaths;
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -16,7 +18,8 @@ pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file inside the current xshell working directory."
+            description: "Read a UTF-8 text file inside the current xshell working directory. \
+Files that look like credentials or keys require user approval."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -56,10 +59,59 @@ pub fn definitions() -> Vec<ToolDefinition> {
     ]
 }
 
-pub fn requires_approval(call: &ToolCall) -> bool {
-    requires_approval_by_name(&call.name)
+/// Why a tool call needs a human decision before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateReason {
+    /// The tool executes arbitrary commands.
+    ShellExecution,
+    /// The tool would read or list a path matching the sensitive-path policy.
+    SensitivePath,
 }
 
+impl std::fmt::Display for GateReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ShellExecution => "shell execution",
+            Self::SensitivePath => "sensitive path",
+        })
+    }
+}
+
+/// Decide whether `call` must be approved before running in `root`.
+///
+/// `run_shell` is always gated. Read-only tools are gated only when their
+/// resolved target matches `sensitive`. Resolution failures (missing file,
+/// escape from root) are not gated here: the tool itself will return an
+/// error, and prompting for a call that cannot run would be noise.
+pub fn requires_approval(
+    call: &ToolCall,
+    root: &Path,
+    sensitive: &SensitivePaths,
+) -> Option<GateReason> {
+    if requires_approval_by_name(&call.name) {
+        return Some(GateReason::ShellExecution);
+    }
+    if sensitive.patterns().is_empty() {
+        return None;
+    }
+    let requested = match call.name.as_str() {
+        "read_file" => call.arguments.get("path").and_then(Value::as_str)?,
+        "list_directory" => call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("."),
+        _ => return None,
+    };
+    let (root, resolved) = resolve_existing_with_root(root, requested).ok()?;
+    let relative = resolved.strip_prefix(&root).unwrap_or(&resolved);
+    sensitive
+        .matches(relative)
+        .then_some(GateReason::SensitivePath)
+}
+
+/// Whether a tool is gated regardless of its arguments.
 pub fn requires_approval_by_name(name: &str) -> bool {
     name == "run_shell"
 }
@@ -254,6 +306,12 @@ fn required_string<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 fn resolve_existing(root: &Path, requested: &str) -> Result<PathBuf> {
+    resolve_existing_with_root(root, requested).map(|(_, path)| path)
+}
+
+/// Like [`resolve_existing`] but also returns the canonical root, so callers
+/// can compute the path relative to it.
+fn resolve_existing_with_root(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf)> {
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot resolve tool root {}", root.display()))?;
@@ -269,7 +327,7 @@ fn resolve_existing(root: &Path, requested: &str) -> Result<PathBuf> {
     if !candidate.starts_with(&root) {
         bail!("path is outside the current xshell working directory");
     }
-    Ok(candidate)
+    Ok((root, candidate))
 }
 
 fn truncate(mut output: String) -> String {
@@ -385,6 +443,60 @@ mod tests {
         assert!(
             !alive,
             "grandchild {grandchild} survived process-group kill"
+        );
+    }
+
+    #[test]
+    fn sensitive_paths_promote_read_only_tools_to_gated() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(root.join("README.md"), "hi").unwrap();
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_ed25519"), "key").unwrap();
+        // A symlink with an innocent name pointing at a secret is still gated,
+        // because matching runs on the canonical path.
+        std::os::unix::fs::symlink(root.join(".env"), root.join("notes.txt")).unwrap();
+        let sensitive = SensitivePaths::default();
+        let call = |name: &str, path: &str| ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments: json!({"path": path}),
+        };
+
+        assert_eq!(
+            requires_approval(&call("read_file", ".env"), root, &sensitive),
+            Some(GateReason::SensitivePath)
+        );
+        assert_eq!(
+            requires_approval(&call("read_file", "notes.txt"), root, &sensitive),
+            Some(GateReason::SensitivePath)
+        );
+        assert_eq!(
+            requires_approval(&call("list_directory", ".ssh"), root, &sensitive),
+            Some(GateReason::SensitivePath)
+        );
+        assert_eq!(
+            requires_approval(&call("read_file", "README.md"), root, &sensitive),
+            None
+        );
+        assert_eq!(
+            requires_approval(&call("list_directory", "."), root, &sensitive),
+            None
+        );
+        assert_eq!(
+            requires_approval(&call("run_shell", "x"), root, &sensitive),
+            Some(GateReason::ShellExecution)
+        );
+        // Missing files are not gated; the tool reports the error itself.
+        assert_eq!(
+            requires_approval(&call("read_file", "missing.pem"), root, &sensitive),
+            None
+        );
+        // An empty policy gates nothing but shell.
+        assert_eq!(
+            requires_approval(&call("read_file", ".env"), root, &SensitivePaths::none()),
+            None
         );
     }
 
