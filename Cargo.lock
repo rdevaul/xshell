@@ -2073,6 +2073,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xshell-flow"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "xshell-platform"
 version = "0.2.0"
 dependencies = [

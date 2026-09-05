@@ -1,0 +1,49 @@
+{
+  "schema": "xshell.flow/v0",
+  "name": "linear_fea",
+  "interface": {
+    "inputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }],
+    "outputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }]
+  },
+  "nodes": [
+    {
+      "id": "input",
+      "kind": "input",
+      "outputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }],
+      "annotations": { "ui.position": [0, 100] }
+    },
+    {
+      "id": "mesh",
+      "label": "Generate mesh",
+      "kind": "task",
+      "program": { "source": "mesh.fsh" },
+      "inputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }],
+      "outputs": [{ "name": "mesh", "type": { "kind": "artifact", "media_type": "application/x-gmsh" } }],
+      "capabilities": { "read": ["model/**"], "write": ["generated/mesh.msh"], "execute": ["gmsh"] },
+      "resources": { "timeout_ms": 300000 }
+    },
+    {
+      "id": "solve",
+      "kind": "task",
+      "program": { "source": "solve.fsh" },
+      "inputs": [{ "name": "mesh", "type": { "kind": "artifact", "media_type": "application/x-gmsh" } }],
+      "outputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }],
+      "capabilities": { "read": ["generated/mesh.msh"], "write": ["analysis.json"], "execute": ["fenics-run"] },
+      "resources": { "timeout_ms": 600000 }
+    },
+    {
+      "id": "output",
+      "kind": "output",
+      "inputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }]
+    }
+  ],
+  "edges": [
+    { "id": "model_to_mesh", "kind": "data", "from": { "node": "input", "port": "model" }, "to": { "node": "mesh", "port": "model" } },
+    { "id": "mesh_to_solve", "kind": "data", "from": { "node": "mesh", "port": "mesh" }, "to": { "node": "solve", "port": "mesh" } },
+    { "id": "solve_to_output", "kind": "data", "from": { "node": "solve", "port": "analysis" }, "to": { "node": "output", "port": "analysis" } }
+  ],
+  "regions": [
+    { "id": "work", "kind": "transaction", "workspace": ".", "nodes": ["mesh", "solve"] }
+  ],
+  "annotations": { "ui.viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

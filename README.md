@@ -15,8 +15,8 @@ At one prompt you can:
 - describe work in natural language and let an agent use bounded tools;
 - prefix input with `$` when you want the ordinary shell directly;
 - run pagers, TUIs, and full-screen programs in detachable PTYs;
-- leave Emacs running while you switch sessions or hosts, or disconnect while
-  a daemon-owned agent turn continues;
+- leave your full screen editor running while you switch sessions or hosts, or 
+  disconnect while a daemon-owned agent turn continues;
 - choose a different local or hosted model for each session and machine; and
 - enforce host-local approval policy and produce tamper-evident audit records
   at the point where execution occurs.
@@ -60,7 +60,11 @@ multi-user sessions and ACLs, and restoration of an in-flight process across an
 language planned on top of this fabric—is currently a design and roadmap, not
 an executable language.
 
-## Quick start
+An experimental typed dataflow representation for FutureShell is available in
+`crates/xshell-flow`. It models tasks, contract-gated branches, parallel joins,
+and bounded feedback loops. See [the Flow IR prototype](docs/futureshell-flow-ir.md).
+
+## Build and run
 
 xshell targets macOS and Linux and requires Rust 1.88 or newer. With Ollama
 serving `qwen3:8b` on its default local endpoint:
