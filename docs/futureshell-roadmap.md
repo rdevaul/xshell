@@ -71,7 +71,8 @@ The initial language and runtime will not:
 | Term | Meaning |
 |---|---|
 | **program** | A parsed FutureShell source file and its imported modules. |
-| **plan** | The checked task graph, capabilities, budgets, contracts, and promotion policy derived from a program. |
+| **flow** | A typed authoring graph shared by textual and graphical frontends, including bounded loop regions. It is not yet an authorized execution plan. |
+| **plan** | The checked execution templates, capabilities, budgets, contracts, and promotion policy derived from a program or flow. |
 | **task** | One shell, process, agent, viewer, verifier, transfer, or nested FutureShell operation. |
 | **transaction** | A bounded execution scope with a base filesystem state and a private writable staging layer. |
 | **checkpoint** | A named reference to a transaction's base or intermediate staged state; it is distinct from an audit signature checkpoint. |
@@ -251,6 +252,22 @@ it mediates; the unmediated authority is reported as an ambient-agent taint.
 Policy may restrict that target to advisory work. A strict workflow instead
 uses a scoped one-shot/managed instance with native tools disabled or a
 connector that can prove equivalent enforcement.
+
+### 5.4 Dataflow representation
+
+Textual FutureShell and graphical editors lower to a shared typed Flow IR.
+Tasks and nested programs are nodes, typed values travel over data edges, and
+contract gates select route edges. Contract acceptance makes a value available
+to downstream nodes; promotion remains a separate policy operation.
+
+Ordinary data, dependency, and route edges form a DAG. Graphical loops use
+structured loop regions with explicit initial and feedback state, a positive
+iteration bound, a contract-gated exit, and an exhaustion policy. The plan
+contains a bounded loop template; runtime iterations produce a finite expanded
+DAG with deterministic task identities.
+
+Layout metadata is retained for editors but excluded from semantic plan
+identity. See [the Flow IR prototype](futureshell-flow-ir.md).
 
 ## 6. Execution model
 

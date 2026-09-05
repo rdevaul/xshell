@@ -29,6 +29,9 @@ FutureShell source
 xshell-language  ---- parse, spans, AST, types, diagnostics, formatter
     |
     v
+xshell-flow      ---- typed authoring graph, gates, joins, bounded loop regions
+    |
+    v
 xshell-plan      ---- checked immutable task DAG, capabilities, plan hash
     |
     v
@@ -64,6 +67,7 @@ must remain separated. In particular:
 | Package | Initial responsibility |
 |---|---|
 | `xshell-language` | Lexer, parser, source spans, AST, diagnostics, formatter, type/value definitions, module loading. |
+| `xshell-flow` | Typed authoring graph shared by textual and graphical frontends; ports, gates, routes, joins and bounded loop regions. |
 | `xshell-plan` | Semantic checking, capability normalization, task DAG, static read/write analysis, canonical serialization and plan hashing. |
 | `xshell-workspace` | Backend trait, portable staged-tree backend, manifests, change sets, promotion journal, conflict detection and recovery. |
 | `xshell-contract` | Evidence schema, deterministic predicates, clause reports, canonical receipts and offline verification. |
@@ -114,6 +118,7 @@ Create a conformance corpus before implementation:
 
 ```text
 fixtures/futureshell/
+  flows/
   syntax/valid/
   syntax/invalid/
   plans/

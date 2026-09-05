@@ -1,0 +1,46 @@
+{
+  "schema": "xshell.flow/v0",
+  "name": "parallel_join",
+  "interface": {
+    "inputs": [{ "name": "source", "type": { "kind": "artifact", "media_type": "text/x-rust" } }],
+    "outputs": [{ "name": "report", "type": { "kind": "artifact", "media_type": "application/json", "schema": "quality-report-v1" } }]
+  },
+  "nodes": [
+    { "id": "input", "kind": "input", "outputs": [{ "name": "source", "type": { "kind": "artifact", "media_type": "text/x-rust" } }] },
+    {
+      "id": "lint",
+      "kind": "task",
+      "program": { "source": "lint.fsh" },
+      "inputs": [{ "name": "source", "type": { "kind": "artifact", "media_type": "text/x-rust" } }],
+      "outputs": [{ "name": "finding", "type": { "kind": "artifact", "media_type": "application/json", "schema": "finding-v1" } }]
+    },
+    {
+      "id": "test",
+      "kind": "task",
+      "program": { "source": "test.fsh" },
+      "inputs": [{ "name": "source", "type": { "kind": "artifact", "media_type": "text/x-rust" } }],
+      "outputs": [{ "name": "finding", "type": { "kind": "artifact", "media_type": "application/json", "schema": "finding-v1" } }]
+    },
+    {
+      "id": "combine",
+      "kind": "join",
+      "strategy": "all",
+      "inputs": [
+        { "name": "lint", "type": { "kind": "artifact", "media_type": "application/json", "schema": "finding-v1" } },
+        { "name": "test", "type": { "kind": "artifact", "media_type": "application/json", "schema": "finding-v1" } }
+      ],
+      "outputs": [{ "name": "report", "type": { "kind": "artifact", "media_type": "application/json", "schema": "quality-report-v1" } }]
+    },
+    { "id": "output", "kind": "output", "inputs": [{ "name": "report", "type": { "kind": "artifact", "media_type": "application/json", "schema": "quality-report-v1" } }] }
+  ],
+  "edges": [
+    { "id": "source_to_lint", "kind": "data", "from": { "node": "input", "port": "source" }, "to": { "node": "lint", "port": "source" } },
+    { "id": "source_to_test", "kind": "data", "from": { "node": "input", "port": "source" }, "to": { "node": "test", "port": "source" } },
+    { "id": "lint_to_join", "kind": "data", "from": { "node": "lint", "port": "finding" }, "to": { "node": "combine", "port": "lint" } },
+    { "id": "test_to_join", "kind": "data", "from": { "node": "test", "port": "finding" }, "to": { "node": "combine", "port": "test" } },
+    { "id": "join_to_output", "kind": "data", "from": { "node": "combine", "port": "report" }, "to": { "node": "output", "port": "report" } }
+  ],
+  "regions": [
+    { "id": "checks", "kind": "parallel", "nodes": ["lint", "test"] }
+  ]
+}
