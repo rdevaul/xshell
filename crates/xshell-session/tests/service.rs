@@ -242,6 +242,74 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
 }
 
 #[test]
+fn creating_a_session_preserves_the_previous_sessions_interactive_process() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .args(["--host-alias", "test-host", "--user", "tester"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut owner = connect_when_ready(&socket);
+    let first = owner
+        .create(SessionCreation {
+            name: "emacs".into(),
+            model: model("local"),
+            cwd: temporary.path().to_owned(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test prompt")],
+        })
+        .unwrap();
+    owner
+        .pty_start(
+            first.descriptor.id.clone(),
+            "sleep 60".into(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+
+    let second = owner
+        .create(SessionCreation {
+            name: "additional-work".into(),
+            model: first.descriptor.model.clone(),
+            cwd: first.descriptor.cwd.clone(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test prompt")],
+        })
+        .unwrap();
+    assert_eq!(second.descriptor.name, "additional-work");
+    let first_in_catalog = owner
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == first.descriptor.id)
+        .unwrap();
+    assert!(matches!(
+        first_in_catalog.activity,
+        SessionActivity::InteractiveProcess { .. }
+    ));
+
+    owner.switch(first.descriptor.id.clone()).unwrap();
+    owner
+        .pty_attach(first.descriptor.id.clone(), None)
+        .expect("the original interactive process should remain attachable");
+    owner.pty_close(first.descriptor.id).unwrap();
+}
+
+#[test]
 fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
     let temporary = TempDir::new().unwrap();
     let state = temporary.path().join("state");
@@ -536,6 +604,16 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     ));
     send_request(
         &mut writer,
+        &ClientRequest::PtyClose {
+            session_id: private.descriptor.id.clone(),
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Error { code, .. } if code == "remote_session_not_visible"
+    ));
+    send_request(
+        &mut writer,
         &ClientRequest::ViewSource {
             session_id: private.descriptor.id.clone(),
             path: "remote-view.md".into(),
@@ -592,7 +670,11 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
         receive_response(&mut reader),
         ServerResponse::Catalog { sessions }
             if sessions.iter().any(|session| {
-                session.id == shared.descriptor.id && session.activity == SessionActivity::Running
+                session.id == shared.descriptor.id
+                    && matches!(
+                        session.activity,
+                        SessionActivity::InteractiveProcess { .. }
+                    )
             })
     ));
     send_request(&mut writer, &ClientRequest::PtyList);
@@ -604,7 +686,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     send_request(
         &mut writer,
         &ClientRequest::PtyClose {
-            pty_id: pty_id.clone(),
+            session_id: shared.descriptor.id.clone(),
         },
     );
     assert_eq!(receive_response(&mut reader), ServerResponse::PtyClosed);
@@ -683,7 +765,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
         .find(|pty| pty.session_id == remote_home_id)
         .expect("terminal job should survive control disconnect");
     assert!(persistent.running);
-    after_disconnect.pty_close(persistent.pty_id).unwrap();
+    after_disconnect.pty_close(remote_home_id).unwrap();
 }
 
 #[test]
@@ -887,7 +969,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             break call_id;
         }
     };
-    assert_eq!(
+    assert!(matches!(
         client
             .list()
             .unwrap()
@@ -895,8 +977,11 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             .find(|entry| entry.id == session.descriptor.id)
             .unwrap()
             .activity,
-        SessionActivity::WaitingApproval
-    );
+        SessionActivity::AgentTurn {
+            phase: xshell_session::AgentTurnPhase::WaitingApproval,
+            ..
+        }
+    ));
     client
         .approve(
             session.descriptor.id.clone(),

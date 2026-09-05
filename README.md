@@ -238,23 +238,29 @@ source native zsh/bash completion frameworks, startup scripts, aliases, or
 functions.
 
 Directly entered commands in daemon-backed local and remote sessions run as
-session-owned terminal jobs. This supports colors, pagers, and full-screen
+session-owned interactive processes backed by PTYs. This supports colors, pagers, and full-screen
 programs; input, output, resize events, and terminal-generated signals are
-relayed byte-for-byte. Closing a controller or PTY stream leaves a terminal job
+relayed byte-for-byte. Closing a controller or PTY stream leaves the interactive process
 running for daemon-lifetime and durable sessions, with up to 1 MiB of output
 available for replay. Ephemeral sessions still terminate their jobs on detach.
 
-While a terminal job has focus, `Ctrl-]` is the default configurable command
-prefix: `d` detaches to the current session's REPL, `s` opens the session
+While an interactive process has focus, `Ctrl-]` is the default configurable command
+prefix: `d` detaches to the xshell session-control prompt, `s` opens the unified session
 switcher, `l` selects the last session, `n`/`p` cycle, `q` terminates, `?` shows
-help, and a second `Ctrl-]` sends the prefix literally. Sessions without a
-terminal job appear as `[REPL]` targets; selecting one activates that session
-and returns to its xshell prompt. At the REPL, `//terminal` reattaches the
-current job, and `//switch HOST:SESSION` automatically resumes a running job on
-the selected session. `//terminal list` and `//terminal kill` inspect or
-terminate jobs. Configure the prefix with `session_fabric.pty_escape`.
+help, and a second `Ctrl-]` sends the prefix literally. The switcher shows what
+each session is doing and can create a fresh session on the currently connected
+host; selecting an idle session opens its prompt, while selecting a session with
+an interactive process resumes it. `//switch HOST:SESSION` has the same behavior
+from the prompt. `//sessions` is the common catalog and `//stop` stops the current
+session's activity. The older `//terminal` commands remain compatibility aliases.
+Configure the prefix with `session_fabric.pty_escape`.
 
-Protocol v8 uses a dedicated authenticated binary stream locally and over SSH.
+An interactive process occupies its session's execution slot. At the control
+prompt, use `//resume`, `//switch`, or `//stop`; `//resume` also follows a
+detached agent turn. Start new agent and shell work in an
+idle session rather than racing it against the process.
+
+The PTY data plane uses a dedicated authenticated binary stream locally and over SSH.
 See [the terminal-job design and trust boundary](docs/pty.md).
 
 See [the session-fabric protocol and current boundary](docs/session-fabric.md).

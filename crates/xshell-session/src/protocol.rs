@@ -75,7 +75,7 @@ pub enum ClientRequest {
         after_offset: Option<u64>,
     },
     PtyClose {
-        pty_id: String,
+        session_id: String,
     },
     PtyClaim {
         ticket: String,

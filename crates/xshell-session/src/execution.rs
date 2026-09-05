@@ -1,7 +1,7 @@
 use crate::audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
 use crate::{
-    ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind, SessionRegistry,
-    TurnInput,
+    AgentTurnPhase, ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind,
+    SessionRegistry, TurnInput,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -259,12 +259,19 @@ impl ExecutionCoordinator {
     pub fn activity(&self, session_id: &str) -> SessionActivity {
         let execution = self.session(session_id);
         let state = execution.state.lock_recover();
-        if state.active.is_none() {
-            SessionActivity::Idle
-        } else if state.pending_approvals.is_empty() {
-            SessionActivity::Running
+        let Some(active) = &state.active else {
+            return SessionActivity::Idle;
+        };
+        if state.pending_approvals.is_empty() {
+            SessionActivity::AgentTurn {
+                turn_id: active.id.clone(),
+                phase: AgentTurnPhase::Running,
+            }
         } else {
-            SessionActivity::WaitingApproval
+            SessionActivity::AgentTurn {
+                turn_id: active.id.clone(),
+                phase: AgentTurnPhase::WaitingApproval,
+            }
         }
     }
 

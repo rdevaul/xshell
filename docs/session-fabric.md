@@ -15,13 +15,16 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 10. The daemon
+with protocol version 11. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Protocol versions are exact rather than negotiated across incompatible
 schemas. Any protocol bump therefore requires upgrading and restarting
 `xshelld` on the controller and every connected remote host before the new CLI
-can attach. Protocol v10 adds the `history_compacted` execution event. Protocol
+can attach. Protocol v11 makes session activity self-describing: the session
+catalog distinguishes idle prompts, agent turns, and interactive processes,
+including the process command and stream attachment state. Protocol v10 added
+the `history_compacted` execution event. Protocol
 v9 added the `tool_skipped` event, emitted for each tool call that was never
 evaluated because the user aborted the turn at an earlier call in the same
 response.
@@ -165,13 +168,14 @@ work.
 - `complete_shell`: return bounded executable/path candidates for a session.
 - `view_source`: return a bounded UTF-8 resource resolved against the attached
   session cwd, with media type, length, and SHA-256 metadata.
-- `pty_start`: start one session-owned terminal job and return its ID and a
+- `pty_start`: start one session-owned interactive process and return its internal PTY ID and a
   one-time stream ticket.
-- `pty_list`: list terminal jobs visible through the current transport.
+- `pty_list`: diagnostic listing of PTY internals; ordinary controllers use the
+  unified session catalog instead.
 - `pty_attach`: mint a one-time ticket at a bounded replay offset.
 - `pty_claim`: consume a ticket on a dedicated daemon connection before binary
   framing begins.
-- `pty_close`: terminate and reap the current session's terminal job.
+- `pty_close`: terminate and reap the current session's interactive process.
 
 `view_source` requires the requesting connection to own the active session.
 The SSH proxy additionally rejects requests for `host_only` sessions. The

@@ -330,8 +330,8 @@ impl SessionClient {
         }
     }
 
-    pub fn pty_close(&mut self, pty_id: String) -> Result<()> {
-        self.send(&ClientRequest::PtyClose { pty_id })?;
+    pub fn pty_close(&mut self, session_id: String) -> Result<()> {
+        self.send(&ClientRequest::PtyClose { session_id })?;
         match self.receive()? {
             ServerResponse::PtyClosed => Ok(()),
             response => response_error("PTY close", response),

@@ -17,8 +17,10 @@ const CONTROL_COMMANDS: &[&str] = &[
     "//model",
     "//new",
     "//quit",
+    "//resume",
     "//sessions",
     "//status",
+    "//stop",
     "//switch",
     "//terminal",
     "//tools",
@@ -426,8 +428,11 @@ mod tests {
         let context = Context::new(&history);
         let (start, matches) = helper.complete("//st", 4, &context).unwrap();
         assert_eq!(start, 0);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].replacement, "//status");
+        let replacements = matches
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(replacements, ["//status", "//stop"]);
     }
 
     #[test]

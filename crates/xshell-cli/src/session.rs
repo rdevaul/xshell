@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
-    EventBatch, PersistenceMode, PtyDescriptor, PtySize, PtyStreamClient, PtyTicket,
+    AgentTurnPhase, EventBatch, PersistenceMode, PtySize, PtyStreamClient, PtyTicket,
     SessionActivity, SessionClient, SessionConfig, SessionCreation, SessionDescriptor,
     SessionSnapshot, SessionStatus, TurnInput, ViewResource, Visibility,
 };
@@ -26,7 +26,6 @@ pub struct SessionRuntime {
     active: Option<SessionDescriptor>,
     navigation_history: Vec<String>,
     event_cursors: HashMap<String, u64>,
-    active_turns: HashMap<String, Option<String>>,
     pty_cursors: HashMap<String, u64>,
 }
 
@@ -68,9 +67,8 @@ impl SessionRuntime {
             })?
         };
         let active = Some(snapshot.descriptor.clone());
-        let (cursor, active_turn) = initial_event_cursor(&mut client, &snapshot.descriptor.id)?;
+        let cursor = initial_event_cursor(&mut client, &snapshot.descriptor.id)?;
         let event_cursors = HashMap::from([(snapshot.descriptor.id.clone(), cursor)]);
-        let active_turns = HashMap::from([(snapshot.descriptor.id.clone(), active_turn)]);
         Ok((
             Self {
                 connection: Some(HostConnection {
@@ -81,7 +79,6 @@ impl SessionRuntime {
                 active,
                 navigation_history: Vec::new(),
                 event_cursors,
-                active_turns,
                 pty_cursors: HashMap::new(),
             },
             Some(snapshot),
@@ -95,7 +92,6 @@ impl SessionRuntime {
             active: None,
             navigation_history: Vec::new(),
             event_cursors: HashMap::new(),
-            active_turns: HashMap::new(),
             pty_cursors: HashMap::new(),
         }
     }
@@ -238,34 +234,33 @@ impl SessionRuntime {
     }
 
     pub fn sync(&mut self, model: &ActiveModel, cwd: &Path, history: &[ChatMessage]) -> Result<()> {
-        let Some((session_id, possibly_running)) = self.active.as_ref().map(|session| {
+        let Some((session_id, interactive_process)) = self.active.as_ref().map(|session| {
             (
                 session.id.clone(),
-                session.activity == SessionActivity::Running,
+                session.activity.is_interactive_process(),
             )
         }) else {
             return Ok(());
         };
         let model = model.to_session_binding();
-        let terminal_running = possibly_running
-            && self
-                .client_mut()?
-                .pty_list()?
-                .into_iter()
-                .any(|pty| pty.session_id == session_id && pty.running);
-        if terminal_running {
-            let snapshot = self.client_mut()?.snapshot(session_id)?;
-            let unchanged = snapshot.descriptor.model == model
-                && snapshot.descriptor.cwd == cwd
-                && snapshot.history == history;
-            self.active = Some(snapshot.descriptor);
-            if !unchanged {
-                bail!(
-                    "cannot change the model, working directory, or conversation while the active \
-terminal job is running; terminate it with //terminal kill first"
-                );
+        if interactive_process {
+            let snapshot = self.client_mut()?.snapshot(session_id.clone())?;
+            if snapshot.descriptor.activity.is_interactive_process() {
+                let unchanged = snapshot.descriptor.model == model
+                    && snapshot.descriptor.cwd == cwd
+                    && snapshot.history == history;
+                self.active = Some(snapshot.descriptor);
+                if !unchanged {
+                    bail!(
+                        "cannot change the model, working directory, or conversation while the \
+session's interactive process is running; stop it first"
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
+            // A process may have exited while its controller was detached.
+            // Refresh the cached activity and continue with the ordinary update.
+            self.active = Some(snapshot.descriptor);
         }
         let descriptor =
             self.client_mut()?
@@ -336,6 +331,31 @@ terminal job is running; terminate it with //terminal kill first"
         Ok(snapshot)
     }
 
+    /// Create a fresh sibling of the active session on the same host. This is
+    /// used by the raw-mode session picker, where the normal REPL arguments are
+    /// deliberately unavailable.
+    pub fn create_sibling(&mut self, name: String) -> Result<SessionSnapshot> {
+        let current = self
+            .active
+            .clone()
+            .context("there is no active session to copy")?;
+        let snapshot = self.client_mut()?.snapshot(current.id.clone())?;
+        let history = snapshot.history.into_iter().take(1).collect();
+        let previous = current.id;
+        let created = self.client_mut()?.create(SessionCreation {
+            name,
+            model: current.model,
+            cwd: current.cwd,
+            history,
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+        })?;
+        self.navigation_history.push(previous);
+        self.active = Some(created.descriptor.clone());
+        self.ensure_event_cursor(&created.descriptor.id)?;
+        Ok(created)
+    }
+
     pub fn detach(&mut self) -> Result<Option<String>> {
         let detached = self.client_mut()?.detach()?;
         self.active = None;
@@ -347,7 +367,12 @@ terminal job is running; terminate it with //terminal kill first"
         let turn_id = self
             .client_mut()?
             .submit(session_id.clone(), input, approval)?;
-        self.active_turns.insert(session_id, Some(turn_id.clone()));
+        if let Some(active) = &mut self.active {
+            active.activity = SessionActivity::AgentTurn {
+                turn_id: turn_id.clone(),
+                phase: AgentTurnPhase::Running,
+            };
+        }
         Ok(turn_id)
     }
 
@@ -363,11 +388,14 @@ terminal job is running; terminate it with //terminal kill first"
         terminal_type: Option<String>,
     ) -> Result<PtyTicket> {
         let session_id = self.active_session_id()?;
-        let ticket = self
-            .client_mut()?
-            .pty_start(session_id, command, size, terminal_type)?;
+        let ticket =
+            self.client_mut()?
+                .pty_start(session_id, command.clone(), size, terminal_type)?;
         if let Some(active) = &mut self.active {
-            active.activity = SessionActivity::Running;
+            active.activity = SessionActivity::InteractiveProcess {
+                command: command.clone(),
+                attached: false,
+            };
         }
         Ok(ticket)
     }
@@ -377,66 +405,55 @@ terminal job is running; terminate it with //terminal kill first"
         command: String,
         size: PtySize,
         terminal_type: Option<String>,
-    ) -> Result<(String, PtyStreamClient)> {
+    ) -> Result<PtyStreamClient> {
         let ticket = self.pty_start(command, size, terminal_type)?;
         match self.open_pty_ticket(&ticket) {
-            Ok(stream) => Ok((ticket.pty_id, stream)),
+            Ok(stream) => Ok(stream),
             Err(error) => {
-                let _ = self.pty_close(&ticket.pty_id);
+                let _ = self.pty_close_current();
                 Err(error)
             }
         }
     }
 
-    pub fn pty_attach_stream(&mut self) -> Result<(String, PtyStreamClient)> {
+    pub fn pty_attach_stream(&mut self) -> Result<PtyStreamClient> {
         self.pty_attach_stream_if_present()?
             .context("active session has no terminal job")
     }
 
-    pub fn active_terminal_running(&mut self) -> Result<bool> {
+    pub fn active_interactive_running(&mut self) -> Result<bool> {
         let session_id = self.active_session_id()?;
-        Ok(self
-            .client_mut()?
-            .pty_list()?
-            .into_iter()
-            .any(|pty| pty.session_id == session_id && pty.running))
+        let snapshot = self.client_mut()?.snapshot(session_id)?;
+        let running = snapshot.descriptor.activity.is_interactive_process();
+        self.active = Some(snapshot.descriptor);
+        Ok(running)
     }
 
-    pub fn pty_attach_stream_if_present(&mut self) -> Result<Option<(String, PtyStreamClient)>> {
+    pub fn pty_attach_stream_if_present(&mut self) -> Result<Option<PtyStreamClient>> {
         let session_id = self.active_session_id()?;
-        let Some(descriptor) = self
-            .client_mut()?
-            .pty_list()?
-            .into_iter()
-            .find(|pty| pty.session_id == session_id)
-        else {
+        let snapshot = self.client_mut()?.snapshot(session_id.clone())?;
+        if !snapshot.descriptor.activity.is_interactive_process() {
+            self.active = Some(snapshot.descriptor);
             return Ok(None);
-        };
-        let after_offset = self.pty_cursors.get(&descriptor.pty_id).copied();
-        let ticket = self.client_mut()?.pty_attach(session_id, after_offset)?;
+        }
+        self.active = Some(snapshot.descriptor);
+        let after_offset = self.pty_cursors.get(&session_id).copied();
+        let ticket = self
+            .client_mut()?
+            .pty_attach(session_id.clone(), after_offset)?;
         let stream = self.open_pty_ticket(&ticket)?;
-        Ok(Some((ticket.pty_id, stream)))
+        Ok(Some(stream))
     }
 
-    pub fn remember_pty_cursor(&mut self, pty_id: &str, cursor: u64) {
-        self.pty_cursors.insert(pty_id.to_owned(), cursor);
+    pub fn remember_pty_cursor(&mut self, cursor: u64) {
+        if let Some(session) = &self.active {
+            self.pty_cursors.insert(session.id.clone(), cursor);
+        }
     }
 
-    pub fn terminal_targets(&mut self) -> Result<Vec<(SessionDescriptor, bool)>> {
-        let terminal_session_ids = self
-            .terminal_jobs()?
-            .into_iter()
-            .map(|(session, _)| session.id)
-            .collect::<HashSet<_>>();
-        let mut sessions = self
-            .list()?
-            .into_iter()
-            .map(|session| {
-                let has_terminal = terminal_session_ids.contains(&session.id);
-                (session, has_terminal)
-            })
-            .collect::<Vec<_>>();
-        sessions.sort_by(|(left, _), (right, _)| {
+    pub fn session_targets(&mut self) -> Result<Vec<SessionDescriptor>> {
+        let mut sessions = self.list()?;
+        sessions.sort_by(|left, right| {
             (&left.host_alias, &left.name).cmp(&(&right.host_alias, &right.name))
         });
         Ok(sessions)
@@ -446,59 +463,22 @@ terminal job is running; terminate it with //terminal kill first"
         self.navigation_history.last().map(String::as_str)
     }
 
-    pub fn terminal_jobs(&mut self) -> Result<Vec<(SessionDescriptor, PtyDescriptor)>> {
-        let mut ptys = self.client_mut()?.pty_list()?;
-        let host_ids = self.parked_connections.keys().cloned().collect::<Vec<_>>();
-        for host_id in host_ids {
-            let result = self
-                .parked_connections
-                .get_mut(&host_id)
-                .expect("parked host exists")
-                .client
-                .pty_list();
-            match result {
-                Ok(remote_ptys) => ptys.extend(remote_ptys),
-                Err(error) => {
-                    eprintln!("xshell: cannot list terminal jobs on parked host: {error:#}");
-                }
-            }
-        }
-        let sessions = self.list()?;
-        let mut jobs = ptys
+    pub fn interactive_sessions(&mut self) -> Result<Vec<SessionDescriptor>> {
+        Ok(self
+            .session_targets()?
             .into_iter()
-            .filter_map(|pty| {
-                sessions
-                    .iter()
-                    .find(|session| session.id == pty.session_id)
-                    .cloned()
-                    .map(|session| (session, pty))
-            })
-            .collect::<Vec<_>>();
-        jobs.sort_by(|(left, _), (right, _)| {
-            (&left.host_alias, &left.name).cmp(&(&right.host_alias, &right.name))
-        });
-        Ok(jobs)
-    }
-
-    pub fn pty_close(&mut self, pty_id: &str) -> Result<()> {
-        self.client_mut()?.pty_close(pty_id.to_owned())?;
-        self.pty_cursors.remove(pty_id);
-        if let Some(active) = &mut self.active {
-            active.activity = SessionActivity::Idle;
-        }
-        Ok(())
+            .filter(|session| session.activity.is_interactive_process())
+            .collect())
     }
 
     pub fn pty_close_current(&mut self) -> Result<()> {
         let session_id = self.active_session_id()?;
-        let pty_id = self
-            .client_mut()?
-            .pty_list()?
-            .into_iter()
-            .find(|pty| pty.session_id == session_id)
-            .map(|pty| pty.pty_id)
-            .context("active session has no terminal job")?;
-        self.pty_close(&pty_id)
+        self.client_mut()?.pty_close(session_id.clone())?;
+        self.pty_cursors.remove(&session_id);
+        if let Some(active) = &mut self.active {
+            active.activity = SessionActivity::Idle;
+        }
+        Ok(())
     }
 
     pub fn events(&mut self, wait_ms: u64) -> Result<EventBatch> {
@@ -510,8 +490,6 @@ terminal job is running; terminate it with //terminal kill first"
         if let Some(last) = batch.events.last() {
             self.event_cursors.insert(session_id.clone(), last.sequence);
         }
-        self.active_turns
-            .insert(session_id, batch.active_turn_id.clone());
         Ok(batch)
     }
 
@@ -534,13 +512,34 @@ terminal job is running; terminate it with //terminal kill first"
     }
 
     pub fn active_turn_id(&self) -> Option<&str> {
-        let session_id = self.active.as_ref()?.id.as_str();
-        self.active_turns.get(session_id).and_then(Option::as_deref)
+        match &self.active.as_ref()?.activity {
+            SessionActivity::AgentTurn { turn_id, .. } => Some(turn_id),
+            _ => None,
+        }
     }
 
     pub fn mark_turn_finished(&mut self) {
-        if let Some(session_id) = self.active.as_ref().map(|session| session.id.clone()) {
-            self.active_turns.insert(session_id, None);
+        if let Some(active) = &mut self.active {
+            active.activity = SessionActivity::Idle;
+        }
+    }
+
+    pub fn stop_current_activity(&mut self) -> Result<&'static str> {
+        let snapshot = self.refresh_snapshot()?;
+        match snapshot.descriptor.activity {
+            SessionActivity::Idle => bail!("the active session has no running activity"),
+            SessionActivity::InteractiveProcess { .. } => {
+                self.pty_close_current()?;
+                Ok("interactive process stopped")
+            }
+            SessionActivity::AgentTurn { turn_id, .. } => {
+                let session_id = snapshot.descriptor.id;
+                self.client_mut()?.cancel(session_id.clone(), turn_id)?;
+                if let Some(active) = &mut self.active {
+                    active.activity = SessionActivity::Idle;
+                }
+                Ok("agent turn cancellation requested")
+            }
         }
     }
 
@@ -554,7 +553,6 @@ terminal job is running; terminate it with //terminal kill first"
         self.client_mut()?.close(None)?;
         self.active = None;
         self.event_cursors.remove(&current_id);
-        self.active_turns.remove(&current_id);
         self.navigation_history
             .retain(|session_id| session_id != &current_id);
 
@@ -658,17 +656,13 @@ terminal job is running; terminate it with //terminal kill first"
         if self.event_cursors.contains_key(session_id) {
             return Ok(());
         }
-        let (cursor, active_turn) = initial_event_cursor(self.client_mut()?, session_id)?;
+        let cursor = initial_event_cursor(self.client_mut()?, session_id)?;
         self.event_cursors.insert(session_id.to_owned(), cursor);
-        self.active_turns.insert(session_id.to_owned(), active_turn);
         Ok(())
     }
 }
 
-fn initial_event_cursor(
-    client: &mut SessionClient,
-    session_id: &str,
-) -> Result<(u64, Option<String>)> {
+fn initial_event_cursor(client: &mut SessionClient, session_id: &str) -> Result<u64> {
     let batch = client.events(session_id.to_owned(), 0, 0)?;
     let cursor = if batch.active_turn_id.is_some() {
         batch
@@ -679,7 +673,7 @@ fn initial_event_cursor(
     } else {
         batch.next_sequence.saturating_sub(1)
     };
-    Ok((cursor, batch.active_turn_id))
+    Ok(cursor)
 }
 
 fn fallback_candidates(

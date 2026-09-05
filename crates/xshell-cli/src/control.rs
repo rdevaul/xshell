@@ -60,9 +60,9 @@ control commands:
   //status          show local session state
   //connect DEST    connect to xshelld on an SSH host
   //sessions        list named sessions on connected hosts
-  //terminal        attach the current session's terminal job
-  //terminal list   list terminal jobs on connected hosts
-  //terminal kill   terminate the current session's terminal job
+  //resume          resume the current session's agent turn or interactive process
+  //stop            stop the current session's agent turn or interactive process
+  //terminal        compatibility alias for resuming an interactive process
   //new NAME        create and switch to a daemon-lifetime session
   //switch SESSION  switch locally or across connected hosts
   //detach          detach, preserving a persistent session, and exit
@@ -100,6 +100,8 @@ control commands:
         ControlCommand::View(_) => unreachable!("view is handled by the REPL"),
         ControlCommand::Connect(_)
         | ControlCommand::Sessions
+        | ControlCommand::Resume(_)
+        | ControlCommand::Stop(_)
         | ControlCommand::Terminal(_)
         | ControlCommand::New(_)
         | ControlCommand::Switch(_)
@@ -119,6 +121,9 @@ pub(crate) fn print_status(
 ) {
     let descriptor = agent.descriptor();
     println!("session: {}", session_label(sessions));
+    if let Some(session) = sessions.active() {
+        println!("activity: {}", session_activity_label(&session.activity));
+    }
     if let Some(service) = sessions.service_label() {
         println!("session service: {service}");
         println!("execution owner: xshelld");

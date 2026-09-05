@@ -358,6 +358,7 @@ fn reject_remote_request(
         ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyStart { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyAttach { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::PtyClose { session_id } => Some(session_id.as_str()),
         _ => None,
     };
     let Some(selector) = selector else {
@@ -761,10 +762,11 @@ fn process_request(
                 ticket: ptys.attach(&session_id, after_offset)?,
             })
         }
-        ClientRequest::PtyClose { pty_id } => {
-            let session_id = ptys.session_id(&pty_id)?;
+        ClientRequest::PtyClose { session_id } => {
             require_current(attached_session, &session_id)?;
-            ptys.terminate(&pty_id)?;
+            if !ptys.terminate_session(&session_id) {
+                bail!("session has no interactive process");
+            }
             Ok(ServerResponse::PtyClosed)
         }
         ClientRequest::PtyClaim { .. } => bail!("PTY claims require a dedicated connection"),
@@ -857,11 +859,8 @@ fn session_activity(
     ptys: &PtyCoordinator,
     session_id: &str,
 ) -> SessionActivity {
-    if ptys.has_session(session_id) {
-        SessionActivity::Running
-    } else {
-        execution.activity(session_id)
-    }
+    ptys.session_activity(session_id)
+        .unwrap_or_else(|| execution.activity(session_id))
 }
 
 fn detach_on_disconnect(
