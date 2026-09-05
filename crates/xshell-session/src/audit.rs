@@ -12,6 +12,13 @@ use std::sync::{Arc, Mutex};
 use xshell_audit::{AuditClient, AuditConfig, AuditEvent};
 use xshell_platform::LockExt;
 
+/// Whether and how much of a terminal job's byte stream the daemon records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalStreamPolicy {
+    /// Per-job capture budget in bytes (input + output). `None` is unbounded.
+    pub max_bytes: Option<u64>,
+}
+
 /// Per-daemon audit policy plus one audit-service session per xshell session.
 #[derive(Clone, Default)]
 pub struct DaemonAudit {
@@ -68,6 +75,22 @@ impl DaemonAudit {
             .is_some_and(|inner| inner.config.required)
     }
 
+    /// Terminal-stream capture policy for this daemon. `None` when auditing is
+    /// off or stream capture is not enabled; otherwise the per-job byte budget
+    /// (`None` inside means unbounded).
+    pub fn terminal_stream(&self) -> Option<TerminalStreamPolicy> {
+        let inner = self.inner.as_ref()?;
+        if !inner.config.terminal_stream {
+            return None;
+        }
+        Some(TerminalStreamPolicy {
+            max_bytes: match inner.config.terminal_stream_max_bytes {
+                0 => None,
+                bytes => Some(bytes),
+            },
+        })
+    }
+
     /// Return a handle for appending events on behalf of one xshell session,
     /// opening the audit-service session on first use.
     pub fn session(
@@ -96,6 +119,7 @@ impl DaemonAudit {
                         host_id: descriptor.host_id,
                         host_alias: descriptor.host_alias,
                         user: descriptor.user,
+                        terminal_stream: Some(inner.config.terminal_stream),
                     });
                     match started {
                         Ok(_) => SessionAudit {

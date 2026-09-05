@@ -23,6 +23,12 @@ required = true
 socket = "/ABSOLUTE/PATH/TO/xshell-audit/audit.sock"
 directory = "/ABSOLUTE/PATH/TO/xshell-audit"
 checkpoint_interval = 16
+# Terminal jobs ($ commands run in a PTY) always have their start and exit
+# audited. Set true to also record the byte-for-byte stream (operator input
+# and program output). Off by default: the trail is for agent accountability.
+terminal_stream = false
+# Per-job cap on captured stream bytes; 0 = unbounded.
+terminal_stream_max_bytes = 16777216
 
 [models.local-qwen]
 provider = "ollama"

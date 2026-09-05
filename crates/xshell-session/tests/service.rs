@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -1104,6 +1105,13 @@ fn daemon_audits_execution_without_an_attached_client() {
             assert!(text.contains("\"route\":\"shell_terminal\""));
             assert!(text.contains(pty_command));
             assert!(text.contains("\"session_ended\""));
+            // Default policy: terminal lifecycle is audited, the byte stream is
+            // not, and the session's first record says so explicitly.
+            assert!(text.contains("\"terminal_stream\":false"));
+            assert!(
+                !text.contains("\"type\":\"terminal_stream\""),
+                "stream bytes were recorded without opt-in"
+            );
             found = true;
         }
         if found {
@@ -1303,4 +1311,231 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
     assert!(!saw_prompt, "policy off must not prompt");
     assert_eq!(decision, Some(ApprovalDecision::Deny));
     assert_eq!(result.as_deref(), Some("tool denied by user"));
+}
+
+/// Decode the `TerminalStream` records of one direction from an audit log,
+/// in offset order, returning the reassembled byte stream and the dropped
+/// count reported by the job's summary record (0 if none).
+fn terminal_stream_bytes(log_text: &str, command: &str, direction: &str) -> (Vec<u8>, u64) {
+    use base64::Engine;
+    let mut chunks = Vec::new();
+    let mut dropped = 0;
+    for line in log_text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let Some(event) = value.pointer("/body/event") else {
+            continue;
+        };
+        if event["type"] != "terminal_stream" || event["command"] != command {
+            continue;
+        }
+        if event["direction"] == "summary" {
+            dropped = event["dropped_bytes"].as_u64().unwrap();
+            continue;
+        }
+        if event["direction"] != direction {
+            continue;
+        }
+        assert_eq!(event["dropped_bytes"], 0);
+        let offset = event["offset"].as_u64().unwrap();
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(event["data"].as_str().unwrap())
+            .unwrap();
+        chunks.push((offset, data));
+    }
+    chunks.sort_by_key(|(offset, _)| *offset);
+    let mut stream = Vec::new();
+    for (offset, data) in chunks {
+        assert_eq!(
+            offset as usize,
+            stream.len(),
+            "stream offsets are not contiguous"
+        );
+        stream.extend(data);
+    }
+    (stream, dropped)
+}
+
+struct AuditedFabric {
+    _auditd: Daemon,
+    _daemon: Daemon,
+    audit_directory: PathBuf,
+    state: PathBuf,
+    socket: PathBuf,
+}
+
+fn start_audited_fabric(temporary: &TempDir, extra_audit_config: &str) -> AuditedFabric {
+    let audit_directory = temporary.path().join("audit");
+    let audit_socket = temporary.path().join("audit.sock");
+    let auditd = Daemon(
+        Command::new(auditd_binary())
+            .arg("--directory")
+            .arg(&audit_directory)
+            .arg("--socket")
+            .arg(&audit_socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_audit_service(&audit_socket);
+
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[audit]\nenabled = true\nrequired = true\nsocket = {:?}\n{extra_audit_config}",
+            audit_socket.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .args(["--config", config_path.to_str().unwrap()])
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    AuditedFabric {
+        _auditd: auditd,
+        _daemon: daemon,
+        audit_directory,
+        state,
+        socket,
+    }
+}
+
+/// Run one terminal job to completion through the daemon, feeding it `input`
+/// over the PTY stream transport, and return the finalized daemon audit log.
+fn run_terminal_job_and_collect_log(
+    fabric: &AuditedFabric,
+    session_name: &str,
+    command: &str,
+    input: &[u8],
+) -> String {
+    let mut client = connect_when_ready(&fabric.socket);
+    let session = client
+        .create(SessionCreation {
+            name: session_name.into(),
+            model: model("local"),
+            cwd: std::env::temp_dir(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let ticket = client
+        .pty_start(
+            session.descriptor.id.clone(),
+            command.into(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+    let (mut proxy, mut proxy_input, mut proxy_output) =
+        spawn_pty_proxy(&fabric.state, &fabric.socket, &ticket.ticket);
+    assert_eq!(
+        read_server_frame(&mut proxy_output).unwrap(),
+        ServerPtyFrame::Ready
+    );
+    if !input.is_empty() {
+        write_client_frame(&mut proxy_input, &ClientPtyFrame::Input(input.to_vec())).unwrap();
+    }
+    loop {
+        match read_server_frame(&mut proxy_output).unwrap() {
+            ServerPtyFrame::Exit(_) => break,
+            ServerPtyFrame::Output { .. } => {}
+            frame => panic!("unexpected PTY frame: {frame:?}"),
+        }
+    }
+    drop(proxy_input);
+    assert!(proxy.wait().unwrap().success());
+    for _ in 0..300 {
+        let finished = client
+            .pty_list()
+            .unwrap()
+            .iter()
+            .any(|pty| pty.command == command && !pty.running);
+        if finished {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    client.close(Some(session_name.into())).unwrap();
+    drop(client);
+
+    let sessions_dir = fabric.audit_directory.join("sessions");
+    let public_key = fabric.audit_directory.join("signing-key.pub");
+    for _ in 0..200 {
+        for entry in std::fs::read_dir(&sessions_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            if !text.contains("\"shell_finished\"") || !text.contains("\"session_ended\"") {
+                continue;
+            }
+            if !text.contains(&serde_json::to_string(command).unwrap()) {
+                continue;
+            }
+            let report = xshell_audit::verify_log(&path, &public_key).unwrap();
+            assert!(report.final_checkpoint, "audit log lacks final checkpoint");
+            return text;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no finalized daemon audit log for {command}");
+}
+
+#[test]
+fn terminal_stream_capture_is_opt_in_and_records_exact_bytes() {
+    let temporary = TempDir::new().unwrap();
+    let fabric = start_audited_fabric(&temporary, "terminal_stream = true\n");
+    // `stty -echo` so the input bytes can only appear in the log via the
+    // input direction, not echoed back through output.
+    let command = "stty -echo; read value; printf 'got:%s' \"$value\"";
+    let text = run_terminal_job_and_collect_log(&fabric, "streamed", command, b"secret-word\n");
+
+    assert!(text.contains("\"terminal_stream\":true"));
+    let (input, dropped) = terminal_stream_bytes(&text, command, "input");
+    assert_eq!(dropped, 0);
+    assert_eq!(input, b"secret-word\n");
+    let (output, _) = terminal_stream_bytes(&text, command, "output");
+    assert!(
+        String::from_utf8_lossy(&output).contains("got:secret-word"),
+        "output stream not captured: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    // Lifecycle records are still present alongside the stream.
+    assert!(text.contains("\"route\":\"shell_terminal\""));
+    assert!(text.contains("\"shell_finished\""));
+}
+
+#[test]
+fn terminal_stream_capture_honours_its_byte_budget() {
+    let temporary = TempDir::new().unwrap();
+    let fabric = start_audited_fabric(
+        &temporary,
+        "terminal_stream = true\nterminal_stream_max_bytes = 100\n",
+    );
+    // Emits well over the budget.
+    let command = "head -c 5000 /dev/zero | tr '\\0' x";
+    let text = run_terminal_job_and_collect_log(&fabric, "budgeted", command, b"");
+
+    let (output, dropped) = terminal_stream_bytes(&text, command, "output");
+    assert_eq!(output.len(), 100, "recorded more than the budget");
+    assert!(output.iter().all(|byte| *byte == b'x'));
+    assert!(
+        dropped >= 4900,
+        "summary under-reports dropped bytes: {dropped}"
+    );
+    // The job's completion is recorded after the stream summary.
+    let summary_at = text.find("\"direction\":\"summary\"").unwrap();
+    let finished_at = text.rfind("\"shell_finished\"").unwrap();
+    assert!(summary_at < finished_at);
 }

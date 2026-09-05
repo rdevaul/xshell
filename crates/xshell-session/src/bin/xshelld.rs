@@ -14,10 +14,10 @@ use std::time::Duration;
 use uuid::Uuid;
 use xshell_platform::LockExt;
 use xshell_session::{
-    ClientPtyFrame, ClientRequest, DaemonAudit, ExecutionCoordinator, PersistenceMode, PtyClaim,
-    PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
-    SessionConfig, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
-    write_server_frame,
+    ClientPtyFrame, ClientRequest, DaemonAudit, ExecutionCoordinator, PersistenceMode, PtyAudit,
+    PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
+    SessionActivity, SessionConfig, SessionRegistry, complete_shell, load_view_resource,
+    read_client_frame, write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -132,6 +132,16 @@ fn main() -> Result<()> {
             (false, _) => "disabled".to_owned(),
             (true, true) => "required (execution-boundary)".to_owned(),
             (true, false) => "best-effort (execution-boundary)".to_owned(),
+        }
+    );
+    println!(
+        "terminal stream capture: {}",
+        match execution.audit().terminal_stream() {
+            None => "off (lifecycle only)".to_owned(),
+            Some(policy) => match policy.max_bytes {
+                None => "on (unbounded)".to_owned(),
+                Some(bytes) => format!("on ({bytes} bytes per job)"),
+            },
         }
     );
 
@@ -430,7 +440,11 @@ fn handle_client(
         send_error(
             &mut writer,
             "protocol_version",
-            "unsupported session protocol version",
+            &format!(
+                "client speaks session protocol {protocol_version} but this xshelld requires \
+                 {SESSION_PROTOCOL_VERSION}; xshell and xshelld are different builds — \
+                 upgrade the client or restart xshelld from the same build"
+            ),
         )?;
         return Ok(());
     }
@@ -746,7 +760,10 @@ fn process_request(
                 .snapshot(&session_id)?
                 .descriptor
                 .cwd;
-            let audit = execution.audit_handle(&session_id)?;
+            let audit = PtyAudit {
+                handle: execution.audit_handle(&session_id)?,
+                stream: execution.audit().terminal_stream(),
+            };
             let ticket =
                 ptys.start_audited(&session_id, command, &cwd, size, terminal_type, audit)?;
             Ok(ServerResponse::PtyStarted { ticket })

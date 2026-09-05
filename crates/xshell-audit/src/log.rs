@@ -493,19 +493,42 @@ mod tests {
     }
 
     #[test]
-    fn verifier_remains_backward_compatible_with_format_one() {
+    fn verifier_remains_backward_compatible_with_every_supported_format() {
+        for format in MIN_SUPPORTED_AUDIT_FORMAT_VERSION..AUDIT_FORMAT_VERSION {
+            let temp = TempDir::new().unwrap();
+            let identity = SigningIdentity::load_or_create(temp.path()).unwrap();
+            let public_key = temp.path().join("signing-key.pub");
+            let mut writer =
+                AuditLogWriter::create_with_format(temp.path(), identity, 501, 2, format).unwrap();
+            let path = writer.path().to_owned();
+            writer.append(event("pre-upgrade record")).unwrap();
+            writer.close().unwrap();
+
+            let report = verify_log(&path, &public_key)
+                .unwrap_or_else(|error| panic!("format {format} log failed to verify: {error:#}"));
+            assert_eq!(report.records, 1, "format {format}");
+            assert!(report.final_checkpoint, "format {format}");
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_a_future_format() {
         let temp = TempDir::new().unwrap();
         let identity = SigningIdentity::load_or_create(temp.path()).unwrap();
         let public_key = temp.path().join("signing-key.pub");
-        let mut writer =
-            AuditLogWriter::create_with_format(temp.path(), identity, 501, 2, 1).unwrap();
+        let mut writer = AuditLogWriter::create_with_format(
+            temp.path(),
+            identity,
+            501,
+            2,
+            AUDIT_FORMAT_VERSION + 1,
+        )
+        .unwrap();
         let path = writer.path().to_owned();
-        writer.append(event("pre-upgrade record")).unwrap();
+        writer.append(event("from the future")).unwrap();
         writer.close().unwrap();
 
-        let report = verify_log(&path, &public_key).unwrap();
-        assert_eq!(report.records, 1);
-        assert!(report.final_checkpoint);
+        assert!(verify_log(&path, &public_key).is_err());
     }
 
     #[test]
