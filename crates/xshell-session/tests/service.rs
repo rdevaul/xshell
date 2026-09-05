@@ -1646,8 +1646,8 @@ fn terminating_an_active_process_finalizes_stream_before_completion() {
             history: Vec::new(),
         })
         .unwrap();
-    let command = "while :; do printf x; sleep 0.01; done";
-    client
+    let command = "printf capture-ready; cat";
+    let ticket = client
         .pty_start(
             session.descriptor.id.clone(),
             command.into(),
@@ -1658,7 +1658,30 @@ fn terminating_an_active_process_finalizes_stream_before_completion() {
             Some("xterm-256color".into()),
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(100));
+    let (mut proxy, mut proxy_input, mut proxy_output) =
+        spawn_pty_proxy(&fabric.state, &fabric.socket, &ticket.ticket);
+    assert_eq!(
+        read_server_frame(&mut proxy_output).unwrap(),
+        ServerPtyFrame::Ready
+    );
+    loop {
+        match read_server_frame(&mut proxy_output).unwrap() {
+            ServerPtyFrame::Output { bytes, .. }
+                if String::from_utf8_lossy(&bytes).contains("capture-ready") =>
+            {
+                break;
+            }
+            ServerPtyFrame::Output { .. } => {}
+            frame => panic!("unexpected PTY frame before capture was ready: {frame:?}"),
+        }
+    }
+    write_client_frame(&mut proxy_input, &ClientPtyFrame::Close).unwrap();
+    assert_eq!(
+        read_server_frame(&mut proxy_output).unwrap(),
+        ServerPtyFrame::Detached
+    );
+    drop(proxy_input);
+    assert!(proxy.wait().unwrap().success());
 
     client.pty_close(session.descriptor.id).unwrap();
     client.close(Some("terminated-stream".into())).unwrap();
