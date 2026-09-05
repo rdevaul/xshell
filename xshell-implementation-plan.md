@@ -3,6 +3,9 @@
 **Companion document:** `xshell-specification.md`
 **Planning assumption:** local-first, SSH-only connectivity, with CAD visualization as an early workflow.
 
+**Future scripting track:** [FutureShell roadmap](docs/futureshell-roadmap.md)
+and [implementation plan](docs/futureshell-implementation-plan.md)
+
 ## Delivery principles
 
 - Build a reliable local single-host experience before distributed filesystem semantics.
@@ -223,3 +226,19 @@ Deliverables:
 ## Milestone-based prioritization
 
 The first externally useful release is the end of Phase 2: a local agentic engineering shell that can execute conventional commands safely and give both people and multimodal agents reproducible views of yapCAD/CAD outputs. The first networked release is the end of Phase 3. Cross-host writable shared filesystem behavior is intentionally deferred until its permission and failure semantics have been proven.
+
+## FutureShell track
+
+FutureShell is an additive workstream rather than a rewrite of the interactive
+REPL. Its `xshell-run` binary will share xshell's execution, adapter, audit,
+platform, viewer, and session-fabric infrastructure while keeping its parser,
+planner, transactional workspace, contract evaluator, and receipt verifier in
+separate crates.
+
+Implementation begins with language semantics, threat modeling, deterministic
+local tasks, staged filesystem state, contracts, and selective promotion.
+Agent tasks follow once those boundaries work end to end; remote execution
+follows once a host can generate a complete verifiable receipt. The initial
+remote model is per-host commit with honest mixed-outcome recovery, not a
+distributed transaction. See the [FutureShell roadmap](docs/futureshell-roadmap.md)
+and [detailed implementation plan](docs/futureshell-implementation-plan.md).
