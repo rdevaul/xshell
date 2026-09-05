@@ -5,6 +5,9 @@
 **Target platforms:** macOS and Linux
 **Primary users:** engineers and designers working with local and remote AI agents, source trees, data, and CAD assets.
 
+**Future scripting track:** [FutureShell roadmap](docs/futureshell-roadmap.md)
+and [implementation plan](docs/futureshell-implementation-plan.md)
+
 ## 1. Purpose
 
 `xshell` is an agent-first, network-aware interactive shell. It provides one durable workspace for people and AI agents working across local and remote machines, while preserving direct access to the user's ordinary shell.
@@ -188,3 +191,20 @@ Logs distinguish transport events, shell execution, agent events, approval decis
 - An agent adapter can expose its capabilities and request a confirmed tool action.
 - A remote STL or STEP artifact can be securely rendered to a reproducible PNG locally through the viewer path and attached to a multimodal-capable agent.
 - Users can inspect the active policy, grants, and audit trail without reading implementation logs.
+
+## 13. FutureShell evolution
+
+After the interactive shell, execution, audit, and session-fabric boundaries
+are established, `xshell-run` will add a separate shell-familiar scripting
+language for deterministic and agent-assisted workflows. Its defining
+features are capability-bounded tasks, structured concurrency, staged
+filesystem transactions, deterministic evidence-backed contracts, selective
+promotion, and independently verifiable per-host receipts.
+
+FutureShell does not change the initial non-goal of POSIX shell compatibility
+and does not promise rollback for effects outside a declared transactional
+workspace. Remote hosts own independent transactions; cross-host atomic commit
+is reserved research. See the [FutureShell roadmap](docs/futureshell-roadmap.md)
+for the product model and the
+[FutureShell implementation plan](docs/futureshell-implementation-plan.md) for
+sequencing and acceptance criteria.

@@ -65,8 +65,8 @@ journal.
   opens one audit session per xshell session on first use, and records the
   execution-boundary events itself — agent and `$` input, model responses and
   errors, tool requests, approval decisions, tool results, working-directory
-  changes, direct shell completion, terminal-job (PTY) start and completion,
-  and history compaction (which turns the model could no longer see).
+  changes, direct shell completion, interactive-process (PTY) start and
+  completion, and history compaction (which turns the model could no longer see).
   A detached turn is audited exactly as an attached one. With `required = true`,
   `xshelld` refuses to start without a reachable audit service, refuses to accept
   a turn whose input cannot be recorded, and stops an in-flight turn at the next
@@ -145,12 +145,12 @@ away.
 
 ### Terminal-stream capture (opt-in)
 
-By default the audit trail records a terminal job's **lifecycle** — the command
-before it starts and its exit outcome — but not the bytes exchanged with it.
-The trail exists to hold agents accountable for what they did; terminal jobs
-are human-driven, and recording every keystroke and screen update of an
-interactive session is a decision an operator should make deliberately, not
-inherit from turning on agent auditing.
+By default the audit trail records an interactive process's **lifecycle** — the
+command before it starts and its exit outcome — but not the bytes exchanged
+with it. The trail exists to hold agents accountable for what they did;
+interactive processes are human-driven, and recording every keystroke and
+screen update of an interactive session is a decision an operator should make
+deliberately, not inherit from turning on agent auditing.
 
 Set `terminal_stream = true` in `[audit]` to also capture the byte stream.
 `xshelld` then records `terminal_stream` events from the same buffer that
@@ -169,7 +169,11 @@ record (`logical_session_attached.terminal_stream`), so a reader can tell
 recorded by `xshelld`, it is captured for detached jobs and cannot be
 suppressed by a client. A stream-record failure stops stream capture for that
 job with one warning; lifecycle records continue to follow the `required`
-policy unchanged.
+policy unchanged. Stream capture is necessarily best-effort after a process
+has started: `required = true` prevents startup if the initial lifecycle event
+cannot be recorded, but it cannot undo bytes already accepted by a running
+process. A later stream-append failure leaves the audit session without a final
+checkpoint, making the incomplete capture evident during verification.
 
 Captured streams are as sensitive as anything typed at a terminal — passwords
 entered at prompts that disable echo are recorded on the input side. Treat

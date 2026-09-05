@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use xshell_audit::{AuditClient, AuditConfig, AuditEvent};
 use xshell_platform::LockExt;
 
-/// Whether and how much of a terminal job's byte stream the daemon records.
+/// Whether and how much of an interactive process's byte stream the daemon records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalStreamPolicy {
     /// Per-job capture budget in bytes (input + output). `None` is unbounded.

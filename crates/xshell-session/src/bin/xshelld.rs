@@ -246,23 +246,6 @@ fn serve_stdio(socket: &Path) -> Result<()> {
         if let ServerResponse::Catalog { sessions } = &mut response {
             sessions.retain(|session| session.visibility == xshell_session::Visibility::Fabric);
         }
-        if let ServerResponse::PtyCatalog { ptys } = &mut response {
-            serde_json::to_writer(&mut daemon_writer, &ClientRequest::List)?;
-            daemon_writer.write_all(b"\n")?;
-            daemon_writer.flush()?;
-            let line = read_request_line(&mut daemon_reader)?
-                .context("local daemon closed while filtering terminal jobs")?;
-            let catalog: ServerResponse = serde_json::from_str(&line)?;
-            let ServerResponse::Catalog { sessions } = catalog else {
-                bail!("local daemon returned an invalid terminal visibility catalog");
-            };
-            ptys.retain(|pty| {
-                sessions.iter().any(|session| {
-                    session.id == pty.session_id
-                        && session.visibility == xshell_session::Visibility::Fabric
-                })
-            });
-        }
         send(&mut client_writer, &response)?;
     }
     Ok(())
@@ -368,6 +351,7 @@ fn reject_remote_request(
         ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyStart { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyAttach { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::PtyClose { session_id } => Some(session_id.as_str()),
         _ => None,
     };
     let Some(selector) = selector else {
@@ -768,7 +752,6 @@ fn process_request(
                 ptys.start_audited(&session_id, command, &cwd, size, terminal_type, audit)?;
             Ok(ServerResponse::PtyStarted { ticket })
         }
-        ClientRequest::PtyList => Ok(ServerResponse::PtyCatalog { ptys: ptys.list() }),
         ClientRequest::PtyAttach {
             session_id,
             after_offset,
@@ -778,10 +761,11 @@ fn process_request(
                 ticket: ptys.attach(&session_id, after_offset)?,
             })
         }
-        ClientRequest::PtyClose { pty_id } => {
-            let session_id = ptys.session_id(&pty_id)?;
+        ClientRequest::PtyClose { session_id } => {
             require_current(attached_session, &session_id)?;
-            ptys.terminate(&pty_id)?;
+            if !ptys.terminate_session(&session_id) {
+                bail!("session has no interactive process");
+            }
             Ok(ServerResponse::PtyClosed)
         }
         ClientRequest::PtyClaim { .. } => bail!("PTY claims require a dedicated connection"),
@@ -874,11 +858,8 @@ fn session_activity(
     ptys: &PtyCoordinator,
     session_id: &str,
 ) -> SessionActivity {
-    if ptys.has_session(session_id) {
-        SessionActivity::Running
-    } else {
-        execution.activity(session_id)
-    }
+    ptys.session_activity(session_id)
+        .unwrap_or_else(|| execution.activity(session_id))
 }
 
 fn detach_on_disconnect(

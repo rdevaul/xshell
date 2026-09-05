@@ -1,4 +1,4 @@
-use crate::{PtyDescriptor, PtySize, PtyTicket, SessionAuditHandle, TerminalStreamPolicy};
+use crate::{PtySize, PtyTicket, SessionActivity, SessionAuditHandle, TerminalStreamPolicy};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::collections::{HashMap, VecDeque};
@@ -130,6 +130,10 @@ struct PtyState {
     replay_end: u64,
     exit_status: Option<String>,
     shutdown: bool,
+    /// Set only after the worker has recorded the stream summary and terminal
+    /// completion. Session closure waits for this barrier before finalizing
+    /// the audit log.
+    worker_finished: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +245,7 @@ impl PtyCoordinator {
                 replay_end: 0,
                 exit_status: None,
                 shutdown: false,
+                worker_finished: false,
             }),
             changed: Condvar::new(),
         });
@@ -259,18 +264,6 @@ impl PtyCoordinator {
             ticket,
             replay_from: 0,
         })
-    }
-
-    pub fn list(&self) -> Vec<PtyDescriptor> {
-        self.inner
-            .lock_recover()
-            .iter()
-            .map(|(pty_id, managed)| descriptor(pty_id, managed))
-            .collect()
-    }
-
-    pub fn session_id(&self, pty_id: &str) -> Result<String> {
-        Ok(self.get(pty_id)?.session_id.clone())
     }
 
     pub fn attach(&self, session_id: &str, after_offset: Option<u64>) -> Result<PtyTicket> {
@@ -339,7 +332,7 @@ impl PtyCoordinator {
     pub fn write_claimed(&self, claim: &PtyClaim, bytes: Vec<u8>) -> Result<()> {
         let managed = self.get_claimed(claim)?;
         let mut state = managed.state.lock_recover();
-        if state.exit_status.is_some() {
+        if state.shutdown || state.exit_status.is_some() {
             bail!("terminal job has exited");
         }
         if state.input.len() + bytes.len() > MAX_INPUT_BYTES {
@@ -406,7 +399,7 @@ impl PtyCoordinator {
         Ok(())
     }
 
-    pub fn terminate_session(&self, session_id: &str) {
+    pub fn terminate_session(&self, session_id: &str) -> bool {
         let removed = {
             let mut ptys = self.inner.lock_recover();
             let ids = ptys
@@ -421,11 +414,30 @@ impl PtyCoordinator {
         for managed in &removed {
             shutdown(managed);
         }
+        !removed.is_empty()
     }
 
     pub fn has_session(&self, session_id: &str) -> bool {
         self.inner.lock_recover().values().any(|pty| {
             pty.session_id == session_id && pty.state.lock_recover().exit_status.is_none()
+        })
+    }
+
+    pub fn session_activity(&self, session_id: &str) -> Option<SessionActivity> {
+        self.inner.lock_recover().values().find_map(|pty| {
+            if pty.session_id != session_id {
+                return None;
+            }
+            let state = pty.state.lock_recover();
+            if state.exit_status.is_some() {
+                return None;
+            }
+            drop(state);
+            let attached = pty.stream.lock_recover().claimed.is_some();
+            Some(SessionActivity::InteractiveProcess {
+                command: pty.command.clone(),
+                attached,
+            })
         })
     }
 
@@ -610,30 +622,22 @@ fn finish(managed: &ManagedPty, status: String) {
     {
         eprintln!("xshelld audit warning: cannot record terminal completion: {error:#}");
     }
+    let mut state = managed.state.lock_recover();
+    state.worker_finished = true;
+    managed.changed.notify_all();
 }
 
 fn shutdown(managed: &ManagedPty) {
-    {
-        managed.state.lock_recover().shutdown = true;
+    let mut state = managed.state.lock_recover();
+    if !state.worker_finished {
+        state.shutdown = true;
         managed.changed.notify_all();
-    }
-    // Record termination synchronously so session closure cannot finalize and
-    // remove the audit stream before the worker observes the shutdown flag.
-    finish(managed, "terminated".into());
-}
-
-fn descriptor(pty_id: &str, managed: &ManagedPty) -> PtyDescriptor {
-    let stream = managed.stream.lock_recover();
-    let state = managed.state.lock_recover();
-    PtyDescriptor {
-        pty_id: pty_id.to_owned(),
-        session_id: managed.session_id.clone(),
-        command: managed.command.clone(),
-        attached: stream.claimed.is_some(),
-        running: state.exit_status.is_none(),
-        exit_status: state.exit_status.clone(),
-        replay_start: state.replay_start,
-        replay_end: state.replay_end,
+        while !state.worker_finished {
+            state = managed
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
     }
 }
 
@@ -715,6 +719,31 @@ mod tests {
             }
         }
         assert!(String::from_utf8_lossy(&output).contains("remote:hello"));
+    }
+
+    #[test]
+    fn termination_waits_for_the_worker_completion_barrier() {
+        let temporary = TempDir::new().unwrap();
+        let coordinator = PtyCoordinator::default();
+        let ticket = coordinator
+            .start(
+                "session-a",
+                "sleep 60".into(),
+                temporary.path(),
+                PtySize {
+                    rows: 24,
+                    columns: 80,
+                },
+                Some("xterm-256color".into()),
+            )
+            .unwrap();
+        let managed = coordinator.get(&ticket.pty_id).unwrap();
+
+        coordinator.terminate(&ticket.pty_id).unwrap();
+
+        let state = managed.state.lock_recover();
+        assert_eq!(state.exit_status.as_deref(), Some("terminated"));
+        assert!(state.worker_finished);
     }
 
     #[test]

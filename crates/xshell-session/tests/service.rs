@@ -208,13 +208,18 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
     assert!(first_proxy.wait().unwrap().success());
 
     let descriptor = owner
-        .pty_list()
+        .list()
         .unwrap()
         .into_iter()
-        .find(|pty| pty.pty_id == ticket.pty_id)
+        .find(|candidate| candidate.id == session.descriptor.id)
         .unwrap();
-    assert!(descriptor.running);
-    assert!(!descriptor.attached);
+    assert!(matches!(
+        descriptor.activity,
+        SessionActivity::InteractiveProcess {
+            attached: false,
+            ..
+        }
+    ));
     let ticket = owner
         .pty_attach(session.descriptor.id, Some(cursor))
         .unwrap();
@@ -240,6 +245,74 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
     assert!(String::from_utf8_lossy(&replay).contains("done:reattached"));
     drop(second_input);
     assert!(second_proxy.wait().unwrap().success());
+}
+
+#[test]
+fn creating_a_session_preserves_the_previous_sessions_interactive_process() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .args(["--host-alias", "test-host", "--user", "tester"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut owner = connect_when_ready(&socket);
+    let first = owner
+        .create(SessionCreation {
+            name: "emacs".into(),
+            model: model("local"),
+            cwd: temporary.path().to_owned(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test prompt")],
+        })
+        .unwrap();
+    owner
+        .pty_start(
+            first.descriptor.id.clone(),
+            "sleep 60".into(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+
+    let second = owner
+        .create(SessionCreation {
+            name: "additional-work".into(),
+            model: first.descriptor.model.clone(),
+            cwd: first.descriptor.cwd.clone(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test prompt")],
+        })
+        .unwrap();
+    assert_eq!(second.descriptor.name, "additional-work");
+    let first_in_catalog = owner
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == first.descriptor.id)
+        .unwrap();
+    assert!(matches!(
+        first_in_catalog.activity,
+        SessionActivity::InteractiveProcess { .. }
+    ));
+
+    owner.switch(first.descriptor.id.clone()).unwrap();
+    owner
+        .pty_attach(first.descriptor.id.clone(), None)
+        .expect("the original interactive process should remain attachable");
+    owner.pty_close(first.descriptor.id).unwrap();
 }
 
 #[test]
@@ -537,6 +610,16 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     ));
     send_request(
         &mut writer,
+        &ClientRequest::PtyClose {
+            session_id: private.descriptor.id.clone(),
+        },
+    );
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::Error { code, .. } if code == "remote_session_not_visible"
+    ));
+    send_request(
+        &mut writer,
         &ClientRequest::ViewSource {
             session_id: private.descriptor.id.clone(),
             path: "remote-view.md".into(),
@@ -584,28 +667,26 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             terminal_type: Some("xterm-256color".into()),
         },
     );
-    let pty_id = match receive_response(&mut reader) {
-        ServerResponse::PtyStarted { ticket } => ticket.pty_id,
-        response => panic!("unexpected PTY start response: {response:?}"),
-    };
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::PtyStarted { .. }
+    ));
     send_request(&mut writer, &ClientRequest::List);
     assert!(matches!(
         receive_response(&mut reader),
         ServerResponse::Catalog { sessions }
             if sessions.iter().any(|session| {
-                session.id == shared.descriptor.id && session.activity == SessionActivity::Running
+                session.id == shared.descriptor.id
+                    && matches!(
+                        session.activity,
+                        SessionActivity::InteractiveProcess { .. }
+                    )
             })
-    ));
-    send_request(&mut writer, &ClientRequest::PtyList);
-    assert!(matches!(
-        receive_response(&mut reader),
-        ServerResponse::PtyCatalog { ptys }
-            if ptys.iter().any(|pty| pty.pty_id == pty_id && pty.running)
     ));
     send_request(
         &mut writer,
         &ClientRequest::PtyClose {
-            pty_id: pty_id.clone(),
+            session_id: shared.descriptor.id.clone(),
         },
     );
     assert_eq!(receive_response(&mut reader), ServerResponse::PtyClosed);
@@ -676,15 +757,12 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     assert!(proxy.wait().unwrap().success());
 
     let mut after_disconnect = connect_when_ready(&socket);
-    after_disconnect.attach(remote_home_id.clone()).unwrap();
-    let persistent = after_disconnect
-        .pty_list()
-        .unwrap()
-        .into_iter()
-        .find(|pty| pty.session_id == remote_home_id)
-        .expect("terminal job should survive control disconnect");
-    assert!(persistent.running);
-    after_disconnect.pty_close(persistent.pty_id).unwrap();
+    let persistent = after_disconnect.attach(remote_home_id.clone()).unwrap();
+    assert!(matches!(
+        persistent.descriptor.activity,
+        SessionActivity::InteractiveProcess { .. }
+    ));
+    after_disconnect.pty_close(remote_home_id).unwrap();
 }
 
 #[test]
@@ -888,7 +966,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             break call_id;
         }
     };
-    assert_eq!(
+    assert!(matches!(
         client
             .list()
             .unwrap()
@@ -896,8 +974,11 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             .find(|entry| entry.id == session.descriptor.id)
             .unwrap()
             .activity,
-        SessionActivity::WaitingApproval
-    );
+        SessionActivity::AgentTurn {
+            phase: xshell_session::AgentTurnPhase::WaitingApproval,
+            ..
+        }
+    ));
     client
         .approve(
             session.descriptor.id.clone(),
@@ -1064,10 +1145,11 @@ fn daemon_audits_execution_without_an_attached_client() {
         .unwrap();
     for _ in 0..100 {
         let finished = reconnected
-            .pty_list()
+            .list()
             .unwrap()
             .iter()
-            .any(|pty| pty.command == pty_command && !pty.running);
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .is_some_and(|candidate| candidate.activity == SessionActivity::Idle);
         if finished {
             break;
         }
@@ -1075,10 +1157,11 @@ fn daemon_audits_execution_without_an_attached_client() {
     }
     assert!(
         reconnected
-            .pty_list()
+            .list()
             .unwrap()
             .iter()
-            .any(|pty| pty.command == pty_command && !pty.running),
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .is_some_and(|candidate| candidate.activity == SessionActivity::Idle),
         "terminal job did not finish"
     );
     // Closing the xshell session finalizes its audit log.
@@ -1182,7 +1265,7 @@ fn required_audit_failure_prevents_pty_process_creation() {
     let command = format!("touch {}", marker.display());
     let error = client
         .pty_start(
-            session.descriptor.id,
+            session.descriptor.id.clone(),
             command.clone(),
             PtySize {
                 rows: 24,
@@ -1194,12 +1277,15 @@ fn required_audit_failure_prevents_pty_process_creation() {
 
     assert!(error.to_string().contains("required audit"));
     assert!(!marker.exists());
-    assert!(
-        !client
-            .pty_list()
+    assert_eq!(
+        client
+            .list()
             .unwrap()
-            .iter()
-            .any(|pty| pty.command == command)
+            .into_iter()
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .unwrap()
+            .activity,
+        SessionActivity::Idle
     );
 }
 
@@ -1459,10 +1545,11 @@ fn run_terminal_job_and_collect_log(
     assert!(proxy.wait().unwrap().success());
     for _ in 0..300 {
         let finished = client
-            .pty_list()
+            .list()
             .unwrap()
             .iter()
-            .any(|pty| pty.command == command && !pty.running);
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .is_some_and(|candidate| candidate.activity == SessionActivity::Idle);
         if finished {
             break;
         }
@@ -1471,6 +1558,10 @@ fn run_terminal_job_and_collect_log(
     client.close(Some(session_name.into())).unwrap();
     drop(client);
 
+    collect_finalized_terminal_log(fabric, command)
+}
+
+fn collect_finalized_terminal_log(fabric: &AuditedFabric, command: &str) -> String {
     let sessions_dir = fabric.audit_directory.join("sessions");
     let public_key = fabric.audit_directory.join("signing-key.pub");
     for _ in 0..200 {
@@ -1538,4 +1629,61 @@ fn terminal_stream_capture_honours_its_byte_budget() {
     let summary_at = text.find("\"direction\":\"summary\"").unwrap();
     let finished_at = text.rfind("\"shell_finished\"").unwrap();
     assert!(summary_at < finished_at);
+}
+
+#[test]
+fn terminating_an_active_process_finalizes_stream_before_completion() {
+    let temporary = TempDir::new().unwrap();
+    let fabric = start_audited_fabric(&temporary, "terminal_stream = true\n");
+    let mut client = connect_when_ready(&fabric.socket);
+    let session = client
+        .create(SessionCreation {
+            name: "terminated-stream".into(),
+            model: model("local"),
+            cwd: std::env::temp_dir(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let command = "while :; do printf x; sleep 0.01; done";
+    client
+        .pty_start(
+            session.descriptor.id.clone(),
+            command.into(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    client.pty_close(session.descriptor.id).unwrap();
+    client.close(Some("terminated-stream".into())).unwrap();
+    drop(client);
+
+    let text = collect_finalized_terminal_log(&fabric, command);
+    let mut saw_stream = false;
+    let mut saw_finished = false;
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let Some(event_type) = value
+            .pointer("/body/event/type")
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        match event_type {
+            "terminal_stream" => {
+                assert!(!saw_finished, "stream bytes were recorded after completion");
+                saw_stream = true;
+            }
+            "shell_finished" => saw_finished = true,
+            _ => {}
+        }
+    }
+    assert!(saw_stream, "active process produced no captured output");
+    assert!(saw_finished, "terminated process has no completion record");
 }

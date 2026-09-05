@@ -17,10 +17,11 @@ const CONTROL_COMMANDS: &[&str] = &[
     "//model",
     "//new",
     "//quit",
+    "//resume",
     "//sessions",
     "//status",
+    "//stop",
     "//switch",
-    "//terminal",
     "//tools",
     "//view",
 ];
@@ -28,7 +29,6 @@ const CONTROL_COMMANDS: &[&str] = &[
 /// Sub-commands recognised after `//model`.
 const MODEL_SUBCOMMANDS: &[&str] = &["list", "show", "use"];
 const VIEWERS: &[&str] = &["markdown", "rst"];
-const TERMINAL_SUBCOMMANDS: &[&str] = &["attach", "kill", "list"];
 
 pub struct XshellHelper {
     cwd: PathBuf,
@@ -132,16 +132,6 @@ impl Completer for XshellHelper {
 
             if let Some(result) =
                 complete_single_argument(line, pos, "//switch", &self.session_names)
-            {
-                return Ok(result);
-            }
-
-            let terminal_commands = TERMINAL_SUBCOMMANDS
-                .iter()
-                .map(|command| (*command).to_owned())
-                .collect::<Vec<_>>();
-            if let Some(result) =
-                complete_single_argument(line, pos, "//terminal", &terminal_commands)
             {
                 return Ok(result);
             }
@@ -426,8 +416,11 @@ mod tests {
         let context = Context::new(&history);
         let (start, matches) = helper.complete("//st", 4, &context).unwrap();
         assert_eq!(start, 0);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].replacement, "//status");
+        let replacements = matches
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(replacements, ["//status", "//stop"]);
     }
 
     #[test]

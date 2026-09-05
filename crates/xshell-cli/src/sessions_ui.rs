@@ -221,19 +221,44 @@ pub(crate) fn print_sessions(sessions: &mut SessionRuntime) -> Result<()> {
             " "
         };
         println!(
-            "{marker} {}/{}:{} — {} / {} — {:?}, {:?}, {:?}, {:?}",
+            "{marker} {}/{}:{} — {} — {} / {} — {:?}, {:?}, {:?}",
             session.host_alias,
             session.user,
             session.name,
+            session_activity_label(&session.activity),
             session.model.profile_name.as_deref().unwrap_or("custom"),
             session.model.model,
             session.status,
-            session.activity,
             session.persistence,
             session.visibility
         );
     }
     Ok(())
+}
+
+pub(crate) fn session_activity_label(activity: &xshell_session::SessionActivity) -> String {
+    match activity {
+        xshell_session::SessionActivity::Idle => "prompt".into(),
+        xshell_session::SessionActivity::AgentTurn { phase, .. } => match phase {
+            xshell_session::AgentTurnPhase::Running => "agent running".into(),
+            xshell_session::AgentTurnPhase::WaitingApproval => "agent waiting for approval".into(),
+        },
+        xshell_session::SessionActivity::InteractiveProcess { command, attached } => {
+            let focus = if *attached { "attached" } else { "detached" };
+            let command = bounded_label(&xshell_view::escape_for_prompt(command), 96);
+            format!("interactive ({focus}): {command}")
+        }
+    }
+}
+
+fn bounded_label(value: &str, max_chars: usize) -> String {
+    let mut characters = value.chars();
+    let prefix = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 pub(crate) fn refresh_session_completions(
@@ -296,5 +321,16 @@ mod tests {
         assert_eq!(options.destination, "rich@mini.local");
         assert_eq!(options.session.as_deref(), Some("cad"));
         assert!(parse_connect_options(&[]).is_err());
+    }
+
+    #[test]
+    fn interactive_activity_labels_are_safe_and_bounded() {
+        let label = session_activity_label(&xshell_session::SessionActivity::InteractiveProcess {
+            command: format!("\u{1b}]0;hidden\u{7}{}", "x".repeat(200)),
+            attached: false,
+        });
+        assert!(!label.contains('\u{1b}'));
+        assert!(label.ends_with('…'));
+        assert!(label.chars().count() < 130);
     }
 }

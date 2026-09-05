@@ -24,15 +24,16 @@ pub struct AuditConfig {
     pub socket: Option<PathBuf>,
     pub directory: Option<PathBuf>,
     pub checkpoint_interval: u64,
-    /// Record the byte-for-byte terminal-job stream (what the operator typed
-    /// and saw) in addition to job start and completion. Off by default: the
-    /// audit trail exists to hold agents accountable, and terminal jobs are
-    /// human-driven. When enabled, capture is performed by `xshelld` from the
-    /// same buffer that feeds terminal replay.
+    /// Record the byte-for-byte interactive-process stream (what the operator
+    /// typed and saw) in addition to job start and completion. Off by default:
+    /// the audit trail exists to hold agents accountable, and interactive
+    /// processes are human-driven. When enabled, capture is performed by
+    /// `xshelld` from the same buffer that feeds terminal replay.
     pub terminal_stream: bool,
-    /// Upper bound on captured stream bytes per terminal job (input and output
-    /// combined). Beyond it, capture stops and the final stream record for the
-    /// job reports how many bytes were not recorded. `0` means no bound.
+    /// Upper bound on captured stream bytes per interactive process (input and
+    /// output combined). Beyond it, capture stops and the final stream record
+    /// for the job reports how many bytes were not recorded. `0` means no
+    /// bound.
     pub terminal_stream_max_bytes: u64,
 }
 
@@ -79,7 +80,7 @@ pub enum AuditEvent {
         /// audit session. Recorded by `xshelld` in the session's first record
         /// so a reader can distinguish "no terminal output" from "not
         /// captured". `None` when written by a component that does not run
-        /// terminal jobs (the CLI) or by a pre-format-3 writer.
+        /// interactive processes (the CLI) or by a pre-format-3 writer.
         #[serde(default)]
         terminal_stream: Option<bool>,
     },
@@ -134,7 +135,7 @@ pub enum AuditEvent {
         outcome: String,
         cwd: String,
     },
-    /// A slice of a terminal job's byte stream, recorded only when
+    /// A slice of an interactive process's byte stream, recorded only when
     /// `audit.terminal_stream` is enabled. `direction` is `"input"` (operator
     /// keystrokes delivered to the job) or `"output"` (bytes the job wrote).
     /// `offset` is the position of the first byte of `data` within that
