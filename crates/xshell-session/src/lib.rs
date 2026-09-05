@@ -9,7 +9,7 @@ mod pty_stream;
 mod registry;
 mod view;
 
-pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
+pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy};
 pub use client::SessionClient;
 pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;
@@ -21,7 +21,7 @@ pub use model::{
     Visibility,
 };
 pub use protocol::{ClientRequest, ServerResponse};
-pub use pty::{PtyClaim, PtyCoordinator, PtyReadResult};
+pub use pty::{PtyAudit, PtyClaim, PtyCoordinator, PtyReadResult};
 pub use pty_stream::{
     ClientPtyFrame, PtyStreamClient, ServerPtyFrame, read_client_frame, read_server_frame,
     write_client_frame, write_server_frame,

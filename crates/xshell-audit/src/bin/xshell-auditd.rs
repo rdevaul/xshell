@@ -129,7 +129,14 @@ fn handle_client(
         return Ok(());
     };
     if protocol_version != AUDIT_PROTOCOL_VERSION {
-        send_error(&mut writer, "unsupported audit protocol version")?;
+        send_error(
+            &mut writer,
+            &format!(
+                "client speaks audit protocol {protocol_version} but this xshell-auditd requires \
+                 {AUDIT_PROTOCOL_VERSION}; upgrade the client or restart xshell-auditd from the \
+                 same build"
+            ),
+        )?;
         return Ok(());
     }
 

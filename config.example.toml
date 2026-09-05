@@ -23,6 +23,12 @@ required = true
 socket = "/ABSOLUTE/PATH/TO/xshell-audit/audit.sock"
 directory = "/ABSOLUTE/PATH/TO/xshell-audit"
 checkpoint_interval = 16
+# Interactive processes ($ commands running in a PTY) always have their start
+# and exit audited. Set true to also record the byte-for-byte stream (operator
+# input and program output). Off by default: the trail is for agent accountability.
+terminal_stream = false
+# Per-job cap on captured stream bytes; 0 = unbounded.
+terminal_stream_max_bytes = 16777216
 
 [models.local-qwen]
 provider = "ollama"
@@ -79,6 +85,6 @@ max_approval = "ask"
 # reported in the transcript and recorded in the audit log.
 # [session_fabric.compaction]
 # max_history_bytes = 262144
-# Prefix for terminal-job commands: d detach, s switch, l last, n/p cycle,
+# Prefix for interactive-process commands: d detach, s switch, l last, n/p cycle,
 # q terminate, ? help, or repeat the prefix to send it literally.
 pty_escape = "ctrl-]"

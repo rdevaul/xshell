@@ -104,7 +104,10 @@ impl SessionClient {
                 user,
             } => {
                 if protocol_version != SESSION_PROTOCOL_VERSION {
-                    bail!("session service selected unsupported protocol {protocol_version}");
+                    bail!(
+                        "session service speaks protocol {protocol_version} but this client requires {SESSION_PROTOCOL_VERSION}; \
+                         the running xshelld is a different build than this xshell — restart xshelld from the same build"
+                    );
                 }
                 client.client_id = client_id;
                 client.host_id = host_id;

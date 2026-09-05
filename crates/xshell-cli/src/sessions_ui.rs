@@ -36,6 +36,8 @@ pub(crate) fn audit_logical_session_attached(
         host_id: session.host_id.clone(),
         host_alias: session.host_alias.clone(),
         user: session.user.clone(),
+        // The CLI does not run terminal jobs; xshelld records the policy.
+        terminal_stream: None,
     })
 }
 

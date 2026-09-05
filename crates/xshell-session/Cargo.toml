@@ -13,6 +13,7 @@ path = "src/bin/xshelld.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 clap.workspace = true
 libc.workspace = true
 serde.workspace = true
@@ -29,5 +30,6 @@ xshell-platform = { path = "../xshell-platform" }
 xshell-pty = { path = "../xshell-pty" }
 
 [dev-dependencies]
+base64.workspace = true
 tempfile = "3.21"
 xshell-audit = { path = "../xshell-audit", features = [] }
