@@ -40,11 +40,14 @@ required = true
 socket = "/run/xshell-audit/audit.sock"
 directory = "/var/lib/xshell-audit"
 checkpoint_interval = 16
+terminal_stream = false        # opt-in byte-for-byte PTY capture (xshelld)
+terminal_stream_max_bytes = 16777216
 ```
 
-`xshell` uses `enabled`, `required`, and `socket`. The daemon uses `socket`,
-`directory`, and `checkpoint_interval`. Command-line flags override the daemon
-paths.
+`xshell` uses `enabled`, `required`, and `socket`. `xshelld` uses those plus
+`terminal_stream` and `terminal_stream_max_bytes`. The audit daemon uses
+`socket`, `directory`, and `checkpoint_interval`. Command-line flags override
+the daemon paths.
 
 When `required = true`, xshell refuses to start if the daemon is unavailable.
 It also refuses to execute an input that the daemon has not acknowledged.
@@ -138,16 +141,47 @@ but are not in the initial format.
 
 Direct `$` command input is logged by `xshelld` before execution, and the daemon
 records the exit outcome even when the controller has detached or switched
-away. The byte-for-byte terminal stream is not yet captured. Stream capture
-without breaking interactive terminal programs requires integrating the
-terminal-job replay journal with the audit service; see [the PTY trust
-boundary](pty.md).
+away.
+
+### Terminal-stream capture (opt-in)
+
+By default the audit trail records a terminal job's **lifecycle** — the command
+before it starts and its exit outcome — but not the bytes exchanged with it.
+The trail exists to hold agents accountable for what they did; terminal jobs
+are human-driven, and recording every keystroke and screen update of an
+interactive session is a decision an operator should make deliberately, not
+inherit from turning on agent auditing.
+
+Set `terminal_stream = true` in `[audit]` to also capture the byte stream.
+`xshelld` then records `terminal_stream` events from the same buffer that
+feeds terminal replay: `direction` is `input` (bytes the job actually accepted
+from the operator) or `output` (bytes the job wrote); `offset` is the position
+within that direction's stream for the job; `data` is standard base64 of the
+raw bytes, escape sequences included. Capture is bounded per job by
+`terminal_stream_max_bytes` (default 16 MiB, `0` for no bound). When the budget
+is exhausted, capture stops, offsets keep advancing so the recorded prefix
+stays faithful, and a final record with `direction = "summary"` states how
+many bytes were not recorded before the job's completion is logged.
+
+Whether capture was enabled is written into each audit session's first
+record (`logical_session_attached.terminal_stream`), so a reader can tell
+"nothing was typed" from "typing was not recorded". Because the stream is
+recorded by `xshelld`, it is captured for detached jobs and cannot be
+suppressed by a client. A stream-record failure stops stream capture for that
+job with one warning; lifecycle records continue to follow the `required`
+policy unchanged.
+
+Captured streams are as sensitive as anything typed at a terminal — passwords
+entered at prompts that disable echo are recorded on the input side. Treat
+the audit directory accordingly.
 
 An unclean client or daemon crash leaves a verifiable hash chain but no final
 checkpoint. The verifier reports this explicitly rather than claiming the log
 is complete.
 
-History-compaction events advance the audit client/daemon protocol to version
-3 and the on-disk audit format to version 2. Upgrade and restart
-`xshell-auditd` together with the CLI. The verifier remains able to read
-version 1 logs.
+History-compaction events advanced the audit client/daemon protocol to version
+3 and the on-disk audit format to version 2; terminal-stream events advance
+them to protocol 4 and format 3. Upgrade and restart `xshell-auditd` together
+with `xshelld` and the CLI — a version mismatch is reported at handshake with
+the expected and received versions. The verifier remains able to read every
+format from version 1 onward.

@@ -1,5 +1,6 @@
-use crate::{PtyDescriptor, PtySize, PtyTicket, SessionAuditHandle};
+use crate::{PtyDescriptor, PtySize, PtyTicket, SessionAuditHandle, TerminalStreamPolicy};
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
@@ -21,6 +22,9 @@ const WORKER_WAIT: Duration = Duration::from_millis(40);
 const MAX_READ_WAIT: Duration = Duration::from_millis(250);
 const MAX_DIMENSION: u16 = 1_000;
 const MAX_TERMINAL_TYPE_BYTES: usize = 128;
+/// Largest `data` payload (pre-base64) in one `TerminalStream` audit record.
+/// Keeps each record comfortably inside the audit service's request bound.
+const STREAM_RECORD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Default)]
 pub struct PtyCoordinator {
@@ -49,9 +53,67 @@ struct ManagedPty {
     command: String,
     cwd: String,
     audit: Option<SessionAuditHandle>,
+    /// Opt-in byte-stream capture; `None` records lifecycle only.
+    capture: Option<Mutex<StreamCapture>>,
     stream: Mutex<StreamAuthorization>,
     state: Mutex<PtyState>,
     changed: Condvar,
+}
+
+/// How a terminal job is audited: lifecycle through `handle`, and optionally
+/// the byte stream as well.
+#[derive(Clone)]
+pub struct PtyAudit {
+    pub handle: SessionAuditHandle,
+    /// `Some` enables byte-for-byte stream capture under the given policy.
+    pub stream: Option<TerminalStreamPolicy>,
+}
+
+/// Bookkeeping for byte-for-byte terminal-stream auditing of one job.
+/// Only bytes the process actually accepted (input) or produced (output) are
+/// recorded, so the trail reflects what happened rather than what was queued.
+struct StreamCapture {
+    budget: Option<u64>,
+    recorded: u64,
+    dropped: u64,
+    input_offset: u64,
+    output_offset: u64,
+    failed: bool,
+}
+
+impl StreamCapture {
+    fn new(policy: TerminalStreamPolicy) -> Self {
+        Self {
+            budget: policy.max_bytes,
+            recorded: 0,
+            dropped: 0,
+            input_offset: 0,
+            output_offset: 0,
+            failed: false,
+        }
+    }
+
+    /// Split `bytes` into the prefix that fits the remaining budget and count
+    /// the rest as dropped. Advances the direction offset by the full length so
+    /// offsets stay faithful to the real stream even when bytes are dropped.
+    fn take(&mut self, direction: &str, bytes: &[u8]) -> (u64, usize) {
+        let offset = match direction {
+            "input" => &mut self.input_offset,
+            _ => &mut self.output_offset,
+        };
+        let start = *offset;
+        *offset += bytes.len() as u64;
+        let allowed = match self.budget {
+            None => bytes.len(),
+            Some(budget) => {
+                let remaining = budget.saturating_sub(self.recorded);
+                bytes.len().min(remaining as usize)
+            }
+        };
+        self.recorded += allowed as u64;
+        self.dropped += (bytes.len() - allowed) as u64;
+        (start, allowed)
+    }
 }
 
 #[derive(Default)]
@@ -96,6 +158,9 @@ impl PtyCoordinator {
         self.start_inner(session_id, command, cwd, size, terminal_type, None)
     }
 
+    /// Start a job whose lifecycle is audited through `audit.handle`. When
+    /// `audit.stream` is `Some`, the job's byte stream is also recorded,
+    /// bounded by that policy.
     pub fn start_audited(
         &self,
         session_id: &str,
@@ -103,7 +168,7 @@ impl PtyCoordinator {
         cwd: &Path,
         size: PtySize,
         terminal_type: Option<String>,
-        audit: SessionAuditHandle,
+        audit: PtyAudit,
     ) -> Result<PtyTicket> {
         self.start_inner(session_id, command, cwd, size, terminal_type, Some(audit))
     }
@@ -115,7 +180,7 @@ impl PtyCoordinator {
         cwd: &Path,
         size: PtySize,
         terminal_type: Option<String>,
-        audit: Option<SessionAuditHandle>,
+        audit: Option<PtyAudit>,
     ) -> Result<PtyTicket> {
         validate_command(&command)?;
         validate_size(size)?;
@@ -130,6 +195,10 @@ impl PtyCoordinator {
                 bail!("session already has a terminal job");
             }
         }
+        let (audit, stream) = match audit {
+            Some(PtyAudit { handle, stream }) => (Some(handle), stream),
+            None => (None, None),
+        };
         if let Some(audit) = &audit {
             // This is the final boundary before process creation. In required
             // mode a failed append returns here and the command never starts.
@@ -150,11 +219,16 @@ impl PtyCoordinator {
         )?;
         let pty_id = Uuid::new_v4().to_string();
         let ticket = Uuid::new_v4().to_string();
+        let capture = match (&audit, stream) {
+            (Some(_), Some(policy)) => Some(Mutex::new(StreamCapture::new(policy))),
+            _ => None,
+        };
         let managed = Arc::new(ManagedPty {
             session_id: session_id.to_owned(),
             command,
             cwd: cwd.display().to_string(),
             audit,
+            capture,
             stream: Mutex::new(StreamAuthorization {
                 tickets: HashMap::from([(ticket.clone(), 0)]),
                 claimed: None,
@@ -420,8 +494,11 @@ fn spawn_worker(managed: Arc<ManagedPty>, mut process: RemotePtyProcess) {
             );
             match result {
                 Ok(chunk) => {
+                    let accepted = chunk.input_accepted.min(input.len());
+                    record_stream(&managed, "input", &input[..accepted]);
+                    record_stream(&managed, "output", &chunk.output);
                     let mut state = managed.state.lock_recover();
-                    for _ in 0..chunk.input_accepted.min(state.input.len()) {
+                    for _ in 0..accepted.min(state.input.len()) {
                         state.input.pop_front();
                     }
                     append_output(&mut state, chunk.output);
@@ -451,6 +528,67 @@ fn append_output(state: &mut PtyState, bytes: Vec<u8>) {
     }
 }
 
+/// Record one direction's bytes for this exchange as `TerminalStream` audit
+/// records, honouring the per-job budget. Records are chunked so each stays
+/// within the audit service's request bound. Only the bytes the process
+/// accepted or produced reach here.
+fn record_stream(managed: &ManagedPty, direction: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let (Some(audit), Some(capture)) = (&managed.audit, &managed.capture) else {
+        return;
+    };
+    let mut capture = capture.lock_recover();
+    if capture.failed {
+        return;
+    }
+    let (start, allowed) = capture.take(direction, bytes);
+    let mut offset = start;
+    for chunk in bytes[..allowed].chunks(STREAM_RECORD_BYTES) {
+        let event = AuditEvent::TerminalStream {
+            command: managed.command.clone(),
+            direction: direction.to_owned(),
+            offset,
+            data: base64::engine::general_purpose::STANDARD.encode(chunk),
+            dropped_bytes: 0,
+        };
+        if let Err(error) = audit.append(event) {
+            // Lifecycle records still flow through `audit` (which applies the
+            // required/best-effort policy itself); stream capture for this job
+            // stops so one failure is not reported once per exchange.
+            eprintln!("xshelld audit warning: cannot record terminal stream: {error:#}");
+            capture.failed = true;
+            return;
+        }
+        offset += chunk.len() as u64;
+    }
+}
+
+/// Emit the job's closing stream record when bytes were withheld by the
+/// budget, so the trail states what it does not contain.
+fn record_stream_summary(managed: &ManagedPty) {
+    let (Some(audit), Some(capture)) = (&managed.audit, &managed.capture) else {
+        return;
+    };
+    let (dropped, failed) = {
+        let capture = capture.lock_recover();
+        (capture.dropped, capture.failed)
+    };
+    if dropped == 0 || failed {
+        return;
+    }
+    if let Err(error) = audit.append(AuditEvent::TerminalStream {
+        command: managed.command.clone(),
+        direction: "summary".into(),
+        offset: 0,
+        data: String::new(),
+        dropped_bytes: dropped,
+    }) {
+        eprintln!("xshelld audit warning: cannot record terminal stream summary: {error:#}");
+    }
+}
+
 fn finish(managed: &ManagedPty, status: String) {
     let should_audit = {
         let mut state = managed.state.lock_recover();
@@ -459,8 +597,11 @@ fn finish(managed: &ManagedPty, status: String) {
         managed.changed.notify_all();
         should_audit
     };
-    if should_audit
-        && let Some(audit) = &managed.audit
+    if !should_audit {
+        return;
+    }
+    record_stream_summary(managed);
+    if let Some(audit) = &managed.audit
         && let Err(error) = audit.append(AuditEvent::ShellFinished {
             command: managed.command.clone(),
             outcome: status,
@@ -574,6 +715,29 @@ mod tests {
             }
         }
         assert!(String::from_utf8_lossy(&output).contains("remote:hello"));
+    }
+
+    #[test]
+    fn stream_capture_budget_drops_bytes_but_keeps_offsets_faithful() {
+        let mut capture = StreamCapture::new(TerminalStreamPolicy {
+            max_bytes: Some(10),
+        });
+        assert_eq!(capture.take("input", b"abcd"), (0, 4));
+        assert_eq!(capture.take("output", b"12345678"), (0, 6));
+        assert_eq!(capture.dropped, 2);
+        // Budget is exhausted: nothing more is recorded, offsets still advance.
+        assert_eq!(capture.take("output", b"xyz"), (8, 0));
+        assert_eq!(capture.take("input", b"e"), (4, 0));
+        assert_eq!(capture.dropped, 6);
+        assert_eq!(capture.recorded, 10);
+    }
+
+    #[test]
+    fn stream_capture_without_budget_records_everything() {
+        let mut capture = StreamCapture::new(TerminalStreamPolicy { max_bytes: None });
+        let large = vec![0u8; 3 * STREAM_RECORD_BYTES + 1];
+        assert_eq!(capture.take("output", &large), (0, large.len()));
+        assert_eq!(capture.dropped, 0);
     }
 
     #[test]

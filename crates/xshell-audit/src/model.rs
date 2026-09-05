@@ -2,13 +2,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// Format written by new audit logs. The verifier continues to accept version
-/// 1 so existing signed logs remain readable after upgrading.
-pub const AUDIT_FORMAT_VERSION: u32 = 2;
+/// Format written by new audit logs. The verifier continues to accept older
+/// versions down to `MIN_SUPPORTED_AUDIT_FORMAT_VERSION` so existing signed
+/// logs remain readable after upgrading.
+///
+/// - 2: adds `AuditEvent::HistoryCompacted`.
+/// - 3: adds `AuditEvent::TerminalStream` and the `terminal_stream` field on
+///   `AuditEvent::LogicalSessionAttached`.
+pub const AUDIT_FORMAT_VERSION: u32 = 3;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
-// Version 3 adds `AuditEvent::HistoryCompacted`. Tagged enum variants are not
+// Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
+// `AuditEvent::TerminalStream`. Tagged enum variants are not
 // forward-compatible in serde, so mixed-version peers must fail at handshake.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 3;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -18,6 +24,21 @@ pub struct AuditConfig {
     pub socket: Option<PathBuf>,
     pub directory: Option<PathBuf>,
     pub checkpoint_interval: u64,
+    /// Record the byte-for-byte terminal-job stream (what the operator typed
+    /// and saw) in addition to job start and completion. Off by default: the
+    /// audit trail exists to hold agents accountable, and terminal jobs are
+    /// human-driven. When enabled, capture is performed by `xshelld` from the
+    /// same buffer that feeds terminal replay.
+    pub terminal_stream: bool,
+    /// Upper bound on captured stream bytes per terminal job (input and output
+    /// combined). Beyond it, capture stops and the final stream record for the
+    /// job reports how many bytes were not recorded. `0` means no bound.
+    pub terminal_stream_max_bytes: u64,
+}
+
+impl AuditConfig {
+    /// Default per-job capture budget: 16 MiB.
+    pub const DEFAULT_TERMINAL_STREAM_MAX_BYTES: u64 = 16 * 1024 * 1024;
 }
 
 impl Default for AuditConfig {
@@ -28,6 +49,8 @@ impl Default for AuditConfig {
             socket: None,
             directory: None,
             checkpoint_interval: 16,
+            terminal_stream: false,
+            terminal_stream_max_bytes: Self::DEFAULT_TERMINAL_STREAM_MAX_BYTES,
         }
     }
 }
@@ -52,6 +75,13 @@ pub enum AuditEvent {
         host_id: String,
         host_alias: String,
         user: String,
+        /// Whether byte-for-byte terminal-stream capture was enabled for this
+        /// audit session. Recorded by `xshelld` in the session's first record
+        /// so a reader can distinguish "no terminal output" from "not
+        /// captured". `None` when written by a component that does not run
+        /// terminal jobs (the CLI) or by a pre-format-3 writer.
+        #[serde(default)]
+        terminal_stream: Option<bool>,
     },
     LogicalSessionDetached {
         action: String,
@@ -103,6 +133,21 @@ pub enum AuditEvent {
         command: String,
         outcome: String,
         cwd: String,
+    },
+    /// A slice of a terminal job's byte stream, recorded only when
+    /// `audit.terminal_stream` is enabled. `direction` is `"input"` (operator
+    /// keystrokes delivered to the job) or `"output"` (bytes the job wrote).
+    /// `offset` is the position of the first byte of `data` within that
+    /// direction's stream for this job; `data` is standard base64.
+    /// `dropped_bytes` is non-zero only on the job's final stream record and
+    /// counts bytes that were not recorded because the capture budget was
+    /// exhausted.
+    TerminalStream {
+        command: String,
+        direction: String,
+        offset: u64,
+        data: String,
+        dropped_bytes: u64,
     },
     /// Older conversation turns were dropped (or summarized) to stay within
     /// the configured history budget. Recorded so a reader of the trail knows

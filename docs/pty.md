@@ -81,7 +81,9 @@ Daemon-lifetime and durable sessions retain terminal jobs across controller and
 stream disconnections, but terminal jobs do not yet survive an `xshelld`
 restart. Ephemeral sessions terminate jobs on detach. PTY activity appears as
 `running` in the session catalog, but terminal bytes are not added to the
-durable conversation or audit journal.
+durable conversation. When auditing is enabled the daemon records each job's
+start and exit; the byte stream itself is recorded only if the operator opts
+in with `audit.terminal_stream` (see [auditing](auditing.md#terminal-stream-capture-opt-in)).
 
 PTY output is trusted terminal output. It may contain cursor movement,
 alternate-screen, hyperlink, clipboard, or other terminal escape sequences;
