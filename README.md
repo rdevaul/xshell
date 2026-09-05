@@ -1,29 +1,64 @@
 # xshell
 
-`xshell` is an agent-first, network-aware interactive shell for working with
-local and remote AI agents while retaining direct access to an ordinary shell.
+**A persistent, network-transparent workspace for humans, AI agents, shells,
+and full-screen terminal tools.**
 
-This repository is at the first local prototype stage. Input is routed as:
+Most agentic shell tools are local chat loops: the conversation belongs to one
+terminal, remote machines are separate SSH worlds, and long-running work ends
+when the client disconnects. xshell makes the **named session** the durable unit
+of work instead. A session carries its agent conversation, model binding,
+working directory, execution state, and interactive process. Sessions can live
+on this machine or another host and are selected through the same interface.
 
-- plain text: send to the configured agent;
-- `$command`: execute with the user's login shell;
-- `//command`: invoke the xshell control plane.
+At one prompt you can:
 
-The current prototype supports:
+- describe work in natural language and let an agent use bounded tools;
+- prefix input with `$` when you want the ordinary shell directly;
+- run pagers, TUIs, and full-screen programs in detachable PTYs;
+- leave your full screen editor running while you switch sessions or hosts, or 
+  disconnect while a daemon-owned agent turn continues;
+- choose a different local or hosted model for each session and machine; and
+- enforce host-local approval policy and produce tamper-evident audit records
+  at the point where execution occurs.
 
-- streamed responses from Ollama and generic OpenAI-compatible Chat
-  Completions endpoints;
-- function/tool calling with a bounded 64-step agent loop;
-- cwd-confined `read_file` and `list_directory` tools;
-- approval-gated `run_shell` calls with timeout and output limits;
-- tab completion for executables, paths, and `//` commands;
-- named model profiles with live switching via `//model`;
-- named local sessions with daemon-lifetime or durable persistence;
-- optional fail-closed audit logging through a separate signing daemon;
-- persistent cwd changes through `$cd`.
+```text
+                         one session catalog and switcher
+                                      │
+               ┌──────────────────────┴──────────────────────┐
+               │                                             │
+        Unix socket                                     SSH stdio tunnel
+               │                                             │
+    xshelld on this host                           xshelld on another host
+      ├─ named sessions                              ├─ named sessions
+      ├─ local/cloud model                           ├─ different model
+      ├─ tools and PTYs                              ├─ tools and PTYs
+      └─ audit boundary                              └─ audit boundary
+```
 
-SSH federation, artifact rendering, and yapCAD integration are specified but
-not implemented yet.
+xshell is not yet a POSIX shell or a drop-in login-shell replacement. It is a
+working alpha of the session and execution fabric needed to become one.
+
+## What works today
+
+| Area | Current capability |
+|---|---|
+| Agent loop | Streaming Ollama and OpenAI-compatible Chat Completions, including OpenRouter; tool calling with a bounded 64-step loop |
+| Shell access | Direct `$` commands, sticky `$$` mode, persistent `cd`, command/path completion, pipelines, colors, pagers, and full-screen PTY applications |
+| Sessions | Multiple named sessions per user and host; ephemeral, daemon-lifetime, and durable lifecycle modes; common switching for idle prompts, active agent turns, and interactive processes |
+| Network fabric | SSH-connected macOS and Linux hosts in the same session catalog; remote creation, switching, execution, completion, viewing, detach, and manual reconnect |
+| Detachment | Daemon-owned agent turns and interactive processes continue after controller disconnect; bounded event and terminal-output replay on return |
+| Models | Named profiles, live `//model` switching, per-session bindings, per-model history budgets, and environment-based credentials that are never printed or sent over the session protocol |
+| Viewing | Streamed terminal Markdown, tables, a safe reStructuredText subset, and local rendering of text acquired from either local or remote sessions with `//view` |
+| Safety | Exact-command approval, remote-host approval ceilings, cwd-confined file tools, sensitive-path gating, execution time/output limits, and process-group cleanup |
+| Audit | Separate append-only service, hash-chained JSONL, Ed25519-signed checkpoints, daemon-side execution events, and opt-in bounded byte-for-byte PTY stream capture |
+
+The major pieces that are **not** implemented yet are automatic installation
+and service setup on remote hosts, resilient SSH supervision, a shared
+`/xshell` filesystem namespace, binary/media viewer plugins and CAD rendering,
+multi-user sessions and ACLs, and restoration of an in-flight process across an
+`xshelld` restart. FutureShell—the contractual workflow and bounded-rollback
+language planned on top of this fabric—is currently a design and roadmap, not
+an executable language.
 
 An experimental typed dataflow representation for FutureShell is available in
 `crates/xshell-flow`. It models tasks, contract-gated branches, parallel joins,
@@ -31,65 +66,195 @@ and bounded feedback loops. See [the Flow IR prototype](docs/futureshell-flow-ir
 
 ## Build and run
 
-Install Rust, then run:
+xshell targets macOS and Linux and requires Rust 1.88 or newer. With Ollama
+serving `qwen3:8b` on its default local endpoint:
 
 ```sh
+git clone https://github.com/rdevaul/xshell.git
+cd xshell
 cargo run -p xshell-cli
 ```
 
-The default configuration expects Ollama at `http://127.0.0.1:11434` and model
-`qwen3:8b`. Override it with flags or environment variables:
+The standalone mode keeps execution inside the CLI and is the shortest path to
+trying the agent/shell REPL. The three input routes are always explicit:
 
-```sh
-XSHELL_MODEL=qwen3:4b cargo run -p xshell-cli
-
-# Ask before agent-requested shell commands (default).
-cargo run -p xshell-cli -- --approval ask
-
-# Run every tool without prompting. Use only in a trusted workspace.
-cargo run -p xshell-cli -- --approval auto
-
-# Allow read-only tools but deny all agent-requested shell commands.
-cargo run -p xshell-cli -- --approval off
-
-cargo run -p xshell-cli -- \
-  --provider openai \
-  --base-url https://api.openai.com \
-  --model YOUR_MODEL \
-  --api-key-env OPENAI_API_KEY
+```text
+Explain the architecture of this repository   # send to the active agent
+$git status --short                            # run in the ordinary shell
+$$rg "TODO" crates                             # enter sticky shell mode
+//status                                       # invoke the xshell control plane
 ```
 
-Prefix a command with `$` for a single shell input. Prefix it with `$$` to
-enter sticky shell mode: subsequent input lines begin with an editable `$`.
-Backspace over that `$` and submit plain text to return to agent input.
+In sticky shell mode, following prompts begin with an editable `$`. Backspace
+over it and submit plain text to return to agent input.
 
-## Agent response rendering
+The default tool approval mode is `ask`. Other modes are intentional command
+line choices:
 
-On a terminal, xshell renders streamed agent Markdown as readable headings,
-paragraphs, lists, quotes, tables, links, inline code, and fenced code blocks.
-Prose wraps to the detected terminal width while code is left structurally
-intact. Rendering is performed only by the client: conversation history,
-session state, and audit records retain the model's original response. Shell
-stdout and stderr also remain verbatim.
+```sh
+cargo run -p xshell-cli -- --approval ask  # prompt before agent shell tools
+cargo run -p xshell-cli -- --approval off  # deny agent shell tools
+cargo run -p xshell-cli -- --approval auto # unattended; trusted workspaces only
+```
 
-Model output is stripped of terminal control sequences before display. ANSI
-styling is enabled only for a terminal and is disabled whenever `NO_COLOR` is
-set. Configure the policy in `config.toml`:
+## Models and providers
+
+Copy the example configuration and edit the named profiles:
+
+```sh
+mkdir -p ~/.config/xshell
+cp config.example.toml ~/.config/xshell/config.toml
+```
+
+The example contains Ollama, OpenRouter, and generic OpenAI-compatible
+profiles. Credentials remain in environment variables; `api_key_env` contains
+the variable's **name**, never its value:
+
+```toml
+default_model = "openrouter-qwen"
+
+[models.openrouter-qwen]
+provider = "openai"
+model = "YOUR_OPENROUTER_MODEL"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+max_history_bytes = 131072
+```
+
+```sh
+export OPENROUTER_API_KEY='your-key-here'
+cargo run -p xshell-cli -- --profile openrouter-qwen
+```
+
+Within xshell, `//model list` shows configured profiles and `//model NAME`
+switches the active session to a fresh conversation. Clearing history on a
+model switch prevents context supplied to one provider from silently crossing
+into another. In daemon-backed sessions, the credential variable is resolved
+in the `xshelld` environment on the machine doing the work.
+
+## Persistent local sessions
+
+Enable the fabric and start the per-user session daemon:
+
+```toml
+[session_fabric]
+enabled = true
+required = true
+default_session = "default"
+max_approval = "ask"
+pty_escape = "ctrl-]"
+```
+
+```sh
+cargo run -p xshell-session --bin xshelld -- \
+  --config ~/.config/xshell/config.toml
+
+# In another terminal:
+cargo run -p xshell-cli -- --session default
+```
+
+Useful session commands include:
+
+```text
+//sessions                            # catalog sessions on every connected host
+//new bees --durable                  # durable conversation and cwd
+//new ornithopter --model local-qwen  # create with a selected model
+//switch bees                         # switch by local session name
+//switch local:default                # explicitly select this host
+//resume                              # return to this session's active work
+//stop                                # stop its agent turn or interactive process
+//detach                              # leave a persistent session running and exit
+//close                               # delete it and fall back to the previous session
+//quit                                # detach and exit without deleting the session
+```
+
+Lifecycle modes differ deliberately:
+
+| Mode | After controller detach | After daemon restart |
+|---|---|---|
+| `ephemeral` | deleted | deleted |
+| `daemon` | retained | deleted |
+| `durable` | retained | conversation, model, and cwd restored |
+
+Active agent turns and interactive processes survive controller disconnect but
+not daemon restart. Durable session snapshots are written atomically and are
+restored detached.
+
+## One fabric across hosts
+
+Install the same xshell build on a remote macOS or Linux host, make `xshelld`
+available on its non-interactive SSH `PATH`, and start its per-user daemon.
+Then connect using the SSH identity and policy you already use:
+
+```text
+//connect rich@mini.local
+//connect rich@mini.local --session cad
+//sessions
+//switch mini:cad
+//switch local:bees
+```
+
+xshell invokes `ssh -T` and `xshelld serve-stdio`; it opens no inbound service
+and does not replace OpenSSH authentication, host-key verification,
+`~/.ssh/config`, or agent handling. Each remote daemon enforces its own model
+credentials, sensitive-path policy, and maximum approval level. Only sessions
+marked `fabric` are exported; `host_only` sessions remain private to that host.
+
+Remote command and path completion is evaluated by the remote daemon against
+its inherited `PATH` and the session cwd without sourcing shell startup files,
+aliases, functions, or native completion frameworks.
+
+Automatic remote bootstrap, daemon installation, reconnection supervision, and
+SSH connection multiplexing remain planned work. See the
+[session-fabric design](docs/session-fabric.md).
+
+## Full terminal applications without a second abstraction
+
+A directly entered `$` command in a fabric-backed interactive session runs as
+that session's interactive process. It receives a real PTY, so commands such as
+these behave normally:
+
+```text
+$cat data.json | jq | less
+$htop
+$emacs -nw design-notes.md
+```
+
+The process belongs to the session; it is not a separately managed user-facing
+object. While it has focus, the default `Ctrl-]` prefix provides local switching
+without sending control bytes to the process:
+
+| Sequence | Action |
+|---|---|
+| `Ctrl-] s` | Open the unified session picker; `n` creates a session on the current host |
+| `Ctrl-] d` | Detach to the xshell session prompt |
+| `Ctrl-] l` | Return to the previously focused session |
+| `Ctrl-] n` / `Ctrl-] p` | Cycle sessions |
+| `Ctrl-] q` | Terminate the current interactive process |
+| `Ctrl-] ?` | Show key help |
+| `Ctrl-] Ctrl-]` | Send a literal prefix byte |
+
+Daemon and durable sessions retain the process across stream or controller
+disconnects and keep up to 1 MiB of output for replay. xshell forwards terminal
+bytes and resize events rather than emulating a terminal, preserving curses and
+Emacs behavior. See the [PTY design and trust boundary](docs/pty.md).
+
+## Rendering and `//view`
+
+Agent Markdown is rendered incrementally as headings, paragraphs, lists,
+quotes, links, tables, inline code, and fenced blocks. Prose wraps to terminal
+width while source conversation and audit records retain the model's original
+text. Model output is stripped of terminal control sequences before display;
+`NO_COLOR` is honored.
 
 ```toml
 [rendering]
-markdown = "auto" # auto, always, or never
-color = "auto"    # auto, always, or never
-# width = 100      # optional; valid range is 20..512
+markdown = "auto" # auto, always, never
+color = "auto"    # auto, always, never
+# width = 100
 ```
 
-The equivalent one-run overrides are `--markdown`, `--color`,
-`XSHELL_MARKDOWN`, and `XSHELL_COLOR`. `markdown = "never"` preserves the
-model's Markdown source layout but still removes terminal control sequences.
-When output is redirected, both policies default to `never` through their
-`auto` setting.
-
-The same rendering engine powers the modular `//view` command:
+The modular viewer uses the same renderer for files:
 
 ```text
 //view README.md
@@ -97,241 +262,68 @@ The same rendering engine powers the modular `//view` command:
 //view --as markdown notes.txt
 ```
 
-Paths are resolved on the active session host, so the command behaves the same
-for local and SSH sessions. The first built-in viewers support Markdown and a
-safe reStructuredText subset. Text acquisition is limited to 4 MiB and records
-the resolved path, media type, byte length, SHA-256 hash, selected viewer, and
-outcome in the audit log. See [the viewer architecture](docs/viewers.md).
+The active session host acquires the source and the controller renders it
+locally, so `//view` behaves consistently across SSH without opening a viewer
+port. Markdown and a safe reStructuredText subset are built in. Acquisition is
+bounded to regular UTF-8 files of at most 4 MiB and records content metadata in
+the audit trail. Pagination policy, binary/media plugins, inline images, F3D
+integration, and multimodal-agent attachments are next-stage work. See the
+[viewer architecture](docs/viewers.md).
 
-## Model profiles and OpenRouter
+## Safety and auditability
 
-Copy the example configuration, then edit its models to suit the providers you
-use:
+xshell is agentic infrastructure, not a sandbox. Its controls make authority
+visible and bounded:
 
-```sh
-mkdir -p ~/.config/xshell
-cp config.example.toml ~/.config/xshell/config.toml
+- `read_file` and `list_directory` are confined to the session cwd after
+  canonical and symlink resolution.
+- Credential-like paths such as `.env`, `.ssh/**`, private keys,
+  `.git/config`, and Terraform state are approval-gated by default.
+- Agent shell tools display an escaped, byte-faithful command before approval;
+  `y` runs it, `n` denies it and continues the turn, and `q` aborts the turn.
+- Shell tools use a non-login shell, bounded captured output, a 60-second
+  timeout, and a separate process group that is killed as a unit.
+- A remote daemon's `max_approval` ceiling can make a controller's requested
+  policy stricter, never more permissive.
+
+For tamper-evident records, `xshell-auditd` writes append-only, hash-chained
+JSONL with periodic and final Ed25519-signed checkpoints. `xshelld` records at
+the execution boundary, including detached agent work. Interactive-process
+lifecycle is recorded at the daemon when auditing is enabled; byte-for-byte
+input and output capture is an explicit, bounded opt-in because it can include
+passwords and other sensitive terminal data.
+
+```toml
+[audit]
+enabled = true
+required = true
+socket = "/ABSOLUTE/PRIVATE/PATH/audit.sock"
+directory = "/ABSOLUTE/PRIVATE/PATH/audit"
+terminal_stream = false
+terminal_stream_max_bytes = 16777216
 ```
 
-The example includes local Ollama, OpenRouter, and OpenAI-compatible profiles.
-API keys are never stored in the configuration: each profile names the
-environment variable from which xshell should read its key. `api_key_env` must
-contain the literal variable name (for example, `OPENROUTER_API_KEY`), never the
-key itself. For OpenRouter:
+A same-user development deployment protects logs from accidental modification,
+not from commands running with that user identity. Tamper resistance requires
+running the audit service as a dedicated OS account with a protected directory.
+Federated or public timestamp witnessing is designed for later addition. See
+the [audit design, deployment guidance, and verifier](docs/auditing.md).
 
-```sh
-export OPENROUTER_API_KEY='your-key-here'
-cargo run -p xshell-cli -- --profile openrouter-free
-```
+## Direction
 
-Model and status output reports only whether credentials are set; it never
-prints the environment variable's name or value. If a configured credential is
-missing, xshell stops before sending a request rather than making an anonymous
-request that will fail at the provider.
+The implemented session fabric is the substrate for the broader xshell vision:
+transparent cross-host resources, agentic CAD workflows around
+[yapCAD](https://github.com/rdevaul/yapCAD), richer viewer plugins, and
+FutureShell programs with explicit agent selection, resource budgets,
+deterministic contractual evidence, selective state promotion, and bounded
+rollback guarantees.
 
-You can also try OpenRouter without creating a configuration file:
+- [Current system specification](xshell-specification.md)
+- [Implementation plan](xshell-implementation-plan.md)
+- [FutureShell roadmap](docs/futureshell-roadmap.md)
+- [FutureShell implementation plan](docs/futureshell-implementation-plan.md)
 
-```sh
-export OPENROUTER_API_KEY='your-key-here'
-cargo run -p xshell-cli -- \
-  --provider openai \
-  --base-url https://openrouter.ai/api/v1 \
-  --model openrouter/free \
-  --api-key-env OPENROUTER_API_KEY
-```
+xshell is under active development. Review agent tool requests, keep recoverable
+copies of important data, and do not assume unimplemented isolation guarantees.
 
-`openrouter/free` is convenient for a connectivity test, but the model selected
-by OpenRouter may not support tools. Configure a specific OpenRouter model that
-supports tool calling when using xshell's agent tools.
-
-Within xshell:
-
-```text
-Explain this project                 # agent message
-$git status --short                  # ordinary shell command
-$cd crates/xshell-core               # persistently change xshell's cwd
-//status                              # inspect the active session
-//model                               # inspect the active model profile
-//model list                          # list configured profiles
-//model openrouter-free               # switch profile and clear chat history
-//sessions                            # list sessions on this host
-//new bees --durable                  # create and enter a durable session
-//new robot --model local-qwen        # create with a chosen model profile
-//switch bees                         # restore its model, cwd, and conversation
-//detach                              # preserve the session and exit
-//close                               # delete it and return to the previous session
-//tools                               # inspect tools exposed to the agent
-//view README.md                      # render a file on the active session host
-//help                                # list control commands
-//quit                                # exit
-```
-
-Press Tab after `$` to complete commands from `PATH` or filesystem paths.
-Completion intentionally provides a portable baseline rather than loading the
-user's complete zsh/bash plugin and completion environment.
-
-Switching model profiles deliberately clears the conversation history. This
-prevents context given to a local model from being sent to a cloud provider
-without an explicit new message. CLI flags and their corresponding environment
-variables override values in the startup profile.
-
-## Named local and SSH sessions
-
-Named sessions are served by `xshelld` over a per-user Unix socket. Enable the
-`[session_fabric]` section in the configuration, then start the service before
-the CLI:
-
-```sh
-cargo run -p xshell-session --bin xshelld -- --config config.example.toml
-cargo run -p xshell-cli -- --config config.example.toml --session bees
-```
-
-The default `//new NAME` lifecycle is `--daemon`: it survives detach and client
-disconnects but not daemon restart. Use `--durable` to serialize the session's
-model binding, working directory, and conversation history, or `--ephemeral`
-to remove it at detach. `--fabric` marks a session for later SSH federation;
-`--host-only` keeps it out of that future export. In this first increment all
-sessions remain local and single-user, and only one interactive client may
-control a session at a time.
-
-`//quit` and Ctrl-D leave the current persistent session available for later
-attachment. `//close` deletes the current session; xshell returns to the
-previously visited available session, or otherwise the most recently active
-available session. Closing the last session exits the CLI.
-
-When the session fabric is enabled, `xshelld` owns model requests, agent tool
-loops, approvals, and `$` command execution. The CLI renders its sequenced
-event stream and sends approval decisions. A daemon-lifetime or durable turn
-continues if the client disconnects; reattachment replays the bounded event
-journal before resuming live output. Completed durable session state survives
-daemon restart, but an in-flight turn does not yet survive daemon restart.
-
-Credential environment variables named by a model profile must be available
-to the `xshelld` process. They are not sent to or resolved by an attached CLI.
-This distinction becomes important once the CLI and daemon are on different
-hosts. Likewise, when auditing is enabled, `xshelld` records execution events
-(input, model output, tool calls, approvals, shell completion) itself at the
-point of execution; see [the audit design](docs/auditing.md#who-records-what).
-
-To connect another macOS or Linux host, install `xshelld` somewhere on that
-host's non-interactive SSH `PATH`, configure and start its per-user daemon, then
-run:
-
-```text
-//connect rich@mini.local
-//connect rich@mini.local --session cad
-//sessions
-//switch laptop:bees
-//switch local:default
-```
-
-`//connect` invokes the system `ssh` command with PTY allocation disabled, so
-the user's normal `~/.ssh/config`, agent, host-key policy, and authentication
-prompts apply. The remote command is `xshelld serve-stdio`; it opens no network
-port and proxies the versioned protocol to the remote user's Unix socket.
-Connected hosts remain available in the common session catalog and switcher.
-`local:NAME` always selects the session on the controller's Unix-socket host,
-regardless of that machine's configured host alias.
-Only sessions marked `fabric` are listed or attachable through this transport.
-If the selected name does not exist, xshell creates it in the remote user's
-home directory using the current model binding. Automatic remote installation
-and version negotiation beyond the protocol handshake are not implemented yet.
-Shell command and path completion is evaluated by the remote daemon against
-its inherited `PATH` and the active session cwd. It intentionally does not
-source native zsh/bash completion frameworks, startup scripts, aliases, or
-functions.
-
-Directly entered commands in daemon-backed local and remote sessions run as
-session-owned interactive processes backed by PTYs. This supports colors, pagers, and full-screen
-programs; input, output, resize events, and terminal-generated signals are
-relayed byte-for-byte. Closing a controller or PTY stream leaves the interactive process
-running for daemon-lifetime and durable sessions, with up to 1 MiB of output
-available for replay. Ephemeral sessions still terminate their jobs on detach.
-
-While an interactive process has focus, `Ctrl-]` is the default configurable command
-prefix: `d` detaches to the xshell session-control prompt, `s` opens the unified session
-switcher, `l` selects the last session, `n`/`p` cycle, `q` terminates, `?` shows
-help, and a second `Ctrl-]` sends the prefix literally. The switcher shows what
-each session is doing and can create a fresh session on the currently connected
-host; selecting an idle session opens its prompt, while selecting a session with
-an interactive process resumes it. `//switch HOST:SESSION` has the same behavior
-from the prompt. `//sessions` is the common catalog and `//stop` stops the current
-session's activity.
-Configure the prefix with `session_fabric.pty_escape`.
-
-An interactive process occupies its session's execution slot. At the control
-prompt, use `//resume`, `//switch`, or `//stop`; `//resume` also follows a
-detached agent turn. Start new agent and shell work in an
-idle session rather than racing it against the process.
-
-The PTY data plane uses a dedicated authenticated binary stream locally and over SSH.
-See [the terminal-job design and trust boundary](docs/pty.md).
-
-See [the session-fabric protocol and current boundary](docs/session-fabric.md).
-
-## Audit logging
-
-The audit service records xshell interactions in hash-chained JSONL logs and
-creates periodic and final Ed25519-signed checkpoints. Each checkpoint includes
-a blinded commitment intended for future peer federation or public timestamp
-anchoring.
-
-For a local functional test, enable the `[audit]` section in
-`config.example.toml`, then start the daemon before xshell:
-
-```sh
-cargo run -p xshell-audit --bin xshell-auditd -- \
-  --directory "$HOME/.local/state/xshell/audit" \
-  --socket "$HOME/.local/state/xshell/audit/audit.sock"
-
-cargo run -p xshell-cli -- --config config.example.toml
-```
-
-Both daemons refuse directories they do not own or that are group/world
-writable, so avoid shared locations such as `/tmp`, where another local user
-could pre-create the path.
-
-This same-user development setup is not protected from shell commands. A
-tamper-resistant installation must run the daemon under a dedicated OS account
-with an audit directory inaccessible to xshell and its child processes. See
-[the audit design and deployment notes](docs/auditing.md), including the
-current stdout/stderr capture limitation and example launchd/systemd units.
-
-## Tool safety
-
-Agent file tools are confined to the current xshell working directory after
-canonical path resolution, including symlink resolution. Read-only file tools
-run automatically and are shown in the transcript. Every agent-requested shell
-command displays the exact command and, in the default `ask` mode, requires
-explicit confirmation. `--approval auto` removes that confirmation and should
-only be used in a trusted workspace; `--approval off` denies shell tools.
-When a session daemon executes turns, its `session_fabric.max_approval`
-setting (default `ask`) caps whatever the CLI requests, so a remote host's
-operator decides whether unattended shell execution is allowed there.
-Shell tools are non-interactive, run in a plain (non-login) shell so the
-user's profile is not sourced for model-authored commands, execute in their
-own process group, and have bounded output. After 60 seconds the entire process
-group is killed, so background jobs and pipelines cannot outlive the timeout.
-The approval prompt shows the command with control characters, newlines, and
-invisible Unicode formatting rendered as visible escapes, so the text you
-approve is exactly the text the shell will receive.
-
-At an approval prompt, `y` executes the requested command, `n` or Enter denies
-that command while allowing the agent turn to continue, and `q` aborts the
-entire agent turn and returns to the xshell prompt.
-
-The working directory is therefore a meaningful trust boundary. Avoid starting
-xshell in a directory containing secrets you do not want the configured model
-provider to receive. As a backstop, reads and listings of paths that match
-`session_fabric.sensitive_paths` (defaults cover `.env`, private keys,
-`.ssh/`, `.aws/`, `.git/config`, Terraform state, and similar) are promoted
-from automatic to approval-gated: `ask` prompts with the reason, `off` denies,
-and `auto` still runs them. Matching uses the resolved path, so a symlink
-with an innocent name does not bypass it.
-
-This is an early prototype; review tool requests and use it only on data you
-can recover.
-
-See [the specification](xshell-specification.md) and
-[the implementation plan](xshell-implementation-plan.md) for the intended
-system.
+Licensed under the [MIT License](LICENSE).
