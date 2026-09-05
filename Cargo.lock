@@ -1994,7 +1994,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xshell-adapters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-execution"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-platform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-pty"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "xshell-view"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

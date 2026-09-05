@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtyDescriptor, PtySize, PtyTicket,
+    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtySize, PtyTicket,
     SESSION_PROTOCOL_VERSION, SessionCreation, SessionDescriptor, SessionSnapshot,
     ShellCompletionResult, TurnInput, ViewResource,
 };
@@ -69,13 +69,12 @@ pub enum ClientRequest {
         size: PtySize,
         terminal_type: Option<String>,
     },
-    PtyList,
     PtyAttach {
         session_id: String,
         after_offset: Option<u64>,
     },
     PtyClose {
-        pty_id: String,
+        session_id: String,
     },
     PtyClaim {
         ticket: String,
@@ -137,9 +136,6 @@ pub enum ServerResponse {
     },
     PtyStarted {
         ticket: PtyTicket,
-    },
-    PtyCatalog {
-        ptys: Vec<PtyDescriptor>,
     },
     PtyAttached {
         ticket: PtyTicket,

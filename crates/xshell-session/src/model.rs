@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-// Version 10 adds `ExecutionEvent::HistoryCompacted`. Tagged enum variants are
-// not forward-compatible in serde, so older peers must be rejected during the
-// handshake instead of failing partway through an event stream.
-pub const SESSION_PROTOCOL_VERSION: u32 = 10;
+// Version 11 makes a session's current activity self-describing. Controllers
+// no longer need to join the session and PTY catalogs to distinguish agent
+// work from an interactive process.
+pub const SESSION_PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -122,13 +122,88 @@ pub enum SessionStatus {
     Detached,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum AgentTurnPhase {
+    Running,
+    WaitingApproval,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionActivity {
     #[default]
     Idle,
-    Running,
-    WaitingApproval,
+    AgentTurn {
+        turn_id: String,
+        phase: AgentTurnPhase,
+    },
+    InteractiveProcess {
+        command: String,
+        attached: bool,
+    },
+}
+
+impl SessionActivity {
+    pub fn is_interactive_process(&self) -> bool {
+        matches!(self, Self::InteractiveProcess { .. })
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionActivity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyActivity {
+            Idle,
+            Running,
+            WaitingApproval,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum CurrentActivity {
+            Idle,
+            AgentTurn {
+                turn_id: String,
+                phase: AgentTurnPhase,
+            },
+            InteractiveProcess {
+                command: String,
+                attached: bool,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ActivityRepresentation {
+            Legacy(LegacyActivity),
+            Current(CurrentActivity),
+        }
+
+        Ok(match ActivityRepresentation::deserialize(deserializer)? {
+            ActivityRepresentation::Legacy(LegacyActivity::Idle)
+            | ActivityRepresentation::Current(CurrentActivity::Idle) => Self::Idle,
+            ActivityRepresentation::Legacy(LegacyActivity::Running) => Self::AgentTurn {
+                turn_id: String::new(),
+                phase: AgentTurnPhase::Running,
+            },
+            ActivityRepresentation::Legacy(LegacyActivity::WaitingApproval) => Self::AgentTurn {
+                turn_id: String::new(),
+                phase: AgentTurnPhase::WaitingApproval,
+            },
+            ActivityRepresentation::Current(CurrentActivity::AgentTurn { turn_id, phase }) => {
+                Self::AgentTurn { turn_id, phase }
+            }
+            ActivityRepresentation::Current(CurrentActivity::InteractiveProcess {
+                command,
+                attached,
+            }) => Self::InteractiveProcess { command, attached },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,14 +353,31 @@ pub struct PtyTicket {
     pub replay_from: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PtyDescriptor {
-    pub pty_id: String,
-    pub session_id: String,
-    pub command: String,
-    pub attached: bool,
-    pub running: bool,
-    pub exit_status: Option<String>,
-    pub replay_start: u64,
-    pub replay_end: u64,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_activity_is_typed_and_reads_legacy_durable_values() {
+        let activity = SessionActivity::InteractiveProcess {
+            command: "emacs -nw notes.md".into(),
+            attached: false,
+        };
+        let encoded = serde_json::to_string(&activity).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionActivity>(&encoded).unwrap(),
+            activity
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionActivity>("\"idle\"").unwrap(),
+            SessionActivity::Idle
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionActivity>("\"waiting_approval\"").unwrap(),
+            SessionActivity::AgentTurn {
+                turn_id: String::new(),
+                phase: AgentTurnPhase::WaitingApproval,
+            }
+        );
+    }
 }

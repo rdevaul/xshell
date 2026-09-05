@@ -26,7 +26,8 @@ pub enum ControlCommand {
     View(String),
     Connect(Vec<String>),
     Sessions,
-    Terminal(Vec<String>),
+    Resume(Vec<String>),
+    Stop(Vec<String>),
     New(Vec<String>),
     Switch(Vec<String>),
     Detach,
@@ -76,7 +77,8 @@ fn parse_control(input: &str) -> ControlCommand {
         "agent" => ControlCommand::Agent(args),
         "connect" => ControlCommand::Connect(args),
         "sessions" => ControlCommand::Sessions,
-        "terminal" => ControlCommand::Terminal(args),
+        "resume" => ControlCommand::Resume(args),
+        "stop" => ControlCommand::Stop(args),
         "new" => ControlCommand::New(args),
         "switch" => ControlCommand::Switch(args),
         "detach" => ControlCommand::Detach,
@@ -309,8 +311,12 @@ mod tests {
             InputRoute::Control(ControlCommand::Sessions)
         );
         assert_eq!(
-            classify_input("//terminal list"),
-            InputRoute::Control(ControlCommand::Terminal(vec!["list".into()]))
+            classify_input("//stop"),
+            InputRoute::Control(ControlCommand::Stop(Vec::new()))
+        );
+        assert_eq!(
+            classify_input("//resume"),
+            InputRoute::Control(ControlCommand::Resume(Vec::new()))
         );
         assert_eq!(
             classify_input("//detach"),

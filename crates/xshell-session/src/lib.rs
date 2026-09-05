@@ -14,8 +14,8 @@ pub use client::SessionClient;
 pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;
 pub use model::{
-    AccessMode, ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PersistenceMode,
-    PtyDescriptor, PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, SessionActivity, SessionConfig,
+    AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, EventBatch, ModelBinding,
+    PersistenceMode, PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, SessionActivity, SessionConfig,
     SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind, SessionSnapshot,
     SessionStatus, ShellCompletionCandidate, ShellCompletionResult, TurnInput, ViewResource,
     Visibility,

@@ -1,4 +1,4 @@
-use crate::{PtyDescriptor, PtySize, PtyTicket, SessionAuditHandle};
+use crate::{PtySize, PtyTicket, SessionActivity, SessionAuditHandle};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -187,18 +187,6 @@ impl PtyCoordinator {
         })
     }
 
-    pub fn list(&self) -> Vec<PtyDescriptor> {
-        self.inner
-            .lock_recover()
-            .iter()
-            .map(|(pty_id, managed)| descriptor(pty_id, managed))
-            .collect()
-    }
-
-    pub fn session_id(&self, pty_id: &str) -> Result<String> {
-        Ok(self.get(pty_id)?.session_id.clone())
-    }
-
     pub fn attach(&self, session_id: &str, after_offset: Option<u64>) -> Result<PtyTicket> {
         let (pty_id, managed) = self
             .inner
@@ -332,7 +320,7 @@ impl PtyCoordinator {
         Ok(())
     }
 
-    pub fn terminate_session(&self, session_id: &str) {
+    pub fn terminate_session(&self, session_id: &str) -> bool {
         let removed = {
             let mut ptys = self.inner.lock_recover();
             let ids = ptys
@@ -347,11 +335,30 @@ impl PtyCoordinator {
         for managed in &removed {
             shutdown(managed);
         }
+        !removed.is_empty()
     }
 
     pub fn has_session(&self, session_id: &str) -> bool {
         self.inner.lock_recover().values().any(|pty| {
             pty.session_id == session_id && pty.state.lock_recover().exit_status.is_none()
+        })
+    }
+
+    pub fn session_activity(&self, session_id: &str) -> Option<SessionActivity> {
+        self.inner.lock_recover().values().find_map(|pty| {
+            if pty.session_id != session_id {
+                return None;
+            }
+            let state = pty.state.lock_recover();
+            if state.exit_status.is_some() {
+                return None;
+            }
+            drop(state);
+            let attached = pty.stream.lock_recover().claimed.is_some();
+            Some(SessionActivity::InteractiveProcess {
+                command: pty.command.clone(),
+                attached,
+            })
         })
     }
 
@@ -479,21 +486,6 @@ fn shutdown(managed: &ManagedPty) {
     // Record termination synchronously so session closure cannot finalize and
     // remove the audit stream before the worker observes the shutdown flag.
     finish(managed, "terminated".into());
-}
-
-fn descriptor(pty_id: &str, managed: &ManagedPty) -> PtyDescriptor {
-    let stream = managed.stream.lock_recover();
-    let state = managed.state.lock_recover();
-    PtyDescriptor {
-        pty_id: pty_id.to_owned(),
-        session_id: managed.session_id.clone(),
-        command: managed.command.clone(),
-        attached: stream.claimed.is_some(),
-        running: state.exit_status.is_none(),
-        exit_status: state.exit_status.clone(),
-        replay_start: state.replay_start,
-        replay_end: state.replay_end,
-    }
 }
 
 fn validate_command(command: &str) -> Result<()> {

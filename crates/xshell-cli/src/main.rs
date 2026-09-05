@@ -170,26 +170,32 @@ async fn main() -> Result<()> {
         args.approval,
     );
 
-    if let Some(turn_id) = sessions.active_turn_id().map(str::to_owned) {
-        println!("reattaching to active turn {turn_id}");
-        let snapshot = follow_daemon_turn(&mut sessions, &mut audit, render_options)?;
-        apply_runtime_snapshot(
-            snapshot,
-            &mut active_model,
-            &mut agent,
-            &mut cwd,
-            &mut history,
-            &args.system_prompt,
-            &mut editor,
-            true,
-        )?;
-    }
+    resume_active_session(
+        &mut sessions,
+        pty_escape,
+        &mut active_model,
+        &mut agent,
+        &mut cwd,
+        &mut history,
+        &args.system_prompt,
+        &mut editor,
+        &mut audit,
+        render_options,
+    )?;
 
     let mut sticky_shell = false;
     let exit_reason = loop {
+        let activity = sessions
+            .active()
+            .map_or("", |session| match &session.activity {
+                xshell_session::SessionActivity::Idle => "",
+                xshell_session::SessionActivity::AgentTurn { .. } => " agent-active",
+                xshell_session::SessionActivity::InteractiveProcess { .. } => " interactive",
+            });
         let prompt = format!(
-            "[{} {} {}] › ",
+            "[{}{} {} {}] › ",
             session_label(&sessions),
+            activity,
             active_model_label(&active_model),
             compact_path(&cwd)
         );
@@ -229,6 +235,17 @@ async fn main() -> Result<()> {
             }
         }
 
+        if matches!(route, InputRoute::Agent(_) | InputRoute::Shell(_))
+            && sessions
+                .active()
+                .is_some_and(|session| session.activity.is_interactive_process())
+        {
+            eprintln!(
+                "xshell: this session has an interactive process; use //resume, //switch, or //stop"
+            );
+            continue;
+        }
+
         match route {
             InputRoute::Empty => {}
             InputRoute::Shell(command) => {
@@ -264,6 +281,23 @@ async fn main() -> Result<()> {
                             )?;
                             refresh_shell_completions(&sessions, &mut editor);
                             refresh_session_completions(&mut sessions, &mut editor);
+                            audit_logical_session_attached(&mut audit, &sessions, "escape_switch")?;
+                            resume_active_session(
+                                &mut sessions,
+                                pty_escape,
+                                &mut active_model,
+                                &mut agent,
+                                &mut cwd,
+                                &mut history,
+                                &args.system_prompt,
+                                &mut editor,
+                                &mut audit,
+                                render_options,
+                            )?;
+                        } else {
+                            // The process may have exited, returning this session
+                            // to its ordinary prompt.
+                            sessions.refresh_snapshot()?;
                         }
                         continue;
                     }
@@ -364,66 +398,34 @@ async fn main() -> Result<()> {
                 }
                 refresh_session_completions(&mut sessions, &mut editor);
             }
-            InputRoute::Control(ControlCommand::Terminal(terminal_args)) => {
-                match terminal_args.as_slice() {
-                    [command] if command == "list" => match sessions.terminal_jobs() {
-                        Ok(jobs) if jobs.is_empty() => println!("no terminal jobs"),
-                        Ok(jobs) => {
-                            for (session, terminal) in jobs {
-                                let state = terminal.exit_status.as_deref().unwrap_or(
-                                    if terminal.attached {
-                                        "attached"
-                                    } else {
-                                        "running"
-                                    },
-                                );
-                                println!(
-                                    "{}:{}  {}  {} — {}",
-                                    session.host_alias,
-                                    session.name,
-                                    state,
-                                    session.cwd.display(),
-                                    terminal.command
-                                );
-                            }
-                        }
-                        Err(error) => eprintln!("xshell: {error:#}"),
-                    },
-                    [command] if command == "kill" => {
-                        if let Err(error) = sessions.pty_close_current() {
-                            eprintln!("xshell: {error:#}");
-                        } else {
-                            println!("terminal job terminated");
-                        }
-                    }
-                    _ if terminal_args.is_empty() || terminal_args.as_slice() == ["attach"] => {
-                        let previous_session = sessions.active().map(|session| session.id.clone());
-                        let result = run_existing_session_pty(&mut sessions, pty_escape);
-                        match result {
-                            Ok(outcome) if outcome != "exit status: 0" => {
-                                println!("xshell: {outcome}")
-                            }
-                            Ok(_) => {}
-                            Err(error) => eprintln!("xshell: {error:#}"),
-                        }
-                        if sessions.active().map(|session| &session.id) != previous_session.as_ref()
-                        {
-                            let snapshot = sessions.refresh_snapshot()?;
-                            apply_runtime_snapshot(
-                                snapshot,
-                                &mut active_model,
-                                &mut agent,
-                                &mut cwd,
-                                &mut history,
-                                &args.system_prompt,
-                                &mut editor,
-                                true,
-                            )?;
-                            refresh_shell_completions(&sessions, &mut editor);
-                            refresh_session_completions(&mut sessions, &mut editor);
-                        }
-                    }
-                    _ => eprintln!("xshell: usage: //terminal [attach|list|kill]"),
+            InputRoute::Control(ControlCommand::Stop(stop_args)) => {
+                if !stop_args.is_empty() {
+                    eprintln!("xshell: usage: //stop");
+                    continue;
+                }
+                match sessions.stop_current_activity() {
+                    Ok(outcome) => println!("xshell: {outcome}"),
+                    Err(error) => eprintln!("xshell: {error:#}"),
+                }
+            }
+            InputRoute::Control(ControlCommand::Resume(resume_args)) => {
+                if !resume_args.is_empty() {
+                    eprintln!("xshell: usage: //resume");
+                    continue;
+                }
+                if let Err(error) = resume_active_session(
+                    &mut sessions,
+                    pty_escape,
+                    &mut active_model,
+                    &mut agent,
+                    &mut cwd,
+                    &mut history,
+                    &args.system_prompt,
+                    &mut editor,
+                    &mut audit,
+                    render_options,
+                ) {
+                    eprintln!("xshell: could not resume session activity: {error:#}");
                 }
             }
             InputRoute::Control(ControlCommand::Switch(session_args)) => {
@@ -448,7 +450,7 @@ async fn main() -> Result<()> {
                         refresh_shell_completions(&sessions, &mut editor);
                         audit_logical_session_attached(&mut audit, &sessions, "switch")?;
                         refresh_session_completions(&mut sessions, &mut editor);
-                        if let Err(error) = resume_active_terminal_if_running(
+                        if let Err(error) = resume_active_session(
                             &mut sessions,
                             pty_escape,
                             &mut active_model,
@@ -457,8 +459,10 @@ async fn main() -> Result<()> {
                             &mut history,
                             &args.system_prompt,
                             &mut editor,
+                            &mut audit,
+                            render_options,
                         ) {
-                            eprintln!("xshell: could not resume terminal job: {error:#}");
+                            eprintln!("xshell: could not resume session activity: {error:#}");
                         }
                     }
                     Err(error) => eprintln!("xshell: {error:#}"),
