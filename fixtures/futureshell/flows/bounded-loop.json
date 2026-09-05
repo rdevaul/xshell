@@ -1,0 +1,72 @@
+{
+  "schema": "xshell.flow/v0",
+  "name": "bounded_refinement",
+  "interface": {
+    "inputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }],
+    "outputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }]
+  },
+  "contracts": [
+    {
+      "id": "acceptable",
+      "expression": { "op": "predicate", "name": "analysis.max_stress_below", "arguments": { "limit_mpa": 250 } }
+    }
+  ],
+  "nodes": [
+    { "id": "input", "kind": "input", "outputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }] },
+    {
+      "id": "analyze",
+      "kind": "task",
+      "program": { "source": "analyze.fsh" },
+      "inputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }],
+      "outputs": [
+        { "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } },
+        { "name": "evidence", "type": { "kind": "evidence" } }
+      ]
+    },
+    {
+      "id": "acceptable_gate",
+      "kind": "gate",
+      "contract": "acceptable",
+      "inputs": [
+        { "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } },
+        { "name": "evidence", "type": { "kind": "evidence" } }
+      ]
+    },
+    {
+      "id": "repair",
+      "kind": "task",
+      "program": { "source": "repair.fsh" },
+      "inputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }],
+      "outputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }]
+    },
+    {
+      "id": "finalize",
+      "kind": "task",
+      "program": { "source": "finalize.fsh" },
+      "inputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }],
+      "outputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }]
+    },
+    { "id": "output", "kind": "output", "inputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }] }
+  ],
+  "edges": [
+    { "id": "initial_model", "kind": "data", "from": { "node": "input", "port": "model" }, "to": { "node": "analyze", "port": "model" } },
+    { "id": "analysis_to_gate", "kind": "data", "from": { "node": "analyze", "port": "analysis" }, "to": { "node": "acceptable_gate", "port": "analysis" } },
+    { "id": "evidence_to_gate", "kind": "data", "from": { "node": "analyze", "port": "evidence" }, "to": { "node": "acceptable_gate", "port": "evidence" } },
+    { "id": "analysis_to_repair", "kind": "data", "from": { "node": "analyze", "port": "analysis" }, "to": { "node": "repair", "port": "analysis" } },
+    { "id": "invalid_route", "kind": "route", "outcome": "invalid", "from": { "node": "acceptable_gate" }, "to": { "node": "repair" } },
+    { "id": "revised_model", "kind": "feedback", "loop_region": "refine", "state": "model", "from": { "node": "repair", "port": "model" }, "to": { "node": "analyze", "port": "model" } },
+    { "id": "valid_route", "kind": "route", "outcome": "valid", "from": { "node": "acceptable_gate" }, "to": { "node": "finalize" } },
+    { "id": "analysis_to_finalize", "kind": "data", "from": { "node": "analyze", "port": "analysis" }, "to": { "node": "finalize", "port": "analysis" } },
+    { "id": "finalize_to_output", "kind": "data", "from": { "node": "finalize", "port": "analysis" }, "to": { "node": "output", "port": "analysis" } }
+  ],
+  "regions": [
+    {
+      "id": "refine",
+      "kind": "loop",
+      "nodes": ["analyze", "acceptable_gate", "repair"],
+      "max_iterations": 8,
+      "until": { "gate": "acceptable_gate", "outcome": "valid" },
+      "on_exhausted": "fail"
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "schema": "xshell.flow/v0",
+  "name": "contract_branch",
+  "interface": {
+    "inputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }],
+    "outputs": [{ "name": "published", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }]
+  },
+  "contracts": [
+    {
+      "id": "valid_analysis",
+      "expression": {
+        "op": "all",
+        "clauses": [
+          { "op": "predicate", "name": "task.succeeded", "arguments": { "task": "analyze" } },
+          { "op": "predicate", "name": "artifact.matches_schema", "arguments": { "port": "analyze.analysis", "schema": "fea-result-v1" } }
+        ]
+      }
+    }
+  ],
+  "nodes": [
+    { "id": "input", "kind": "input", "outputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }] },
+    {
+      "id": "analyze",
+      "kind": "task",
+      "program": { "source": "analyze.fsh" },
+      "inputs": [{ "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }],
+      "outputs": [
+        { "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } },
+        { "name": "evidence", "type": { "kind": "evidence" } }
+      ]
+    },
+    {
+      "id": "accept",
+      "label": "Analysis acceptable?",
+      "kind": "gate",
+      "contract": "valid_analysis",
+      "inputs": [
+        { "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } },
+        { "name": "evidence", "type": { "kind": "evidence" } }
+      ]
+    },
+    {
+      "id": "publish",
+      "kind": "task",
+      "program": { "source": "publish.fsh" },
+      "inputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }],
+      "outputs": [{ "name": "published", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }]
+    },
+    {
+      "id": "repair",
+      "kind": "task",
+      "program": { "source": "repair.fsh" },
+      "inputs": [{ "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }]
+    },
+    { "id": "output", "kind": "output", "inputs": [{ "name": "published", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }] }
+  ],
+  "edges": [
+    { "id": "input_to_analyze", "kind": "data", "from": { "node": "input", "port": "model" }, "to": { "node": "analyze", "port": "model" } },
+    { "id": "analysis_to_gate", "kind": "data", "from": { "node": "analyze", "port": "analysis" }, "to": { "node": "accept", "port": "analysis" } },
+    { "id": "evidence_to_gate", "kind": "data", "from": { "node": "analyze", "port": "evidence" }, "to": { "node": "accept", "port": "evidence" } },
+    { "id": "analysis_to_publish", "kind": "data", "from": { "node": "analyze", "port": "analysis" }, "to": { "node": "publish", "port": "analysis" } },
+    { "id": "analysis_to_repair", "kind": "data", "from": { "node": "analyze", "port": "analysis" }, "to": { "node": "repair", "port": "analysis" } },
+    { "id": "valid_route", "kind": "route", "outcome": "valid", "from": { "node": "accept" }, "to": { "node": "publish" } },
+    { "id": "invalid_route", "kind": "route", "outcome": "invalid", "from": { "node": "accept" }, "to": { "node": "repair" } },
+    { "id": "publish_to_output", "kind": "data", "from": { "node": "publish", "port": "published" }, "to": { "node": "output", "port": "published" } }
+  ]
+}

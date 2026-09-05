@@ -25,6 +25,10 @@ The current prototype supports:
 SSH federation, artifact rendering, and yapCAD integration are specified but
 not implemented yet.
 
+An experimental typed dataflow representation for FutureShell is available in
+`crates/xshell-flow`. It models tasks, contract-gated branches, parallel joins,
+and bounded feedback loops. See [the Flow IR prototype](docs/futureshell-flow-ir.md).
+
 ## Build and run
 
 Install Rust, then run:
