@@ -35,7 +35,10 @@ impl AuditClient {
                 signing_key_id,
             } => {
                 if protocol_version != AUDIT_PROTOCOL_VERSION {
-                    bail!("audit service selected unsupported protocol {protocol_version}");
+                    bail!(
+                        "audit service speaks protocol {protocol_version} but this client requires {AUDIT_PROTOCOL_VERSION}; \
+                         the running xshell-auditd is a different build — restart xshell-auditd from the same build"
+                    );
                 }
                 client.session_id = session_id;
                 client.signing_key_id = signing_key_id;
