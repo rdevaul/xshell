@@ -62,7 +62,6 @@ control commands:
   //sessions        list named sessions on connected hosts
   //resume          resume the current session's agent turn or interactive process
   //stop            stop the current session's agent turn or interactive process
-  //terminal        compatibility alias for resuming an interactive process
   //new NAME        create and switch to a daemon-lifetime session
   //switch SESSION  switch locally or across connected hosts
   //detach          detach, preserving a persistent session, and exit
@@ -102,7 +101,6 @@ control commands:
         | ControlCommand::Sessions
         | ControlCommand::Resume(_)
         | ControlCommand::Stop(_)
-        | ControlCommand::Terminal(_)
         | ControlCommand::New(_)
         | ControlCommand::Switch(_)
         | ControlCommand::Detach

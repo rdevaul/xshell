@@ -463,14 +463,6 @@ session's interactive process is running; stop it first"
         self.navigation_history.last().map(String::as_str)
     }
 
-    pub fn interactive_sessions(&mut self) -> Result<Vec<SessionDescriptor>> {
-        Ok(self
-            .session_targets()?
-            .into_iter()
-            .filter(|session| session.activity.is_interactive_process())
-            .collect())
-    }
-
     pub fn pty_close_current(&mut self) -> Result<()> {
         let session_id = self.active_session_id()?;
         self.client_mut()?.pty_close(session_id.clone())?;

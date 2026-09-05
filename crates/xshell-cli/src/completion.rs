@@ -22,7 +22,6 @@ const CONTROL_COMMANDS: &[&str] = &[
     "//status",
     "//stop",
     "//switch",
-    "//terminal",
     "//tools",
     "//view",
 ];
@@ -30,7 +29,6 @@ const CONTROL_COMMANDS: &[&str] = &[
 /// Sub-commands recognised after `//model`.
 const MODEL_SUBCOMMANDS: &[&str] = &["list", "show", "use"];
 const VIEWERS: &[&str] = &["markdown", "rst"];
-const TERMINAL_SUBCOMMANDS: &[&str] = &["attach", "kill", "list"];
 
 pub struct XshellHelper {
     cwd: PathBuf,
@@ -134,16 +132,6 @@ impl Completer for XshellHelper {
 
             if let Some(result) =
                 complete_single_argument(line, pos, "//switch", &self.session_names)
-            {
-                return Ok(result);
-            }
-
-            let terminal_commands = TERMINAL_SUBCOMMANDS
-                .iter()
-                .map(|command| (*command).to_owned())
-                .collect::<Vec<_>>();
-            if let Some(result) =
-                complete_single_argument(line, pos, "//terminal", &terminal_commands)
             {
                 return Ok(result);
             }

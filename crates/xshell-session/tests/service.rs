@@ -207,13 +207,18 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
     assert!(first_proxy.wait().unwrap().success());
 
     let descriptor = owner
-        .pty_list()
+        .list()
         .unwrap()
         .into_iter()
-        .find(|pty| pty.pty_id == ticket.pty_id)
+        .find(|candidate| candidate.id == session.descriptor.id)
         .unwrap();
-    assert!(descriptor.running);
-    assert!(!descriptor.attached);
+    assert!(matches!(
+        descriptor.activity,
+        SessionActivity::InteractiveProcess {
+            attached: false,
+            ..
+        }
+    ));
     let ticket = owner
         .pty_attach(session.descriptor.id, Some(cursor))
         .unwrap();
@@ -661,10 +666,10 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             terminal_type: Some("xterm-256color".into()),
         },
     );
-    let pty_id = match receive_response(&mut reader) {
-        ServerResponse::PtyStarted { ticket } => ticket.pty_id,
-        response => panic!("unexpected PTY start response: {response:?}"),
-    };
+    assert!(matches!(
+        receive_response(&mut reader),
+        ServerResponse::PtyStarted { .. }
+    ));
     send_request(&mut writer, &ClientRequest::List);
     assert!(matches!(
         receive_response(&mut reader),
@@ -676,12 +681,6 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
                         SessionActivity::InteractiveProcess { .. }
                     )
             })
-    ));
-    send_request(&mut writer, &ClientRequest::PtyList);
-    assert!(matches!(
-        receive_response(&mut reader),
-        ServerResponse::PtyCatalog { ptys }
-            if ptys.iter().any(|pty| pty.pty_id == pty_id && pty.running)
     ));
     send_request(
         &mut writer,
@@ -757,14 +756,11 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
     assert!(proxy.wait().unwrap().success());
 
     let mut after_disconnect = connect_when_ready(&socket);
-    after_disconnect.attach(remote_home_id.clone()).unwrap();
-    let persistent = after_disconnect
-        .pty_list()
-        .unwrap()
-        .into_iter()
-        .find(|pty| pty.session_id == remote_home_id)
-        .expect("terminal job should survive control disconnect");
-    assert!(persistent.running);
+    let persistent = after_disconnect.attach(remote_home_id.clone()).unwrap();
+    assert!(matches!(
+        persistent.descriptor.activity,
+        SessionActivity::InteractiveProcess { .. }
+    ));
     after_disconnect.pty_close(remote_home_id).unwrap();
 }
 
@@ -1148,10 +1144,11 @@ fn daemon_audits_execution_without_an_attached_client() {
         .unwrap();
     for _ in 0..100 {
         let finished = reconnected
-            .pty_list()
+            .list()
             .unwrap()
             .iter()
-            .any(|pty| pty.command == pty_command && !pty.running);
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .is_some_and(|candidate| candidate.activity == SessionActivity::Idle);
         if finished {
             break;
         }
@@ -1159,10 +1156,11 @@ fn daemon_audits_execution_without_an_attached_client() {
     }
     assert!(
         reconnected
-            .pty_list()
+            .list()
             .unwrap()
             .iter()
-            .any(|pty| pty.command == pty_command && !pty.running),
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .is_some_and(|candidate| candidate.activity == SessionActivity::Idle),
         "terminal job did not finish"
     );
     // Closing the xshell session finalizes its audit log.
@@ -1259,7 +1257,7 @@ fn required_audit_failure_prevents_pty_process_creation() {
     let command = format!("touch {}", marker.display());
     let error = client
         .pty_start(
-            session.descriptor.id,
+            session.descriptor.id.clone(),
             command.clone(),
             PtySize {
                 rows: 24,
@@ -1271,12 +1269,15 @@ fn required_audit_failure_prevents_pty_process_creation() {
 
     assert!(error.to_string().contains("required audit"));
     assert!(!marker.exists());
-    assert!(
-        !client
-            .pty_list()
+    assert_eq!(
+        client
+            .list()
             .unwrap()
-            .iter()
-            .any(|pty| pty.command == command)
+            .into_iter()
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .unwrap()
+            .activity,
+        SessionActivity::Idle
     );
 }
 

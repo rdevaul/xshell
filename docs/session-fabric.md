@@ -170,8 +170,6 @@ work.
   session cwd, with media type, length, and SHA-256 metadata.
 - `pty_start`: start one session-owned interactive process and return its internal PTY ID and a
   one-time stream ticket.
-- `pty_list`: diagnostic listing of PTY internals; ordinary controllers use the
-  unified session catalog instead.
 - `pty_attach`: mint a one-time ticket at a bounded replay offset.
 - `pty_claim`: consume a ticket on a dedicated daemon connection before binary
   framing begins.

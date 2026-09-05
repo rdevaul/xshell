@@ -74,8 +74,7 @@ host using the current model, cwd, and system prompt. This makes it possible to
 leave Emacs running and immediately create a new workspace. `//sessions` shows
 the same catalog, `//switch` uses the same resume behavior, and `//stop`
 terminates the current activity. Agent turns are resumed through this same
-session-selection path. The `//terminal` command family is retained as
-a compatibility alias during the transition.
+session-selection path.
 
 The control prompt is deliberately not a concurrent agent REPL: an interactive
 process occupies the session's single execution slot. Agent or shell input there

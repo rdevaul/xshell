@@ -353,18 +353,6 @@ pub struct PtyTicket {
     pub replay_from: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PtyDescriptor {
-    pub pty_id: String,
-    pub session_id: String,
-    pub command: String,
-    pub attached: bool,
-    pub running: bool,
-    pub exit_status: Option<String>,
-    pub replay_start: u64,
-    pub replay_end: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

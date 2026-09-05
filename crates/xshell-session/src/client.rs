@@ -1,7 +1,7 @@
 use crate::{
-    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding, PtyDescriptor, PtySize,
-    PtyTicket, SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor,
-    SessionSnapshot, ShellCompletionResult, TurnInput, ViewResource,
+    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding, PtySize, PtyTicket,
+    SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot,
+    ShellCompletionResult, TurnInput, ViewResource,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -304,14 +304,6 @@ impl SessionClient {
         match self.receive()? {
             ServerResponse::PtyStarted { ticket } => Ok(ticket),
             response => response_error("PTY start", response),
-        }
-    }
-
-    pub fn pty_list(&mut self) -> Result<Vec<PtyDescriptor>> {
-        self.send(&ClientRequest::PtyList)?;
-        match self.receive()? {
-            ServerResponse::PtyCatalog { ptys } => Ok(ptys),
-            response => response_error("PTY list", response),
         }
     }
 

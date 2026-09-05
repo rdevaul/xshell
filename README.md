@@ -252,7 +252,7 @@ each session is doing and can create a fresh session on the currently connected
 host; selecting an idle session opens its prompt, while selecting a session with
 an interactive process resumes it. `//switch HOST:SESSION` has the same behavior
 from the prompt. `//sessions` is the common catalog and `//stop` stops the current
-session's activity. The older `//terminal` commands remain compatibility aliases.
+session's activity.
 Configure the prefix with `session_fabric.pty_escape`.
 
 An interactive process occupies its session's execution slot. At the control

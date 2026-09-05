@@ -428,50 +428,6 @@ async fn main() -> Result<()> {
                     eprintln!("xshell: could not resume session activity: {error:#}");
                 }
             }
-            InputRoute::Control(ControlCommand::Terminal(terminal_args)) => {
-                eprintln!("xshell: //terminal is deprecated; use //sessions, //resume, or //stop");
-                match terminal_args.as_slice() {
-                    [command] if command == "list" => match sessions.interactive_sessions() {
-                        Ok(jobs) if jobs.is_empty() => println!("no interactive sessions"),
-                        Ok(jobs) => {
-                            for session in jobs {
-                                println!(
-                                    "{}:{} — {} — {}",
-                                    session.host_alias,
-                                    session.name,
-                                    session_activity_label(&session.activity),
-                                    session.cwd.display()
-                                );
-                            }
-                        }
-                        Err(error) => eprintln!("xshell: {error:#}"),
-                    },
-                    [command] if command == "kill" => {
-                        if let Err(error) = sessions.stop_current_activity() {
-                            eprintln!("xshell: {error:#}");
-                        } else {
-                            println!("interactive process stopped");
-                        }
-                    }
-                    _ if terminal_args.is_empty() || terminal_args.as_slice() == ["attach"] => {
-                        if let Err(error) = resume_active_session(
-                            &mut sessions,
-                            pty_escape,
-                            &mut active_model,
-                            &mut agent,
-                            &mut cwd,
-                            &mut history,
-                            &args.system_prompt,
-                            &mut editor,
-                            &mut audit,
-                            render_options,
-                        ) {
-                            eprintln!("xshell: could not resume session activity: {error:#}");
-                        }
-                    }
-                    _ => eprintln!("xshell: usage: //terminal [attach|list|kill]"),
-                }
-            }
             InputRoute::Control(ControlCommand::Switch(session_args)) => {
                 let selector = match session_args.as_slice() {
                     [selector] => selector,
