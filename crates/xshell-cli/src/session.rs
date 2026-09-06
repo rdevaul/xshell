@@ -476,13 +476,18 @@ session's interactive process is running; stop it first"
     pub fn events(&mut self, wait_ms: u64) -> Result<EventBatch> {
         let session_id = self.active_session_id()?;
         let after_sequence = self.event_cursors.get(&session_id).copied().unwrap_or(0);
-        let batch = self
-            .client_mut()?
-            .events(session_id.clone(), after_sequence, wait_ms)?;
-        if let Some(last) = batch.events.last() {
-            self.event_cursors.insert(session_id.clone(), last.sequence);
-        }
-        Ok(batch)
+        self.client_mut()?
+            .events(session_id, after_sequence, wait_ms)
+    }
+
+    /// Commit one event after the controller has handled it. In particular an
+    /// approval request is left unacknowledged when focus moves elsewhere, so
+    /// reattaching replays the request instead of stranding the daemon turn.
+    pub fn acknowledge_event(&mut self, sequence: u64) -> Result<()> {
+        let session_id = self.active_session_id()?;
+        let cursor = self.event_cursors.entry(session_id).or_insert(0);
+        *cursor = (*cursor).max(sequence);
+        Ok(())
     }
 
     pub fn approve(

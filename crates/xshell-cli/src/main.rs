@@ -153,6 +153,7 @@ async fn main() -> Result<()> {
     let model_profiles: Vec<String> = model_config.models.keys().cloned().collect();
     let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
         .context("could not initialize terminal input")?;
+    let controller_actions = bind_controller_keys(&mut editor, pty_escape);
     editor.set_helper(Some(XshellHelper::new(cwd.clone(), model_profiles)));
     refresh_session_completions(&mut sessions, &mut editor);
     refresh_shell_completions(&sessions, &mut editor);
@@ -207,6 +208,58 @@ async fn main() -> Result<()> {
         } {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
+                if let Some(action) = controller_actions.take() {
+                    match action {
+                        xshell_pty::ControllerAction::Help => {
+                            print_controller_help()?;
+                        }
+                        xshell_pty::ControllerAction::Detach => {
+                            println!("xshell: already at the session-control prompt");
+                        }
+                        xshell_pty::ControllerAction::Terminate => {
+                            match sessions.stop_current_activity() {
+                                Ok(outcome) => println!("xshell: {outcome}"),
+                                Err(error) => eprintln!("xshell: {error:#}"),
+                            }
+                        }
+                        action => match switch_from_controller_action(&mut sessions, action) {
+                            Ok(Some(snapshot)) => {
+                                apply_runtime_snapshot(
+                                    snapshot,
+                                    &mut active_model,
+                                    &mut agent,
+                                    &mut cwd,
+                                    &mut history,
+                                    &args.system_prompt,
+                                    &mut editor,
+                                    true,
+                                )?;
+                                refresh_shell_completions(&sessions, &mut editor);
+                                refresh_session_completions(&mut sessions, &mut editor);
+                                audit_logical_session_attached(
+                                    &mut audit,
+                                    &sessions,
+                                    "escape_switch",
+                                )?;
+                                resume_active_session(
+                                    &mut sessions,
+                                    pty_escape,
+                                    &mut active_model,
+                                    &mut agent,
+                                    &mut cwd,
+                                    &mut history,
+                                    &args.system_prompt,
+                                    &mut editor,
+                                    &mut audit,
+                                    render_options,
+                                )?;
+                            }
+                            Ok(None) => {}
+                            Err(error) => eprintln!("xshell: {error:#}"),
+                        },
+                    }
+                    continue;
+                }
                 println!("^C");
                 continue;
             }
@@ -301,26 +354,27 @@ async fn main() -> Result<()> {
                         }
                         continue;
                     }
-                    match run_daemon_turn(
-                        &mut sessions,
+                    let result = sessions.submit(
                         TurnInput::Shell {
                             command: command.clone(),
                         },
                         args.approval,
-                        &mut audit,
-                        render_options,
-                    ) {
-                        Ok(snapshot) => apply_runtime_snapshot(
-                            snapshot,
+                    );
+                    if let Err(error) = result.and_then(|_| {
+                        resume_active_session(
+                            &mut sessions,
+                            pty_escape,
                             &mut active_model,
                             &mut agent,
                             &mut cwd,
                             &mut history,
                             &args.system_prompt,
                             &mut editor,
-                            true,
-                        )?,
-                        Err(error) => eprintln!("xshell: {error:#}"),
+                            &mut audit,
+                            render_options,
+                        )
+                    }) {
+                        eprintln!("xshell: {error:#}");
                     }
                     continue;
                 }
@@ -582,31 +636,30 @@ async fn main() -> Result<()> {
             ),
             InputRoute::Agent(message) => {
                 if sessions.enabled() {
-                    match run_daemon_turn(
-                        &mut sessions,
+                    let result = sessions.submit(
                         TurnInput::Agent {
                             message: message.clone(),
                         },
                         args.approval,
-                        &mut audit,
-                        render_options,
-                    ) {
-                        Ok(snapshot) => apply_runtime_snapshot(
-                            snapshot,
+                    );
+                    if let Err(error) = result.and_then(|_| {
+                        resume_active_session(
+                            &mut sessions,
+                            pty_escape,
                             &mut active_model,
                             &mut agent,
                             &mut cwd,
                             &mut history,
                             &args.system_prompt,
                             &mut editor,
-                            true,
-                        )?,
-                        Err(error) => {
-                            let _ = audit.append_execution(AuditEvent::AgentError {
-                                message: format!("{error:#}"),
-                            });
-                            eprintln!("xshell agent error: {error:#}");
-                        }
+                            &mut audit,
+                            render_options,
+                        )
+                    }) {
+                        let _ = audit.append_execution(AuditEvent::AgentError {
+                            message: format!("{error:#}"),
+                        });
+                        eprintln!("xshell agent error: {error:#}");
                     }
                     continue;
                 }

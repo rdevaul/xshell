@@ -49,9 +49,11 @@ an acknowledged detach operation; explicit `pty_close` terminates the job.
 
 ## Escape router and unified session switching
 
-The local relay consumes a configurable prefix before ordinary input reaches
-the focused PTY. The default is `Ctrl-]`, configured as `pty_escape = "ctrl-]"`
-under `[session_fabric]`.
+The interactive controller consumes a configurable prefix before input reaches
+the focused activity. The same router is active at the xshell prompt, while a
+structured agent turn is streaming or waiting for approval, and while a PTY is
+attached. The default is `Ctrl-]`, configured as `pty_escape = "ctrl-]"` under
+`[session_fabric]`.
 
 | Sequence | Action |
 |---|---|
@@ -59,21 +61,25 @@ under `[session_fabric]`.
 | `Ctrl-] s` | Select or create a session interactively |
 | `Ctrl-] l` | Return to the previously focused session |
 | `Ctrl-] n` / `Ctrl-] p` | Cycle to the next/previous session |
-| `Ctrl-] q` | Terminate the focused job |
+| `Ctrl-] q` | Stop the focused agent turn or interactive process |
 | `Ctrl-] ?` | Show key help |
-| `Ctrl-] Ctrl-]` | Send a literal prefix byte |
+| `Ctrl-] Ctrl-]` | Send a literal prefix byte to a focused PTY |
 
 The keystroke is a local data-plane escape; listing, switching sessions,
 minting a fresh ticket, and claiming the selected stream remain authenticated
 control-plane operations. Every visible session is a switch target, and the
 picker labels it as a prompt, agent turn, or interactive process. Selecting it
-leaves raw mode and activates the session; an interactive process is resumed
-automatically, while an idle session opens at its prompt. The picker can also
-create a daemon-lifetime, fabric-visible sibling on the currently connected
-host using the current model, cwd, and system prompt. This makes it possible to
-leave Emacs running and immediately create a new workspace. `//sessions` shows
-the same catalog, `//switch` uses the same resume behavior, and `//stop`
-terminates the current activity. Agent turns are resumed through this same
+activates the session; active work is resumed automatically, while an idle
+session opens at its prompt. Switching away only releases controller focus: it
+does not cancel an agent turn, deny a pending approval, or terminate a PTY.
+Unanswered approval events remain replayable when the controller returns. The
+picker can also create a daemon-lifetime, fabric-visible sibling on the
+currently connected host using the current model, cwd, and system prompt. This
+makes it possible to leave Emacs running and immediately create a new
+workspace. `//sessions` shows the same catalog, `//switch` uses the same resume
+behavior, and `//stop` terminates the current activity. `Ctrl-] d` stops
+following structured output and returns to the same session's prompt;
+`//resume` follows it again. Agent turns are resumed through this same
 session-selection path.
 
 The control prompt is deliberately not a concurrent agent REPL: an interactive

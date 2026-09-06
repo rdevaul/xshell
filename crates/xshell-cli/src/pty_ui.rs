@@ -7,17 +7,127 @@ use crate::session::SessionRuntime;
 use crate::sessions_ui::*;
 use crate::turn::*;
 use anyhow::{Context, Result, bail};
-use rustyline::Editor;
 use rustyline::history::DefaultHistory;
+use rustyline::{
+    Cmd, ConditionalEventHandler, Editor, Event, EventContext, EventHandler, KeyEvent, RepeatCount,
+};
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use xshell_adapters::AgentAdapter;
 use xshell_core::ChatMessage;
 use xshell_view::RenderOptions;
 
 pub(crate) struct TerminalFocusOutcome {
     pub(crate) description: String,
+}
+
+#[derive(Default)]
+struct PromptControllerState {
+    prefix_pending: bool,
+    action: Option<xshell_pty::ControllerAction>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ControllerActionMailbox(Arc<Mutex<PromptControllerState>>);
+
+impl ControllerActionMailbox {
+    pub(crate) fn take(&self) -> Option<xshell_pty::ControllerAction> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .action
+            .take()
+    }
+}
+
+struct PromptControllerBinding {
+    mailbox: ControllerActionMailbox,
+    kind: PromptBindingKind,
+}
+
+#[derive(Clone, Copy)]
+enum PromptBindingKind {
+    Prefix,
+    Action(xshell_pty::ControllerAction),
+    Fallback,
+}
+
+fn route_prompt_binding(state: &mut PromptControllerState, kind: PromptBindingKind) -> Option<Cmd> {
+    match kind {
+        PromptBindingKind::Fallback => {
+            state.prefix_pending = false;
+            None
+        }
+        PromptBindingKind::Prefix => {
+            state.prefix_pending = true;
+            Some(Cmd::Noop)
+        }
+        PromptBindingKind::Action(_) if !state.prefix_pending => None,
+        PromptBindingKind::Action(action) => {
+            state.prefix_pending = false;
+            state.action = Some(action);
+            Some(Cmd::Interrupt)
+        }
+    }
+}
+
+impl ConditionalEventHandler for PromptControllerBinding {
+    fn handle(
+        &self,
+        _event: &Event,
+        _repeat: RepeatCount,
+        _positive: bool,
+        _context: &EventContext,
+    ) -> Option<Cmd> {
+        let mut state = self
+            .mailbox
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        route_prompt_binding(&mut state, self.kind)
+    }
+}
+
+pub(crate) fn bind_controller_keys(
+    editor: &mut Editor<XshellHelper, DefaultHistory>,
+    escape_prefix: u8,
+) -> ControllerActionMailbox {
+    let mailbox = ControllerActionMailbox::default();
+    let prefix = KeyEvent::from(char::from(escape_prefix));
+    editor.bind_sequence(
+        prefix,
+        EventHandler::Conditional(Box::new(PromptControllerBinding {
+            mailbox: mailbox.clone(),
+            kind: PromptBindingKind::Prefix,
+        })),
+    );
+    for (key, action) in [
+        ('d', xshell_pty::ControllerAction::Detach),
+        ('s', xshell_pty::ControllerAction::Switcher),
+        ('l', xshell_pty::ControllerAction::Last),
+        ('n', xshell_pty::ControllerAction::Next),
+        ('p', xshell_pty::ControllerAction::Previous),
+        ('q', xshell_pty::ControllerAction::Terminate),
+        ('?', xshell_pty::ControllerAction::Help),
+    ] {
+        editor.bind_sequence(
+            KeyEvent::from(key),
+            EventHandler::Conditional(Box::new(PromptControllerBinding {
+                mailbox: mailbox.clone(),
+                kind: PromptBindingKind::Action(action),
+            })),
+        );
+    }
+    editor.bind_sequence(
+        Event::Any,
+        EventHandler::Conditional(Box::new(PromptControllerBinding {
+            mailbox: mailbox.clone(),
+            kind: PromptBindingKind::Fallback,
+        })),
+    );
+    mailbox
 }
 
 pub(crate) fn run_session_pty(
@@ -61,38 +171,98 @@ pub(crate) fn resume_active_session(
     if !sessions.enabled() {
         return Ok(());
     }
-    if let Some(turn_id) = sessions.active_turn_id().map(str::to_owned) {
-        println!("reattaching to active turn {turn_id}");
-        let snapshot = follow_daemon_turn(sessions, audit, render_options)?;
-        apply_runtime_snapshot(
-            snapshot,
+    loop {
+        if let Some(turn_id) = sessions.active_turn_id().map(str::to_owned) {
+            println!("reattaching to active turn {turn_id}");
+            match follow_daemon_turn(sessions, audit, render_options, escape_prefix)? {
+                DaemonTurnOutcome::Completed(snapshot) => {
+                    apply_runtime_snapshot(
+                        *snapshot,
+                        active_model,
+                        agent,
+                        cwd,
+                        history,
+                        default_system_prompt,
+                        editor,
+                        true,
+                    )?;
+                    refresh_shell_completions(sessions, editor);
+                    refresh_session_completions(sessions, editor);
+                    return Ok(());
+                }
+                DaemonTurnOutcome::Focus(xshell_pty::ControllerAction::Detach) => return Ok(()),
+                DaemonTurnOutcome::Focus(action) => {
+                    let Some(snapshot) = switch_from_controller_action(sessions, action)? else {
+                        return Ok(());
+                    };
+                    apply_runtime_snapshot(
+                        snapshot,
+                        active_model,
+                        agent,
+                        cwd,
+                        history,
+                        default_system_prompt,
+                        editor,
+                        true,
+                    )?;
+                    refresh_shell_completions(sessions, editor);
+                    refresh_session_completions(sessions, editor);
+                    audit_logical_session_attached(audit, sessions, "escape_switch")?;
+                    continue;
+                }
+            }
+        }
+        let previous_session = sessions.active().map(|session| session.id.clone());
+        resume_active_interactive_if_running(
+            sessions,
+            escape_prefix,
             active_model,
             agent,
             cwd,
             history,
             default_system_prompt,
             editor,
-            true,
         )?;
-        refresh_shell_completions(sessions, editor);
-        refresh_session_completions(sessions, editor);
+        if sessions.active().map(|session| &session.id) != previous_session.as_ref() {
+            audit_logical_session_attached(audit, sessions, "escape_switch")?;
+            continue;
+        }
         return Ok(());
     }
-    let previous_session = sessions.active().map(|session| session.id.clone());
-    resume_active_interactive_if_running(
-        sessions,
-        escape_prefix,
-        active_model,
-        agent,
-        cwd,
-        history,
-        default_system_prompt,
-        editor,
-    )?;
-    if sessions.active().map(|session| &session.id) != previous_session.as_ref() {
-        audit_logical_session_attached(audit, sessions, "escape_switch")?;
+}
+
+pub(crate) fn switch_from_controller_action(
+    sessions: &mut SessionRuntime,
+    action: xshell_pty::ControllerAction,
+) -> Result<Option<xshell_session::SessionSnapshot>> {
+    if action == xshell_pty::ControllerAction::Detach {
+        return Ok(None);
     }
-    Ok(())
+    let targets = sessions.session_targets()?;
+    let current_session_id = sessions
+        .active()
+        .map(|session| session.id.clone())
+        .context("there is no active session")?;
+    let target = choose_session_target(
+        &targets,
+        &current_session_id,
+        sessions.previous_session_id(),
+        action,
+    )?;
+    let snapshot = match target {
+        SessionTargetChoice::Existing(index) => sessions.switch(&targets[index].id)?,
+        SessionTargetChoice::New => {
+            let Some(name) = prompt_for_session_name()? else {
+                return Ok(None);
+            };
+            sessions.create_sibling(name)?
+        }
+    };
+    println!(
+        "switched to {}:{}",
+        snapshot.descriptor.host_alias, snapshot.descriptor.name
+    );
+    Ok(Some(snapshot))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -159,6 +329,17 @@ pub(crate) fn run_pty_focus_loop(
                 });
             }
             direction => {
+                let direction = match direction {
+                    xshell_pty::DuplexPtyOutcome::Last => xshell_pty::ControllerAction::Last,
+                    xshell_pty::DuplexPtyOutcome::Next => xshell_pty::ControllerAction::Next,
+                    xshell_pty::DuplexPtyOutcome::Previous => {
+                        xshell_pty::ControllerAction::Previous
+                    }
+                    xshell_pty::DuplexPtyOutcome::Switcher => {
+                        xshell_pty::ControllerAction::Switcher
+                    }
+                    _ => unreachable!("terminal outcome handled above"),
+                };
                 let targets = sessions.session_targets()?;
                 let current_session_id = sessions
                     .active()
@@ -213,7 +394,7 @@ pub(crate) fn choose_session_target(
     targets: &[xshell_session::SessionDescriptor],
     current_session_id: &str,
     last_session_id: Option<&str>,
-    direction: xshell_pty::DuplexPtyOutcome,
+    direction: xshell_pty::ControllerAction,
 ) -> Result<SessionTargetChoice> {
     if targets.is_empty() {
         bail!("there are no sessions to switch to");
@@ -223,12 +404,12 @@ pub(crate) fn choose_session_target(
         .position(|session| session.id == current_session_id)
         .unwrap_or(0);
     let index = match direction {
-        xshell_pty::DuplexPtyOutcome::Next => (current + 1) % targets.len(),
-        xshell_pty::DuplexPtyOutcome::Previous => (current + targets.len() - 1) % targets.len(),
-        xshell_pty::DuplexPtyOutcome::Last => last_session_id
+        xshell_pty::ControllerAction::Next => (current + 1) % targets.len(),
+        xshell_pty::ControllerAction::Previous => (current + targets.len() - 1) % targets.len(),
+        xshell_pty::ControllerAction::Last => last_session_id
             .and_then(|id| targets.iter().position(|session| session.id == id))
             .unwrap_or((current + targets.len() - 1) % targets.len()),
-        xshell_pty::DuplexPtyOutcome::Switcher => {
+        xshell_pty::ControllerAction::Switcher => {
             return choose_session_interactively(targets, current);
         }
         _ => bail!("invalid terminal-switch action"),
@@ -349,7 +530,7 @@ mod tests {
             &targets,
             "emacs-id",
             Some("default-id"),
-            xshell_pty::DuplexPtyOutcome::Last,
+            xshell_pty::ControllerAction::Last,
         )
         .unwrap();
         let SessionTargetChoice::Existing(index) = target else {
@@ -376,5 +557,44 @@ mod tests {
             parse_picker_selection("", 2, 1).unwrap(),
             PickerSelection::Existing(1)
         );
+    }
+
+    #[test]
+    fn prompt_router_requires_prefix_and_clears_it_after_unknown_input() {
+        let mut state = PromptControllerState::default();
+        assert_eq!(
+            route_prompt_binding(
+                &mut state,
+                PromptBindingKind::Action(xshell_pty::ControllerAction::Switcher)
+            ),
+            None
+        );
+        assert_eq!(
+            route_prompt_binding(&mut state, PromptBindingKind::Prefix),
+            Some(Cmd::Noop)
+        );
+        assert_eq!(
+            route_prompt_binding(&mut state, PromptBindingKind::Fallback),
+            None
+        );
+        assert_eq!(
+            route_prompt_binding(
+                &mut state,
+                PromptBindingKind::Action(xshell_pty::ControllerAction::Switcher)
+            ),
+            None
+        );
+        assert_eq!(
+            route_prompt_binding(&mut state, PromptBindingKind::Prefix),
+            Some(Cmd::Noop)
+        );
+        assert_eq!(
+            route_prompt_binding(
+                &mut state,
+                PromptBindingKind::Action(xshell_pty::ControllerAction::Switcher)
+            ),
+            Some(Cmd::Interrupt)
+        );
+        assert_eq!(state.action, Some(xshell_pty::ControllerAction::Switcher));
     }
 }
