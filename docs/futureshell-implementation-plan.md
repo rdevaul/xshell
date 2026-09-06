@@ -195,6 +195,12 @@ and schema version. The plan hash covers the canonical bytes. Human-readable
 JSON is an inspection format; it is not canonical merely because it was
 produced by `serde_json`.
 
+The initial [Plan V0 prototype](futureshell-plan-v0.md) lowers Flow IR into
+deterministic task and loop templates, normalizes capabilities, detects obvious
+write conflicts, and records unresolved program and predicate dependencies. It
+uses normalized JSON hashing only as a prototype; it is not yet the durable
+canonical encoding described above.
+
 ### 5.2 Authorization
 
 Planning and authorization are separate. The runtime compares the plan with:
@@ -941,23 +947,28 @@ examples that normalize `promote all` after an agent task.
 
 ## 16. Immediate backlog
 
-The first implementation branch should contain documentation and test fixtures,
-not a working evaluator. In order:
+The Flow IR and Plan V0 crates now exist as explicitly provisional prototypes.
+They test graph and lowering semantics but are not durable formats or an
+executable runtime. Continue in this order:
 
-1. write `docs/futureshell-language.md` with the minimal grammar and examples;
-2. write `docs/futureshell-threat-model.md` with assets, actors, boundaries and
+1. add a pure program-manifest resolver and typed contract-predicate catalog so
+   Plan V0 can replace resolution blockers with pinned identities;
+2. write `docs/futureshell-language.md` with the minimal grammar, typed program
+   interfaces and text-to-Flow examples;
+3. write `docs/futureshell-threat-model.md` with assets, actors, boundaries and
    guarantee levels;
-3. define draft JSON schemas for canonical plan inspection, evidence, change
-   sets, receipts, clause reports, agent targets, connector capabilities,
-   gateway policy, autonomy grants and usage reports;
-4. create the deterministic FEA fixture without requiring real gmsh/FEniCS;
-5. spike secure staged-tree creation and change detection on macOS/Linux;
-6. decide canonical serialization after testing candidate encodings;
-7. scaffold `xshell-language`, `xshell-plan`, and `xshell-run` only after the
-   FS0 review gate.
+4. define draft schemas for evidence, change sets, receipts, clause reports,
+   agent targets, connector capabilities, gateway policy, autonomy grants and
+   usage reports;
+5. create the deterministic FEA fixture and fixture program manifests without
+   requiring real gmsh/FEniCS;
+6. spike secure staged-tree creation and change detection on macOS/Linux;
+7. decide canonical serialization after testing candidate encodings;
+8. promote the language, plan and `xshell-run` surfaces beyond prototype status
+   only after the FS0 review gate.
 
 This order keeps syntax, security claims and durable schema choices reviewable
-before they become coupled to runtime code.
+before they become coupled to runtime execution.
 
 ## 17. Definition of done for the first release
 

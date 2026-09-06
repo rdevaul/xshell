@@ -6,8 +6,8 @@
 
 FutureShell Flow IR is a typed authoring graph shared by future textual and
 graphical frontends. It is not an authorized execution plan. Both frontends
-will lower to this representation, and the semantic checker will subsequently
-lower a valid flow into an immutable plan.
+will lower to this representation. The Plan V0 prototype now lowers a valid
+flow into deterministic, immutable task templates.
 
 ```text
 FutureShell text ----\
@@ -95,7 +95,8 @@ cycles, and ordinary execution cycles.
 The prototype does not yet:
 
 - parse textual FutureShell;
-- lower Flow IR into the immutable runtime plan;
+- resolve referenced FutureShell programs or contract predicate signatures;
+- authorize Plan V0 as an executable runtime plan;
 - execute nodes or evaluate contracts;
 - define artifact ownership and fan-out materialization;
 - define join merge functions beyond the scheduling strategies;

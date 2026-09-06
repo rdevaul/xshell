@@ -267,7 +267,8 @@ contains a bounded loop template; runtime iterations produce a finite expanded
 DAG with deterministic task identities.
 
 Layout metadata is retained for editors but excluded from semantic plan
-identity. See [the Flow IR prototype](futureshell-flow-ir.md).
+identity. See the [Flow IR prototype](futureshell-flow-ir.md) and its
+[Plan V0 lowering](futureshell-plan-v0.md).
 
 ## 6. Execution model
 

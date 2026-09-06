@@ -1,0 +1,316 @@
+{
+  "plan_hash": "f4d5584da545d07ac3f16920c5829aba90360f28050dbfb5861ec49274b0f999",
+  "schema": "xshell.plan/v0",
+  "name": "linear_fea",
+  "flow": {
+    "schema": "xshell.flow/v0",
+    "semantic_sha256": "ade51a0cd97470d74f4b2046c7647b718c630c0f80a5ee372d1137224ab0e107"
+  },
+  "interface": {
+    "inputs": [
+      {
+        "name": "model",
+        "type": {
+          "kind": "artifact",
+          "media_type": "model/step"
+        },
+        "optional": false
+      }
+    ],
+    "outputs": [
+      {
+        "name": "analysis",
+        "type": {
+          "kind": "artifact",
+          "media_type": "application/json",
+          "schema": "fea-result-v1"
+        },
+        "optional": false
+      }
+    ]
+  },
+  "contracts": [],
+  "tasks": [
+    {
+      "id": "input",
+      "operation": {
+        "kind": "input"
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": {
+            "kind": "artifact",
+            "media_type": "model/step"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": []
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "mesh",
+      "operation": {
+        "kind": "program",
+        "source": "mesh.fsh"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "model",
+            "type": {
+              "kind": "artifact",
+              "media_type": "model/step"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "input",
+                "port": "model"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mesh",
+          "type": {
+            "kind": "artifact",
+            "media_type": "application/x-gmsh"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "input"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [
+        "work"
+      ],
+      "transaction": "work",
+      "capabilities": {
+        "read": [
+          "model/**"
+        ],
+        "write": [
+          "generated/mesh.msh"
+        ],
+        "execute": [
+          "gmsh"
+        ],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": 300000,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "solve",
+      "operation": {
+        "kind": "program",
+        "source": "solve.fsh"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "mesh",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/x-gmsh"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "mesh",
+                "port": "mesh"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "analysis",
+          "type": {
+            "kind": "artifact",
+            "media_type": "application/json",
+            "schema": "fea-result-v1"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "mesh"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [
+        "work"
+      ],
+      "transaction": "work",
+      "capabilities": {
+        "read": [
+          "generated/mesh.msh"
+        ],
+        "write": [
+          "analysis.json"
+        ],
+        "execute": [
+          "fenics-run"
+        ],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": 600000,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "output",
+      "operation": {
+        "kind": "output"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "analysis",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "fea-result-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "solve",
+                "port": "analysis"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "solve"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    }
+  ],
+  "regions": [
+    {
+      "id": "work",
+      "kind": {
+        "kind": "transaction",
+        "workspace": "."
+      },
+      "direct_members": [
+        "mesh",
+        "solve"
+      ]
+    }
+  ],
+  "loops": [],
+  "capabilities": {
+    "read": [
+      "generated/mesh.msh",
+      "model/**"
+    ],
+    "write": [
+      "analysis.json",
+      "generated/mesh.msh"
+    ],
+    "execute": [
+      "fenics-run",
+      "gmsh"
+    ],
+    "network": []
+  },
+  "resolution": {
+    "fully_resolved": false,
+    "blockers": [
+      {
+        "kind": "unresolved_program",
+        "task": "mesh",
+        "source": "mesh.fsh"
+      },
+      {
+        "kind": "unresolved_program",
+        "task": "solve",
+        "source": "solve.fsh"
+      }
+    ]
+  }
+}

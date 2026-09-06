@@ -1,0 +1,381 @@
+{
+  "plan_hash": "9748f5d42dde33345a5c1a4bc4d3f5737c04dec26794241fd360eae73eaf1039",
+  "schema": "xshell.plan/v0",
+  "name": "parallel_join",
+  "flow": {
+    "schema": "xshell.flow/v0",
+    "semantic_sha256": "4daf05c9f44095c3f5d7728ee142db4157b7622039bb6416a30c1fde0f5f2d90"
+  },
+  "interface": {
+    "inputs": [
+      {
+        "name": "source",
+        "type": {
+          "kind": "artifact",
+          "media_type": "text/x-rust"
+        },
+        "optional": false
+      }
+    ],
+    "outputs": [
+      {
+        "name": "report",
+        "type": {
+          "kind": "artifact",
+          "media_type": "application/json",
+          "schema": "quality-report-v1"
+        },
+        "optional": false
+      }
+    ]
+  },
+  "contracts": [],
+  "tasks": [
+    {
+      "id": "input",
+      "operation": {
+        "kind": "input"
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "source",
+          "type": {
+            "kind": "artifact",
+            "media_type": "text/x-rust"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": []
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "lint",
+      "operation": {
+        "kind": "program",
+        "source": "lint.fsh"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "source",
+            "type": {
+              "kind": "artifact",
+              "media_type": "text/x-rust"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "input",
+                "port": "source"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "finding",
+          "type": {
+            "kind": "artifact",
+            "media_type": "application/json",
+            "schema": "finding-v1"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "input"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [
+        "checks"
+      ],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "test",
+      "operation": {
+        "kind": "program",
+        "source": "test.fsh"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "source",
+            "type": {
+              "kind": "artifact",
+              "media_type": "text/x-rust"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "input",
+                "port": "source"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "finding",
+          "type": {
+            "kind": "artifact",
+            "media_type": "application/json",
+            "schema": "finding-v1"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "input"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [
+        "checks"
+      ],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "combine",
+      "operation": {
+        "kind": "join",
+        "strategy": "all"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "lint",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "finding-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "lint",
+                "port": "finding"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        },
+        {
+          "port": {
+            "name": "test",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "finding-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "test",
+                "port": "finding"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "report",
+          "type": {
+            "kind": "artifact",
+            "media_type": "application/json",
+            "schema": "quality-report-v1"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "lint",
+            "test"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "output",
+      "operation": {
+        "kind": "output"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "report",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "quality-report-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "combine",
+                "port": "report"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "combine"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    }
+  ],
+  "regions": [
+    {
+      "id": "checks",
+      "kind": {
+        "kind": "parallel"
+      },
+      "direct_members": [
+        "lint",
+        "test"
+      ]
+    }
+  ],
+  "loops": [],
+  "capabilities": {
+    "read": [],
+    "write": [],
+    "execute": [],
+    "network": []
+  },
+  "resolution": {
+    "fully_resolved": false,
+    "blockers": [
+      {
+        "kind": "unresolved_program",
+        "task": "lint",
+        "source": "lint.fsh"
+      },
+      {
+        "kind": "unresolved_program",
+        "task": "test",
+        "source": "test.fsh"
+      }
+    ]
+  }
+}
