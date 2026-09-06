@@ -157,6 +157,7 @@ Useful session commands include:
 
 ```text
 //sessions                            # catalog sessions on every connected host
+//history                             # list input entered in this client
 //new bees --durable                  # durable conversation and cwd
 //new ornithopter --model local-qwen  # create with a selected model
 //switch bees                         # switch by local session name

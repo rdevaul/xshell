@@ -57,6 +57,7 @@ xshell input routes:
 
 control commands:
   //help            show this help
+  //history         list input entered in this xshell client
   //status          show local session state
   //connect DEST    connect to xshelld on an SSH host
   //sessions        list named sessions on connected hosts
@@ -75,6 +76,9 @@ control commands:
   //view PATH        render a Markdown or reStructuredText file
   //quit             detach from the current session and exit xshell"
         ),
+        ControlCommand::History => {
+            unreachable!("history is handled by the REPL")
+        }
         ControlCommand::Status => print_status(agent, active_model, audit, sessions, cwd, approval),
         ControlCommand::Audit(args) if args.is_empty() || args == ["status"] => {
             print_audit_status(audit)
