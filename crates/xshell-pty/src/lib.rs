@@ -96,6 +96,112 @@ pub enum DuplexPtyOutcome {
     Terminate,
 }
 
+/// An out-of-band command recognized by the interactive controller. These
+/// commands are shared by PTY relays and structured agent-turn followers so
+/// the configured prefix remains available regardless of what has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerAction {
+    Detach,
+    Last,
+    Next,
+    Previous,
+    Switcher,
+    Terminate,
+    Help,
+}
+
+/// Decode the command byte that follows the configured controller prefix.
+pub fn controller_action_for_key(byte: u8) -> Option<ControllerAction> {
+    match byte.to_ascii_lowercase() {
+        b'd' => Some(ControllerAction::Detach),
+        b'l' => Some(ControllerAction::Last),
+        b'n' => Some(ControllerAction::Next),
+        b'p' => Some(ControllerAction::Previous),
+        b's' => Some(ControllerAction::Switcher),
+        b'q' => Some(ControllerAction::Terminate),
+        b'?' => Some(ControllerAction::Help),
+        _ => None,
+    }
+}
+
+/// Raw terminal input used while structured output (rather than a PTY) has
+/// focus. Ordinary bytes are returned to the caller; xshell currently ignores
+/// them because an agent stream has no byte-oriented input sink.
+pub struct ControllerInput {
+    descriptor: RawFd,
+    guard: TerminalGuard,
+    escape_prefix: u8,
+    prefix_pending: bool,
+}
+
+impl ControllerInput {
+    /// Enter raw mode for the controller terminal. Non-interactive callers do
+    /// not acquire input ownership and receive `None`.
+    pub fn acquire(escape_prefix: u8) -> Result<Option<Self>> {
+        if !controller_is_terminal() {
+            return Ok(None);
+        }
+        let terminal = io::stdin();
+        let descriptor = terminal.as_raw_fd();
+        let original = tcgetattr(terminal.as_fd()).context("cannot read terminal attributes")?;
+        let guard = TerminalGuard::enter(descriptor, original)?;
+        Ok(Some(Self {
+            descriptor,
+            guard,
+            escape_prefix,
+            prefix_pending: false,
+        }))
+    }
+
+    /// Wait for controller input and split it into ordinary bytes and at most
+    /// one recognized out-of-band action.
+    pub fn read(&mut self, wait: Duration) -> Result<(Vec<u8>, Option<ControllerAction>)> {
+        let timeout = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+        let mut descriptor = libc::pollfd {
+            fd: self.descriptor,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok((Vec::new(), None));
+            }
+            return Err(error).context("cannot poll controller input");
+        }
+        if result == 0 || descriptor.revents & libc::POLLIN == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let mut input = [0_u8; REMOTE_INPUT_BYTES];
+        let count =
+            unsafe { libc::read(self.descriptor, input.as_mut_ptr().cast(), input.len() as _) };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                return Ok((Vec::new(), None));
+            }
+            return Err(error).context("cannot read controller input");
+        }
+        if count == 0 {
+            return Ok((Vec::new(), None));
+        }
+        Ok(route_escape_input(
+            &input[..count as usize],
+            self.escape_prefix,
+            &mut self.prefix_pending,
+        ))
+    }
+
+    /// Restore cooked input before displaying a picker or line editor.
+    pub fn restore(&mut self) -> Result<()> {
+        self.guard.restore()
+    }
+}
+
 /// An exchange-driven PTY process. The caller supplies bounded input and drains
 /// bounded output through `exchange`; dropping it terminates the child.
 pub struct RemotePtyProcess {
@@ -327,7 +433,7 @@ fn relay_duplex_inner(
                     continue;
                 }
                 if let Some(action) = action {
-                    if action == EscapeAction::Help {
+                    if action == ControllerAction::Help {
                         output.write_all(
                             b"\r\n[xshell: d detach | s switch | l last | n/p next/previous | q terminate | ? help]\r\n",
                         )?;
@@ -388,27 +494,16 @@ fn is_closed_transport(error: &anyhow::Error) -> bool {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EscapeAction {
-    Detach,
-    Last,
-    Next,
-    Previous,
-    Switcher,
-    Terminate,
-    Help,
-}
-
-impl From<EscapeAction> for DuplexPtyOutcome {
-    fn from(action: EscapeAction) -> Self {
+impl From<ControllerAction> for DuplexPtyOutcome {
+    fn from(action: ControllerAction) -> Self {
         match action {
-            EscapeAction::Detach => Self::Detached,
-            EscapeAction::Last => Self::Last,
-            EscapeAction::Next => Self::Next,
-            EscapeAction::Previous => Self::Previous,
-            EscapeAction::Switcher => Self::Switcher,
-            EscapeAction::Terminate => Self::Terminate,
-            EscapeAction::Help => unreachable!("help does not leave the PTY relay"),
+            ControllerAction::Detach => Self::Detached,
+            ControllerAction::Last => Self::Last,
+            ControllerAction::Next => Self::Next,
+            ControllerAction::Previous => Self::Previous,
+            ControllerAction::Switcher => Self::Switcher,
+            ControllerAction::Terminate => Self::Terminate,
+            ControllerAction::Help => unreachable!("help does not leave the PTY relay"),
         }
     }
 }
@@ -417,7 +512,7 @@ fn route_escape_input(
     input: &[u8],
     prefix: u8,
     prefix_pending: &mut bool,
-) -> (Vec<u8>, Option<EscapeAction>) {
+) -> (Vec<u8>, Option<ControllerAction>) {
     let mut forwarded = Vec::with_capacity(input.len() + 1);
     for &byte in input {
         if !*prefix_pending {
@@ -433,16 +528,7 @@ fn route_escape_input(
             forwarded.push(prefix);
             continue;
         }
-        let action = match byte.to_ascii_lowercase() {
-            b'd' => Some(EscapeAction::Detach),
-            b'l' => Some(EscapeAction::Last),
-            b'n' => Some(EscapeAction::Next),
-            b'p' => Some(EscapeAction::Previous),
-            b's' => Some(EscapeAction::Switcher),
-            b'q' => Some(EscapeAction::Terminate),
-            b'?' => Some(EscapeAction::Help),
-            _ => None,
-        };
+        let action = controller_action_for_key(byte);
         if let Some(action) = action {
             return (forwarded, Some(action));
         }
@@ -867,7 +953,7 @@ mod tests {
         assert!(pending);
         assert_eq!(
             route_escape_input(b"d", prefix, &mut pending),
-            (Vec::new(), Some(EscapeAction::Detach))
+            (Vec::new(), Some(ControllerAction::Detach))
         );
         assert_eq!(
             route_escape_input(&[prefix, prefix], prefix, &mut pending),

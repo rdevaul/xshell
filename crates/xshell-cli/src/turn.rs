@@ -12,37 +12,48 @@ use rustyline::Editor;
 use rustyline::history::DefaultHistory;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use xshell_adapters::AgentAdapter;
 use xshell_audit::AuditEvent;
 use xshell_core::{ChatMessage, ToolCall};
 use xshell_execution::{
-    ApprovalDecision, ApprovalPolicy, CancellationFlag, ExecutionEvent, GateReason, TurnObserver,
-    TurnPolicy, tool_summary,
+    ApprovalDecision, CancellationFlag, ExecutionEvent, GateReason, TurnObserver, TurnPolicy,
+    tool_summary,
 };
-use xshell_session::{SessionEventKind, SessionSnapshot, TurnInput};
+use xshell_session::{SessionEventKind, SessionSnapshot};
 use xshell_view::{AgentRenderer, RenderOptions, escape_for_prompt, sanitize_terminal_text};
 
-pub(crate) fn run_daemon_turn(
-    sessions: &mut SessionRuntime,
-    input: TurnInput,
-    approval: ApprovalPolicy,
-    audit: &mut AuditRuntime,
-    render_options: RenderOptions,
-) -> Result<SessionSnapshot> {
-    sessions.submit(input, approval)?;
-    follow_daemon_turn(sessions, audit, render_options)
+pub(crate) enum DaemonTurnOutcome {
+    Completed(Box<SessionSnapshot>),
+    Focus(xshell_pty::ControllerAction),
 }
 
 pub(crate) fn follow_daemon_turn(
     sessions: &mut SessionRuntime,
     audit: &mut AuditRuntime,
     render_options: RenderOptions,
-) -> Result<SessionSnapshot> {
+    escape_prefix: u8,
+) -> Result<DaemonTurnOutcome> {
     let mut renderer = AgentRenderer::new(render_options);
     let mut stdout = io::stdout();
     let mut shell_finished: Option<(String, String)> = None;
+    let mut controller = xshell_pty::ControllerInput::acquire(escape_prefix)?;
     loop {
-        let batch = sessions.events(1_000)?;
+        if let Some(action) = poll_controller_action(&mut controller)? {
+            match action {
+                xshell_pty::ControllerAction::Help => {
+                    print_controller_help()?;
+                }
+                xshell_pty::ControllerAction::Terminate => {
+                    sessions.stop_current_activity()?;
+                }
+                action => {
+                    renderer.finish(&mut stdout)?;
+                    return Ok(DaemonTurnOutcome::Focus(action));
+                }
+            }
+        }
+        let batch = sessions.events(if controller.is_some() { 50 } else { 1_000 })?;
         if let Some(sequence) = batch.truncated_before {
             eprintln!("xshell: session event replay was truncated before sequence {sequence}");
         }
@@ -50,6 +61,7 @@ pub(crate) fn follow_daemon_turn(
             bail!("session turn ended without a terminal event");
         }
         for record in batch.events {
+            let sequence = record.sequence;
             match record.event {
                 SessionEventKind::TurnStarted {
                     approval,
@@ -95,9 +107,23 @@ requested \"{requested}\" was not applied"
                         })?;
                     }
                     ExecutionEvent::ApprovalRequested { call, reason } => {
-                        let decision =
-                            confirm_tool(&call, reason.unwrap_or(GateReason::ShellExecution))?;
-                        sessions.approve(record.turn_id.clone(), call.id.clone(), decision)?;
+                        match confirm_daemon_tool(
+                            &call,
+                            reason.unwrap_or(GateReason::ShellExecution),
+                            &mut controller,
+                        )? {
+                            ApprovalPromptOutcome::Decision(decision) => {
+                                sessions.approve(
+                                    record.turn_id.clone(),
+                                    call.id.clone(),
+                                    decision,
+                                )?;
+                            }
+                            ApprovalPromptOutcome::Focus(action) => {
+                                renderer.finish(&mut stdout)?;
+                                return Ok(DaemonTurnOutcome::Focus(action));
+                            }
+                        }
                     }
                     ExecutionEvent::ToolDecision { call_id, decision } => {
                         audit.append_execution(AuditEvent::ToolDecision {
@@ -154,6 +180,7 @@ requested \"{requested}\" was not applied"
                 SessionEventKind::TurnCompleted => {
                     sessions.mark_turn_finished();
                     renderer.finish(&mut stdout)?;
+                    sessions.acknowledge_event(sequence)?;
                     let snapshot = sessions.refresh_snapshot()?;
                     if let Some((command, status)) = shell_finished.take() {
                         audit.append_execution(AuditEvent::ShellFinished {
@@ -162,18 +189,105 @@ requested \"{requested}\" was not applied"
                             cwd: snapshot.descriptor.cwd.display().to_string(),
                         })?;
                     }
-                    return Ok(snapshot);
+                    return Ok(DaemonTurnOutcome::Completed(Box::new(snapshot)));
                 }
                 SessionEventKind::TurnFailed { message } => {
                     sessions.mark_turn_finished();
                     renderer.finish(&mut stdout)?;
+                    sessions.acknowledge_event(sequence)?;
                     bail!("{message}");
                 }
                 SessionEventKind::TurnCancelled => {
                     sessions.mark_turn_finished();
                     renderer.finish(&mut stdout)?;
+                    sessions.acknowledge_event(sequence)?;
                     bail!("session turn was cancelled");
                 }
+            }
+            sessions.acknowledge_event(sequence)?;
+        }
+    }
+}
+
+fn poll_controller_action(
+    controller: &mut Option<xshell_pty::ControllerInput>,
+) -> Result<Option<xshell_pty::ControllerAction>> {
+    let Some(controller) = controller else {
+        return Ok(None);
+    };
+    let (ignored, action) = controller.read(Duration::ZERO)?;
+    if !ignored.is_empty() {
+        // Structured agent output has no byte stream to receive ordinary
+        // keystrokes. Ring the terminal bell instead of silently treating
+        // them as agent or shell input.
+        print!("\x07");
+        io::stdout().flush()?;
+    }
+    Ok(action)
+}
+
+pub(crate) fn print_controller_help() -> Result<()> {
+    print!(
+        "\r\n[xshell: d detach | s switch | l last | n/p next/previous | q stop activity | ? help]\r\n"
+    );
+    io::stdout().flush()?;
+    Ok(())
+}
+
+enum ApprovalPromptOutcome {
+    Decision(ApprovalDecision),
+    Focus(xshell_pty::ControllerAction),
+}
+
+fn confirm_daemon_tool(
+    call: &ToolCall,
+    reason: GateReason,
+    controller: &mut Option<xshell_pty::ControllerInput>,
+) -> Result<ApprovalPromptOutcome> {
+    let Some(controller) = controller else {
+        return confirm_tool(call, reason).map(ApprovalPromptOutcome::Decision);
+    };
+    let why = match reason {
+        GateReason::ShellExecution => String::new(),
+        GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
+    };
+    print!(
+        "Approve `{}`{why}? [y/N/q] ",
+        escape_for_prompt(&tools::summary(call))
+    );
+    io::stdout().flush()?;
+    loop {
+        let (bytes, action) = controller.read(Duration::from_millis(100))?;
+        if let Some(action) = action {
+            match action {
+                xshell_pty::ControllerAction::Help => print_controller_help()?,
+                xshell_pty::ControllerAction::Terminate => {
+                    println!("q");
+                    return Ok(ApprovalPromptOutcome::Decision(ApprovalDecision::AbortTurn));
+                }
+                action => {
+                    println!();
+                    return Ok(ApprovalPromptOutcome::Focus(action));
+                }
+            }
+        }
+        for byte in bytes {
+            let decision = match byte.to_ascii_lowercase() {
+                b'y' => Some(ApprovalDecision::Approve),
+                b'n' | b'\r' | b'\n' => Some(ApprovalDecision::Deny),
+                b'q' => Some(ApprovalDecision::AbortTurn),
+                _ => None,
+            };
+            if let Some(decision) = decision {
+                println!(
+                    "{}",
+                    match decision {
+                        ApprovalDecision::Approve => "y",
+                        ApprovalDecision::Deny => "n",
+                        ApprovalDecision::AbortTurn => "q",
+                    }
+                );
+                return Ok(ApprovalPromptOutcome::Decision(decision));
             }
         }
     }

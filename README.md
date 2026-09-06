@@ -246,8 +246,10 @@ $emacs -nw design-notes.md
 ```
 
 The process belongs to the session; it is not a separately managed user-facing
-object. While it has focus, the default `Ctrl-]` prefix provides local switching
-without sending control bytes to the process:
+object. The default `Ctrl-]` router is also available at the xshell prompt and
+while an agent turn is streaming or waiting for approval, so long-running work
+never traps the controller in one session. In a PTY, its control bytes are not
+sent to the process:
 
 | Sequence | Action |
 |---|---|
@@ -255,14 +257,16 @@ without sending control bytes to the process:
 | `Ctrl-] d` | Detach to the xshell session prompt |
 | `Ctrl-] l` | Return to the previously focused session |
 | `Ctrl-] n` / `Ctrl-] p` | Cycle sessions |
-| `Ctrl-] q` | Terminate the current interactive process |
+| `Ctrl-] q` | Stop the current agent turn or interactive process |
 | `Ctrl-] ?` | Show key help |
-| `Ctrl-] Ctrl-]` | Send a literal prefix byte |
+| `Ctrl-] Ctrl-]` | Send a literal prefix byte to a focused PTY |
 
-Daemon and durable sessions retain the process across stream or controller
-disconnects and keep up to 1 MiB of output for replay. xshell forwards terminal
-bytes and resize events rather than emulating a terminal, preserving curses and
-Emacs behavior. See the [PTY design and trust boundary](docs/pty.md).
+Switching releases focus without cancelling work or answering a pending
+approval; returning to the session replays and resumes it. Daemon and durable
+sessions retain the process across stream or controller disconnects and keep up
+to 1 MiB of output for replay. xshell forwards terminal bytes and resize events
+rather than emulating a terminal, preserving curses and Emacs behavior. See the
+[PTY design and trust boundary](docs/pty.md).
 
 ## Rendering and `//view`
 
