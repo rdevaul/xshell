@@ -2086,6 +2086,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xshell-plan"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "xshell-flow",
+]
+
+[[package]]
 name = "xshell-platform"
 version = "0.2.0"
 dependencies = [
