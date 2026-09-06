@@ -96,8 +96,10 @@ xshell cannot sanitize those sequences without breaking interactive programs.
 Run interactive commands only on hosts and in directories whose programs and
 data you trust.
 
-On attachment xshell reapplies the controller dimensions, which prompts most
-curses applications and Emacs to redraw. xshell does not yet emulate VT screen
-state, so replay after ring truncation cannot guarantee a perfect full-screen
-restoration. A VT snapshot layer or optional tmux-backed provider remains a
-future enhancement.
+On attachment xshell reapplies the controller dimensions and explicitly sends
+`SIGWINCH` to the PTY's foreground process group. This asks curses applications,
+Emacs, and similar full-screen programs to redraw even when the dimensions have
+not changed. xshell does not yet emulate VT screen state, so an application that
+does not respond to `SIGWINCH`, or replay after ring truncation, cannot be
+guaranteed a perfect restoration. A VT snapshot layer or optional tmux-backed
+provider remains a future enhancement.
