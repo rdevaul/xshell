@@ -74,8 +74,9 @@ ephemeral/daemon/durable lifecycles, local session commands, model/cwd/chat
 snapshot restoration, daemon-owned agent and shell turns, approval rendezvous,
 cancellation, bounded event replay after reconnect, authenticated SSH stdio
 transport, multi-host catalogs, and cross-host switching. Signed remote
-bootstrap, reconnect supervision, daemon-side audit appends, and platform
-service installation remain Phase 3 work.
+bootstrap, reconnect supervision, and platform service installation remain
+Phase 3 work. Execution-boundary audit appends, including opt-in bounded PTY
+stream capture, are implemented in the daemon.
 
 The first terminal-UX increment below is also implemented: protocol v4 provides
 bounded executable and path completion against the active local or remote
@@ -85,7 +86,8 @@ The initial viewer foundation is implemented in `xshell-view`: a reusable
 terminal renderer, an in-process viewer trait and registry, built-in Markdown
 and safe-subset reStructuredText viewers, and protocol-v5 bounded source
 acquisition from the active local or remote session. External renderers remain
-future out-of-process plugins.
+future out-of-process plugins. Controller-local pagination policy supports
+automatic, forced, and disabled modes plus media-class and viewer overrides.
 
 ### Terminal interaction and rendering plan of record
 
@@ -112,11 +114,13 @@ Terminal UX will advance in this order:
    falls back to inherited stdio when redirected. Protocol v6 provides bounded,
    connection-owned PTY exchanges on remote hosts. `cat file.json | jq | less`
    is the first acceptance case.
-4. **Persistent full-screen PTYs.** Preserve and reattach interactive PTYs,
-   including redraw after reconnect. Truecolor, alternate screen, resize,
-   bracketed paste, mouse input, signals, and an explicit terminal-escape trust
-   policy are required; `emacs -nw` with a real user configuration is the
-   acceptance target.
+4. **Persistent full-screen PTYs (implemented for daemon lifetime).** The daemon
+   preserves and reattaches interactive PTYs, replays bounded output, and asks
+   the foreground process to redraw. Its byte-transparent relay preserves
+   truecolor, alternate-screen, resize, bracketed-paste, mouse, and signal
+   behavior, with the terminal-escape trust boundary documented explicitly.
+   Interactive processes do not yet survive a daemon restart, and xshell does
+   not yet maintain VT screen snapshots.
 
 Native zsh/bash completion frameworks remain opt-in future work because their
 scripts execute user and third-party code. Remote completion initially covers

@@ -9,6 +9,23 @@ markdown = "auto"
 color = "auto"
 # width = 100
 
+# `//view` pages long rendered text on the controlling terminal. The pager is
+# an argv vector and is launched directly, never through a shell. "auto" pages
+# only when the rendered output is taller than the terminal; "always" and
+# "never" may be overridden per invocation with --paginate/--no-paginate.
+[view]
+pagination = "auto"
+pager = ["less", "-R", "-X"]
+
+# Policy may be specialized by presentation class and then by canonical viewer
+# ID. Viewer policy has precedence over class policy; command flags win over both.
+# Future viewers can add typed options for classes such as image, video, and
+# model-3d without changing the acquisition/presentation boundary.
+# [view.classes.text]
+# pagination = "auto"
+# [view.viewers.markdown]
+# pagination = "always"
+
 # Auditing is disabled until xshell-auditd has been installed and started.
 # Single-user development paths are shown here; both daemons refuse to use a
 # directory they do not own or that is group/world writable, so avoid shared

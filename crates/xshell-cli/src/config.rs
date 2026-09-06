@@ -8,6 +8,8 @@ use xshell_audit::AuditConfig;
 use xshell_session::{ModelBinding, SessionConfig};
 pub use xshell_view::{OutputMode, RenderingConfig};
 
+use crate::view::ViewConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -34,6 +36,8 @@ pub struct XshellConfig {
     pub default_model: Option<String>,
     #[serde(default)]
     pub rendering: RenderingConfig,
+    #[serde(default)]
+    pub(crate) view: ViewConfig,
     #[serde(default)]
     pub audit: AuditConfig,
     #[serde(default)]
@@ -111,7 +115,11 @@ impl XshellConfig {
         }
         let source = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read configuration file {}", path.display()))?;
-        let config = toml::from_str(&source)
+        let config: Self = toml::from_str(&source)
+            .with_context(|| format!("invalid configuration file {}", path.display()))?;
+        config
+            .view
+            .validate()
             .with_context(|| format!("invalid configuration file {}", path.display()))?;
         Ok((config, path))
     }
@@ -224,6 +232,7 @@ fn default_base_url(provider: Provider) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::PaginationMode;
 
     fn sample() -> XshellConfig {
         toml::from_str(
@@ -313,6 +322,39 @@ api_key_env = "OPENROUTER_API_KEY"
     fn rendering_defaults_preserve_existing_configurations() {
         let config: XshellConfig = toml::from_str("").unwrap();
         assert_eq!(config.rendering, RenderingConfig::default());
+        assert_eq!(config.view, ViewConfig::default());
+    }
+
+    #[test]
+    fn parses_typed_view_policy() {
+        let config: XshellConfig = toml::from_str(
+            r#"
+            [view]
+            pagination = "always"
+            pager = ["less", "-R", "-X"]
+
+            [view.classes.text]
+            pagination = "auto"
+
+            [view.viewers.markdown]
+            pagination = "never"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.view.pagination, PaginationMode::Always);
+        assert_eq!(config.view.pager[0], "less");
+        assert_eq!(
+            config.view.classes["text"].pagination,
+            Some(PaginationMode::Auto)
+        );
+        assert_eq!(
+            config.view.viewers["markdown"].pagination,
+            Some(PaginationMode::Never)
+        );
+        config.view.validate().unwrap();
+
+        let invalid: XshellConfig = toml::from_str("[view]\npager = []").unwrap();
+        assert!(invalid.view.validate().is_err());
     }
 
     #[test]

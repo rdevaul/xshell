@@ -565,6 +565,7 @@ async fn main() -> Result<()> {
                     &cwd,
                     &viewers,
                     render_options,
+                    &model_config.view,
                     &mut audit,
                 ) {
                     eprintln!("xshell: {error:#}");

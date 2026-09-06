@@ -891,6 +891,9 @@ pub trait ViewerPlugin: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedView {
     pub viewer_id: String,
+    /// Stable presentation class used by controller-side display policy.
+    /// More specific viewer policy may override this class policy.
+    pub media_class: String,
     pub bytes: Vec<u8>,
 }
 
@@ -940,15 +943,17 @@ impl ViewerRegistry {
         let descriptor = viewer.descriptor();
         let content = viewer.render(input)?;
         let mut bytes = Vec::new();
-        match content {
+        let media_class = match content {
             ViewerContent::TerminalMarkdown(markdown) => {
                 let mut renderer = AgentRenderer::new(options);
                 renderer.push(&markdown, &mut bytes)?;
                 renderer.finish(&mut bytes)?;
+                "text"
             }
-        }
+        };
         Ok(RenderedView {
             viewer_id: descriptor.id.into(),
+            media_class: media_class.into(),
             bytes,
         })
     }
@@ -1478,6 +1483,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(detected.viewer_id, "markdown");
+        assert_eq!(detected.media_class, "text");
         assert!(
             String::from_utf8(detected.bytes)
                 .unwrap()
