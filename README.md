@@ -48,7 +48,7 @@ working alpha of the session and execution fabric needed to become one.
 | Network fabric | SSH-connected macOS and Linux hosts in the same session catalog; remote creation, switching, execution, completion, viewing, detach, and manual reconnect |
 | Detachment | Daemon-owned agent turns and interactive processes continue after controller disconnect; bounded event and terminal-output replay on return |
 | Models | Named profiles, live `//model` switching, per-session bindings, per-model history budgets, and environment-based credentials that are never printed or sent over the session protocol |
-| Viewing | Streamed terminal Markdown, tables, a safe reStructuredText subset, and local rendering of text acquired from either local or remote sessions with `//view` |
+| Viewing | Streamed terminal Markdown, tables, a safe reStructuredText subset, policy-driven pagination, and local rendering of text acquired from either local or remote sessions with `//view` |
 | Safety | Exact-command approval, remote-host approval ceilings, cwd-confined file tools, sensitive-path gating, execution time/output limits, and process-group cleanup |
 | Audit | Separate append-only service, hash-chained JSONL, Ed25519-signed checkpoints, daemon-side execution events, and opt-in bounded byte-for-byte PTY stream capture |
 
@@ -63,6 +63,8 @@ an executable language.
 An experimental typed dataflow representation for FutureShell is available in
 `crates/xshell-flow`. It models tasks, contract-gated branches, parallel joins,
 and bounded feedback loops. See [the Flow IR prototype](docs/futureshell-flow-ir.md).
+The `xshell-plan` crate lowers valid flows into deterministic Plan V0 task
+templates; see [the Plan V0 prototype](docs/futureshell-plan-v0.md).
 
 ## Build and run
 
@@ -283,14 +285,34 @@ The modular viewer uses the same renderer for files:
 //view README.md
 //view docs/design.rst
 //view --as markdown notes.txt
+//view --paginate long-report.md
+//view --no-paginate short-notes.md
 ```
 
 The active session host acquires the source and the controller renders it
 locally, so `//view` behaves consistently across SSH without opening a viewer
 port. Markdown and a safe reStructuredText subset are built in. Acquisition is
 bounded to regular UTF-8 files of at most 4 MiB and records content metadata in
-the audit trail. Pagination policy, binary/media plugins, inline images, F3D
-integration, and multimodal-agent attachments are next-stage work. See the
+the audit trail. Long views are paged automatically on interactive terminals;
+short or redirected output remains inline. Pagination can be configured by
+presentation class or viewer and overridden for one command. The configured
+pager is an argument vector executed directly rather than a shell command;
+xshell's default is `less -R -X` in secure mode.
+
+```toml
+[view]
+pagination = "auto" # auto, always, never
+pager = ["less", "-R", "-X"]
+
+[view.classes.text]
+pagination = "auto"
+
+[view.viewers.markdown]
+pagination = "always"
+```
+
+Binary/media plugins, inline images, F3D integration, and multimodal-agent
+attachments are next-stage work. See the
 [viewer architecture](docs/viewers.md).
 
 ## Safety and auditability

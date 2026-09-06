@@ -30,6 +30,7 @@ const CONTROL_COMMANDS: &[&str] = &[
 /// Sub-commands recognised after `//model`.
 const MODEL_SUBCOMMANDS: &[&str] = &["list", "show", "use"];
 const VIEWERS: &[&str] = &["markdown", "rst"];
+const VIEW_OPTIONS: &[&str] = &["--paginate", "--no-paginate"];
 
 pub struct XshellHelper {
     cwd: PathBuf,
@@ -208,10 +209,14 @@ fn complete_view(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usize
     }
     let words = arguments.split_whitespace().collect::<Vec<_>>();
     let ends_with_space = arguments.chars().last().is_some_and(char::is_whitespace);
-    if words.first() == Some(&"--as")
-        && ((words.len() == 1 && ends_with_space) || (words.len() == 2 && !ends_with_space))
-    {
-        let viewer_prefix = words.get(1).copied().unwrap_or("");
+    let viewer_prefix = if ends_with_space && words.last() == Some(&"--as") {
+        Some("")
+    } else if !ends_with_space && words.len() >= 2 && words[words.len() - 2] == "--as" {
+        words.last().copied()
+    } else {
+        None
+    };
+    if let Some(viewer_prefix) = viewer_prefix {
         let start = prefix.len() - viewer_prefix.len();
         let candidates = VIEWERS
             .iter()
@@ -232,7 +237,17 @@ fn complete_view(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usize
         .map_or("//view".len(), |index| index + 1);
     let fragment = &prefix[fragment_start..];
     if fragment.starts_with('-') {
-        return Some((pos, Vec::new()));
+        return Some((
+            fragment_start,
+            VIEW_OPTIONS
+                .iter()
+                .filter(|option| option.starts_with(fragment))
+                .map(|option| Pair {
+                    display: (*option).into(),
+                    replacement: (*option).into(),
+                })
+                .collect(),
+        ));
     }
     let synthetic = format!("$cat {fragment}");
     let result = helper.shell_candidates(&synthetic, synthetic.len())?;
@@ -577,6 +592,16 @@ mod tests {
         assert_eq!(start, 12);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].replacement, "rst");
+
+        let line = "//view --paginate --as m";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert_eq!(start, 23);
+        assert_eq!(matches[0].replacement, "markdown");
+
+        let line = "//view --p";
+        let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+        assert_eq!(start, 7);
+        assert_eq!(matches[0].replacement, "--paginate");
 
         let line = "//view Cargo";
         let (start, matches) = helper.complete(line, line.len(), &context).unwrap();

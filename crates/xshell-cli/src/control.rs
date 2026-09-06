@@ -73,7 +73,9 @@ control commands:
   //model NAME      switch profiles and start a fresh conversation
   //agent            show active agent capabilities
   //tools            show tools exposed to the active agent
-  //view PATH        render a Markdown or reStructuredText file
+  //view [OPTIONS] PATH
+                     render a Markdown or reStructuredText file
+                     (--as VIEWER, --paginate, --no-paginate)
   //quit             detach from the current session and exit xshell"
         ),
         ControlCommand::History => {

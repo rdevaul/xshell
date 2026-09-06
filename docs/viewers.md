@@ -11,6 +11,8 @@ does not expose an inbound viewer service.
 //view README.md
 //view "docs/design notes.rst"
 //view --as markdown notes.txt
+//view --paginate long-report.md
+//view --no-paginate short-notes.md
 ```
 
 Relative paths are resolved against the active session cwd. `~` is expanded on
@@ -45,6 +47,49 @@ or arbitrary directives.
 Audit records contain acquisition/render metadata and the outcome, but not a
 second copy of the source content.
 
+## Display policy and pagination
+
+Resource acquisition and rendering finish before controller-local display
+policy is applied. This means a document acquired from a remote host is paged
+by the controller and never needs to grant the remote host access to the local
+terminal. The policy precedence is:
+
+1. `--paginate` or `--no-paginate` on the current command;
+2. the canonical viewer ID under `view.viewers`;
+3. the rendered media class under `view.classes`;
+4. the top-level `view.pagination` default.
+
+```toml
+[view]
+pagination = "auto" # auto, always, never
+pager = ["less", "-R", "-X"]
+
+[view.classes.text]
+pagination = "auto"
+
+[view.viewers.markdown]
+pagination = "always"
+```
+
+`auto` starts the pager only when stdin/stdout are terminals and rendered output
+exceeds the detected terminal height. `always` pages whenever the controller is
+interactive; `never` writes directly. Redirected output is never sent through
+an interactive pager. If an automatically selected pager cannot start, xshell
+warns and safely falls back to direct output; an explicit `always` request
+reports the error instead. An error after a pager has started never triggers a
+second copy of potentially partially displayed output.
+
+The pager setting is an argv vector: xshell invokes its executable directly and
+does not interpret shell syntax. The default `less` invocation receives only
+already-sanitized renderer output. xshell removes inherited less option, key,
+and preprocessor settings and sets `LESSSECURE=1`, preventing preprocessors and
+less shell/file commands. A user-configured replacement pager is trusted local
+configuration.
+
+The policy maps are the extension point for future typed options such as video
+autoplay and 3D camera layout. Options are added only alongside a renderer that
+implements them, so accepted configuration is never silently ignored.
+
 ## External plugins
 
 The Rust trait is an internal composition boundary, not a stable dynamic ABI.
@@ -64,6 +109,6 @@ content-addressed derived artifacts with render manifests. xshell will not load
 untrusted Rust dynamic libraries into its own process. F3D and future CAD
 renderers should use this process boundary.
 
-Binary viewer transport, content-addressed staging, external processes, inline
-image protocols, multimodal attachment, and plugin installation remain
-unimplemented as of protocol v6.
+Binary viewer transport, content-addressed staging, external renderer processes,
+inline image protocols, multimodal attachment, and plugin installation remain
+unimplemented.
