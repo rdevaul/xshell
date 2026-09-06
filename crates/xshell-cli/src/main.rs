@@ -354,6 +354,11 @@ async fn main() -> Result<()> {
                 }
                 break "quit";
             }
+            InputRoute::Control(ControlCommand::History) => {
+                for (index, entry) in editor.history().iter().enumerate() {
+                    println!("{:>5}  {entry}", index + 1);
+                }
+            }
             InputRoute::Control(ControlCommand::Connect(connect_args)) => {
                 let options = match parse_connect_options(&connect_args) {
                     Ok(options) => options,

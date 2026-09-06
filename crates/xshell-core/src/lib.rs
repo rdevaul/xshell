@@ -18,6 +18,7 @@ pub enum InputRoute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCommand {
     Help,
+    History,
     Status,
     Audit(Vec<String>),
     Tools,
@@ -70,6 +71,7 @@ fn parse_control(input: &str) -> ControlCommand {
 
     match name {
         "help" => ControlCommand::Help,
+        "history" => ControlCommand::History,
         "status" => ControlCommand::Status,
         "audit" => ControlCommand::Audit(args),
         "tools" => ControlCommand::Tools,
@@ -269,6 +271,14 @@ mod tests {
         assert_eq!(
             classify_input("//tools"),
             InputRoute::Control(ControlCommand::Tools)
+        );
+    }
+
+    #[test]
+    fn parses_history_control_command() {
+        assert_eq!(
+            classify_input("//history"),
+            InputRoute::Control(ControlCommand::History)
         );
     }
 
