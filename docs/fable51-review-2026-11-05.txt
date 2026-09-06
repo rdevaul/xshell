@@ -1,0 +1,70 @@
+Summary. There is no Xcode project here, so I reviewed the xshell Rust workspace. It is an unusually well-engineered alpha. The trust boundaries are drawn in the right places, every input is bounded, and the docs match the code. The main debt is structural rather than local: the CLI still carries a second execution path and a shadow copy of session state from before the daemon existed, and that doubles the UX plumbing. I found one real bug and several performance hazards, all listed below.
+
+Check	Result
+cargo test --workspace --all-targets	145 tests pass
+cargo clippy -- -D warnings	clean
+cargo fmt --check	clean
+1. Design and architecture
+
+The crate layering is clean. Dependencies flow one way: core, adapters, execution, session, then the CLI, with platform, pty, audit, view, and flow as leaves. The core crate depends only on serde and thiserror. Nothing is circular.
+
+The central decision is correct. Making xshelld own execution, conversation state, approval rendezvous, and PTYs, with the CLI as a controller and renderer, is what makes detach, durable sessions, and remote hosts fall out of one mechanism. The shared agent loop in engine.rs with a TurnObserver trait lets the CLI and daemon run the same engine, so approval and audit semantics cannot drift.
+
+The transport choice is the strongest part. Running ssh -T to a stateless stdio proxy reuses OpenSSH for authentication, host keys, and agent handling, and adds no listener. The trusted computing base is OpenSSH plus a small JSON protocol. The cost is three ssh processes per remote host: control, PTY stream, and completion. That is documented as future multiplexing work.
+
+The audit design is honest. Hash-chained records, Ed25519 checkpoints with their own chain, blinded witness commitments, and explicit statements about what same-user deployment does not protect against. The verifier reads every format version and reports a missing final checkpoint instead of claiming completeness.
+
+Where the architecture is weak:
+
+Two execution modes. Standalone mode runs turns in-process; fabric mode follows daemon events. The engine is shared, but the observer, shell execution, audit delegation, and credential handling each exist twice, selected by booleans threaded through the CLI.
+The CLI keeps shadow state. It holds its own copies of history, cwd, and model and pushes the full history to the daemon after every REPL command. When the daemon owns execution, that copy is redundant and forces a full-history write per keystroke command.
+Four ways to spawn a shell. Standalone $ commands, daemon non-PTY $ turns, daemon PTY jobs, and the agent tool each build their own command. They disagree on login shell, stdin, and timeout, so the same typed command behaves differently depending on mode.
+Exact protocol version match. The protocol is at version 11 and any change forces lockstep upgrades on every connected host. That will hurt as soon as two machines are not rebuilt together.
+Polling concurrency. The daemon is thread-per-connection with std mutexes and condition variables, spawns a fresh tokio runtime per turn, and drives PTYs from a worker that wakes every 40 ms. It works, but it is a hybrid that neither commits to blocking nor to async.
+2. Implementation quality
+
+Strengths. Byte and time bounds are applied everywhere a peer or model can influence size. The 37 unsafe sites are all thin libc wrappers with safety comments. The lost-wakeup handling in CancellationFlag and the daemon approval wait is correct. Path confinement canonicalizes before checking, so symlinks and .. cannot escape. The peer UID check, close-on-exec on service sockets, and refusal to use group-writable directories are the right defaults. The injectivity test for the approval prompt escaping is exemplary: it proves two different commands never render identically. Compaction removes whole turns so tool results are never orphaned. The integration tests spawn real daemons over sockets and a real audit service.
+
+Bug found:
+
+Close kills another controller's process before the ownership check. In xshelld.rs:788 the interactive process is terminated, then the registry refuses the close because another client holds the session. Swap the order or check ownership first.
+
+Performance hazards:
+
+Audit appends hold a daemon-wide lock across blocking I/O. audit.rs:238 holds the sessions map lock while doing a socket round trip that the audit service answers only after an fsync. Every session's turn serializes on that one lock. With terminal-stream capture enabled it sits on the 40 ms PTY hot path.
+Keystroke latency is two polling stages in series. The PTY worker only reads queued input once per 40 ms exchange, and the stream thread waits up to 40 ms on output before it reads the next client frame. Local worst case is roughly 80 ms before SSH is added, which is noticeable in an editor.
+Session state is rewritten and fsynced on every command. persist runs on every update, detach, and turn even when only non-durable sessions changed. In fabric mode the REPL syncs after each command, so //help costs a JSON rewrite and fsync.
+
+Smaller issues:
+
+A submit is audited as input before the daemon checks for an active turn, so a rejected duplicate submit is still logged as if accepted.
+The event journal is cleared on each submit, so the documented 8,192-event bound is per turn, not per session.
+The session client has no read timeout, so a wedged daemon hangs the CLI.
+Duplicated helpers: home and tilde expansion in three crates, close-on-exec in two, line-framed JSON reading in three, transport guards in two, closed-transport detection in two, approval decision naming in two, and cd parsing in three.
+Eight functions in the CLI carry too_many_arguments allowances because REPL state is passed as loose variables.
+Markdown block structure is hand-parsed while inline structure uses pulldown-cmark. Two parsers for one format.
+3. Simplification opportunities
+
+Ordered by payoff.
+
+Collapse standalone mode into the daemon path. Define a SessionBackend trait implemented by both the socket client and an in-process coordinator. The CLI then has one turn follower, and LocalObserver, the in-process turn wrapper, the standalone shell runner, the audit delegation flag, and the credential-inclusion booleans all disappear. The engine is already shared, so this is mostly deletion.
+Make the daemon the only owner of history, cwd, and model. The CLI keeps just a session descriptor. Replace the full-history update with narrow requests such as set-model and reset-history. This removes the per-command sync, the persist churn, and three places that re-seed a system prompt into an empty history.
+One shell-spawn helper. A single builder in the execution crate with login, stdin, timeout, and process-group options, used by all four sites, plus one cd parser. This also makes the mode-dependent behavior differences go away.
+One model-configuration type. Four near-identical structs exist across three crates, two using a string provider and two an enum. Keep the TOML profile shape and one binding type in core.
+A REPL state struct. Bundle sessions, model, agent, cwd, history, editor, audit, and render options with methods on it. That removes the eight long parameter lists and a large share of main.rs.
+Move shared Unix helpers into the platform crate. Close-on-exec, line-framed JSON I/O with a byte cap, transport guards, closed-transport detection, and home expansion. Delete the one-line re-export module in the CLI.
+Persist only on dirty durable state. A dirty flag set only when a durable snapshot changes.
+Decide on blocking or async in the daemon. Everything except the adapter HTTP stream is blocking threads. Either move adapters to blocking HTTP with a per-chunk cancellation check and drop the per-turn runtime, or move the daemon fully onto tokio. The current hybrid needs both a condition variable and a Notify for the same approval event.
+Protocol tolerance. Accept a version range at open and stop denying unknown fields on wire types, so additive changes do not force lockstep upgrades.
+4. Extensions and improvements
+Event-driven PTY worker. Poll the master fd together with an input-notification pipe instead of a 40 ms tick. This fixes latency and idle CPU at once and is a prerequisite for the terminal feeling native over SSH.
+One multiplexed SSH connection per host. Tag frames with a channel id over a single ssh -T process. That collapses three processes to one and gives a natural place for reconnect supervision and backoff.
+Richer adapter events. AgentEvent only carries text deltas. Adding usage, reasoning, and tool-call deltas enables token-based compaction, a summarizing compactor behind the existing trait, and the //context commands the spec reserves.
+A generic external-process adapter. The spec calls for it and it is the path to Codex, Hermes, and similar agents without hard-coding each.
+Remembered approvals. Per-session allowlists of exact approved commands so git status is not prompted forty times. Record the allowlist change in the audit trail.
+Audit throughput. Move appends to a per-session queue with a dedicated writer thread and batch fsync at checkpoint boundaries, keeping the required-mode guarantee by blocking the turn only at tool boundaries. Add //audit verify and retention.
+File transfer before a filesystem. A streamed fetch and put over the existing proxy would deliver most of the /xshell namespace value long before FUSE.
+Viewer plugin protocol. The out-of-process manifest design is right. Start with an image path using the Kitty or iTerm2 protocols, since that unlocks the F3D and CAD workflow.
+Give the flow IR an interpreter early. Wire Task nodes to the existing direct-shell runner so the FutureShell design is tested against the real runtime before the language grows.
+Testing. Property tests for the glob matcher and prompt escaping, a fuzz target for the binary frame readers, and one end-to-end test driving the CLI against the daemon with a scripted adapter.
+
