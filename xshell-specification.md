@@ -5,8 +5,9 @@
 **Target platforms:** macOS and Linux
 **Primary users:** engineers and designers working with local and remote AI agents, source trees, data, and CAD assets.
 
-**Future scripting track:** [FutureShell roadmap](docs/futureshell-roadmap.md)
-and [implementation plan](docs/futureshell-implementation-plan.md)
+**Future scripting track:** [status](docs/futureshell-status.md), [canonical
+roadmap](docs/futureshell-roadmap.md), and [implementation
+plan](docs/futureshell-implementation-plan.md)
 
 ## 1. Purpose
 

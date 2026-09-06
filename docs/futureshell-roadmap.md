@@ -1,10 +1,12 @@
 # FutureShell roadmap
 
-**Status:** Draft plan of record
+**Status:** Canonical draft plan of record
 
-**Companion documents:** [concept note](futureshell.md),
-[implementation plan](futureshell-implementation-plan.md), and
-[xshell specification](../xshell-specification.md)
+**Progress:** [status and traceability](futureshell-status.md)
+
+**Companion documents:** [implementation plan](futureshell-implementation-plan.md),
+[historical concept note](futureshell.md), and [xshell
+specification](../xshell-specification.md)
 
 ## 1. Vision
 

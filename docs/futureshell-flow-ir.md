@@ -4,6 +4,8 @@
 
 **Implementation:** `crates/xshell-flow`
 
+**Project progress:** [FutureShell status and traceability](futureshell-status.md)
+
 FutureShell Flow IR is a typed authoring graph shared by future textual and
 graphical frontends. It is not an authorized execution plan. Both frontends
 will lower to this representation. The Plan V0 prototype now lowers a valid
