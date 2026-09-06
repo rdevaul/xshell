@@ -316,6 +316,63 @@ fn creating_a_session_preserves_the_previous_sessions_interactive_process() {
 }
 
 #[test]
+fn unauthorized_close_does_not_terminate_another_clients_process() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut owner = connect_when_ready(&socket);
+    let session = owner
+        .create(SessionCreation {
+            name: "owned-terminal".into(),
+            model: model("local"),
+            cwd: temporary.path().to_owned(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    owner
+        .pty_start(
+            session.descriptor.id.clone(),
+            "sleep 60".into(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+
+    let mut other = connect_when_ready(&socket);
+    let error = other.close(Some("owned-terminal".into())).unwrap_err();
+    assert!(error.to_string().contains("controlled by another client"));
+    assert!(matches!(
+        owner
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .unwrap()
+            .activity,
+        SessionActivity::InteractiveProcess { .. }
+    ));
+    owner
+        .pty_attach(session.descriptor.id.clone(), None)
+        .expect("the owning client should still be able to attach the process");
+    owner.pty_close(session.descriptor.id).unwrap();
+}
+
+#[test]
 fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
     let temporary = TempDir::new().unwrap();
     let state = temporary.path().join("state");
@@ -835,6 +892,77 @@ fn shell_turn_continues_after_disconnect_and_replays_on_attach() {
 }
 
 #[test]
+fn event_journal_retains_completed_turns_until_its_bounds_require_eviction() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "journal".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let session_id = session.descriptor.id;
+    let mut after = 0;
+    let mut turn_ids = Vec::new();
+
+    for command in ["printf first", "printf second"] {
+        let turn_id = client
+            .submit(
+                session_id.clone(),
+                TurnInput::Shell {
+                    command: command.into(),
+                },
+                ApprovalPolicy::Ask,
+            )
+            .unwrap();
+        let mut completed = false;
+        for _ in 0..100 {
+            let batch = client.events(session_id.clone(), after, 100).unwrap();
+            for event in batch.events {
+                after = event.sequence;
+                if event.turn_id == turn_id
+                    && matches!(event.event, SessionEventKind::TurnCompleted)
+                {
+                    completed = true;
+                }
+            }
+            if completed {
+                break;
+            }
+        }
+        assert!(completed, "turn {turn_id} did not complete");
+        turn_ids.push(turn_id);
+    }
+
+    let replay = client.events(session_id, 0, 0).unwrap();
+    assert_eq!(replay.truncated_before, None);
+    for turn_id in turn_ids {
+        assert!(
+            replay.events.iter().any(|event| {
+                event.turn_id == turn_id && matches!(event.event, SessionEventKind::TurnCompleted)
+            }),
+            "journal discarded completed turn {turn_id}"
+        );
+    }
+}
+
+#[test]
 fn running_shell_turn_can_be_cancelled() {
     let temporary = TempDir::new().unwrap();
     let state = temporary.path().join("state");
@@ -1209,7 +1337,7 @@ fn daemon_audits_execution_without_an_attached_client() {
 }
 
 #[test]
-fn required_audit_failure_prevents_pty_process_creation() {
+fn required_audit_failure_releases_turn_reservation_and_prevents_execution() {
     let temporary = TempDir::new().unwrap();
     let audit_directory = temporary.path().join("audit");
     let audit_socket = temporary.path().join("audit.sock");
@@ -1263,6 +1391,30 @@ fn required_audit_failure_prevents_pty_process_creation() {
     auditd.0.wait().unwrap();
     let marker = temporary.path().join("must-not-exist");
     let command = format!("touch {}", marker.display());
+    let error = client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Shell {
+                command: command.clone(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("required audit"));
+    assert!(!marker.exists());
+    assert_eq!(
+        client
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == session.descriptor.id)
+            .unwrap()
+            .activity,
+        SessionActivity::Idle,
+        "a refused turn must release its active-turn reservation"
+    );
+
     let error = client
         .pty_start(
             session.descriptor.id.clone(),
@@ -1581,6 +1733,73 @@ fn collect_finalized_terminal_log(fabric: &AuditedFabric, command: &str) -> Stri
         thread::sleep(Duration::from_millis(20));
     }
     panic!("no finalized daemon audit log for {command}");
+}
+
+#[test]
+fn rejected_duplicate_submit_is_not_recorded_as_accepted_input() {
+    let temporary = TempDir::new().unwrap();
+    let fabric = start_audited_fabric(&temporary, "");
+    let mut client = connect_when_ready(&fabric.socket);
+    let session = client
+        .create(SessionCreation {
+            name: "duplicate-submit".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let accepted = "sleep 0.25; printf accepted-marker";
+    let accepted_turn = client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Shell {
+                command: accepted.into(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    let rejected = "printf rejected-marker";
+    let error = client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Shell {
+                command: rejected.into(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("already has active turn"));
+
+    let mut after = 0;
+    let mut completed = false;
+    for _ in 0..100 {
+        let batch = client
+            .events(session.descriptor.id.clone(), after, 100)
+            .unwrap();
+        for event in batch.events {
+            after = event.sequence;
+            if event.turn_id == accepted_turn
+                && matches!(event.event, SessionEventKind::TurnCompleted)
+            {
+                completed = true;
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    assert!(completed, "accepted turn did not complete");
+    client.close(Some("duplicate-submit".into())).unwrap();
+    drop(client);
+
+    let text = collect_finalized_terminal_log(&fabric, accepted);
+    assert!(text.contains(accepted));
+    assert!(
+        !text.contains(rejected),
+        "rejected input was recorded as if the daemon had accepted it"
+    );
 }
 
 #[test]

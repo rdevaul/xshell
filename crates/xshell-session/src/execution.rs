@@ -135,30 +135,33 @@ impl ExecutionCoordinator {
         let execution = self.session(session_id);
         let turn_id = Uuid::new_v4().to_string();
         let cancellation = CancellationFlag::default();
-        // Record the input at the execution boundary before anything runs.
-        // With required auditing, a failure here refuses the turn outright.
-        let audit = self.audit_handle_for_snapshot(&snapshot);
-        let (route, text) = match &input {
-            TurnInput::Agent { message } => ("agent", message.clone()),
-            TurnInput::Shell { command } => ("shell", format!("${command}")),
-        };
-        audit.append(AuditEvent::Input {
-            route: route.into(),
-            text,
-        })?;
         {
             let mut state = execution.state.lock_recover();
             if let Some(active) = &state.active {
                 bail!("session already has active turn {}", active.id);
             }
-            state.events.clear();
-            state.event_bytes = 0;
             state.approvals.clear();
             state.pending_approvals.clear();
             state.active = Some(ActiveTurn {
                 id: turn_id.clone(),
                 cancellation: cancellation.clone(),
             });
+        }
+        // Record the input at the execution boundary before anything runs.
+        // The active-turn reservation above makes this an accepted input, not
+        // merely an attempted duplicate submission. With required auditing, a
+        // failure here releases the reservation and refuses the turn outright.
+        let audit = self.audit_handle_for_snapshot(&snapshot);
+        let (route, text) = match &input {
+            TurnInput::Agent { message } => ("agent", message.clone()),
+            TurnInput::Shell { command } => ("shell", format!("${command}")),
+        };
+        if let Err(error) = audit.append(AuditEvent::Input {
+            route: route.into(),
+            text,
+        }) {
+            execution.finish(&turn_id);
+            return Err(error);
         }
         execution.append(
             &turn_id,
