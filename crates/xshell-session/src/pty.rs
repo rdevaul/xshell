@@ -130,6 +130,9 @@ struct PtyState {
     replay_end: u64,
     exit_status: Option<String>,
     shutdown: bool,
+    /// Set by attachment so the worker can signal the PTY foreground process
+    /// group after the new stream's replay cursor has been established.
+    redraw_requested: bool,
     /// Set only after the worker has recorded the stream summary and terminal
     /// completion. Session closure waits for this barrier before finalizing
     /// the audit log.
@@ -245,6 +248,7 @@ impl PtyCoordinator {
                 replay_end: 0,
                 exit_status: None,
                 shutdown: false,
+                redraw_requested: false,
                 worker_finished: false,
             }),
             changed: Condvar::new(),
@@ -274,16 +278,17 @@ impl PtyCoordinator {
             .find(|(_, pty)| pty.session_id == session_id)
             .map(|(id, pty)| (id.clone(), Arc::clone(pty)))
             .context("session has no terminal job")?;
-        let state = managed.state.lock_recover();
-        let replay_from = after_offset
-            .unwrap_or(state.replay_start)
-            .clamp(state.replay_start, state.replay_end);
-        drop(state);
-        let ticket = Uuid::new_v4().to_string();
         let mut stream = managed.stream.lock_recover();
         if stream.claimed.is_some() {
             bail!("terminal job is already attached");
         }
+        let mut state = managed.state.lock_recover();
+        let replay_from = after_offset
+            .unwrap_or(state.replay_start)
+            .clamp(state.replay_start, state.replay_end);
+        state.redraw_requested = true;
+        drop(state);
+        let ticket = Uuid::new_v4().to_string();
         stream.tickets.clear();
         stream.tickets.insert(ticket.clone(), replay_from);
         Ok(PtyTicket {
@@ -477,8 +482,8 @@ impl PtyCoordinator {
 fn spawn_worker(managed: Arc<ManagedPty>, mut process: RemotePtyProcess) {
     thread::spawn(move || {
         loop {
-            let (input, size, shutdown_requested) = {
-                let state = managed.state.lock_recover();
+            let (input, size, shutdown_requested, redraw_requested) = {
+                let mut state = managed.state.lock_recover();
                 (
                     state
                         .input
@@ -488,12 +493,18 @@ fn spawn_worker(managed: Arc<ManagedPty>, mut process: RemotePtyProcess) {
                         .collect::<Vec<_>>(),
                     state.size,
                     state.shutdown,
+                    std::mem::take(&mut state.redraw_requested),
                 )
             };
             if shutdown_requested {
                 process.terminate();
                 finish(&managed, "terminated".into());
                 return;
+            }
+            if redraw_requested && let Err(error) = process.request_redraw() {
+                // A process can exit between attachment and this request. Keep
+                // the PTY usable and let the normal exchange observe its exit.
+                eprintln!("xshelld warning: cannot request terminal redraw: {error:#}");
             }
             let result = process.exchange(
                 &input,
@@ -719,6 +730,59 @@ mod tests {
             }
         }
         assert!(String::from_utf8_lossy(&output).contains("remote:hello"));
+    }
+
+    #[test]
+    fn attaching_requests_a_redraw_from_the_foreground_process() {
+        let temporary = TempDir::new().unwrap();
+        let coordinator = PtyCoordinator::default();
+        let ticket = coordinator
+            .start(
+                "session-a",
+                "python3 -c 'import signal,time; signal.signal(signal.SIGWINCH, lambda *_: print(\"redraw-marker\", flush=True)); print(\"ready-marker\", flush=True); time.sleep(60)'"
+                    .into(),
+                temporary.path(),
+                PtySize {
+                    rows: 24,
+                    columns: 80,
+                },
+                Some("xterm-256color".into()),
+            )
+            .unwrap();
+        let claim = coordinator.claim(&ticket.ticket).unwrap();
+        let mut cursor = claim.cursor;
+        let mut initial_output = Vec::new();
+        for _ in 0..20 {
+            let result = coordinator.read_claimed(&claim, cursor, 100).unwrap();
+            cursor = result.offset + result.output.len() as u64;
+            initial_output.extend(result.output);
+            if String::from_utf8_lossy(&initial_output).contains("ready-marker") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&initial_output).contains("ready-marker"));
+        assert!(!String::from_utf8_lossy(&initial_output).contains("redraw-marker"));
+        coordinator.release_claim(&claim);
+
+        let ticket = coordinator.attach("session-a", Some(cursor)).unwrap();
+        let claim = coordinator.claim(&ticket.ticket).unwrap();
+        let mut cursor = claim.cursor;
+        let mut output = Vec::new();
+        for _ in 0..20 {
+            let result = coordinator.read_claimed(&claim, cursor, 100).unwrap();
+            cursor = result.offset + result.output.len() as u64;
+            output.extend(result.output);
+            if String::from_utf8_lossy(&output).contains("redraw-marker") {
+                break;
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&output).contains("redraw-marker"),
+            "reattached output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        coordinator.release_claim(&claim);
+        coordinator.terminate(&ticket.pty_id).unwrap();
     }
 
     #[test]

@@ -167,6 +167,24 @@ impl RemotePtyProcess {
         })
     }
 
+    /// Ask the application currently in the foreground of the pseudoterminal
+    /// to repaint itself. Reapplying an unchanged window size is not required
+    /// to generate `SIGWINCH`, so attachments request it explicitly.
+    pub fn request_redraw(&self) -> Result<()> {
+        let process_group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if process_group < 0 {
+            return Err(io::Error::last_os_error())
+                .context("cannot find the foreground PTY process group");
+        }
+        if process_group <= 1 {
+            bail!("invalid foreground PTY process group {process_group}");
+        }
+        if unsafe { libc::kill(-process_group, libc::SIGWINCH) } < 0 {
+            return Err(io::Error::last_os_error()).context("cannot request a PTY redraw");
+        }
+        Ok(())
+    }
+
     pub fn terminate(&mut self) {
         terminate(&mut self.child);
         self.master_closed = true;

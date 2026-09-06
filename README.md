@@ -185,6 +185,28 @@ restored detached.
 
 Install the same xshell build on a remote macOS or Linux host, make `xshelld`
 available on its non-interactive SSH `PATH`, and start its per-user daemon.
+From the same xshell checkout and revision used by the controller:
+
+```sh
+cargo install --locked --path crates/xshell-session
+xshelld --config ~/.config/xshell/config.toml
+```
+
+The second command runs the daemon in the foreground, which is convenient for
+initial testing; leave that terminal open. Ensure `$HOME/.cargo/bin` is on the
+remote account's non-interactive SSH `PATH`. For zsh, put the following in
+`~/.zshenv` (not only `~/.zshrc`):
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Verify discovery from the controlling host before connecting:
+
+```sh
+ssh rich@mini.local 'command -v xshelld && xshelld --version'
+```
+
 Then connect using the SSH identity and policy you already use:
 
 ```text
@@ -205,8 +227,8 @@ Remote command and path completion is evaluated by the remote daemon against
 its inherited `PATH` and the session cwd without sourcing shell startup files,
 aliases, functions, or native completion frameworks.
 
-Automatic remote bootstrap, daemon installation, reconnection supervision, and
-SSH connection multiplexing remain planned work. See the
+Automatic remote bootstrap, service installation, reconnection supervision,
+and SSH connection multiplexing remain planned work. See the
 [session-fabric design](docs/session-fabric.md).
 
 ## Full terminal applications without a second abstraction
