@@ -6,6 +6,10 @@
 **Future scripting track:** [FutureShell roadmap](docs/futureshell-roadmap.md)
 and [implementation plan](docs/futureshell-implementation-plan.md)
 
+**Design review history:** [Fable 5.1 implementation review](docs/fable51-review-2026-11-05.txt),
+an independent structural and correctness review that informed the post-v0.2
+simplification and hardening sequence.
+
 ## Delivery principles
 
 - Build a reliable local single-host experience before distributed filesystem semantics.

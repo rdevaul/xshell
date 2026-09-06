@@ -784,11 +784,15 @@ fn process_request(
             let selector = selector
                 .or_else(|| attached_session.clone())
                 .context("close requires a session selector when detached")?;
-            let resolved = registry.lock_recover().snapshot(&selector)?.descriptor.id;
-            ptys.terminate_session(&resolved);
             let session_id = registry.lock_recover().close(client_id, &selector)?;
-            execution.cancel_and_remove(&resolved);
-            execution.audit().close_session(&resolved, "session closed");
+            // Session removal performs the controller-ownership check. Do not
+            // terminate work until that authorization has succeeded: another
+            // client may legitimately own the requested session.
+            ptys.terminate_session(&session_id);
+            execution.cancel_and_remove(&session_id);
+            execution
+                .audit()
+                .close_session(&session_id, "session closed");
             if attached_session.as_deref() == Some(session_id.as_str()) {
                 *attached_session = None;
             }
