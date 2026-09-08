@@ -4,6 +4,8 @@
 
 **Implementation:** `crates/xshell-plan`
 
+**Project progress:** [FutureShell status and traceability](futureshell-status.md)
+
 Plan V0 is the first checked lowering target for FutureShell Flow IR. It makes
 task eligibility, value selection, region ownership, bounded-loop state,
 capabilities, and unresolved execution dependencies explicit without running a

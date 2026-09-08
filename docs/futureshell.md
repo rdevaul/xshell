@@ -1,4 +1,17 @@
 # Next Generation Xshell
+
+> **Historical concept note.** This document records the initial idea that led
+> to FutureShell; it is not a current specification. The canonical direction is
+> the [FutureShell roadmap](futureshell-roadmap.md), with current implementation
+> progress tracked in [FutureShell status](futureshell-status.md).
+>
+> In particular, the current design uses a separate `xshell-run` runtime,
+> staged transactional workspaces rather than wrapping BusyBox commands,
+> deterministic typed contract evidence rather than natural-language contract
+> clauses, and typed xshell APIs rather than reparsing interactive `//`
+> commands. The portable executable shebang is `#!/usr/bin/env xshell-run`;
+> `#!xshell` is at most an explicit-source marker.
+
 Xshell should become its own scripting language that allows the user to mix deterministic bash-like shell syntax with the output of LLMs, invoked either in-line or as subprocesses. These scripts would be a more powerful and deterministic alternative to the current notion of an LLM skill, which ultimately has zero enforcability.
 
 This would involve the following:

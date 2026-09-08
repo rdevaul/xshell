@@ -65,6 +65,8 @@ An experimental typed dataflow representation for FutureShell is available in
 and bounded feedback loops. See [the Flow IR prototype](docs/futureshell-flow-ir.md).
 The `xshell-plan` crate lowers valid flows into deterministic Plan V0 task
 templates; see [the Plan V0 prototype](docs/futureshell-plan-v0.md).
+Current milestone state, blockers, and artifact traceability are maintained in
+[FutureShell status](docs/futureshell-status.md).
 
 ## Build and run
 
@@ -369,6 +371,7 @@ rollback guarantees.
 
 - [Current system specification](xshell-specification.md)
 - [Implementation plan](xshell-implementation-plan.md)
+- [FutureShell status and traceability](docs/futureshell-status.md)
 - [FutureShell roadmap](docs/futureshell-roadmap.md)
 - [FutureShell implementation plan](docs/futureshell-implementation-plan.md)
 

@@ -2,9 +2,14 @@
 
 **Status:** Draft for review
 
-**Companion documents:** [roadmap](futureshell-roadmap.md),
-[concept note](futureshell.md), [xshell specification](../xshell-specification.md),
-and [current xshell implementation plan](../xshell-implementation-plan.md)
+**Authority:** The [roadmap](futureshell-roadmap.md) is the canonical product
+and semantics plan. This document expands its implementation details.
+
+**Progress:** [status and traceability](futureshell-status.md)
+
+**Companion documents:** [historical concept note](futureshell.md), [xshell
+specification](../xshell-specification.md), and [current xshell implementation
+plan](../xshell-implementation-plan.md)
 
 ## 1. Objective
 
