@@ -14,6 +14,9 @@ pub const SESSION_PROTOCOL_VERSION: u32 = 11;
 pub struct SessionConfig {
     pub enabled: bool,
     pub required: bool,
+    /// Human-facing name advertised by this daemon. When omitted, xshelld
+    /// uses the operating-system hostname.
+    pub host_alias: Option<String>,
     pub socket: Option<PathBuf>,
     pub state_directory: Option<PathBuf>,
     pub default_session: String,
@@ -48,6 +51,7 @@ impl Default for SessionConfig {
         Self {
             enabled: false,
             required: true,
+            host_alias: None,
             socket: None,
             state_directory: None,
             default_session: "default".into(),

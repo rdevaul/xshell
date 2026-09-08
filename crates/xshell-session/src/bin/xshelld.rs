@@ -93,7 +93,11 @@ fn main() -> Result<()> {
     if matches!(args.command, Some(DaemonCommand::ServePtyStdio)) {
         return serve_pty_stdio(&socket);
     }
-    let host_alias = args.host_alias.unwrap_or_else(system_hostname);
+    let host_alias = validate_host_alias(
+        args.host_alias
+            .or_else(|| config.host_alias.clone())
+            .unwrap_or_else(system_hostname),
+    )?;
     let user = args.user.unwrap_or_else(system_user);
     let host_id = load_or_create_host_id(&state_directory)?;
     let registry = Arc::new(Mutex::new(SessionRegistry::load(
@@ -986,6 +990,20 @@ fn system_hostname() -> String {
         }
     }
     "localhost".to_owned()
+}
+
+fn validate_host_alias(alias: String) -> Result<String> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        bail!("host alias must not be empty");
+    }
+    if alias
+        .chars()
+        .any(|character| character.is_control() || matches!(character, ':' | '/' | '#'))
+    {
+        bail!("host alias must not contain control characters, ':', '/', or '#'");
+    }
+    Ok(alias.to_owned())
 }
 
 fn system_user() -> String {

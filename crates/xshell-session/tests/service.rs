@@ -823,6 +823,30 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
 }
 
 #[test]
+fn daemon_advertises_host_alias_from_config() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[session_fabric]\nhost_alias = \"rich-mini\"\n",
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--config", config_path.to_str().unwrap()])
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let client = connect_when_ready(&socket);
+    assert_eq!(client.host_alias(), "rich-mini");
+}
+
+#[test]
 fn shell_turn_continues_after_disconnect_and_replays_on_attach() {
     let temporary = TempDir::new().unwrap();
     let state = temporary.path().join("state");

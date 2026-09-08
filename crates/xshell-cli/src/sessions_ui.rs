@@ -17,7 +17,7 @@ use xshell_session::{PersistenceMode, SessionSnapshot, Visibility};
 pub(crate) fn session_label(sessions: &SessionRuntime) -> String {
     sessions.active().map_or_else(
         || "local:standalone".into(),
-        |session| format!("{}:{}", session.host_alias, session.name),
+        |session| format!("{}:{}", sessions.display_host_alias(session), session.name),
     )
 }
 

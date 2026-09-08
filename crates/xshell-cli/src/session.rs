@@ -23,6 +23,7 @@ enum ConnectionEndpoint {
 pub struct SessionRuntime {
     connection: Option<HostConnection>,
     parked_connections: HashMap<String, HostConnection>,
+    display_host_aliases: HashMap<String, String>,
     active: Option<SessionDescriptor>,
     navigation_history: Vec<String>,
     event_cursors: HashMap<String, u64>,
@@ -69,26 +70,27 @@ impl SessionRuntime {
         let active = Some(snapshot.descriptor.clone());
         let cursor = initial_event_cursor(&mut client, &snapshot.descriptor.id)?;
         let event_cursors = HashMap::from([(snapshot.descriptor.id.clone(), cursor)]);
-        Ok((
-            Self {
-                connection: Some(HostConnection {
-                    client,
-                    endpoint: ConnectionEndpoint::Local(socket),
-                }),
-                parked_connections: HashMap::new(),
-                active,
-                navigation_history: Vec::new(),
-                event_cursors,
-                pty_cursors: HashMap::new(),
-            },
-            Some(snapshot),
-        ))
+        let mut runtime = Self {
+            connection: Some(HostConnection {
+                client,
+                endpoint: ConnectionEndpoint::Local(socket),
+            }),
+            parked_connections: HashMap::new(),
+            display_host_aliases: HashMap::new(),
+            active,
+            navigation_history: Vec::new(),
+            event_cursors,
+            pty_cursors: HashMap::new(),
+        };
+        runtime.rebuild_display_host_aliases();
+        Ok((runtime, Some(snapshot)))
     }
 
     pub fn disabled() -> Self {
         Self {
             connection: None,
             parked_connections: HashMap::new(),
+            display_host_aliases: HashMap::new(),
             active: None,
             navigation_history: Vec::new(),
             event_cursors: HashMap::new(),
@@ -98,6 +100,13 @@ impl SessionRuntime {
 
     pub fn active(&self) -> Option<&SessionDescriptor> {
         self.active.as_ref()
+    }
+
+    pub fn display_host_alias<'a>(&'a self, session: &'a SessionDescriptor) -> &'a str {
+        self.display_host_aliases
+            .get(&session.host_id)
+            .map(String::as_str)
+            .unwrap_or(&session.host_alias)
     }
 
     pub fn service_label(&self) -> Option<String> {
@@ -128,6 +137,7 @@ impl SessionRuntime {
     }
 
     pub fn list(&mut self) -> Result<Vec<SessionDescriptor>> {
+        self.rebuild_display_host_aliases();
         let mut sessions = Vec::new();
         let active_error = match self.client_mut()?.list() {
             Ok(catalog) => {
@@ -149,6 +159,7 @@ impl SessionRuntime {
                 Err(error) => {
                     eprintln!("xshell: dropping unavailable host connection: {error:#}");
                     self.parked_connections.remove(&host_id);
+                    self.rebuild_display_host_aliases();
                 }
             }
         }
@@ -157,6 +168,11 @@ impl SessionRuntime {
                 return Err(error);
             }
             eprintln!("xshell: active host connection is unavailable: {error:#}");
+        }
+        for session in &mut sessions {
+            if let Some(alias) = self.display_host_aliases.get(&session.host_id) {
+                session.host_alias.clone_from(alias);
+            }
         }
         Ok(sessions)
     }
@@ -228,6 +244,7 @@ impl SessionRuntime {
             client,
             endpoint: ConnectionEndpoint::Ssh(destination.to_owned()),
         });
+        self.rebuild_display_host_aliases();
         self.active = Some(snapshot.descriptor.clone());
         self.ensure_event_cursor(&snapshot.descriptor.id)?;
         Ok(snapshot)
@@ -649,6 +666,23 @@ session's interactive process is running; stop it first"
             .context("there is no active session")
     }
 
+    fn rebuild_display_host_aliases(&mut self) {
+        let mut hosts = Vec::new();
+        if let Some(connection) = &self.connection {
+            hosts.push((
+                connection.client.host_id().to_owned(),
+                connection.client.host_alias().to_owned(),
+            ));
+        }
+        hosts.extend(self.parked_connections.values().map(|connection| {
+            (
+                connection.client.host_id().to_owned(),
+                connection.client.host_alias().to_owned(),
+            )
+        }));
+        self.display_host_aliases = disambiguate_host_aliases(&hosts);
+    }
+
     fn ensure_event_cursor(&mut self, session_id: &str) -> Result<()> {
         if self.event_cursors.contains_key(session_id) {
             return Ok(());
@@ -657,6 +691,37 @@ session's interactive process is running; stop it first"
         self.event_cursors.insert(session_id.to_owned(), cursor);
         Ok(())
     }
+}
+
+fn disambiguate_host_aliases(hosts: &[(String, String)]) -> HashMap<String, String> {
+    let mut aliases: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (host_id, alias) in hosts {
+        aliases.entry(alias).or_default().push(host_id);
+    }
+
+    let mut labels = HashMap::new();
+    for (host_id, alias) in hosts {
+        let colliding = &aliases[alias.as_str()];
+        if colliding.len() == 1 {
+            labels.insert(host_id.clone(), alias.clone());
+            continue;
+        }
+        let prefix_length = (8..=host_id.len())
+            .find(|length| {
+                let prefix = &host_id[..*length];
+                colliding
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(prefix))
+                    .count()
+                    == 1
+            })
+            .unwrap_or(host_id.len());
+        labels.insert(
+            host_id.clone(),
+            format!("{alias}#{}", &host_id[..prefix_length]),
+        );
+    }
+    labels
 }
 
 fn initial_event_cursor(client: &mut SessionClient, session_id: &str) -> Result<u64> {
@@ -713,5 +778,17 @@ mod tests {
             fallback_candidates(&history, Vec::new(), "current"),
             vec!["first", "second"]
         );
+    }
+
+    #[test]
+    fn duplicate_host_aliases_receive_stable_unique_labels() {
+        let labels = disambiguate_host_aliases(&[
+            ("12345678-aaaa".into(), "Mac.lan".into()),
+            ("87654321-bbbb".into(), "Mac.lan".into()),
+            ("abcdef00-cccc".into(), "jarvis".into()),
+        ]);
+        assert_eq!(labels["12345678-aaaa"], "Mac.lan#12345678");
+        assert_eq!(labels["87654321-bbbb"], "Mac.lan#87654321");
+        assert_eq!(labels["abcdef00-cccc"], "jarvis");
     }
 }
