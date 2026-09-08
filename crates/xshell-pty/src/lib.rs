@@ -125,8 +125,10 @@ pub fn controller_action_for_key(byte: u8) -> Option<ControllerAction> {
 }
 
 /// Raw terminal input used while structured output (rather than a PTY) has
-/// focus. Ordinary bytes are returned to the caller; xshell currently ignores
-/// them because an agent stream has no byte-oriented input sink.
+/// focus. Output processing remains enabled so ordinary line feeds emitted by
+/// renderers still return the cursor to the first column. Ordinary input bytes
+/// are returned to the caller; xshell currently ignores them because an agent
+/// stream has no byte-oriented input sink.
 pub struct ControllerInput {
     descriptor: RawFd,
     guard: TerminalGuard,
@@ -135,8 +137,9 @@ pub struct ControllerInput {
 }
 
 impl ControllerInput {
-    /// Enter raw mode for the controller terminal. Non-interactive callers do
-    /// not acquire input ownership and receive `None`.
+    /// Enter raw input mode while preserving the controller's output flags.
+    /// Non-interactive callers do not acquire input ownership and receive
+    /// `None`.
     pub fn acquire(escape_prefix: u8) -> Result<Option<Self>> {
         if !controller_is_terminal() {
             return Ok(None);
@@ -144,7 +147,7 @@ impl ControllerInput {
         let terminal = io::stdin();
         let descriptor = terminal.as_raw_fd();
         let original = tcgetattr(terminal.as_fd()).context("cannot read terminal attributes")?;
-        let guard = TerminalGuard::enter(descriptor, original)?;
+        let guard = TerminalGuard::enter_input_raw(descriptor, original)?;
         Ok(Some(Self {
             descriptor,
             guard,
@@ -906,8 +909,20 @@ impl TerminalGuard {
     fn enter(descriptor: RawFd, original: Termios) -> Result<Self> {
         let mut raw = original.clone();
         cfmakeraw(&mut raw);
+        Self::enter_attributes(descriptor, original, raw)
+    }
+
+    fn enter_input_raw(descriptor: RawFd, original: Termios) -> Result<Self> {
+        let mut raw_input = original.clone();
+        let output_flags = raw_input.output_flags;
+        cfmakeraw(&mut raw_input);
+        raw_input.output_flags = output_flags;
+        Self::enter_attributes(descriptor, original, raw_input)
+    }
+
+    fn enter_attributes(descriptor: RawFd, original: Termios, active: Termios) -> Result<Self> {
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(descriptor) };
-        tcsetattr(borrowed, SetArg::TCSANOW, &raw).context("cannot enter terminal raw mode")?;
+        tcsetattr(borrowed, SetArg::TCSANOW, &active).context("cannot set terminal attributes")?;
         Ok(Self {
             descriptor,
             original: Some(original),
@@ -933,6 +948,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::termios::{LocalFlags, OutputFlags};
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     use tempfile::TempDir;
@@ -960,6 +976,35 @@ mod tests {
             (vec![prefix], None)
         );
         assert!(parse_escape_prefix("not-a-key").is_err());
+    }
+
+    #[test]
+    fn controller_input_preserves_output_processing_while_making_input_raw() {
+        let OpenptyResult { master, slave } = openpty(None, None).unwrap();
+        let mut original = tcgetattr(slave.as_fd()).unwrap();
+        original
+            .output_flags
+            .insert(OutputFlags::OPOST | OutputFlags::ONLCR);
+        tcsetattr(slave.as_fd(), SetArg::TCSANOW, &original).unwrap();
+
+        let guard = TerminalGuard::enter_input_raw(slave.as_raw_fd(), original.clone()).unwrap();
+        let active = tcgetattr(slave.as_fd()).unwrap();
+        assert_eq!(active.output_flags, original.output_flags);
+        assert!(!active.local_flags.contains(LocalFlags::ICANON));
+        assert!(!active.local_flags.contains(LocalFlags::ECHO));
+
+        let mut terminal_output = File::from(slave.try_clone().unwrap());
+        terminal_output.write_all(b"first\nsecond").unwrap();
+        let mut controller = File::from(master);
+        let mut rendered = [0_u8; 13];
+        controller.read_exact(&mut rendered).unwrap();
+        assert_eq!(&rendered, b"first\r\nsecond");
+
+        drop(guard);
+        let restored = tcgetattr(slave.as_fd()).unwrap();
+        assert_eq!(restored.output_flags, original.output_flags);
+        assert!(restored.local_flags.contains(LocalFlags::ICANON));
+        assert!(restored.local_flags.contains(LocalFlags::ECHO));
     }
 
     #[test]
