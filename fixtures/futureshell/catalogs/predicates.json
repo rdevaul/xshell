@@ -1,0 +1,22 @@
+{
+  "schema": "xshell.predicate-catalog/v0",
+  "predicates": [
+    {
+      "name": "artifact.matches_schema",
+      "version": "1",
+      "implementation_sha256": "ce79d198d1ead38f1938f34a9d131941e029ff724cec380bb6629fdd91c856a6",
+      "arguments": {
+        "port": { "type": "string" },
+        "schema": { "type": "string" }
+      }
+    },
+    {
+      "name": "task.succeeded",
+      "version": "1",
+      "implementation_sha256": "caf56461752f399bb100ec1b1b496e6d3e27caf397b6603ef8bd4b19788b7e9f",
+      "arguments": {
+        "task": { "type": "string" }
+      }
+    }
+  ]
+}

@@ -202,7 +202,9 @@ produced by `serde_json`.
 
 The initial [Plan V0 prototype](futureshell-plan-v0.md) lowers Flow IR into
 deterministic task and loop templates, normalizes capabilities, detects obvious
-write conflicts, and records unresolved program and predicate dependencies. It
+write conflicts, and records unresolved program and predicate dependencies. A
+pure resolver can bind those dependencies from provisional fixture catalogs,
+checking typed interfaces, predicate arguments, and capability containment. It
 uses normalized JSON hashing only as a prototype; it is not yet the durable
 canonical encoding described above.
 
@@ -953,23 +955,23 @@ examples that normalize `promote all` after an agent task.
 ## 16. Immediate backlog
 
 The Flow IR and Plan V0 crates now exist as explicitly provisional prototypes.
-They test graph and lowering semantics but are not durable formats or an
-executable runtime. Continue in this order:
+They test graph, lowering, and catalog-resolution semantics but are not durable
+formats or an executable runtime. The pure program-manifest resolver, fixture
+manifests, and typed contract-predicate catalog are complete. Continue in this
+order:
 
-1. add a pure program-manifest resolver and typed contract-predicate catalog so
-   Plan V0 can replace resolution blockers with pinned identities;
-2. write `docs/futureshell-language.md` with the minimal grammar, typed program
+1. write `docs/futureshell-language.md` with the minimal grammar, typed program
    interfaces and text-to-Flow examples;
-3. write `docs/futureshell-threat-model.md` with assets, actors, boundaries and
+2. write `docs/futureshell-threat-model.md` with assets, actors, boundaries and
    guarantee levels;
-4. define draft schemas for evidence, change sets, receipts, clause reports,
+3. define draft schemas for evidence, change sets, receipts, clause reports,
    agent targets, connector capabilities, gateway policy, autonomy grants and
    usage reports;
-5. create the deterministic FEA fixture and fixture program manifests without
+4. create the deterministic FEA fixture and fixture program manifests without
    requiring real gmsh/FEniCS;
-6. spike secure staged-tree creation and change detection on macOS/Linux;
-7. decide canonical serialization after testing candidate encodings;
-8. promote the language, plan and `xshell-run` surfaces beyond prototype status
+5. spike secure staged-tree creation and change detection on macOS/Linux;
+6. decide canonical serialization after testing candidate encodings;
+7. promote the language, plan and `xshell-run` surfaces beyond prototype status
    only after the FS0 review gate.
 
 This order keeps syntax, security claims and durable schema choices reviewable

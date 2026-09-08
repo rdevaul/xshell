@@ -1,0 +1,464 @@
+{
+  "plan_hash": "56429a2b4caf8c45253a62c58c45516187a0fcd44ee8483602b525bee183ab2d",
+  "schema": "xshell.plan/v0",
+  "name": "contract_branch",
+  "flow": {
+    "schema": "xshell.flow/v0",
+    "semantic_sha256": "313be4f9975f4b8b001d9bfc2bca234577db410a405cdea731c9684a03a49244"
+  },
+  "interface": {
+    "inputs": [
+      {
+        "name": "model",
+        "type": {
+          "kind": "artifact",
+          "media_type": "model/step"
+        },
+        "optional": false
+      }
+    ],
+    "outputs": [
+      {
+        "name": "published",
+        "type": {
+          "kind": "artifact",
+          "media_type": "application/json",
+          "schema": "fea-result-v1"
+        },
+        "optional": false
+      }
+    ]
+  },
+  "contracts": [
+    {
+      "id": "valid_analysis",
+      "expression": {
+        "op": "all",
+        "clauses": [
+          {
+            "op": "predicate",
+            "name": "task.succeeded",
+            "arguments": {
+              "task": "analyze"
+            },
+            "resolution": {
+              "definition_sha256": "73d52473d52e7a0ab7bc180126d5e9d6e0c53df74473a30c704414079d4682a9",
+              "version": "1",
+              "implementation_sha256": "caf56461752f399bb100ec1b1b496e6d3e27caf397b6603ef8bd4b19788b7e9f"
+            }
+          },
+          {
+            "op": "predicate",
+            "name": "artifact.matches_schema",
+            "arguments": {
+              "port": "analyze.analysis",
+              "schema": "fea-result-v1"
+            },
+            "resolution": {
+              "definition_sha256": "d9b40645c14720d963b46b12fcf988c0d2cc69cf5b7f9169f3eea1f709203df3",
+              "version": "1",
+              "implementation_sha256": "ce79d198d1ead38f1938f34a9d131941e029ff724cec380bb6629fdd91c856a6"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "id": "input",
+      "operation": {
+        "kind": "input"
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": {
+            "kind": "artifact",
+            "media_type": "model/step"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": []
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "analyze",
+      "operation": {
+        "kind": "program",
+        "source": "analyze.fsh",
+        "resolution": {
+          "manifest_sha256": "d7735d54315fea23d636432b3705cf918cef010270cb6e1611498bf994e23ab6",
+          "source_sha256": "27378cb6733ed1b2ae3722d37be7beccc1cfa5d1cec36037e4cff7874862a4b7",
+          "entrypoint": "main"
+        }
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "model",
+            "type": {
+              "kind": "artifact",
+              "media_type": "model/step"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "input",
+                "port": "model"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "analysis",
+          "type": {
+            "kind": "artifact",
+            "media_type": "application/json",
+            "schema": "fea-result-v1"
+          },
+          "optional": false
+        },
+        {
+          "name": "evidence",
+          "type": {
+            "kind": "evidence"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "input"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "accept",
+      "operation": {
+        "kind": "gate",
+        "contract": "valid_analysis"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "analysis",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "fea-result-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "analyze",
+                "port": "analysis"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        },
+        {
+          "port": {
+            "name": "evidence",
+            "type": {
+              "kind": "evidence"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "analyze",
+                "port": "evidence"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "analyze"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "publish",
+      "operation": {
+        "kind": "program",
+        "source": "publish.fsh",
+        "resolution": {
+          "manifest_sha256": "0233677946c0d1e81bf31aa6182c8cf7fa41788f9b3429f0768f5f04a2ef6d71",
+          "source_sha256": "8f148bcbaf846bb2f833b448324a23a6a752b89eaac75e80ba685b6d8273133f",
+          "entrypoint": "main"
+        }
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "analysis",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "fea-result-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "analyze",
+                "port": "analysis"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "published",
+          "type": {
+            "kind": "artifact",
+            "media_type": "application/json",
+            "schema": "fea-result-v1"
+          },
+          "optional": false
+        }
+      ],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "analyze"
+          ]
+        },
+        "after": [],
+        "activate_on_any": [
+          {
+            "gate": "accept",
+            "outcome": "valid"
+          }
+        ]
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "output",
+      "operation": {
+        "kind": "output"
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "published",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "fea-result-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "publish",
+                "port": "published"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "publish"
+          ]
+        },
+        "after": [],
+        "activate_on_any": []
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    },
+    {
+      "id": "repair",
+      "operation": {
+        "kind": "program",
+        "source": "repair.fsh",
+        "resolution": {
+          "manifest_sha256": "c7a542d0dbedb1552d4fef1088a87b972885b45235cca43590c81f23212c9329",
+          "source_sha256": "952baf380882138681d87b9b761a36c363b43c894e23bf2477dcae1cb4ef0bfb",
+          "entrypoint": "main"
+        }
+      },
+      "inputs": [
+        {
+          "port": {
+            "name": "analysis",
+            "type": {
+              "kind": "artifact",
+              "media_type": "application/json",
+              "schema": "fea-result-v1"
+            },
+            "optional": false
+          },
+          "sources": [
+            {
+              "from": {
+                "task": "analyze",
+                "port": "analysis"
+              },
+              "selection": {
+                "kind": "direct"
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": [],
+      "readiness": {
+        "data": {
+          "mode": "all",
+          "tasks": [
+            "analyze"
+          ]
+        },
+        "after": [],
+        "activate_on_any": [
+          {
+            "gate": "accept",
+            "outcome": "invalid"
+          }
+        ]
+      },
+      "region_path": [],
+      "capabilities": {
+        "read": [],
+        "write": [],
+        "execute": [],
+        "network": []
+      },
+      "resources": {
+        "timeout_ms": null,
+        "memory_bytes": null,
+        "output_bytes": null,
+        "attempts": null
+      }
+    }
+  ],
+  "regions": [],
+  "loops": [],
+  "capabilities": {
+    "read": [],
+    "write": [],
+    "execute": [],
+    "network": []
+  },
+  "resolution": {
+    "fully_resolved": true,
+    "blockers": []
+  }
+}

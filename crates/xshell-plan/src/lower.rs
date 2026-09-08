@@ -469,6 +469,7 @@ impl<'a> Planner<'a> {
             NodeKind::Task { program } => TaskOperation::Program {
                 source: program.source.clone(),
                 entrypoint: program.entrypoint.clone(),
+                resolution: None,
             },
             NodeKind::Gate { contract } => TaskOperation::Gate {
                 contract: contract.clone(),
@@ -682,7 +683,7 @@ fn normalized_capabilities(capabilities: &xshell_flow::Capabilities) -> Capabili
     result
 }
 
-fn normalize_workspace_path(path: &str, allow_dot: bool) -> Result<String, String> {
+pub(crate) fn normalize_workspace_path(path: &str, allow_dot: bool) -> Result<String, String> {
     if path.starts_with('/') {
         return Err(format!("workspace path {path:?} must be relative"));
     }

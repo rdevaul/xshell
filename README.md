@@ -64,7 +64,8 @@ An experimental typed dataflow representation for FutureShell is available in
 `crates/xshell-flow`. It models tasks, contract-gated branches, parallel joins,
 and bounded feedback loops. See [the Flow IR prototype](docs/futureshell-flow-ir.md).
 The `xshell-plan` crate lowers valid flows into deterministic Plan V0 task
-templates; see [the Plan V0 prototype](docs/futureshell-plan-v0.md).
+templates and can resolve provisional program and predicate catalogs into
+pinned plan identities; see [the Plan V0 prototype](docs/futureshell-plan-v0.md).
 Current milestone state, blockers, and artifact traceability are maintained in
 [FutureShell status](docs/futureshell-status.md).
 
