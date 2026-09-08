@@ -9,10 +9,26 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionHandshake {
+    Opened {
+        protocol_version: u32,
+        host_id: String,
+        host_alias: String,
+        user: String,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+}
 
 pub struct SessionClient {
     client_id: String,
@@ -39,6 +55,50 @@ impl Drop for TransportGuard {
 }
 
 impl SessionClient {
+    /// Probe a local daemon without attaching to or mutating any session.
+    /// Unlike `connect`, this preserves a protocol rejection as structured
+    /// data so a bootstrap client can distinguish incompatibility from an
+    /// unavailable service.
+    pub fn probe(socket: &Path, client_version: &str) -> Result<SessionHandshake> {
+        let stream = UnixStream::connect(socket).with_context(|| {
+            format!(
+                "cannot connect to xshell session service at {}",
+                socket.display()
+            )
+        })?;
+        set_close_on_exec(&stream)?;
+        stream
+            .set_read_timeout(Some(PROBE_TIMEOUT))
+            .context("cannot set session probe read timeout")?;
+        stream
+            .set_write_timeout(Some(PROBE_TIMEOUT))
+            .context("cannot set session probe write timeout")?;
+        let mut writer = stream.try_clone().context("cannot clone session socket")?;
+        set_close_on_exec(&writer)?;
+        serde_json::to_writer(&mut writer, &ClientRequest::open(client_version))?;
+        writer.write_all(b"\n")?;
+        writer.flush().context("cannot flush session probe")?;
+        let mut reader = BufReader::new(stream);
+        match receive_response(&mut reader)? {
+            ServerResponse::Opened {
+                protocol_version,
+                host_id,
+                host_alias,
+                user,
+                ..
+            } => Ok(SessionHandshake::Opened {
+                protocol_version,
+                host_id,
+                host_alias,
+                user,
+            }),
+            ServerResponse::Error { code, message } => {
+                Ok(SessionHandshake::Rejected { code, message })
+            }
+            response => bail!("unexpected session probe response: {response:?}"),
+        }
+    }
+
     pub fn connect(socket: &Path, client_version: &str) -> Result<Self> {
         let stream = UnixStream::connect(socket).with_context(|| {
             format!(
@@ -356,20 +416,21 @@ impl SessionClient {
     }
 
     fn receive(&mut self) -> Result<ServerResponse> {
-        let mut bytes = Vec::new();
-        let count = self
-            .reader
-            .by_ref()
-            .take((MAX_RESPONSE_BYTES + 1) as u64)
-            .read_until(b'\n', &mut bytes)?;
-        if count == 0 {
-            bail!("session service closed the connection");
-        }
-        if bytes.len() > MAX_RESPONSE_BYTES || bytes.last() != Some(&b'\n') {
-            bail!("session service response exceeds {MAX_RESPONSE_BYTES} bytes");
-        }
-        serde_json::from_slice(&bytes).context("session service returned an invalid response")
+        receive_response(&mut self.reader)
     }
+}
+
+fn receive_response(reader: &mut dyn BufRead) -> Result<ServerResponse> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take((MAX_RESPONSE_BYTES + 1) as u64);
+    let count = limited.read_until(b'\n', &mut bytes)?;
+    if count == 0 {
+        bail!("session service closed the connection");
+    }
+    if bytes.len() > MAX_RESPONSE_BYTES || bytes.last() != Some(&b'\n') {
+        bail!("session service response exceeds {MAX_RESPONSE_BYTES} bytes");
+    }
+    serde_json::from_slice(&bytes).context("session service returned an invalid response")
 }
 
 fn response_error<T>(operation: &str, response: ServerResponse) -> Result<T> {

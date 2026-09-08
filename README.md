@@ -216,8 +216,12 @@ export PATH="$HOME/.cargo/bin:$PATH"
 Verify discovery from the controlling host before connecting:
 
 ```sh
-ssh rich@mini.local 'command -v xshelld && xshelld --version'
+ssh rich@mini.local 'xshelld probe'
 ```
+
+The probe emits one JSON object. It reports the installed binary and supported
+protocol versions plus a daemon status of `ready`, `incompatible`, `rejected`,
+or `unavailable`; it does not start a daemon or alter any session.
 
 Then connect using the SSH identity and policy you already use:
 

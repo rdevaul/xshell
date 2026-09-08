@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -847,6 +847,108 @@ fn daemon_advertises_host_alias_from_config() {
 }
 
 #[test]
+fn probe_reports_binary_and_running_daemon_capabilities() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .args(["--host-alias", "probe-host", "--user", "probe-user"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    drop(connect_when_ready(&socket));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("probe")
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["binary_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        report["supported_protocol_version"],
+        SESSION_PROTOCOL_VERSION
+    );
+    assert_eq!(report["daemon_status"], "ready");
+    assert_eq!(report["protocol_version"], SESSION_PROTOCOL_VERSION);
+    assert_eq!(report["host_alias"], "probe-host");
+    assert_eq!(report["user"], "probe-user");
+    assert!(report["host_id"].as_str().is_some_and(|id| !id.is_empty()));
+}
+
+#[test]
+fn probe_reports_an_unavailable_daemon_without_failing_the_probe() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("missing.sock");
+    let output = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("probe")
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["daemon_status"], "unavailable");
+    assert!(
+        report["message"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+}
+
+#[test]
+fn probe_classifies_a_protocol_rejection_as_incompatible() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let socket = state.join("incompatible.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ClientRequest>(&request).unwrap(),
+            ClientRequest::Open { .. }
+        ));
+        serde_json::to_writer(
+            &mut stream,
+            &ServerResponse::Error {
+                code: "protocol_version".into(),
+                message: "daemon requires a different protocol".into(),
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("probe")
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["daemon_status"], "incompatible");
+    assert_eq!(report["code"], "protocol_version");
+}
+
+#[test]
 fn shell_turn_continues_after_disconnect_and_replays_on_attach() {
     let temporary = TempDir::new().unwrap();
     let state = temporary.path().join("state");
@@ -913,6 +1015,80 @@ fn shell_turn_continues_after_disconnect_and_replays_on_attach() {
     }
     assert!(completed);
     assert_eq!(output, "daemon-owned");
+}
+
+#[test]
+fn running_turn_survives_switching_to_another_session_and_back() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut client = connect_when_ready(&socket);
+    let running = client
+        .create(SessionCreation {
+            name: "running".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    let other = client
+        .create(SessionCreation {
+            name: "other".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    client.switch(running.descriptor.id.clone()).unwrap();
+    let turn_id = client
+        .submit(
+            running.descriptor.id.clone(),
+            TurnInput::Shell {
+                command: "sleep 0.2; printf switched-output".into(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+
+    let switched = client.switch(other.descriptor.id.clone()).unwrap();
+    assert_eq!(switched.descriptor.id, other.descriptor.id);
+    client.switch(running.descriptor.id.clone()).unwrap();
+
+    let mut after = 0;
+    let mut output = String::new();
+    let mut completed = false;
+    for _ in 0..100 {
+        let batch = client
+            .events(running.descriptor.id.clone(), after, 100)
+            .unwrap();
+        for event in batch.events {
+            after = event.sequence;
+            assert_eq!(event.turn_id, turn_id);
+            match event.event {
+                SessionEventKind::ShellOutput { text, .. } => output.push_str(&text),
+                SessionEventKind::TurnCompleted => completed = true,
+                _ => {}
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    assert!(completed);
+    assert_eq!(output, "switched-output");
 }
 
 #[test]
@@ -1088,6 +1264,17 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             history: vec![ChatMessage::system("test")],
         })
         .unwrap();
+    let other = client
+        .create(SessionCreation {
+            name: "other-work".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    client.switch(session.descriptor.id.clone()).unwrap();
     let turn_id = client
         .submit(
             session.descriptor.id.clone(),
@@ -1126,6 +1313,16 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             .find(|entry| entry.id == session.descriptor.id)
             .unwrap()
             .activity,
+        SessionActivity::AgentTurn {
+            phase: xshell_session::AgentTurnPhase::WaitingApproval,
+            ..
+        }
+    ));
+    let switched = client.switch(other.descriptor.id.clone()).unwrap();
+    assert_eq!(switched.descriptor.id, other.descriptor.id);
+    let resumed = client.switch(session.descriptor.id.clone()).unwrap();
+    assert!(matches!(
+        resumed.descriptor.activity,
         SessionActivity::AgentTurn {
             phase: xshell_session::AgentTurnPhase::WaitingApproval,
             ..

@@ -10,7 +10,7 @@ mod registry;
 mod view;
 
 pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy};
-pub use client::SessionClient;
+pub use client::{SessionClient, SessionHandshake};
 pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;
 pub use model::{
