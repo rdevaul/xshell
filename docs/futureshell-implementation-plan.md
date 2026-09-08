@@ -957,21 +957,16 @@ examples that normalize `promote all` after an agent task.
 The Flow IR and Plan V0 crates now exist as explicitly provisional prototypes.
 They test graph, lowering, and catalog-resolution semantics but are not durable
 formats or an executable runtime. The pure program-manifest resolver, fixture
-manifests, and typed contract-predicate catalog are complete. Continue in this
-order:
+manifests, and typed contract-predicate catalog are complete. The indexed
+[FS0 specification package](futureshell-fs0.md) now supplies the language,
+security, schema, platform-spike and deterministic FEA review artifacts.
+Continue in this order:
 
-1. write `docs/futureshell-language.md` with the minimal grammar, typed program
-   interfaces and text-to-Flow examples;
-2. write `docs/futureshell-threat-model.md` with assets, actors, boundaries and
-   guarantee levels;
-3. define draft schemas for evidence, change sets, receipts, clause reports,
-   agent targets, connector capabilities, gateway policy, autonomy grants and
-   usage reports;
-4. create the deterministic FEA fixture and fixture program manifests without
-   requiring real gmsh/FEniCS;
-5. spike secure staged-tree creation and change detection on macOS/Linux;
-6. decide canonical serialization after testing candidate encodings;
-7. promote the language, plan and `xshell-run` surfaces beyond prototype status
+1. hold the FS0 language and security reviews and revise the package;
+2. record decisions that constrain public semantics or the trusted computing
+   base as short ADRs;
+3. decide canonical serialization after testing candidate encodings;
+4. promote the language, plan and `xshell-run` surfaces beyond prototype status
    only after the FS0 review gate.
 
 This order keeps syntax, security claims and durable schema choices reviewable

@@ -67,7 +67,8 @@ The `xshell-plan` crate lowers valid flows into deterministic Plan V0 task
 templates and can resolve provisional program and predicate catalogs into
 pinned plan identities; see [the Plan V0 prototype](docs/futureshell-plan-v0.md).
 Current milestone state, blockers, and artifact traceability are maintained in
-[FutureShell status](docs/futureshell-status.md).
+[FutureShell status](docs/futureshell-status.md). The first reviewable semantics
+bundle is indexed by the [FS0 specification package](docs/futureshell-fs0.md).
 
 ## Build and run
 
@@ -373,6 +374,7 @@ rollback guarantees.
 - [Current system specification](xshell-specification.md)
 - [Implementation plan](xshell-implementation-plan.md)
 - [FutureShell status and traceability](docs/futureshell-status.md)
+- [FutureShell FS0 specification package](docs/futureshell-fs0.md)
 - [FutureShell roadmap](docs/futureshell-roadmap.md)
 - [FutureShell implementation plan](docs/futureshell-implementation-plan.md)
 

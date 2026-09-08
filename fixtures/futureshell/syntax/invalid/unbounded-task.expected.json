@@ -1,0 +1,22 @@
+{
+  "diagnostics": [
+    {
+      "code": "T0201",
+      "line": 1,
+      "column": 20,
+      "message_key": "task_requires_positive_timeout"
+    },
+    {
+      "code": "T0202",
+      "line": 1,
+      "column": 20,
+      "message_key": "task_requires_capability_block"
+    },
+    {
+      "code": "T0203",
+      "line": 1,
+      "column": 20,
+      "message_key": "task_requires_positive_output_bound"
+    }
+  ]
+}

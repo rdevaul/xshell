@@ -23,6 +23,10 @@ jobs:
           toolchain: 1.98.0
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Probe FutureShell workspace capabilities
+        run: ./scripts/futureshell-workspace-probe.sh
+      - name: Verify FutureShell FEA fixture
+        run: ./fixtures/futureshell/fea/check-fixture.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
@@ -43,6 +47,8 @@ jobs:
           toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Probe FutureShell workspace capabilities
+        run: ./scripts/futureshell-workspace-probe.sh
       - name: Run tests
         run: cargo test --workspace --all-targets
       - name: Run Clippy
@@ -71,4 +77,3 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-

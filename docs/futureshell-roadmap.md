@@ -472,6 +472,9 @@ macOS and Linux offer identical native sandbox mechanisms.
 
 ### FS0 — Semantics and threat model
 
+The current review target is the indexed
+[FS0 specification package](futureshell-fs0.md).
+
 Define the grammar, type/value model, task and agent lifecycles, connector and
 gateway-policy contract, capability vocabulary, transaction invariants,
 contract predicate semantics, evidence schema, receipt schema, budget units,

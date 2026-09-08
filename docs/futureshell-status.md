@@ -23,8 +23,8 @@ Two provisional crates exercise the authoring and planning model:
   conflicts, and resolves program and predicate dependencies from provisional
   caller-supplied catalogs.
 
-Four fixture families cover a linear pipeline, contract branch, parallel join,
-and bounded refinement loop. Their golden Plan V0 artifacts test stable
+Four Flow fixture families cover a linear pipeline, contract branch, parallel
+join, and bounded refinement loop. Their golden Plan V0 artifacts test stable
 lowering and hashing. These plans are inspectable but are not authorized or
 executable. Normalized JSON is a prototype encoding, not a stable wire or disk
 format.
@@ -38,7 +38,7 @@ verifier, or agent gateway.
 
 | Milestone | State | Implemented evidence | Exit blockers | Next proof point |
 |---|---|---|---|---|
-| FS0 — Semantics and threat model | **In progress** | Roadmap, implementation plan, Flow/Plan semantic spikes | Language reference, threat model and guarantee matrix, schema drafts, platform spikes, accepted deterministic FEA fixture, review gates | FS0 specification package is reviewed and its example failure paths are fully described |
+| FS0 — Semantics and threat model | **Review candidate** | [FS0 package](futureshell-fs0.md): language reference and conformance examples, threat/guarantee model, schema drafts, APFS/Linux capability probe, deterministic FEA fixture and failure matrix | Language and security review gates; review-backed invariant links | Reviewers resolve the package checklist and record durable decisions |
 | FS1 — Language toolchain and dry-run planner | **Prototype only** | Flow IR validation and hashing; Plan V0 lowering, hashing, capability normalization, basic conflict checks, pure fixture-catalog resolution | Text parser, spans and diagnostics, formatter, module loader and source verification, canonical plan encoding, `xshell-run check\|fmt\|plan`, conformance and fuzz corpora | One textual FEA program produces a fully resolved stable plan without execution or network access |
 | FS2 — Deterministic local task runtime | **Not started** | Reusable xshell process and audit infrastructure only | Scheduler, argv-native runner integration, shell blocks, structured concurrency, resource bounds, task evidence, authorization preview | A concurrent local workflow produces attributable typed evidence and cancels complete process groups |
 | FS3 — Transactional workspaces | **Not started** | Design and acceptance matrix only | Portable staging backend, manifests, change sets, preview, discard, selective promotion, conflict detection, journal and recovery | Invalid work leaves the destination unchanged; accepted allowlisted outputs are hash-verified after promotion |
@@ -58,17 +58,17 @@ xshell components.
 | Detailed architecture and backlog | [Implementation plan](futureshell-implementation-plan.md) | Implementation plan sections 2–17 | Milestone acceptance criteria | Draft for review |
 | Flow authoring graph | Roadmap §5.4; implementation plan §2 | [`crates/xshell-flow`](../crates/xshell-flow), [Flow IR notes](futureshell-flow-ir.md), `fixtures/futureshell/flows` | `cargo test -p xshell-flow` | Executable provisional prototype |
 | Checked plan lowering | Implementation plan §5 | [`crates/xshell-plan`](../crates/xshell-plan), [Plan V0 notes](futureshell-plan-v0.md), `fixtures/futureshell/plans` | `cargo test -p xshell-plan` | Executable provisional prototype |
-| Language and source conformance | Implementation plan §4 | None | Parser/formatter properties, invalid-source diagnostics and fuzzing | Not started |
+| Language and source conformance | Implementation plan §4 | [Language reference](futureshell-language.md), `fixtures/futureshell/syntax` | FS0 language review; later parser/formatter properties, diagnostics and fuzzing | Specification review candidate |
 | Program and predicate resolution | Implementation plan §§5.1 and 16 | Plan V0 resolver and `fixtures/futureshell/catalogs` | Resolver fixtures bind declared pinned identities without side effects and reject interface, predicate, and capability mismatches | Executable provisional prototype |
-| Transaction and promotion safety | Roadmap §7; implementation plan §6 | Design only | FS3 acceptance matrix | Not started |
-| Evidence, contracts and receipts | Roadmap §§8–9; implementation plan §8 | Contract expression DTOs only | FS4 failure matrix and offline verification | Not started |
+| Transaction and promotion safety | Roadmap §7; implementation plan §6 | [Threat model](futureshell-threat-model.md), [platform spike](futureshell-platform-spikes.md), change-set schema | FS0 security review; later FS3 acceptance matrix | Specification review candidate |
+| Evidence, contracts and receipts | Roadmap §§8–9; implementation plan §8 | [Schema package](futureshell-schemas.md), FEA contract/failure matrix, provisional contract DTOs | Schema validation; FS4 failure matrix and offline verification | Specification review candidate |
+| Agent target and policy semantics | Roadmap §5.3; implementation plan §9 | Agent, connector, gateway, autonomy and usage schema drafts; language lifecycle semantics | FS0 language/security review; FS5 connector conformance | Specification review candidate |
 
 ## Immediate sequence
 
-1. Complete the FS0 language reference, threat model, guarantee matrix, schema
-   drafts, deterministic FEA fixture, and platform spike reports.
-2. Hold the FS0 language and security review gates and record durable decisions
-   as short architecture decision records.
+1. Review the indexed FS0 package against its language and security checklists.
+2. Record durable decisions and required revisions as short architecture
+   decision records.
 3. Select canonical serialization only after candidate encodings have been
    tested against the fixture corpus.
 4. Complete FS1 from textual source through `xshell-run check`, `fmt`, and

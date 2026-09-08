@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xshell.dev/schema/fixtures/fea-result-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "max_von_mises_mpa", "solver"],
+  "properties": {
+    "schema": { "const": "fea-result-v1" },
+    "max_von_mises_mpa": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "solver": { "const": "fake-fenics" }
+  }
+}

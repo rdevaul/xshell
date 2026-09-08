@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xshell.dev/schema/futureshell/fs0.schema.json",
+  "title": "FutureShell FS0 semantic object bundle",
+  "oneOf": [
+    { "$ref": "#/$defs/evidence_bundle" },
+    { "$ref": "#/$defs/change_set" },
+    { "$ref": "#/$defs/clause_report" },
+    { "$ref": "#/$defs/receipt" },
+    { "$ref": "#/$defs/agent_target" },
+    { "$ref": "#/$defs/connector_capabilities" },
+    { "$ref": "#/$defs/gateway_policy" },
+    { "$ref": "#/$defs/autonomy_grant" },
+    { "$ref": "#/$defs/usage_report" }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+$"
+    },
+    "external_path": { "type": "string", "minLength": 1, "pattern": "^/" },
+    "assurance": {
+      "type": "string",
+      "enum": ["enforced", "provider_enforced", "measured", "estimated", "unavailable"]
+    },
+    "filesystem_assurance": {
+      "type": "string",
+      "enum": ["staged", "isolated", "external"]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read", "write", "external_read", "external_write", "execute", "network", "credentials", "devices"],
+      "properties": {
+        "read": { "type": "array", "items": { "$ref": "#/$defs/relative_path" }, "uniqueItems": true },
+        "write": { "type": "array", "items": { "$ref": "#/$defs/relative_path" }, "uniqueItems": true },
+        "external_read": { "type": "array", "items": { "$ref": "#/$defs/external_path" }, "uniqueItems": true },
+        "external_write": { "type": "array", "items": { "$ref": "#/$defs/external_path" }, "uniqueItems": true },
+        "execute": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "network": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "credentials": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "devices": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true }
+      }
+    },
+    "artifact_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "size", "media_type"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "media_type": { "$ref": "#/$defs/id" },
+        "schema": { "$ref": "#/$defs/id" },
+        "locator": { "type": "string", "maxLength": 2048 }
+      }
+    },
+    "event_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "plan_sha256", "transaction_id", "task_id", "attempt", "host_id"],
+      "properties": {
+        "event_id": { "$ref": "#/$defs/id" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "transaction_id": { "$ref": "#/$defs/id" },
+        "task_id": { "$ref": "#/$defs/id" },
+        "iteration": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "host_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "kind", "issuer", "trust", "assurance", "payload_sha256"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/event_identity" },
+        "kind": { "type": "string", "enum": ["authorization", "process", "output", "artifact", "filesystem", "verifier", "agent", "remote_receipt", "promotion"] },
+        "issuer": { "$ref": "#/$defs/id" },
+        "trust": { "type": "string", "enum": ["observed", "reported", "advisory"] },
+        "assurance": { "$ref": "#/$defs/assurance" },
+        "payload_sha256": { "$ref": "#/$defs/sha256" },
+        "payload": { "type": "object" }
+      }
+    },
+    "evidence_bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "plan_sha256", "transaction_id", "events"],
+      "properties": {
+        "schema": { "const": "xshell.evidence/v0" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "transaction_id": { "$ref": "#/$defs/id" },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/evidence" } }
+      }
+    },
+    "file_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["file", "directory", "symlink", "unsupported"] },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size": { "type": "integer", "minimum": 0 },
+        "mode": { "type": "integer", "minimum": 0 },
+        "symlink_target": { "type": "string" },
+        "unsupported_metadata": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relative_path" },
+        "kind": { "type": "string", "enum": ["add", "modify", "delete", "symlink", "permission", "directory_add", "directory_delete", "unsupported"] },
+        "before": { "$ref": "#/$defs/file_identity" },
+        "after": { "$ref": "#/$defs/file_identity" },
+        "rename_candidate_from": { "$ref": "#/$defs/relative_path" }
+      }
+    },
+    "change_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "transaction_id", "checkpoint_id", "filesystem_assurance", "changes", "manifest_sha256"],
+      "properties": {
+        "schema": { "const": "xshell.changeset/v0" },
+        "transaction_id": { "$ref": "#/$defs/id" },
+        "checkpoint_id": { "$ref": "#/$defs/id" },
+        "filesystem_assurance": { "$ref": "#/$defs/filesystem_assurance" },
+        "changes": { "type": "array", "items": { "$ref": "#/$defs/change" } },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "clause_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "clause_id", "outcome", "evidence_ids", "children"],
+      "properties": {
+        "schema": { "const": "xshell.clause-report/v0" },
+        "clause_id": { "$ref": "#/$defs/id" },
+        "predicate": { "$ref": "#/$defs/id" },
+        "outcome": { "type": "string", "enum": ["pass", "fail", "error"] },
+        "evidence_ids": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "diagnostic": { "type": "string", "maxLength": 4096 },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/clause_report" } }
+      }
+    },
+    "promotion_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "selected_paths"],
+      "properties": {
+        "state": { "type": "string", "enum": ["not_requested", "discarded", "promoted", "conflicted", "recovery_required"] },
+        "selected_paths": { "type": "array", "items": { "$ref": "#/$defs/relative_path" }, "uniqueItems": true },
+        "journal_id": { "$ref": "#/$defs/id" },
+        "final_manifest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "receipt_id", "plan_sha256", "host_id", "transaction_id", "authorization_id", "evidence_bundle_sha256", "changeset_sha256", "contract", "taints", "promotion", "audit_binding"],
+      "properties": {
+        "schema": { "const": "xshell.receipt/v0" },
+        "receipt_id": { "$ref": "#/$defs/id" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "host_id": { "$ref": "#/$defs/id" },
+        "transaction_id": { "$ref": "#/$defs/id" },
+        "authorization_id": { "$ref": "#/$defs/id" },
+        "evidence_bundle_sha256": { "$ref": "#/$defs/sha256" },
+        "changeset_sha256": { "$ref": "#/$defs/sha256" },
+        "contract": { "$ref": "#/$defs/clause_report" },
+        "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact_ref" } },
+        "taints": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "promotion": { "$ref": "#/$defs/promotion_outcome" },
+        "audit_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["log_id", "checkpoint_sha256"],
+          "properties": { "log_id": { "$ref": "#/$defs/id" }, "checkpoint_sha256": { "$ref": "#/$defs/sha256" } }
+        },
+        "signature": { "$ref": "#/$defs/signature" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value_base64"],
+      "properties": {
+        "algorithm": { "$ref": "#/$defs/id" },
+        "key_id": { "$ref": "#/$defs/id" },
+        "value_base64": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
+    },
+    "agent_target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "profile", "connector", "lifecycle", "state_owner", "state_policy", "gateway_location", "gateway_policy_id"],
+      "properties": {
+        "schema": { "const": "xshell.agent-target/v0" },
+        "profile": { "$ref": "#/$defs/id" },
+        "model": { "$ref": "#/$defs/id" },
+        "connector": { "$ref": "#/$defs/id" },
+        "lifecycle": { "type": "string", "enum": ["one_shot", "managed", "persistent"] },
+        "state_owner": { "type": "string", "enum": ["xshell", "connector", "external"] },
+        "state_policy": { "$ref": "#/$defs/agent_state_policy" },
+        "gateway_location": { "type": "string", "enum": ["coordinator", "execution_host"] },
+        "gateway_policy_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "agent_state_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["close_disposition", "mutation_policy", "reuse_policy"],
+      "properties": {
+        "close_disposition": { "type": "string", "enum": ["dispose", "detach", "retain"] },
+        "mutation_policy": { "type": "string", "enum": ["deny", "taint", "require_checkpoint"] },
+        "reuse_policy": { "type": "string", "enum": ["new", "attach_named", "reuse_named"] },
+        "retention_ms": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "connector_capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "connector", "revision", "features", "usage_assurance"],
+      "properties": {
+        "schema": { "const": "xshell.connector-capabilities/v0" },
+        "connector": { "$ref": "#/$defs/id" },
+        "revision": { "$ref": "#/$defs/id" },
+        "features": { "type": "array", "items": { "type": "string", "enum": ["create", "attach", "detach", "dispose", "send", "events", "cancel", "status", "tool_mediation", "approval_pause", "resume", "context_checkpoint", "context_fork", "context_restore", "artifact_attach", "usage_tokens", "usage_cost", "native_audit"] }, "uniqueItems": true },
+        "usage_assurance": { "$ref": "#/$defs/assurance" }
+      }
+    },
+    "gateway_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "policy_id", "connectors", "models", "capability_ceiling", "allow_persistent_mutation", "require_tool_mediation", "max_prompt_bytes", "max_context_bytes", "max_response_bytes"],
+      "properties": {
+        "schema": { "const": "xshell.gateway-policy/v0" },
+        "policy_id": { "$ref": "#/$defs/id" },
+        "connectors": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "models": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "capability_ceiling": { "$ref": "#/$defs/capabilities" },
+        "allow_persistent_mutation": { "type": "boolean" },
+        "require_tool_mediation": { "type": "boolean" },
+        "allowed_tools": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "secret_refs": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "max_prompt_bytes": { "type": "integer", "minimum": 0 },
+        "max_context_bytes": { "type": "integer", "minimum": 0 },
+        "max_response_bytes": { "type": "integer", "minimum": 0 },
+        "allowed_egress_classes": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true }
+      }
+    },
+    "autonomy_grant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "grant_id", "authorization_id", "model_rounds", "tool_dispatches", "timeout_ms", "on_exhausted"],
+      "properties": {
+        "schema": { "const": "xshell.autonomy-grant/v0" },
+        "grant_id": { "$ref": "#/$defs/id" },
+        "authorization_id": { "$ref": "#/$defs/id" },
+        "model_rounds": { "type": "integer", "minimum": 0 },
+        "tool_dispatches": { "type": "integer", "minimum": 0 },
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cost_microunits": { "type": "integer", "minimum": 0 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "on_exhausted": { "type": "string", "enum": ["stop", "fail", "request_approval"] }
+      }
+    },
+    "usage_value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assurance"],
+      "properties": {
+        "value": { "type": "integer", "minimum": 0 },
+        "assurance": { "$ref": "#/$defs/assurance" }
+      }
+    },
+    "usage_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "grant_id", "model_rounds", "tool_dispatches", "input_tokens", "output_tokens", "cost_microunits"],
+      "properties": {
+        "schema": { "const": "xshell.usage-report/v0" },
+        "grant_id": { "$ref": "#/$defs/id" },
+        "model_rounds": { "$ref": "#/$defs/usage_value" },
+        "tool_dispatches": { "$ref": "#/$defs/usage_value" },
+        "input_tokens": { "$ref": "#/$defs/usage_value" },
+        "output_tokens": { "$ref": "#/$defs/usage_value" },
+        "cost_microunits": { "$ref": "#/$defs/usage_value" },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      }
+    }
+  }
+}
