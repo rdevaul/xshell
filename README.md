@@ -146,6 +146,7 @@ Enable the fabric and start the per-user session daemon:
 [session_fabric]
 enabled = true
 required = true
+host_alias = "rich-laptop" # choose a distinct name for each machine
 default_session = "default"
 max_approval = "ask"
 pty_escape = "ctrl-]"
@@ -158,6 +159,11 @@ cargo run -p xshell-session --bin xshelld -- \
 # In another terminal:
 cargo run -p xshell-cli -- --session default
 ```
+
+Give each host a distinct `host_alias` and restart its daemon after changing
+the value. If aliases still collide, xshell adds a short stable host-ID suffix
+in catalogs, completion, and the session picker so every target remains
+distinguishable and selectable.
 
 Useful session commands include:
 

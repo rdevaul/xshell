@@ -18,6 +18,12 @@ socket or an authenticated SSH stdio proxy. The first request must be `open`
 with protocol version 11. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
+Set `session_fabric.host_alias` to a short, distinct name for each machine; if
+it is omitted, `xshelld` advertises the operating-system hostname. The
+`--host-alias` daemon argument overrides the configured value. If two connected
+daemons nevertheless advertise the same alias, the controller appends the
+shortest distinguishing host-ID prefix (for example `Mac.lan#12ab34cd`) in
+session listings, completion, selectors, and the interactive picker.
 Protocol versions are exact rather than negotiated across incompatible
 schemas. Any protocol bump therefore requires upgrading and restarting
 `xshelld` on the controller and every connected remote host before the new CLI
