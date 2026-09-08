@@ -1,0 +1,17 @@
+{
+  "schema": "xshell.fixture-scenarios/v0",
+  "workflow": "deterministic-fea",
+  "scenarios": [
+    { "id": "success", "mesh_mode": "success", "solve_mode": "success", "contract": "pass", "promotion": ["analysis.json"] },
+    { "id": "mesh_failure", "mesh_mode": "fail", "solve_mode": "not_run", "contract": "fail", "promotion": [] },
+    { "id": "solve_failure", "mesh_mode": "success", "solve_mode": "fail", "contract": "fail", "promotion": [] },
+    { "id": "invalid_json", "mesh_mode": "success", "solve_mode": "invalid_json", "contract": "fail", "promotion": [] },
+    { "id": "invalid_schema", "mesh_mode": "success", "solve_mode": "invalid_schema", "contract": "fail", "promotion": [] },
+    { "id": "undeclared_write", "mesh_mode": "success", "solve_mode": "undeclared_write", "contract": "fail", "promotion": [] },
+    { "id": "cancelled", "mesh_mode": "success", "solve_mode": "slow", "cancel": true, "contract": "error", "promotion": [] },
+    { "id": "destination_conflict", "mesh_mode": "success", "solve_mode": "success", "mutate_destination_before_promotion": "analysis.json", "contract": "pass", "promotion": [], "promotion_outcome": "conflicted" },
+    { "id": "changed_executable", "mesh_mode": "success", "solve_mode": "success", "replace_tool_after_preflight": "fake-fenics", "contract": "error", "promotion": [] },
+    { "id": "tampered_evidence", "mesh_mode": "success", "solve_mode": "success", "tamper": "process_exit", "contract": "error", "promotion": [] },
+    { "id": "audit_gap", "mesh_mode": "success", "solve_mode": "success", "drop_required_event": "task_completed", "contract": "error", "promotion": [] }
+  ]
+}

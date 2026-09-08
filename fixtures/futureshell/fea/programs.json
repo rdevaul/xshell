@@ -1,0 +1,31 @@
+{
+  "schema": "xshell.fixture-programs/v0",
+  "programs": [
+    {
+      "id": "mesh",
+      "executable": "tools/fake-gmsh",
+      "executable_sha256": "37512225bebbf8f99a2ca04edf5a5ab9699273073c629aee6f7aac4c97afa0ee",
+      "argv": ["input/model.step", "mesh.msh"],
+      "inputs": [{ "path": "input/model.step", "media_type": "model/step" }],
+      "outputs": [{ "path": "mesh.msh", "media_type": "application/x-gmsh" }],
+      "capabilities": { "read": ["input/model.step"], "write": ["mesh.msh"], "external_read": [], "external_write": [], "execute": ["tools/fake-gmsh"], "network": [], "credentials": [], "devices": [] },
+      "resources": { "timeout_ms": 300000, "output_bytes": 1048576 }
+    },
+    {
+      "id": "solve",
+      "executable": "tools/fake-fenics",
+      "executable_sha256": "7aa8c550add61a398ef35201e3233c8d5bfba8f6506ca3db613c074d53779b51",
+      "argv": ["mesh.msh", "analysis.json"],
+      "inputs": [{ "path": "mesh.msh", "media_type": "application/x-gmsh" }],
+      "outputs": [{ "path": "analysis.json", "media_type": "application/json", "schema": "fea-result-v1" }],
+      "capabilities": { "read": ["mesh.msh"], "write": ["analysis.json"], "external_read": [], "external_write": [], "execute": ["tools/fake-fenics"], "network": [], "credentials": [], "devices": [] },
+      "resources": { "timeout_ms": 600000, "output_bytes": 1048576 }
+    }
+  ],
+  "contract": {
+    "required_tasks": ["mesh", "solve"],
+    "schema": { "path": "analysis.json", "id": "fea-result-v1", "sha256": "0a8c383f85763a83f18c5abfbba20cd7fb0f5adaa755115f243e0a2e369bfe99" },
+    "allowed_changes": ["mesh.msh", "analysis.json"],
+    "promote": ["analysis.json"]
+  }
+}

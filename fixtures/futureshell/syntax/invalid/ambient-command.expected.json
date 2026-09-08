@@ -1,0 +1,10 @@
+{
+  "diagnostics": [
+    {
+      "code": "L0101",
+      "line": 1,
+      "column": 14,
+      "message_key": "command_substitution_not_supported"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+input=$1
+output=$2
+mode=${3:-success}
+
+if [ "$mode" = "fail" ]; then
+    printf '%s\n' 'fake-gmsh: requested failure' >&2
+    exit 17
+fi
+
+if ! grep -q "FS0-BRACKET" "$input"; then
+    printf '%s\n' 'fake-gmsh: unexpected input' >&2
+    exit 18
+fi
+
+printf '%s\n' '$MeshFormat' '4.1 0 8' '$EndMeshFormat' '$Nodes' '1 1 1 1' '1 1 0 1' '1' '0 0 0' '$EndNodes' > "$output"

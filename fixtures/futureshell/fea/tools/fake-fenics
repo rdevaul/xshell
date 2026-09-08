@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+input=$1
+output=$2
+mode=${3:-success}
+
+if [ "$mode" = "fail" ]; then
+    printf '%s\n' 'fake-fenics: requested failure' >&2
+    exit 27
+fi
+
+if ! grep -q '\$MeshFormat' "$input"; then
+    printf '%s\n' 'fake-fenics: unexpected mesh' >&2
+    exit 28
+fi
+
+case "$mode" in
+    invalid_json) printf '%s\n' '{not-json' > "$output" ;;
+    invalid_schema) printf '%s\n' '{"schema":"fea-result-v1","max_von_mises_mpa":"high","solver":"fake-fenics"}' > "$output" ;;
+    undeclared_write)
+        printf '%s\n' '{"schema":"fea-result-v1","max_von_mises_mpa":123,"solver":"fake-fenics"}' > "$output"
+        printf '%s\n' 'unexpected' > undeclared.txt
+        ;;
+    slow)
+        sleep 30
+        printf '%s\n' '{"schema":"fea-result-v1","max_von_mises_mpa":123,"solver":"fake-fenics"}' > "$output"
+        ;;
+    success) printf '%s\n' '{"schema":"fea-result-v1","max_von_mises_mpa":123,"solver":"fake-fenics"}' > "$output" ;;
+    *) printf '%s\n' "fake-fenics: unknown mode $mode" >&2; exit 29 ;;
+esac
