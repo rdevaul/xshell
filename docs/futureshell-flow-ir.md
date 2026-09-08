@@ -97,7 +97,8 @@ cycles, and ordinary execution cycles.
 The prototype does not yet:
 
 - parse textual FutureShell;
-- resolve referenced FutureShell programs or contract predicate signatures;
+- itself resolve referenced FutureShell programs or contract predicate
+  signatures (the Plan V0 resolver consumes separate provisional catalogs);
 - authorize Plan V0 as an executable runtime plan;
 - execute nodes or evaluate contracts;
 - define artifact ownership and fan-out materialization;

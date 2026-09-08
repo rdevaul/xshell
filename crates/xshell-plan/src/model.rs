@@ -105,6 +105,8 @@ pub enum PlanContractExpression {
         name: String,
         #[serde(default)]
         arguments: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<ResolvedPredicate>,
     },
     All {
         clauses: Vec<PlanContractExpression>,
@@ -144,6 +146,8 @@ pub enum TaskOperation {
         source: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entrypoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<ResolvedProgram>,
     },
     Gate {
         contract: String,
@@ -312,6 +316,22 @@ pub struct CapabilitySummary {
     pub network: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedProgram {
+    pub manifest_sha256: String,
+    pub source_sha256: String,
+    pub entrypoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedPredicate {
+    pub definition_sha256: String,
+    pub version: String,
+    pub implementation_sha256: String,
+}
+
 impl CapabilitySummary {
     pub(crate) fn normalize(&mut self) {
         normalize_strings(&mut self.read);
@@ -388,6 +408,7 @@ impl From<&xshell_flow::ContractExpression> for PlanContractExpression {
             xshell_flow::ContractExpression::Predicate { name, arguments } => Self::Predicate {
                 name: name.clone(),
                 arguments: arguments.clone(),
+                resolution: None,
             },
             xshell_flow::ContractExpression::All { clauses } => Self::All {
                 clauses: clauses.iter().map(Self::from).collect(),

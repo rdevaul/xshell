@@ -1,0 +1,51 @@
+{
+  "schema": "xshell.program-catalog/v0",
+  "programs": [
+    {
+      "source": "analyze.fsh",
+      "source_sha256": "27378cb6733ed1b2ae3722d37be7beccc1cfa5d1cec36037e4cff7874862a4b7",
+      "default_entrypoint": "main",
+      "entrypoints": [
+        {
+          "name": "main",
+          "inputs": [
+            { "name": "model", "type": { "kind": "artifact", "media_type": "model/step" } }
+          ],
+          "outputs": [
+            { "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } },
+            { "name": "evidence", "type": { "kind": "evidence" } }
+          ]
+        }
+      ]
+    },
+    {
+      "source": "publish.fsh",
+      "source_sha256": "8f148bcbaf846bb2f833b448324a23a6a752b89eaac75e80ba685b6d8273133f",
+      "default_entrypoint": "main",
+      "entrypoints": [
+        {
+          "name": "main",
+          "inputs": [
+            { "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }
+          ],
+          "outputs": [
+            { "name": "published", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }
+          ]
+        }
+      ]
+    },
+    {
+      "source": "repair.fsh",
+      "source_sha256": "952baf380882138681d87b9b761a36c363b43c894e23bf2477dcae1cb4ef0bfb",
+      "default_entrypoint": "main",
+      "entrypoints": [
+        {
+          "name": "main",
+          "inputs": [
+            { "name": "analysis", "type": { "kind": "artifact", "media_type": "application/json", "schema": "fea-result-v1" } }
+          ]
+        }
+      ]
+    }
+  ]
+}

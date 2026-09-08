@@ -1,6 +1,6 @@
 # FutureShell status
 
-**Last reviewed:** 2026-09-06
+**Last reviewed:** 2026-09-08
 
 **Overall status:** Pre-alpha design and planning prototype. FutureShell is not
 an executable language or runtime.
@@ -20,7 +20,8 @@ Two provisional crates exercise the authoring and planning model:
   presentation-independent semantic hash, and renders Graphviz DOT;
 - `xshell-plan` lowers valid flows into deterministic Plan V0 task and loop
   templates, normalizes capabilities, detects a conservative set of write
-  conflicts, and reports unresolved program and predicate dependencies.
+  conflicts, and resolves program and predicate dependencies from provisional
+  caller-supplied catalogs.
 
 Four fixture families cover a linear pipeline, contract branch, parallel join,
 and bounded refinement loop. Their golden Plan V0 artifacts test stable
@@ -38,7 +39,7 @@ verifier, or agent gateway.
 | Milestone | State | Implemented evidence | Exit blockers | Next proof point |
 |---|---|---|---|---|
 | FS0 — Semantics and threat model | **In progress** | Roadmap, implementation plan, Flow/Plan semantic spikes | Language reference, threat model and guarantee matrix, schema drafts, platform spikes, accepted deterministic FEA fixture, review gates | FS0 specification package is reviewed and its example failure paths are fully described |
-| FS1 — Language toolchain and dry-run planner | **Prototype only** | Flow IR validation and hashing; Plan V0 lowering, hashing, capability normalization, basic conflict checks, fixtures | Text parser, spans and diagnostics, formatter, module loader, resolver, canonical plan encoding, `xshell-run check\|fmt\|plan`, conformance and fuzz corpora | One textual FEA program produces a fully resolved stable plan without execution or network access |
+| FS1 — Language toolchain and dry-run planner | **Prototype only** | Flow IR validation and hashing; Plan V0 lowering, hashing, capability normalization, basic conflict checks, pure fixture-catalog resolution | Text parser, spans and diagnostics, formatter, module loader and source verification, canonical plan encoding, `xshell-run check\|fmt\|plan`, conformance and fuzz corpora | One textual FEA program produces a fully resolved stable plan without execution or network access |
 | FS2 — Deterministic local task runtime | **Not started** | Reusable xshell process and audit infrastructure only | Scheduler, argv-native runner integration, shell blocks, structured concurrency, resource bounds, task evidence, authorization preview | A concurrent local workflow produces attributable typed evidence and cancels complete process groups |
 | FS3 — Transactional workspaces | **Not started** | Design and acceptance matrix only | Portable staging backend, manifests, change sets, preview, discard, selective promotion, conflict detection, journal and recovery | Invalid work leaves the destination unchanged; accepted allowlisted outputs are hash-verified after promotion |
 | FS4 — Deterministic contracts and receipts | **Not started** | Contract expressions represented in Flow IR and Plan V0 only | Predicate evaluator, evidence model, clause reports, taint policy, receipts, audit binding and offline verifier | The deterministic FEA slice promotes only schema-valid `analysis.json` and rejects every specified failure case |
@@ -58,22 +59,19 @@ xshell components.
 | Flow authoring graph | Roadmap §5.4; implementation plan §2 | [`crates/xshell-flow`](../crates/xshell-flow), [Flow IR notes](futureshell-flow-ir.md), `fixtures/futureshell/flows` | `cargo test -p xshell-flow` | Executable provisional prototype |
 | Checked plan lowering | Implementation plan §5 | [`crates/xshell-plan`](../crates/xshell-plan), [Plan V0 notes](futureshell-plan-v0.md), `fixtures/futureshell/plans` | `cargo test -p xshell-plan` | Executable provisional prototype |
 | Language and source conformance | Implementation plan §4 | None | Parser/formatter properties, invalid-source diagnostics and fuzzing | Not started |
-| Program and predicate resolution | Implementation plan §§5.1 and 16 | Plan V0 resolution blockers | Resolver fixtures must bind pinned identities without side effects | Next implementation increment |
+| Program and predicate resolution | Implementation plan §§5.1 and 16 | Plan V0 resolver and `fixtures/futureshell/catalogs` | Resolver fixtures bind declared pinned identities without side effects and reject interface, predicate, and capability mismatches | Executable provisional prototype |
 | Transaction and promotion safety | Roadmap §7; implementation plan §6 | Design only | FS3 acceptance matrix | Not started |
 | Evidence, contracts and receipts | Roadmap §§8–9; implementation plan §8 | Contract expression DTOs only | FS4 failure matrix and offline verification | Not started |
 
 ## Immediate sequence
 
-1. Add a pure program-manifest resolver, fixture program manifests, and a typed
-   contract-predicate catalog. Resolved capabilities must not expand the Flow
-   declaration.
-2. Complete the FS0 language reference, threat model, guarantee matrix, schema
+1. Complete the FS0 language reference, threat model, guarantee matrix, schema
    drafts, deterministic FEA fixture, and platform spike reports.
-3. Hold the FS0 language and security review gates and record durable decisions
+2. Hold the FS0 language and security review gates and record durable decisions
    as short architecture decision records.
-4. Select canonical serialization only after candidate encodings have been
+3. Select canonical serialization only after candidate encodings have been
    tested against the fixture corpus.
-5. Complete FS1 from textual source through `xshell-run check`, `fmt`, and
+4. Complete FS1 from textual source through `xshell-run check`, `fmt`, and
    `plan` before starting an executable runtime.
 
 FS2 through FS4 form the first useful local release. Agent and remote execution
