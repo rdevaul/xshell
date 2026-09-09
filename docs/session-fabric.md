@@ -135,6 +135,26 @@ automatically reads `$XSHELL_CONFIG` or `~/.config/xshell/config.toml` when
 present, resolves the daemon socket, and proxies protocol requests to that
 socket. Stdout contains protocol frames only; diagnostics use stderr.
 
+`xshelld probe` is the read-only discovery boundary for bootstrap tooling. It
+emits one versioned JSON object containing the installed binary version, the
+protocol version supported by that binary, and one of these running-daemon
+states:
+
+- `ready`, with the daemon protocol version, stable host ID, host alias, and
+  OS user;
+- `incompatible`, when the daemon rejects the probing binary's protocol;
+- `rejected`, for another structured handshake rejection; or
+- `unavailable`, when the configured Unix socket cannot be reached or does not
+  complete a valid handshake.
+
+An unavailable daemon is a successful probe result rather than a command
+failure: the executable was discovered and returned actionable state. The
+probe never creates, attaches, lists, or changes a session, and it does not
+start or replace the daemon. Local probe I/O has a two-second deadline. A
+future `//connect` bootstrap flow can therefore
+inspect state before asking for installation, upgrade, or service-start
+approval.
+
 The proxy is deliberately stateless. Killing the SSH process closes its daemon
 client connection, applying ordinary detach semantics while daemon-owned work
 continues. The CLI keeps one connection per discovered host, aggregates their

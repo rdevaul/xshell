@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::CStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -16,8 +16,8 @@ use xshell_platform::LockExt;
 use xshell_session::{
     ClientPtyFrame, ClientRequest, DaemonAudit, ExecutionCoordinator, PersistenceMode, PtyAudit,
     PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
-    SessionActivity, SessionConfig, SessionRegistry, complete_shell, load_view_resource,
-    read_client_frame, write_server_frame,
+    SessionActivity, SessionConfig, SessionHandshake, SessionRegistry, complete_shell,
+    load_view_resource, read_client_frame, write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -57,6 +57,8 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    /// Report binary and running-daemon compatibility as one JSON object.
+    Probe,
     /// Proxy the session protocol between stdin/stdout and the local daemon.
     ServeStdio,
     /// Claim a PTY ticket and proxy its framed binary stream over stdin/stdout.
@@ -87,6 +89,9 @@ fn main() -> Result<()> {
         .socket
         .or(config.socket.clone())
         .unwrap_or_else(|| state_directory.join("xshelld.sock"));
+    if matches!(args.command, Some(DaemonCommand::Probe)) {
+        return print_probe(&socket);
+    }
     if matches!(args.command, Some(DaemonCommand::ServeStdio)) {
         return serve_stdio(&socket);
     }
@@ -173,6 +178,69 @@ fn main() -> Result<()> {
             Err(error) => eprintln!("xshelld accept error: {error}"),
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeReport<'a> {
+    schema_version: u32,
+    binary_version: &'a str,
+    supported_protocol_version: u32,
+    #[serde(flatten)]
+    daemon: ProbeDaemon,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "daemon_status", rename_all = "snake_case")]
+enum ProbeDaemon {
+    Ready {
+        protocol_version: u32,
+        host_id: String,
+        host_alias: String,
+        user: String,
+    },
+    Incompatible {
+        code: String,
+        message: String,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+}
+
+fn print_probe(socket: &Path) -> Result<()> {
+    let daemon = match xshell_session::SessionClient::probe(socket, env!("CARGO_PKG_VERSION")) {
+        Ok(SessionHandshake::Opened {
+            protocol_version,
+            host_id,
+            host_alias,
+            user,
+        }) => ProbeDaemon::Ready {
+            protocol_version,
+            host_id,
+            host_alias,
+            user,
+        },
+        Ok(SessionHandshake::Rejected { code, message }) if code == "protocol_version" => {
+            ProbeDaemon::Incompatible { code, message }
+        }
+        Ok(SessionHandshake::Rejected { code, message }) => ProbeDaemon::Rejected { code, message },
+        Err(error) => ProbeDaemon::Unavailable {
+            message: format!("{error:#}"),
+        },
+    };
+    let report = ProbeReport {
+        schema_version: 1,
+        binary_version: env!("CARGO_PKG_VERSION"),
+        supported_protocol_version: SESSION_PROTOCOL_VERSION,
+        daemon,
+    };
+    serde_json::to_writer(std::io::stdout().lock(), &report)?;
+    println!();
     Ok(())
 }
 
