@@ -8,6 +8,38 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // no longer need to join the session and PTY catalogs to distinguish agent
 // work from an interactive process.
 pub const SESSION_PROTOCOL_VERSION: u32 = 11;
+pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonProbeReport {
+    pub schema_version: u32,
+    pub binary_version: String,
+    pub supported_protocol_version: u32,
+    #[serde(flatten)]
+    pub daemon: DaemonProbeStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "daemon_status", rename_all = "snake_case")]
+pub enum DaemonProbeStatus {
+    Ready {
+        protocol_version: u32,
+        host_id: String,
+        host_alias: String,
+        user: String,
+    },
+    Incompatible {
+        code: String,
+        message: String,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]

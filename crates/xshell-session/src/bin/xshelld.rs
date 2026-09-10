@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::ffi::CStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -14,10 +14,11 @@ use std::time::Duration;
 use uuid::Uuid;
 use xshell_platform::LockExt;
 use xshell_session::{
-    ClientPtyFrame, ClientRequest, DaemonAudit, ExecutionCoordinator, PersistenceMode, PtyAudit,
-    PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
-    SessionActivity, SessionConfig, SessionHandshake, SessionRegistry, complete_shell,
-    load_view_resource, read_client_frame, write_server_frame,
+    ClientPtyFrame, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonAudit, DaemonProbeReport,
+    DaemonProbeStatus, ExecutionCoordinator, PersistenceMode, PtyAudit, PtyClaim, PtyCoordinator,
+    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionConfig,
+    SessionHandshake, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
+    write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -181,37 +182,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct ProbeReport<'a> {
-    schema_version: u32,
-    binary_version: &'a str,
-    supported_protocol_version: u32,
-    #[serde(flatten)]
-    daemon: ProbeDaemon,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "daemon_status", rename_all = "snake_case")]
-enum ProbeDaemon {
-    Ready {
-        protocol_version: u32,
-        host_id: String,
-        host_alias: String,
-        user: String,
-    },
-    Incompatible {
-        code: String,
-        message: String,
-    },
-    Rejected {
-        code: String,
-        message: String,
-    },
-    Unavailable {
-        message: String,
-    },
-}
-
 fn print_probe(socket: &Path) -> Result<()> {
     let daemon = match xshell_session::SessionClient::probe(socket, env!("CARGO_PKG_VERSION")) {
         Ok(SessionHandshake::Opened {
@@ -219,23 +189,25 @@ fn print_probe(socket: &Path) -> Result<()> {
             host_id,
             host_alias,
             user,
-        }) => ProbeDaemon::Ready {
+        }) => DaemonProbeStatus::Ready {
             protocol_version,
             host_id,
             host_alias,
             user,
         },
         Ok(SessionHandshake::Rejected { code, message }) if code == "protocol_version" => {
-            ProbeDaemon::Incompatible { code, message }
+            DaemonProbeStatus::Incompatible { code, message }
         }
-        Ok(SessionHandshake::Rejected { code, message }) => ProbeDaemon::Rejected { code, message },
-        Err(error) => ProbeDaemon::Unavailable {
+        Ok(SessionHandshake::Rejected { code, message }) => {
+            DaemonProbeStatus::Rejected { code, message }
+        }
+        Err(error) => DaemonProbeStatus::Unavailable {
             message: format!("{error:#}"),
         },
     };
-    let report = ProbeReport {
-        schema_version: 1,
-        binary_version: env!("CARGO_PKG_VERSION"),
+    let report = DaemonProbeReport {
+        schema_version: DAEMON_PROBE_SCHEMA_VERSION,
+        binary_version: env!("CARGO_PKG_VERSION").into(),
         supported_protocol_version: SESSION_PROTOCOL_VERSION,
         daemon,
     };
