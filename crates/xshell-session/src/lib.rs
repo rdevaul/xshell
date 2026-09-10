@@ -10,7 +10,9 @@ mod registry;
 mod view;
 
 pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy};
-pub use client::{RemoteBootstrapAction, RemoteDaemonProbe, SessionClient, SessionHandshake};
+pub use client::{
+    RemoteBootstrapAction, RemoteDaemonProbe, RemoteTarget, SessionClient, SessionHandshake,
+};
 pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;
 pub use model::{

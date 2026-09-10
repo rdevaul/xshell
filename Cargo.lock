@@ -2042,6 +2042,7 @@ dependencies = [
  "xshell-core",
  "xshell-execution",
  "xshell-pty",
+ "xshell-release",
  "xshell-session",
  "xshell-view",
 ]
@@ -2115,6 +2116,23 @@ dependencies = [
  "anyhow",
  "libc",
  "nix 0.31.3",
+ "tempfile",
+]
+
+[[package]]
+name = "xshell-release"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "rand_core 0.6.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 
