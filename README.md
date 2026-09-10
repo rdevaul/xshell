@@ -384,6 +384,7 @@ rollback guarantees.
 
 - [Current system specification](xshell-specification.md)
 - [Implementation plan](xshell-implementation-plan.md)
+- [Release artifacts and signing](docs/releasing.md)
 - [FutureShell status and traceability](docs/futureshell-status.md)
 - [FutureShell FS0 specification package](docs/futureshell-fs0.md)
 - [FutureShell roadmap](docs/futureshell-roadmap.md)

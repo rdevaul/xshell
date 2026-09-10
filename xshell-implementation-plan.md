@@ -81,9 +81,14 @@ stream capture, are implemented in the daemon.
 
 Remote bootstrap discovery now has a read-only machine contract and controller
 decision matrix: a bounded SSH probe distinguishes install, protocol upgrade,
-service start, daemon restart, direct connect, and non-version rejection. The
-remaining bootstrap work is trusted artifact distribution, explicit approval,
-atomic install/rollback, and `launchd` / `systemd --user` lifecycle control.
+service start, daemon restart, direct connect, and non-version rejection.
+
+Trusted artifact distribution is now implemented at the library and release
+pipeline boundary: Ed25519-signed, version/protocol-pinned manifests describe
+bounded SHA-256 artifacts for macOS and static-musl Linux on Arm64 and x86-64;
+the controller can detect the remote target and acquire only verified bytes.
+The remaining connection work is approval presentation, atomic remote
+installation, service management, re-probing, and rollback.
 
 The first terminal-UX increment below is also implemented: protocol v4 provides
 bounded executable and path completion against the active local or remote

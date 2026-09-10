@@ -9,6 +9,7 @@ members = [
     "crates/xshell-platform",
     "crates/xshell-plan",
     "crates/xshell-pty",
+    "crates/xshell-release",
     "crates/xshell-session",
     "crates/xshell-view",
 ]

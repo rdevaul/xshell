@@ -25,5 +25,6 @@ xshell-audit = { path = "../xshell-audit" }
 xshell-core = { path = "../xshell-core" }
 xshell-execution = { path = "../xshell-execution" }
 xshell-pty = { path = "../xshell-pty" }
+xshell-release = { path = "../xshell-release" }
 xshell-session = { path = "../xshell-session" }
 xshell-view = { path = "../xshell-view" }
