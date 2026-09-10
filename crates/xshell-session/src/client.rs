@@ -58,6 +58,25 @@ pub enum RemoteBootstrapAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTarget {
+    Aarch64AppleDarwin,
+    X86_64AppleDarwin,
+    Aarch64UnknownLinuxMusl,
+    X86_64UnknownLinuxMusl,
+}
+
+impl RemoteTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aarch64AppleDarwin => "aarch64-apple-darwin",
+            Self::X86_64AppleDarwin => "x86_64-apple-darwin",
+            Self::Aarch64UnknownLinuxMusl => "aarch64-unknown-linux-musl",
+            Self::X86_64UnknownLinuxMusl => "x86_64-unknown-linux-musl",
+        }
+    }
+}
+
 impl RemoteDaemonProbe {
     pub fn required_action(&self) -> RemoteBootstrapAction {
         let Self::Report(report) = self else {
@@ -184,42 +203,33 @@ impl SessionClient {
     /// as data so the caller can offer an explicit bootstrap operation.
     pub fn probe_ssh(destination: &str) -> Result<RemoteDaemonProbe> {
         validate_ssh_destination(destination)?;
-        let mut child = Command::new("ssh")
-            .args(["-T", "--", destination, "xshelld", "probe"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("cannot start ssh probe for {destination:?}"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("cannot capture ssh probe stdout")?;
-        let reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout
-                .take((MAX_REMOTE_PROBE_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes)
-        });
-        let deadline = Instant::now() + REMOTE_PROBE_TIMEOUT;
-        let status = loop {
-            if let Some(status) = child.try_wait().context("cannot poll ssh probe")? {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                bail!("ssh probe for {destination:?} timed out after 10 seconds");
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        let bytes = reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("ssh probe output reader panicked"))??;
+        let (status, bytes) = run_bounded_ssh(
+            destination,
+            &["xshelld", "probe"],
+            MAX_REMOTE_PROBE_BYTES,
+            REMOTE_PROBE_TIMEOUT,
+            "xshelld probe",
+        )?;
         parse_remote_probe(status, &bytes)
             .with_context(|| format!("invalid xshelld probe response from {destination:?}"))
+    }
+
+    /// Detect the release target for a remote macOS or Linux host without
+    /// changing remote state or relying on shell startup files.
+    pub fn detect_ssh_target(destination: &str) -> Result<RemoteTarget> {
+        validate_ssh_destination(destination)?;
+        let (status, bytes) = run_bounded_ssh(
+            destination,
+            &["uname", "-sm"],
+            1024,
+            REMOTE_PROBE_TIMEOUT,
+            "platform probe",
+        )?;
+        if !status.success() {
+            bail!("remote platform probe exited with {status}");
+        }
+        parse_remote_target(&bytes)
+            .with_context(|| format!("unsupported platform reported by {destination:?}"))
     }
 
     pub fn connect_ssh(destination: &str, client_version: &str) -> Result<Self> {
@@ -530,6 +540,72 @@ fn validate_ssh_destination(destination: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_bounded_ssh(
+    destination: &str,
+    remote_command: &[&str],
+    maximum_bytes: usize,
+    timeout: Duration,
+    operation: &str,
+) -> Result<(ExitStatus, Vec<u8>)> {
+    let mut child = Command::new("ssh")
+        .args(["-T", "--", destination])
+        .args(remote_command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("cannot start SSH {operation} for {destination:?}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .with_context(|| format!("cannot capture SSH {operation} stdout"))?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take((maximum_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("cannot poll SSH {operation}"))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            bail!("SSH {operation} for {destination:?} timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("SSH {operation} output reader panicked"))??;
+    if bytes.len() > maximum_bytes {
+        bail!("SSH {operation} response exceeds {maximum_bytes} bytes");
+    }
+    Ok((status, bytes))
+}
+
+fn parse_remote_target(bytes: &[u8]) -> Result<RemoteTarget> {
+    let output = std::str::from_utf8(bytes).context("platform probe returned non-UTF-8 output")?;
+    let fields = output.split_whitespace().collect::<Vec<_>>();
+    let [system, architecture] = fields.as_slice() else {
+        bail!("expected `uname -sm` to return an operating system and architecture");
+    };
+    match (*system, *architecture) {
+        ("Darwin", "arm64" | "aarch64") => Ok(RemoteTarget::Aarch64AppleDarwin),
+        ("Darwin", "x86_64" | "amd64") => Ok(RemoteTarget::X86_64AppleDarwin),
+        ("Linux", "arm64" | "aarch64") => Ok(RemoteTarget::Aarch64UnknownLinuxMusl),
+        ("Linux", "x86_64" | "amd64") => Ok(RemoteTarget::X86_64UnknownLinuxMusl),
+        _ => bail!("unsupported remote platform {system} {architecture}"),
+    }
+}
+
 fn parse_remote_probe(status: ExitStatus, bytes: &[u8]) -> Result<RemoteDaemonProbe> {
     if bytes.len() > MAX_REMOTE_PROBE_BYTES {
         bail!("remote probe response exceeds {MAX_REMOTE_PROBE_BYTES} bytes");
@@ -714,5 +790,19 @@ mod tests {
             .to_string()
             .contains("exceeds")
         );
+    }
+
+    #[test]
+    fn maps_supported_uname_outputs_to_release_targets() {
+        assert_eq!(
+            parse_remote_target(b"Darwin arm64\n").unwrap().as_str(),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            parse_remote_target(b"Linux x86_64\n").unwrap().as_str(),
+            "x86_64-unknown-linux-musl"
+        );
+        assert!(parse_remote_target(b"FreeBSD amd64\n").is_err());
+        assert!(parse_remote_target(b"Linux\n").is_err());
     }
 }

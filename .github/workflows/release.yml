@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/xshell-release/**"
+      - "crates/xshell-session/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build-xshelld:
+    name: Build xshelld / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            install_musl: true
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            install_musl: true
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            install_musl: false
+          - os: macos-15
+            target: aarch64-apple-darwin
+            install_musl: false
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.install_musl
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build xshelld
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p xshell-session --bin xshelld
+      - name: Stage release artifact
+        run: |
+          mkdir -p dist
+          install -m 0755 "target/${{ matrix.target }}/release/xshelld" "dist/xshelld-${{ matrix.target }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: xshelld-${{ matrix.target }}
+          path: dist/xshelld-${{ matrix.target }}
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Sign and publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-xshelld
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      XSHELL_RELEASE_SIGNING_KEY: ${{ secrets.XSHELL_RELEASE_SIGNING_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: 1.98.0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Resolve release identity
+        id: release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          workspace_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "xshell-release") | .version')"
+          test "$version" = "$workspace_version"
+          protocol="$(cargo run --quiet --locked -p xshell-session --bin xshelld -- \
+            --no-user-config --state-directory "$RUNNER_TEMP/xshell-probe" probe | \
+            jq -er '.supported_protocol_version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "protocol=$protocol" >> "$GITHUB_OUTPUT"
+      - name: Require release signing key
+        run: test -n "$XSHELL_RELEASE_SIGNING_KEY"
+      - name: Create signed manifest
+        run: |
+          cargo run --quiet --locked --release -p xshell-release --bin xshell-release-manifest -- \
+            create \
+            --version "${{ steps.release.outputs.version }}" \
+            --protocol-version "${{ steps.release.outputs.protocol }}" \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
+            --output dist/xshell-release.json \
+            dist/xshelld-*
+      - name: Publish release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "xshell ${{ steps.release.outputs.version }}" \
+            --generate-notes \
+            dist/xshell-release.json \
+            dist/xshelld-*

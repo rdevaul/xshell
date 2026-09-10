@@ -47,6 +47,15 @@ terminal_stream = false
 # Per-job cap on captured stream bytes; 0 = unbounded.
 terminal_stream_max_bytes = 16777216
 
+# Remote bootstrap stays disabled unless a signed release source is configured.
+# The public key is an Ed25519 verifying key encoded as 64 lowercase hex
+# characters. It is a trust anchor, not a secret. `{version}` resolves to the
+# exact version of the controlling xshell binary; manifests and artifacts must
+# use HTTPS and must also match the controller's session protocol.
+# [remote_bootstrap]
+# manifest_url = "https://github.com/rdevaul/xshell/releases/download/v{version}/xshell-release.json"
+# public_key = "RELEASE_ED25519_PUBLIC_KEY_HEX"
+
 [models.local-qwen]
 provider = "ollama"
 model = "qwen3:8b"
