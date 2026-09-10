@@ -100,7 +100,7 @@ valid-handler = "on" , "valid" , promotion-block ;
 invalid-handler = "on" , "invalid" , discard-block ;
 promotion-block = "{" , "promote" , path-list , ";" , "}" ;
 discard-block = "{" , "discard" , ("all" | path-list) , ";" , "}" ;
-task-options = "{" , resources , capabilities , "}" ;
+task-options = "{" , resources? , capabilities? , "}" ;
 resources    = "resources" , "{" , { resource-field } , "}" ;
 resource-field = identifier , ":" , (duration | size | integer) , ";" ;
 capabilities = "capabilities" , "{" , { capability-field } , "}" ;
@@ -122,10 +122,13 @@ the resource fields `timeout`, `cpu`, `memory`, `processes`, `output`,
 `artifacts`, `retries`, `input_tokens`, `output_tokens`, and `cost_microunits`,
 and the capability fields `read`, `write`, `external_read`, `external_write`,
 `execute`, `network`, `credentials`, and `devices`; unknown fields are errors.
-A task must set positive `timeout` and `output` bounds. Path arguments inside
-capability lists use workspace-relative string form because their field
-supplies the path type. Trailing commas are permitted in lists and calls;
-semicolons terminate fields and clauses.
+A task option block contains at most one `resources` block followed by at most
+one `capabilities` block. Both are optional in the grammar so the checker can
+parse an incomplete task and report the missing bounds and authority together;
+a valid task must include a capability block and set positive `timeout` and
+`output` bounds. Path arguments inside capability lists use workspace-relative
+string form because their field supplies the path type. Trailing commas are
+permitted in lists and calls; semicolons terminate fields and clauses.
 
 The initial autonomy field names are `model_rounds`, `tool_dispatches`,
 `timeout`, `input_tokens`, `output_tokens`, `cost_microunits`, `currency`, and
@@ -146,11 +149,12 @@ multi-program fixture requires it.
 Lowering creates one Flow task node for each `run`, `shell`, `verify`, `agent`,
 or resolved program call; `spawn`/`await` create dependency edges;
 transactions create lexical regions; and contracts create deterministic route
-gates plus a separate promotion policy. Source order or stable explicit names
-derive task IDs—presentation layout and task completion order never do. The
-FEA source and its pinned `programs.json` manifest are the first text-to-Flow
-review pair; FS1 will add the golden Flow and Plan snapshots produced by the
-parser rather than hand-authoring those outputs now.
+gates plus a separate promotion policy. A task expression bound directly by a
+`let` statement uses that binding as its stable source name; otherwise source
+order derives its task ID. Presentation layout and task completion order never
+participate. The FEA source and its pinned `programs.json` manifest are the
+first text-to-Flow review pair; FS1 will add the golden Flow and Plan snapshots
+produced by the parser rather than hand-authoring those outputs now.
 
 Functions, bounded iteration, remote placement, and typed xshell service calls
 are reserved for later grammar increments. They cannot be accepted as
@@ -272,8 +276,10 @@ panic, or fallback to shell interpretation.
 
 ## 12. Conformance corpus
 
-`fixtures/futureshell/syntax/valid` contains canonical source. Each invalid
-fixture has an adjacent JSON expectation containing stable diagnostic codes and
-spans. Until the FS1 parser exists these are specification fixtures, not passing
-parser tests. The deterministic FEA fixture is the accepted FS0 vertical-slice
-source and intentionally uses fake tools rather than gmsh or FEniCS.
+`fixtures/futureshell/syntax/valid` contains canonical source, including
+human-authored and independently agent-authored forms of the bounded FEA
+workflow. Each invalid fixture has an adjacent JSON expectation containing
+stable diagnostic codes and spans. Until the FS1 parser exists these are
+specification fixtures, not passing parser tests. The deterministic FEA fixture
+is the accepted FS0 vertical-slice source and intentionally uses fake tools
+rather than gmsh or FEniCS.
