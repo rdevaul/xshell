@@ -1,20 +1,24 @@
 use crate::{
-    ApprovalReply, AttachmentRole, ClientRequest, EventBatch, ModelBinding, PtySize, PtyTicket,
-    SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot,
-    ShellCompletionResult, TurnInput, ViewResource,
+    ApprovalReply, AttachmentRole, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonProbeReport,
+    DaemonProbeStatus, EventBatch, ModelBinding, PtySize, PtyTicket, SESSION_PROTOCOL_VERSION,
+    ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot, ShellCompletionResult,
+    TurnInput, ViewResource,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REMOTE_PROBE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionHandshake {
@@ -28,6 +32,64 @@ pub enum SessionHandshake {
         code: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteDaemonProbe {
+    MissingBinary,
+    Report(DaemonProbeReport),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteBootstrapAction {
+    Connect,
+    Install,
+    Upgrade {
+        binary_version: String,
+        supported_protocol_version: u32,
+    },
+    Start,
+    Restart {
+        reason: String,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+}
+
+impl RemoteDaemonProbe {
+    pub fn required_action(&self) -> RemoteBootstrapAction {
+        let Self::Report(report) = self else {
+            return RemoteBootstrapAction::Install;
+        };
+        if report.supported_protocol_version != SESSION_PROTOCOL_VERSION {
+            return RemoteBootstrapAction::Upgrade {
+                binary_version: report.binary_version.clone(),
+                supported_protocol_version: report.supported_protocol_version,
+            };
+        }
+        match &report.daemon {
+            DaemonProbeStatus::Ready {
+                protocol_version, ..
+            } if *protocol_version == SESSION_PROTOCOL_VERSION => RemoteBootstrapAction::Connect,
+            DaemonProbeStatus::Ready {
+                protocol_version, ..
+            } => RemoteBootstrapAction::Restart {
+                reason: format!(
+                    "running daemon speaks protocol {protocol_version}, but the installed binary supports {SESSION_PROTOCOL_VERSION}"
+                ),
+            },
+            DaemonProbeStatus::Incompatible { message, .. } => RemoteBootstrapAction::Restart {
+                reason: message.clone(),
+            },
+            DaemonProbeStatus::Unavailable { .. } => RemoteBootstrapAction::Start,
+            DaemonProbeStatus::Rejected { code, message } => RemoteBootstrapAction::Rejected {
+                code: code.clone(),
+                message: message.clone(),
+            },
+        }
+    }
 }
 
 pub struct SessionClient {
@@ -117,10 +179,51 @@ impl SessionClient {
         )
     }
 
+    /// Discover an installed remote binary and its running daemon without
+    /// attaching to or mutating a session. A missing `xshelld` is represented
+    /// as data so the caller can offer an explicit bootstrap operation.
+    pub fn probe_ssh(destination: &str) -> Result<RemoteDaemonProbe> {
+        validate_ssh_destination(destination)?;
+        let mut child = Command::new("ssh")
+            .args(["-T", "--", destination, "xshelld", "probe"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("cannot start ssh probe for {destination:?}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("cannot capture ssh probe stdout")?;
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .take((MAX_REMOTE_PROBE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        });
+        let deadline = Instant::now() + REMOTE_PROBE_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait().context("cannot poll ssh probe")? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                bail!("ssh probe for {destination:?} timed out after 10 seconds");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let bytes = reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("ssh probe output reader panicked"))??;
+        parse_remote_probe(status, &bytes)
+            .with_context(|| format!("invalid xshelld probe response from {destination:?}"))
+    }
+
     pub fn connect_ssh(destination: &str, client_version: &str) -> Result<Self> {
-        if destination.trim().is_empty() || destination.starts_with('-') {
-            bail!("SSH destination must be non-empty and may not begin with '-'");
-        }
+        validate_ssh_destination(destination)?;
         let mut child = Command::new("ssh")
             .args(["-T", "--", destination, "xshelld", "serve-stdio"])
             .stdin(Stdio::piped())
@@ -420,6 +523,35 @@ impl SessionClient {
     }
 }
 
+fn validate_ssh_destination(destination: &str) -> Result<()> {
+    if destination.trim().is_empty() || destination.starts_with('-') {
+        bail!("SSH destination must be non-empty and may not begin with '-'");
+    }
+    Ok(())
+}
+
+fn parse_remote_probe(status: ExitStatus, bytes: &[u8]) -> Result<RemoteDaemonProbe> {
+    if bytes.len() > MAX_REMOTE_PROBE_BYTES {
+        bail!("remote probe response exceeds {MAX_REMOTE_PROBE_BYTES} bytes");
+    }
+    if !status.success() {
+        if status.code() == Some(127) && bytes.is_empty() {
+            return Ok(RemoteDaemonProbe::MissingBinary);
+        }
+        bail!("remote probe exited with {status}");
+    }
+    let report: DaemonProbeReport = serde_json::from_slice(bytes)
+        .context("remote probe did not return its JSON capability report")?;
+    if report.schema_version != DAEMON_PROBE_SCHEMA_VERSION {
+        bail!(
+            "remote probe uses schema {}, but this client requires {}",
+            report.schema_version,
+            DAEMON_PROBE_SCHEMA_VERSION
+        );
+    }
+    Ok(RemoteDaemonProbe::Report(report))
+}
+
 fn receive_response(reader: &mut dyn BufRead) -> Result<ServerResponse> {
     let mut bytes = Vec::new();
     let mut limited = reader.take((MAX_RESPONSE_BYTES + 1) as u64);
@@ -453,4 +585,134 @@ fn set_close_on_exec(stream: &UnixStream) -> Result<()> {
             .context("cannot protect session socket from child processes");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn report(protocol: u32, daemon: DaemonProbeStatus) -> RemoteDaemonProbe {
+        RemoteDaemonProbe::Report(DaemonProbeReport {
+            schema_version: DAEMON_PROBE_SCHEMA_VERSION,
+            binary_version: "0.2.0".into(),
+            supported_protocol_version: protocol,
+            daemon,
+        })
+    }
+
+    #[test]
+    fn bootstrap_decision_matrix_distinguishes_remote_repairs() {
+        assert_eq!(
+            RemoteDaemonProbe::MissingBinary.required_action(),
+            RemoteBootstrapAction::Install
+        );
+        assert_eq!(
+            report(
+                SESSION_PROTOCOL_VERSION - 1,
+                DaemonProbeStatus::Unavailable {
+                    message: "not running".into(),
+                },
+            )
+            .required_action(),
+            RemoteBootstrapAction::Upgrade {
+                binary_version: "0.2.0".into(),
+                supported_protocol_version: SESSION_PROTOCOL_VERSION - 1,
+            }
+        );
+        assert_eq!(
+            report(
+                SESSION_PROTOCOL_VERSION,
+                DaemonProbeStatus::Unavailable {
+                    message: "not running".into(),
+                },
+            )
+            .required_action(),
+            RemoteBootstrapAction::Start
+        );
+        assert!(matches!(
+            report(
+                SESSION_PROTOCOL_VERSION,
+                DaemonProbeStatus::Incompatible {
+                    code: "protocol_version".into(),
+                    message: "old daemon".into(),
+                },
+            )
+            .required_action(),
+            RemoteBootstrapAction::Restart { reason } if reason == "old daemon"
+        ));
+        assert_eq!(
+            report(
+                SESSION_PROTOCOL_VERSION,
+                DaemonProbeStatus::Ready {
+                    protocol_version: SESSION_PROTOCOL_VERSION,
+                    host_id: "host-id".into(),
+                    host_alias: "host".into(),
+                    user: "user".into(),
+                },
+            )
+            .required_action(),
+            RemoteBootstrapAction::Connect
+        );
+        assert_eq!(
+            report(
+                SESSION_PROTOCOL_VERSION,
+                DaemonProbeStatus::Rejected {
+                    code: "policy".into(),
+                    message: "denied".into(),
+                },
+            )
+            .required_action(),
+            RemoteBootstrapAction::Rejected {
+                code: "policy".into(),
+                message: "denied".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_missing_binary_and_versioned_report() {
+        let missing = ExitStatus::from_raw(127 << 8);
+        assert_eq!(
+            parse_remote_probe(missing, b"").unwrap(),
+            RemoteDaemonProbe::MissingBinary
+        );
+
+        let bytes = serde_json::to_vec(&DaemonProbeReport {
+            schema_version: DAEMON_PROBE_SCHEMA_VERSION,
+            binary_version: "0.2.0".into(),
+            supported_protocol_version: SESSION_PROTOCOL_VERSION,
+            daemon: DaemonProbeStatus::Unavailable {
+                message: "socket missing".into(),
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            parse_remote_probe(ExitStatus::from_raw(0), &bytes).unwrap(),
+            RemoteDaemonProbe::Report(DaemonProbeReport {
+                daemon: DaemonProbeStatus::Unavailable { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_or_oversized_probe_responses() {
+        let unknown_schema = br#"{"schema_version":2,"binary_version":"0.2.0","supported_protocol_version":11,"daemon_status":"unavailable","message":"missing"}"#;
+        assert!(
+            parse_remote_probe(ExitStatus::from_raw(0), unknown_schema)
+                .unwrap_err()
+                .to_string()
+                .contains("requires 1")
+        );
+        assert!(
+            parse_remote_probe(
+                ExitStatus::from_raw(0),
+                &vec![b'x'; MAX_REMOTE_PROBE_BYTES + 1]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds")
+        );
+    }
 }

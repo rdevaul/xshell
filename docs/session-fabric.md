@@ -150,10 +150,30 @@ states:
 An unavailable daemon is a successful probe result rather than a command
 failure: the executable was discovered and returned actionable state. The
 probe never creates, attaches, lists, or changes a session, and it does not
-start or replace the daemon. Local probe I/O has a two-second deadline. A
-future `//connect` bootstrap flow can therefore
-inspect state before asking for installation, upgrade, or service-start
-approval.
+start or replace the daemon. Local probe I/O has a two-second deadline, so the
+`//connect` bootstrap flow can inspect state before asking for installation,
+upgrade, or service-start approval.
+
+The session client can now run this probe over SSH with a bounded 64 KiB
+response and a ten-second end-to-end deadline. It turns discovery into one of
+six explicit controller actions:
+
+| Remote state | Required action |
+|---|---|
+| `xshelld` absent | install |
+| installed binary uses another protocol | upgrade or downgrade |
+| compatible binary, daemon unavailable | start |
+| compatible binary, daemon incompatible | restart |
+| compatible binary and daemon | connect |
+| structured non-version rejection | stop and report |
+
+This decision is read-only. `//connect` now preflights a remote host, proceeds
+when it is ready, and reports the exact repair needed otherwise. It falls back
+to the legacy direct stdio connection when an older helper cannot produce a
+valid probe, preserving compatibility with already working deployments.
+Artifact selection, signature verification, approval presentation, atomic
+replacement, service management, re-probing, and rollback remain the next
+bootstrap increment.
 
 The proxy is deliberately stateless. Killing the SSH process closes its daemon
 client connection, applying ordinary detach semantics while daemon-owned work

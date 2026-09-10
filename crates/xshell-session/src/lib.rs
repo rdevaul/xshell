@@ -10,15 +10,15 @@ mod registry;
 mod view;
 
 pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy};
-pub use client::{SessionClient, SessionHandshake};
+pub use client::{RemoteBootstrapAction, RemoteDaemonProbe, SessionClient, SessionHandshake};
 pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;
 pub use model::{
-    AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, EventBatch, ModelBinding,
-    PersistenceMode, PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, SessionActivity, SessionConfig,
-    SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind, SessionSnapshot,
-    SessionStatus, ShellCompletionCandidate, ShellCompletionResult, TurnInput, ViewResource,
-    Visibility,
+    AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, DAEMON_PROBE_SCHEMA_VERSION,
+    DaemonProbeReport, DaemonProbeStatus, EventBatch, ModelBinding, PersistenceMode, PtySize,
+    PtyTicket, SESSION_PROTOCOL_VERSION, SessionActivity, SessionConfig, SessionCreation,
+    SessionDescriptor, SessionEvent, SessionEventKind, SessionSnapshot, SessionStatus,
+    ShellCompletionCandidate, ShellCompletionResult, TurnInput, ViewResource, Visibility,
 };
 pub use protocol::{ClientRequest, ServerResponse};
 pub use pty::{PtyAudit, PtyClaim, PtyCoordinator, PtyReadResult};

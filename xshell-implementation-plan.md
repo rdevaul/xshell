@@ -79,6 +79,12 @@ bootstrap, reconnect supervision, and platform service installation remain
 Phase 3 work. Execution-boundary audit appends, including opt-in bounded PTY
 stream capture, are implemented in the daemon.
 
+Remote bootstrap discovery now has a read-only machine contract and controller
+decision matrix: a bounded SSH probe distinguishes install, protocol upgrade,
+service start, daemon restart, direct connect, and non-version rejection. The
+remaining bootstrap work is trusted artifact distribution, explicit approval,
+atomic install/rollback, and `launchd` / `systemd --user` lifecycle control.
+
 The first terminal-UX increment below is also implemented: protocol v4 provides
 bounded executable and path completion against the active local or remote
 session without evaluating shell code.

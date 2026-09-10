@@ -6,8 +6,8 @@ use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
     AgentTurnPhase, EventBatch, PersistenceMode, PtySize, PtyStreamClient, PtyTicket,
-    SessionActivity, SessionClient, SessionConfig, SessionCreation, SessionDescriptor,
-    SessionSnapshot, SessionStatus, TurnInput, ViewResource, Visibility,
+    RemoteBootstrapAction, SessionActivity, SessionClient, SessionConfig, SessionCreation,
+    SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput, ViewResource, Visibility,
 };
 
 struct HostConnection {
@@ -200,6 +200,12 @@ impl SessionRuntime {
         model: &ActiveModel,
         system_prompt: &str,
     ) -> Result<SessionSnapshot> {
+        match SessionClient::probe_ssh(destination) {
+            Ok(probe) => require_connectable_remote(probe.required_action())?,
+            Err(error) => eprintln!(
+                "xshell: remote capability probe unavailable; trying the legacy direct connection: {error:#}"
+            ),
+        }
         let mut client = SessionClient::connect_ssh(destination, env!("CARGO_PKG_VERSION"))?;
         let host_id = client.host_id().to_owned();
         if self
@@ -693,6 +699,33 @@ session's interactive process is running; stop it first"
     }
 }
 
+fn require_connectable_remote(action: RemoteBootstrapAction) -> Result<()> {
+    match action {
+        RemoteBootstrapAction::Connect => Ok(()),
+        RemoteBootstrapAction::Install => bail!(
+            "xshelld is not installed on the remote host; remote installation requires the signed-artifact bootstrap increment"
+        ),
+        RemoteBootstrapAction::Upgrade {
+            binary_version,
+            supported_protocol_version,
+        } => bail!(
+            "remote xshelld {binary_version} supports protocol {supported_protocol_version}, but this xshell requires protocol {}; remote upgrade requires the signed-artifact bootstrap increment",
+            xshell_session::SESSION_PROTOCOL_VERSION
+        ),
+        RemoteBootstrapAction::Start => bail!(
+            "the remote xshelld binary is compatible but its daemon is unavailable; start or install its user service"
+        ),
+        RemoteBootstrapAction::Restart { reason } => {
+            bail!(
+                "the installed remote xshelld is compatible but its daemon must be restarted: {reason}"
+            )
+        }
+        RemoteBootstrapAction::Rejected { code, message } => {
+            bail!("remote xshelld probe was rejected ({code}): {message}")
+        }
+    }
+}
+
 fn disambiguate_host_aliases(hosts: &[(String, String)]) -> HashMap<String, String> {
     let mut aliases: HashMap<&str, Vec<&str>> = HashMap::new();
     for (host_id, alias) in hosts {
@@ -790,5 +823,31 @@ mod tests {
         assert_eq!(labels["12345678-aaaa"], "Mac.lan#12345678");
         assert_eq!(labels["87654321-bbbb"], "Mac.lan#87654321");
         assert_eq!(labels["abcdef00-cccc"], "jarvis");
+    }
+
+    #[test]
+    fn remote_preflight_only_connects_when_no_repair_is_needed() {
+        assert!(require_connectable_remote(RemoteBootstrapAction::Connect).is_ok());
+        assert!(
+            require_connectable_remote(RemoteBootstrapAction::Install)
+                .unwrap_err()
+                .to_string()
+                .contains("not installed")
+        );
+        assert!(
+            require_connectable_remote(RemoteBootstrapAction::Start)
+                .unwrap_err()
+                .to_string()
+                .contains("daemon is unavailable")
+        );
+        assert!(
+            require_connectable_remote(RemoteBootstrapAction::Upgrade {
+                binary_version: "0.1.0".into(),
+                supported_protocol_version: 10,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("supports protocol 10")
+        );
     }
 }
