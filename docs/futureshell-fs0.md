@@ -1,6 +1,6 @@
 # FutureShell FS0 specification package
 
-**Status:** Review candidate; the FS0 language and security gates remain open
+**Status:** Complete; accepted as the FS1 implementation baseline
 
 This page is the index and review record for the first FutureShell milestone.
 The package defines the intended semantics precisely enough to review and to
@@ -34,6 +34,9 @@ Review outcomes should be recorded as short ADRs for decisions that constrain
 the wire format, trusted computing base, or public semantics. Editorial fixes
 may land directly in these documents.
 
+The completed review, findings, accepted limitations, and durable-decision
+links are in the [FS0 review record](futureshell-fs0-review.md).
+
 ## Exit checklist
 
 - [x] Language reference draft and annotated conformance examples exist.
@@ -41,9 +44,10 @@ may land directly in these documents.
 - [x] Provisional typed schema bundle covers every named FS0 policy object.
 - [x] Deterministic FEA fixture specifies success and required failure paths.
 - [x] Reproducible APFS/Linux staging and platform-capability probe exists.
-- [ ] Human and agent-authored language examples receive language review.
-- [ ] Security review accepts path, symlink, race and promotion semantics.
-- [ ] Every accepted rollback or isolation claim names a testable invariant.
+- [x] Human and agent-authored language examples receive language review.
+- [x] Security review accepts path, symlink, race and promotion semantics.
+- [x] Every accepted rollback or isolation claim names a testable invariant.
 
-FS0 advances only when the final three boxes are checked with links to the
-review record. Schema stability and runtime conformance are later milestones.
+FS0 completed on 2026-09-10. Schema stability and runtime conformance remain
+later milestones; completion does not turn provisional JSON into a stable
+format or claim runtime enforcement.

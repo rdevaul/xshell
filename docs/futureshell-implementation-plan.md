@@ -954,23 +954,21 @@ examples that normalize `promote all` after an agent task.
 
 ## 16. Immediate backlog
 
-The Flow IR and Plan V0 crates now exist as explicitly provisional prototypes.
-They test graph, lowering, and catalog-resolution semantics but are not durable
-formats or an executable runtime. The pure program-manifest resolver, fixture
-manifests, and typed contract-predicate catalog are complete. The indexed
-[FS0 specification package](futureshell-fs0.md) now supplies the language,
-security, schema, platform-spike and deterministic FEA review artifacts.
-Continue in this order:
+The [FS0 specification package](futureshell-fs0.md) and [review
+record](futureshell-fs0-review.md) now fix the accepted language and security
+baseline. The Flow IR and Plan V0 crates remain explicitly provisional: they
+test graph, lowering, and catalog-resolution semantics but are not durable
+formats or an executable runtime. Continue FS1 in this order:
 
-1. hold the FS0 language and security reviews and revise the package;
-2. record decisions that constrain public semantics or the trusted computing
-   base as short ADRs;
-3. decide canonical serialization after testing candidate encodings;
-4. promote the language, plan and `xshell-run` surfaces beyond prototype status
-   only after the FS0 review gate.
+1. test candidate canonical encodings against every Flow and Plan fixture;
+2. record the encoding and hash-domain decision as an ADR;
+3. implement bounded lexing, spans, parsing, diagnostics, and formatting in
+   `xshell-language` with purity and property tests;
+4. connect textual lowering to the existing Flow and Plan prototypes;
+5. expose the pure path as `xshell-run check`, `fmt`, and `plan`.
 
-This order keeps syntax, security claims and durable schema choices reviewable
-before they become coupled to runtime execution.
+This order makes durable identity explicit before parser and CLI output become
+compatibility surfaces.
 
 ## 17. Definition of done for the first release
 
