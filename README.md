@@ -38,6 +38,40 @@ At one prompt you can:
 xshell is not yet a POSIX shell or a drop-in login-shell replacement. It is a
 working alpha of the session and execution fabric needed to become one.
 
+## Two environments, one product
+
+xshell has two equal design goals:
+
+- **A convenient daily driver for personal work and home labs:** quick setup,
+  user-selected models, ordinary shell access, and dependable local and remote
+  sessions with little approval friction for explicitly trusted work.
+- **Deployable infrastructure for controlled information environments:** AI and
+  programmatic workloads governed by protected administrative policy, approved
+  data destinations, enforced execution boundaries, and protected audit evidence,
+  including the requirements of a particular ITAR/CUI deployment.
+
+The development plan keeps one modular codebase, a shared execution lifecycle,
+and common tool semantics. Deployment profiles will select authority and required
+guarantees; execution providers will enforce them. Personal policy can grant broad
+authority through the same authorization path that controlled policy restricts.
+Reliable cancellation, truthful failure records, bounded operations, and recovery
+are requirements for both environments.
+
+Personal and controlled distributions may ship different component sets,
+cryptographic implementations, and qualification schedules. Personal releases
+can advance independently of controlled qualification. A controlled profile must
+be protected from client or workload overrides, and changing profiles must not
+strip restrictions from existing data. A permanent `ITARxshell` source fork is
+not planned.
+
+**These deployment profiles are architectural goals, not implemented compliance
+modes.** The current alpha runs with its user's authority and is not an adequate
+enforcement boundary for a controlled-data production deployment. The
+[design, security, and usability review](docs/xshell-design-security-usability-review.md)
+records known limitations and corrections. The
+[development roadmap](docs/xshell-development-roadmap.md) defines shared fixes,
+daily-driver milestones, and the separate controlled-deployment acceptance gates.
+
 ## What works today
 
 | Area | Current capability |
@@ -375,6 +409,12 @@ the [audit design, deployment guidance, and verifier](docs/auditing.md).
 
 ## Direction
 
+The [dual-mandate development roadmap](docs/xshell-development-roadmap.md) is the
+current cross-product sequencing plan: repair shared correctness, establish a
+common authorization boundary, and advance daily-driver usability alongside a
+narrow controlled deployment. A small local workflow will prove execution,
+evidence, selective promotion, and recovery before broader runtime expansion.
+
 The implemented session fabric is the substrate for the broader xshell vision:
 transparent cross-host resources, agentic CAD workflows around
 [yapCAD](https://github.com/rdevaul/yapCAD), richer viewer plugins, and
@@ -383,7 +423,9 @@ deterministic contractual evidence, selective state promotion, and bounded
 rollback guarantees.
 
 - [Current system specification](xshell-specification.md)
-- [Implementation plan](xshell-implementation-plan.md)
+- [Design, security, and usability review](docs/xshell-design-security-usability-review.md)
+- [Dual-mandate development roadmap](docs/xshell-development-roadmap.md)
+- [Original implementation plan and detailed backlog](xshell-implementation-plan.md)
 - [Release artifacts and signing](docs/releasing.md)
 - [FutureShell status and traceability](docs/futureshell-status.md)
 - [FutureShell FS0 specification package](docs/futureshell-fs0.md)
