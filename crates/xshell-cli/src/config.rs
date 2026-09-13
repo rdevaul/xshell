@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use xshell_audit::AuditConfig;
+use xshell_release::ReleaseSource;
 use xshell_session::{ModelBinding, SessionConfig};
 pub use xshell_view::{OutputMode, RenderingConfig};
 
@@ -40,6 +41,7 @@ pub struct XshellConfig {
     pub(crate) view: ViewConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    pub remote_bootstrap: Option<ReleaseSource>,
     #[serde(default)]
     pub session_fabric: SessionConfig,
     #[serde(default)]
@@ -121,6 +123,11 @@ impl XshellConfig {
             .view
             .validate()
             .with_context(|| format!("invalid configuration file {}", path.display()))?;
+        if let Some(source) = &config.remote_bootstrap {
+            source
+                .validate()
+                .with_context(|| format!("invalid configuration file {}", path.display()))?;
+        }
         Ok((config, path))
     }
 
@@ -323,6 +330,7 @@ api_key_env = "OPENROUTER_API_KEY"
         let config: XshellConfig = toml::from_str("").unwrap();
         assert_eq!(config.rendering, RenderingConfig::default());
         assert_eq!(config.view, ViewConfig::default());
+        assert!(config.remote_bootstrap.is_none());
     }
 
     #[test]

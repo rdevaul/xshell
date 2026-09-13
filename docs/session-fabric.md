@@ -171,9 +171,16 @@ This decision is read-only. `//connect` now preflights a remote host, proceeds
 when it is ready, and reports the exact repair needed otherwise. It falls back
 to the legacy direct stdio connection when an older helper cannot produce a
 valid probe, preserving compatibility with already working deployments.
-Artifact selection, signature verification, approval presentation, atomic
-replacement, service management, re-probing, and rollback remain the next
-bootstrap increment.
+
+The trusted-artifact foundation is implemented separately from remote
+mutation. `xshell-release` accepts a configured HTTPS manifest URL and pinned
+Ed25519 public key, verifies the signed release and exact controller
+version/protocol, selects one of the detected macOS or static-musl Linux
+targets, downloads with strict bounds, and verifies artifact size and SHA-256.
+The release workflow builds both supported architectures for both operating
+systems and signs their common manifest. `//connect` does not yet acquire or
+install those bytes; presenting the verified release and applying it atomically
+remain the next increment.
 
 The proxy is deliberately stateless. Killing the SSH process closes its daemon
 client connection, applying ordinary detach semantics while daemon-owned work
