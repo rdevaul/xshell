@@ -425,6 +425,8 @@ rollback guarantees.
 - [Current system specification](xshell-specification.md)
 - [Design, security, and usability review](docs/xshell-design-security-usability-review.md)
 - [Dual-mandate development roadmap](docs/xshell-development-roadmap.md)
+- [Security finding ledger](docs/xshell-security-findings.md)
+- [Execution mode conformance](docs/xshell-mode-conformance.md)
 - [Original implementation plan and detailed backlog](xshell-implementation-plan.md)
 - [Release artifacts and signing](docs/releasing.md)
 - [FutureShell status and traceability](docs/futureshell-status.md)

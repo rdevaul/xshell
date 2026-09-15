@@ -205,8 +205,9 @@ deterministic task and loop templates, normalizes capabilities, detects obvious
 write conflicts, and records unresolved program and predicate dependencies. A
 pure resolver can bind those dependencies from provisional fixture catalogs,
 checking typed interfaces, predicate arguments, and capability containment. It
-uses normalized JSON hashing only as a prototype; it is not yet the durable
-canonical encoding described above.
+uses the explicit canonical Plan V0 encoding selected by
+[ADR 0004](adr/0004-explicit-canonical-plan-encoding.md), with exact byte and
+hash vectors across the fixture corpus.
 
 ### 5.2 Authorization
 
@@ -955,20 +956,24 @@ examples that normalize `promote all` after an agent task.
 ## 16. Immediate backlog
 
 The [FS0 specification package](futureshell-fs0.md) and [review
-record](futureshell-fs0-review.md) now fix the accepted language and security
-baseline. The Flow IR and Plan V0 crates remain explicitly provisional: they
-test graph, lowering, and catalog-resolution semantics but are not durable
-formats or an executable runtime. Continue FS1 in this order:
+record](futureshell-fs0-review.md) fix the accepted language and security
+baseline. Plan V0 canonical identity is now fixed by ADR 0004, while the Flow
+IR, catalogs, and broader planner remain provisional and non-executable.
 
-1. test candidate canonical encodings against every Flow and Plan fixture;
-2. record the encoding and hash-domain decision as an ADR;
-3. implement bounded lexing, spans, parsing, diagnostics, and formatting in
+The [xshell development roadmap](xshell-development-roadmap.md) supersedes the
+old FS1-first delivery sequence across the product. Complete the near-term M1
+correctness work, establish the M2 authorization/provider boundary, and prove
+the narrow M5 structured-plan workflow before expanding the textual frontend.
+Then continue FS1 in this order:
+
+1. implement bounded lexing, spans, parsing, diagnostics, and formatting in
    `xshell-language` with purity and property tests;
-4. connect textual lowering to the existing Flow and Plan prototypes;
-5. expose the pure path as `xshell-run check`, `fmt`, and `plan`.
+2. connect textual lowering to the existing Flow and Plan prototypes;
+3. expose the pure path as `xshell-run check`, `fmt`, and `plan`.
 
-This order makes durable identity explicit before parser and CLI output become
-compatibility surfaces.
+This order keeps parser and CLI output on the already-fixed canonical plan
+identity. The M5 structured-plan proof does not complete FS1; FS1 still requires
+this textual toolchain and its documented conformance evidence.
 
 ## 17. Definition of done for the first release
 

@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 
-// Version 11 makes a session's current activity self-describing. Controllers
-// no longer need to join the session and PTY catalogs to distinguish agent
-// work from an interactive process.
-pub const SESSION_PROTOCOL_VERSION: u32 = 11;
+// Version 12 adds an explicit stopping phase so controllers do not report a
+// cancellation request as complete while owned process cleanup is still in
+// progress.
+pub const SESSION_PROTOCOL_VERSION: u32 = 12;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +163,7 @@ pub enum SessionStatus {
 pub enum AgentTurnPhase {
     Running,
     WaitingApproval,
+    Stopping,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]

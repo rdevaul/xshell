@@ -15,7 +15,7 @@ use xshell_core::ToolCall;
 use xshell_execution::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, CompactionConfig,
     ExecutionEvent, GateReason, SensitivePaths, TurnObserver, TurnPolicy, build_adapter,
-    run_agent_turn, run_direct_shell_streaming,
+    run_agent_turn, run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
 
@@ -31,6 +31,8 @@ pub struct ExecutionCoordinator {
 struct CoordinatorInner {
     registry: Arc<Mutex<SessionRegistry>>,
     sessions: Mutex<HashMap<String, Arc<SessionExecution>>>,
+    admission: Mutex<bool>,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
     audit: DaemonAudit,
     max_approval: ApprovalPolicy,
     sensitive_paths: SensitivePaths,
@@ -84,6 +86,8 @@ impl ExecutionCoordinator {
             inner: Arc::new(CoordinatorInner {
                 registry,
                 sessions: Mutex::new(HashMap::new()),
+                admission: Mutex::new(true),
+                workers: Mutex::new(Vec::new()),
                 audit,
                 max_approval,
                 sensitive_paths,
@@ -127,6 +131,10 @@ impl ExecutionCoordinator {
         input: TurnInput,
         requested_approval: ApprovalPolicy,
     ) -> Result<String> {
+        if !*self.inner.admission.lock_recover() {
+            bail!("session execution is shutting down");
+        }
+        self.reap_finished_workers();
         // The daemon executes; the daemon decides how much unattended
         // execution it permits. A client may ask for less, never more.
         let approval = requested_approval.clamp_to(self.inner.max_approval);
@@ -163,6 +171,14 @@ impl ExecutionCoordinator {
             execution.finish(&turn_id);
             return Err(error);
         }
+        if let Err(error) = self.inner.registry.lock_recover().begin_execution(
+            &snapshot.descriptor.id,
+            &turn_id,
+            route,
+        ) {
+            execution.finish(&turn_id);
+            return Err(error).context("cannot persist accepted session operation");
+        }
         execution.append(
             &turn_id,
             SessionEventKind::TurnStarted {
@@ -174,8 +190,19 @@ impl ExecutionCoordinator {
 
         let coordinator = self.clone();
         let session_id = session_id.to_owned();
+        let marker_session_id = session_id.clone();
         let spawned_turn_id = turn_id.clone();
-        if let Err(error) = thread::Builder::new()
+        let admission = self.inner.admission.lock_recover();
+        if !*admission {
+            self.inner
+                .registry
+                .lock_recover()
+                .finish_execution(&snapshot.descriptor.id, &turn_id)?;
+            execution.append(&turn_id, SessionEventKind::TurnCancelled);
+            execution.finish(&turn_id);
+            bail!("session execution is shutting down");
+        }
+        let worker = thread::Builder::new()
             .name(format!("xshell-turn-{}", &turn_id[..8]))
             .spawn(move || {
                 coordinator.run_turn(
@@ -187,18 +214,81 @@ impl ExecutionCoordinator {
                     cancellation,
                     audit,
                 );
-            })
-        {
-            execution.append(
-                &turn_id,
-                SessionEventKind::TurnFailed {
-                    message: error.to_string(),
-                },
-            );
-            execution.finish(&turn_id);
-            return Err(error).context("cannot start session turn");
-        }
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let persistence = self
+                    .inner
+                    .registry
+                    .lock_recover()
+                    .finish_execution(&marker_session_id, &turn_id);
+                execution.append(
+                    &turn_id,
+                    SessionEventKind::TurnFailed {
+                        message: error.to_string(),
+                    },
+                );
+                execution.finish(&turn_id);
+                persistence.context("cannot clear unstarted session operation")?;
+                return Err(error).context("cannot start session turn");
+            }
+        };
+        self.inner.workers.lock_recover().push(worker);
+        drop(admission);
         Ok(turn_id)
+    }
+
+    pub fn stop_accepting_and_cancel(&self) {
+        *self.inner.admission.lock_recover() = false;
+        let sessions = self
+            .inner
+            .sessions
+            .lock_recover()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for execution in sessions {
+            if let Some(active) = &execution.state.lock_recover().active {
+                active.cancellation.cancel();
+                execution.changed.notify_all();
+                execution.approvals_ready.notify_waiters();
+            }
+        }
+    }
+
+    pub fn wait_for_shutdown(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.reap_finished_workers();
+            if self.inner.workers.lock_recover().is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn reap_finished_workers(&self) {
+        let finished = {
+            let mut workers = self.inner.workers.lock_recover();
+            let mut pending = Vec::with_capacity(workers.len());
+            let mut finished = Vec::new();
+            for worker in workers.drain(..) {
+                if worker.is_finished() {
+                    finished.push(worker);
+                } else {
+                    pending.push(worker);
+                }
+            }
+            *workers = pending;
+            finished
+        };
+        for worker in finished {
+            let _ = worker.join();
+        }
     }
 
     pub fn events(&self, session_id: &str, after_sequence: u64, wait_ms: u64) -> EventBatch {
@@ -265,7 +355,12 @@ impl ExecutionCoordinator {
         let Some(active) = &state.active else {
             return SessionActivity::Idle;
         };
-        if state.pending_approvals.is_empty() {
+        if active.cancellation.is_cancelled() {
+            SessionActivity::AgentTurn {
+                turn_id: active.id.clone(),
+                phase: AgentTurnPhase::Stopping,
+            }
+        } else if state.pending_approvals.is_empty() {
             SessionActivity::AgentTurn {
                 turn_id: active.id.clone(),
                 phase: AgentTurnPhase::Running,
@@ -352,19 +447,31 @@ impl ExecutionCoordinator {
                     outcome
                 }
                 TurnInput::Shell { command } => {
-                    let result = tokio::select! {
-                        result = run_direct_shell_streaming(
-                            &command,
-                            &snapshot.descriptor.cwd,
-                            |stream, text| execution.append(
+                    let shell_result = run_direct_shell_streaming_cancellable(
+                        &command,
+                        &snapshot.descriptor.cwd,
+                        cancellation.clone(),
+                        |stream, text| {
+                            execution.append(
                                 &turn_id,
                                 SessionEventKind::ShellOutput {
                                     stream: stream.into(),
                                     text,
                                 },
-                            ),
-                        ) => result?,
-                        () = cancellation.wait() => bail!("shell command cancelled"),
+                            )
+                        },
+                    )
+                    .await;
+                    let result = match shell_result {
+                        Ok(result) => result,
+                        Err(error) => {
+                            audit.append(AuditEvent::ShellFinished {
+                                command: command.clone(),
+                                outcome: format!("error: {error:#}"),
+                                cwd: snapshot.descriptor.cwd.display().to_string(),
+                            })?;
+                            return Err(error);
+                        }
                     };
                     if result.cwd != snapshot.descriptor.cwd {
                         snapshot.descriptor.cwd = result.cwd.clone();
@@ -397,7 +504,19 @@ impl ExecutionCoordinator {
         // no further tool runs without a record. Report it as a failure, not
         // a user cancellation.
         let audit_failure = observer.audit_failure.take();
-        if let Some(error) = audit_failure {
+        let persistence = self.inner.registry.lock_recover().update_execution_state(
+            &session_id,
+            snapshot.descriptor.cwd,
+            snapshot.history,
+        );
+        if let Err(error) = persistence {
+            execution.append(
+                &turn_id,
+                SessionEventKind::TurnFailed {
+                    message: format!("cannot persist terminal turn state: {error:#}"),
+                },
+            );
+        } else if let Some(error) = audit_failure {
             execution.append(
                 &turn_id,
                 SessionEventKind::TurnFailed {
@@ -414,20 +533,7 @@ impl ExecutionCoordinator {
                 },
             );
         } else {
-            let update = self.inner.registry.lock_recover().update_execution_state(
-                &session_id,
-                snapshot.descriptor.cwd,
-                snapshot.history,
-            );
-            match update {
-                Ok(_) => execution.append(&turn_id, SessionEventKind::TurnCompleted),
-                Err(error) => execution.append(
-                    &turn_id,
-                    SessionEventKind::TurnFailed {
-                        message: format!("cannot persist completed turn: {error:#}"),
-                    },
-                ),
-            }
+            execution.append(&turn_id, SessionEventKind::TurnCompleted);
         }
         execution.finish(&turn_id);
     }

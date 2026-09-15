@@ -46,6 +46,25 @@ fn connect_when_ready(socket: &Path) -> SessionClient {
     panic!("xshelld did not become ready at {}", socket.display());
 }
 
+fn terminate_daemon(daemon: &mut Daemon) {
+    let result = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(result, 0, "could not send SIGTERM to xshelld");
+    assert!(
+        daemon.0.wait().unwrap().success(),
+        "xshelld did not shut down cleanly"
+    );
+}
+
+fn wait_for_path(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
 #[test]
 fn daemon_rejects_the_previous_protocol_during_handshake() {
     let temporary = TempDir::new().unwrap();
@@ -1220,6 +1239,267 @@ fn running_shell_turn_can_be_cancelled() {
 }
 
 #[test]
+fn f3_sigterm_cancels_captured_shell_process_group_before_exit() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let started = temporary.path().join("shell-started");
+    let delayed = temporary.path().join("shell-delayed");
+    let command = format!(
+        "printf ready > {}; (sleep 0.5; printf late > {}) & wait",
+        started.display(),
+        delayed.display()
+    );
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "shutdown-shell".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Durable,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    client
+        .submit(
+            session.descriptor.id,
+            TurnInput::Shell { command },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    wait_for_path(&started);
+
+    terminate_daemon(&mut daemon);
+    thread::sleep(Duration::from_millis(700));
+    assert!(
+        !delayed.exists(),
+        "shell descendant survived daemon shutdown"
+    );
+}
+
+#[test]
+fn f3_sigterm_cancels_agent_tool_process_group_before_exit() {
+    let temporary = TempDir::new().unwrap();
+    let started = temporary.path().join("agent-started");
+    let delayed = temporary.path().join("agent-delayed");
+    let command = format!(
+        "printf ready > {}; (sleep 0.5; printf late > {}) & wait",
+        started.display(),
+        delayed.display()
+    );
+    let tool_response = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"shutdown-tool\",\"function\":{{\"name\":\"run_shell\",\"arguments\":{}}}}}]}}}}]}}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&serde_json::json!({"command": command}).to_string()).unwrap()
+    );
+    let (base_url, model_server) = serve_sse(vec![tool_response]);
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "shutdown-agent".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+                max_history_bytes: None,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Durable,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    let session_id = session.descriptor.id;
+    let turn_id = client
+        .submit(
+            session_id.clone(),
+            TurnInput::Agent {
+                message: "run the tool".into(),
+            },
+            ApprovalPolicy::Auto,
+        )
+        .unwrap();
+    let mut after = 0;
+    for _ in 0..200 {
+        let batch = client.events(session_id.clone(), after, 10).unwrap();
+        for event in batch.events {
+            after = event.sequence;
+            if let SessionEventKind::Execution {
+                event: ExecutionEvent::ApprovalRequested { call, .. },
+            } = event.event
+            {
+                client
+                    .approve(
+                        session_id.clone(),
+                        turn_id.clone(),
+                        call.id,
+                        ApprovalDecision::Approve,
+                    )
+                    .unwrap();
+            }
+        }
+        if started.exists() {
+            break;
+        }
+    }
+    assert!(started.exists(), "agent tool did not start");
+
+    terminate_daemon(&mut daemon);
+    model_server.join().unwrap();
+    thread::sleep(Duration::from_millis(700));
+    assert!(
+        !delayed.exists(),
+        "agent tool descendant survived daemon shutdown"
+    );
+}
+
+#[test]
+fn f3_sigterm_terminates_pty_process_group_before_exit() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let started = temporary.path().join("pty-started");
+    let delayed = temporary.path().join("pty-delayed");
+    let command = format!(
+        "printf ready > {}; (sleep 0.5; printf late > {}) & wait",
+        started.display(),
+        delayed.display()
+    );
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "shutdown-pty".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Durable,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    client
+        .pty_start(
+            session.descriptor.id,
+            command,
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+    wait_for_path(&started);
+
+    terminate_daemon(&mut daemon);
+    thread::sleep(Duration::from_millis(700));
+    assert!(!delayed.exists(), "PTY descendant survived daemon shutdown");
+}
+
+#[test]
+fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let shell_pid = temporary.path().join("shell-pid");
+    let command = format!("echo $$ > {}; sleep 30", shell_pid.display());
+    let session_id;
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    {
+        let mut client = connect_when_ready(&socket);
+        let session = client
+            .create(SessionCreation {
+                name: "forced-recovery".into(),
+                model: model("local"),
+                cwd: temporary.path().into(),
+                persistence: PersistenceMode::Durable,
+                visibility: Visibility::Fabric,
+                history: vec![ChatMessage::system("test")],
+            })
+            .unwrap();
+        session_id = session.descriptor.id;
+        client
+            .submit(
+                session_id.clone(),
+                TurnInput::Shell { command },
+                ApprovalPolicy::Ask,
+            )
+            .unwrap();
+        wait_for_path(&shell_pid);
+    }
+
+    daemon.0.kill().unwrap();
+    let status = daemon.0.wait().unwrap();
+    assert!(!status.success(), "SIGKILL unexpectedly reported success");
+    let process_group = std::fs::read_to_string(&shell_pid)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+
+    let _restarted = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let restored = client.attach(session_id).unwrap();
+    assert!(restored.history.iter().any(|message| {
+        message.content.contains("outcome_unknown")
+            && message.content.contains("inspect external effects")
+    }));
+}
+
+#[test]
 fn agent_turn_waits_for_remote_approval_then_continues() {
     let tool_response = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
@@ -1369,6 +1649,114 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             .any(|message| message.content == "finished")
     );
     model_server.join().unwrap();
+}
+
+#[test]
+fn f1_failed_agent_effect_survives_durable_session_reload() {
+    let temporary = TempDir::new().unwrap();
+    let marker = temporary.path().join("effect-marker");
+    let command = format!("printf persisted > {}", marker.display());
+    let tool_response = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"effect\",\"function\":{{\"name\":\"run_shell\",\"arguments\":{}}}}}]}}}}]}}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&serde_json::json!({"command": command}).to_string()).unwrap()
+    );
+    let (base_url, model_server) = serve_sse(vec![tool_response]);
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let session_id;
+    {
+        let _daemon = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_xshelld"))
+                .arg("--no-user-config")
+                .args(["--state-directory", state.to_str().unwrap()])
+                .args(["--socket", socket.to_str().unwrap()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut client = connect_when_ready(&socket);
+        let session = client
+            .create(SessionCreation {
+                name: "effect-recovery".into(),
+                model: ModelBinding {
+                    profile_name: Some("fake".into()),
+                    provider: "openai".into(),
+                    model: "fake-model".into(),
+                    base_url,
+                    api_key_env: None,
+                    max_history_bytes: None,
+                },
+                cwd: temporary.path().into(),
+                persistence: PersistenceMode::Durable,
+                visibility: Visibility::Fabric,
+                history: vec![ChatMessage::system("test")],
+            })
+            .unwrap();
+        session_id = session.descriptor.id.clone();
+        let turn_id = client
+            .submit(
+                session_id.clone(),
+                TurnInput::Agent {
+                    message: "perform effect".into(),
+                },
+                ApprovalPolicy::Auto,
+            )
+            .unwrap();
+
+        let mut after = 0;
+        let mut failed = false;
+        for _ in 0..100 {
+            let batch = client.events(session_id.clone(), after, 100).unwrap();
+            for event in batch.events {
+                after = event.sequence;
+                match event.event {
+                    SessionEventKind::Execution {
+                        event: ExecutionEvent::ApprovalRequested { call, .. },
+                    } => client
+                        .approve(
+                            session_id.clone(),
+                            turn_id.clone(),
+                            call.id,
+                            ApprovalDecision::Approve,
+                        )
+                        .unwrap(),
+                    SessionEventKind::TurnFailed { .. } => failed = true,
+                    _ => {}
+                }
+            }
+            if failed {
+                break;
+            }
+        }
+        assert!(failed, "F1 turn did not reach a failed terminal state");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "persisted");
+        model_server.join().unwrap();
+    }
+
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let restored = client.attach(session_id).unwrap();
+    assert!(restored.history.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("effect") && message.content.contains("exit status")
+    }));
+    assert!(
+        restored
+            .history
+            .last()
+            .unwrap()
+            .content
+            .contains("provider failed")
+    );
 }
 
 /// Locate the `xshell-auditd` binary built alongside this test. Cargo only
@@ -1954,6 +2342,45 @@ fn collect_finalized_terminal_log(fabric: &AuditedFabric, command: &str) -> Stri
         thread::sleep(Duration::from_millis(20));
     }
     panic!("no finalized daemon audit log for {command}");
+}
+
+#[test]
+fn f3_sigterm_records_shell_resolution_before_final_audit_closure() {
+    let temporary = TempDir::new().unwrap();
+    let mut fabric = start_audited_fabric(&temporary, "");
+    let started = temporary.path().join("audited-shutdown-started");
+    let command = format!("printf ready > {}; sleep 30", started.display());
+    let mut client = connect_when_ready(&fabric.socket);
+    let session = client
+        .create(SessionCreation {
+            name: "audited-shutdown".into(),
+            model: model("local"),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Durable,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+        })
+        .unwrap();
+    client
+        .submit(
+            session.descriptor.id,
+            TurnInput::Shell {
+                command: command.clone(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    wait_for_path(&started);
+
+    terminate_daemon(&mut fabric._daemon);
+    drop(client);
+    let text = collect_finalized_terminal_log(&fabric, &command);
+    let finished_at = text.rfind("\"shell_finished\"").unwrap();
+    let ended_at = text.rfind("\"session_ended\"").unwrap();
+    assert!(
+        finished_at < ended_at,
+        "audit closed before shell resolution"
+    );
 }
 
 #[test]

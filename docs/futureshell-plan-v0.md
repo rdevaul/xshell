@@ -132,14 +132,15 @@ not an authorized or executable plan.
 
 ## Semantic hash
 
-The plan hash uses domain-separated SHA-256 over normalized Plan V0 JSON. It
-covers the Flow hash, tasks, bindings, contracts, regions, capabilities,
-resources, and resolution state. Layout, labels, and declaration ordering do
-not change it; capability, resource, program, contract, and graph-semantic
-changes do.
+The plan hash uses domain-separated SHA-256 over the explicit binary encoding
+selected by [ADR 0004](adr/0004-explicit-canonical-plan-encoding.md). It covers
+the Flow hash, tasks, bindings, contracts, regions, capabilities, resources,
+and resolution state. Layout, labels, and declaration ordering do not change
+it; capability, resource, program, contract, and graph-semantic changes do.
 
-Normalized JSON is still a prototype encoding, not a durable canonical-format
-commitment.
+JSON remains the human-readable inspection and fixture representation. Exact
+canonical byte and hash vectors live in
+`fixtures/futureshell/plans/canonical-v1-vectors.json`.
 
 ## Try it
 

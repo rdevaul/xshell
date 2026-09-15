@@ -1,6 +1,8 @@
+use crate::process::{ProcessGroupGuard, configure_process_group};
+use crate::tools::execute_tool_cancellable;
 use crate::{
     CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, definitions,
-    execute_tool, requires_approval,
+    requires_approval,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -17,7 +19,6 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::{Notify, mpsc};
-use tokio::time::timeout;
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{AgentEvent, ChatMessage, ChatRequest, ToolCall};
 
@@ -281,6 +282,7 @@ pub async fn run_agent_turn(
     history.push(ChatMessage::user(message));
     let mut request_compaction = policy.compactor.compact(history);
     let tools = definitions();
+    let mut observed_tool_activity = false;
 
     for _ in 0..MAX_AGENT_STEPS {
         let mut streamed_text = String::new();
@@ -305,7 +307,12 @@ pub async fn run_agent_turn(
             }
         };
         let Some(response) = response else {
-            *history = rollback_history.clone();
+            preserve_or_rollback_failed_turn(
+                history,
+                &rollback_history,
+                observed_tool_activity,
+                "agent turn cancelled",
+            );
             bail!("agent turn cancelled");
         };
         let response = match response {
@@ -318,7 +325,12 @@ pub async fn run_agent_turn(
                         partial: true,
                     });
                 }
-                *history = rollback_history.clone();
+                preserve_or_rollback_failed_turn(
+                    history,
+                    &rollback_history,
+                    observed_tool_activity,
+                    &format!("agent provider failed: {error}"),
+                );
                 return Err(error.into());
             }
         };
@@ -349,7 +361,19 @@ pub async fn run_agent_turn(
 
         for (index, call) in response.tool_calls.iter().enumerate() {
             if observer.cancellation().is_cancelled() {
-                *history = rollback_history.clone();
+                if observed_tool_activity {
+                    stub_unfinished_tool_calls(
+                        history,
+                        &response.tool_calls[index..],
+                        "tool not run because the agent turn was cancelled",
+                    );
+                }
+                preserve_or_rollback_failed_turn(
+                    history,
+                    &rollback_history,
+                    observed_tool_activity,
+                    "agent turn cancelled",
+                );
                 bail!("agent turn cancelled");
             }
             let gate = requires_approval(call, cwd, &policy.sensitive_paths);
@@ -375,7 +399,19 @@ pub async fn run_agent_turn(
             // observer can cancel when recording it fails; honor that before
             // executing the exact tool whose audit record is unavailable.
             if observer.cancellation().is_cancelled() {
-                *history = rollback_history.clone();
+                if observed_tool_activity {
+                    stub_unfinished_tool_calls(
+                        history,
+                        &response.tool_calls[index..],
+                        "tool not run because the agent turn was cancelled before execution",
+                    );
+                }
+                preserve_or_rollback_failed_turn(
+                    history,
+                    &rollback_history,
+                    observed_tool_activity,
+                    "agent turn cancelled before tool execution",
+                );
                 bail!("agent turn cancelled before tool execution");
             }
             if decision == ApprovalDecision::AbortTurn {
@@ -396,7 +432,8 @@ pub async fn run_agent_turn(
             }
 
             let result = if decision == ApprovalDecision::Approve {
-                execute_tool(call, cwd).await
+                observed_tool_activity = true;
+                execute_tool_cancellable(call, cwd, observer.cancellation()).await
             } else {
                 "tool denied by user".into()
             };
@@ -406,10 +443,56 @@ pub async fn run_agent_turn(
                 result: result.clone(),
             });
             history.push(ChatMessage::tool_result(call, result));
+            if observer.cancellation().is_cancelled() {
+                for skipped in &response.tool_calls[index + 1..] {
+                    observer.emit(ExecutionEvent::ToolSkipped {
+                        call_id: skipped.id.clone(),
+                        name: skipped.name.clone(),
+                    });
+                }
+                stub_unfinished_tool_calls(
+                    history,
+                    &response.tool_calls[index + 1..],
+                    "tool not run because the agent turn was cancelled",
+                );
+                preserve_or_rollback_failed_turn(
+                    history,
+                    &rollback_history,
+                    observed_tool_activity,
+                    "agent turn cancelled during tool execution",
+                );
+                bail!("agent turn cancelled during tool execution");
+            }
         }
     }
-    *history = rollback_history;
+    preserve_or_rollback_failed_turn(
+        history,
+        &rollback_history,
+        observed_tool_activity,
+        &format!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit"),
+    );
     bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
+}
+
+fn stub_unfinished_tool_calls(history: &mut Vec<ChatMessage>, calls: &[ToolCall], message: &str) {
+    for call in calls {
+        history.push(ChatMessage::tool_result(call, message));
+    }
+}
+
+fn preserve_or_rollback_failed_turn(
+    history: &mut Vec<ChatMessage>,
+    rollback_history: &[ChatMessage],
+    observed_tool_activity: bool,
+    message: &str,
+) {
+    if observed_tool_activity {
+        history.push(ChatMessage::system(format!(
+            "xshell execution record: the previous turn ended after observed tool activity: {message}"
+        )));
+    } else {
+        *history = rollback_history.to_vec();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -427,6 +510,15 @@ pub async fn run_direct_shell(command: &str, cwd: &Path) -> Result<DirectShellRe
 pub async fn run_direct_shell_streaming(
     command: &str,
     cwd: &Path,
+    emit: impl FnMut(&str, String) + Send,
+) -> Result<DirectShellResult> {
+    run_direct_shell_streaming_cancellable(command, cwd, CancellationFlag::default(), emit).await
+}
+
+pub async fn run_direct_shell_streaming_cancellable(
+    command: &str,
+    cwd: &Path,
+    cancellation: CancellationFlag,
     mut emit: impl FnMut(&str, String) + Send,
 ) -> Result<DirectShellResult> {
     if command.trim().is_empty() {
@@ -437,24 +529,9 @@ pub async fn run_direct_shell_streaming(
             stderr: String::new(),
         });
     }
-    let words = shell_words::split(command).context("could not parse shell command")?;
-    if words.first().map(String::as_str) == Some("cd") {
-        if words.len() > 2 {
-            bail!("cd expects zero or one path");
-        }
-        let destination = match words.get(1) {
-            Some(path) => expand_tilde(path)?,
-            None => home_dir()?,
-        };
-        let next = if destination.is_absolute() {
-            destination
-        } else {
-            cwd.join(destination)
-        };
+    if let Some(next) = captured_cd_destination(command, cwd)? {
         return Ok(DirectShellResult {
-            cwd: next
-                .canonicalize()
-                .with_context(|| format!("cannot cd to {}", next.display()))?,
+            cwd: validate_working_directory(&next)?,
             status: "working directory changed".into(),
             stdout: String::new(),
             stderr: String::new(),
@@ -469,11 +546,12 @@ pub async fn run_direct_shell_streaming(
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
+    configure_process_group(&mut process);
     let mut child = process
         .spawn()
         .with_context(|| format!("could not launch shell {shell}"))?;
+    let mut group = ProcessGroupGuard::for_child(&child);
     let stdout = child.stdout.take().context("cannot capture shell stdout")?;
     let stderr = child.stderr.take().context("cannot capture shell stderr")?;
     let (sender, mut receiver) = mpsc::channel::<(&'static str, Vec<u8>)>(32);
@@ -482,31 +560,86 @@ pub async fn run_direct_shell_streaming(
     drop(sender);
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
-    let status = timeout(DIRECT_SHELL_TIMEOUT, async {
-        while let Some((stream, bytes)) = receiver.recv().await {
-            let target = if stream == "stderr" {
-                &mut stderr_bytes
-            } else {
-                &mut stdout_bytes
-            };
-            if target.len() < DIRECT_SHELL_OUTPUT_LIMIT {
-                let remaining = DIRECT_SHELL_OUTPUT_LIMIT - target.len();
-                target.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+    let mut wait_task = tokio::spawn(async move { child.wait().await });
+    let deadline = tokio::time::sleep(DIRECT_SHELL_TIMEOUT);
+    tokio::pin!(deadline);
+    let terminal = loop {
+        tokio::select! {
+            item = receiver.recv() => {
+                if let Some((stream, bytes)) = item {
+                    retain_shell_chunk(
+                        stream,
+                        &bytes,
+                        &mut stdout_bytes,
+                        &mut stderr_bytes,
+                        &mut emit,
+                    );
+                }
             }
-            emit(stream, String::from_utf8_lossy(&bytes).into_owned());
+            result = &mut wait_task => {
+                break Some(result.context("shell wait task failed")??);
+            }
+            () = cancellation.wait() => break None,
+            () = &mut deadline => break None,
         }
-        stdout_task.await.context("stdout reader failed")??;
-        stderr_task.await.context("stderr reader failed")??;
-        child.wait().await.context("cannot wait for shell command")
-    })
-    .await
-    .context("shell command timed out")??;
+    };
+    let status = match terminal {
+        Some(status) => status,
+        None => {
+            let cancelled = cancellation.is_cancelled();
+            group.kill();
+            let _ = wait_task.await;
+            group.disarm();
+            while let Some((stream, bytes)) = receiver.recv().await {
+                retain_shell_chunk(
+                    stream,
+                    &bytes,
+                    &mut stdout_bytes,
+                    &mut stderr_bytes,
+                    &mut emit,
+                );
+            }
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            if cancelled {
+                bail!("shell command cancelled; the process group was killed and reaped");
+            }
+            bail!("shell command timed out; the process group was killed and reaped");
+        }
+    };
+    group.disarm();
+    while let Some((stream, bytes)) = receiver.recv().await {
+        retain_shell_chunk(
+            stream,
+            &bytes,
+            &mut stdout_bytes,
+            &mut stderr_bytes,
+            &mut emit,
+        );
+    }
+    stdout_task.await.context("stdout reader failed")??;
+    stderr_task.await.context("stderr reader failed")??;
     Ok(DirectShellResult {
         cwd: cwd.to_owned(),
         status: status.to_string(),
         stdout: bounded_utf8(&stdout_bytes),
         stderr: bounded_utf8(&stderr_bytes),
     })
+}
+
+fn retain_shell_chunk(
+    stream: &str,
+    bytes: &[u8],
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    emit: &mut impl FnMut(&str, String),
+) {
+    let target = if stream == "stderr" { stderr } else { stdout };
+    if target.len() < DIRECT_SHELL_OUTPUT_LIMIT {
+        let remaining = DIRECT_SHELL_OUTPUT_LIMIT - target.len();
+        target.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+    }
+    emit(stream, String::from_utf8_lossy(bytes).into_owned());
 }
 
 async fn read_output<R>(
@@ -547,6 +680,66 @@ fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")
+}
+
+pub fn validate_working_directory(path: &Path) -> Result<PathBuf> {
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve working directory {}", path.display()))?;
+    if !resolved.is_dir() {
+        bail!(
+            "working directory {} is not a directory",
+            resolved.display()
+        );
+    }
+    std::fs::read_dir(&resolved)
+        .with_context(|| format!("working directory {} is not accessible", resolved.display()))?;
+    Ok(resolved)
+}
+
+pub fn captured_cd_destination(command: &str, cwd: &Path) -> Result<Option<PathBuf>> {
+    let trimmed = command.trim();
+    if trimmed != "cd" && (!trimmed.starts_with("cd ") || has_unquoted_shell_operator(trimmed)) {
+        return Ok(None);
+    }
+    let words = shell_words::split(trimmed).context("could not parse shell command")?;
+    if words.first().map(String::as_str) != Some("cd") {
+        return Ok(None);
+    }
+    if words.len() > 2 {
+        bail!("cd expects zero or one path");
+    }
+    let destination = match words.get(1) {
+        Some(path) => expand_tilde(path)?,
+        None => home_dir()?,
+    };
+    Ok(Some(if destination.is_absolute() {
+        destination
+    } else {
+        cwd.join(destination)
+    }))
+}
+
+fn has_unquoted_shell_operator(command: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => escaped = true,
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' | '\n' if !single_quoted && !double_quoted => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf> {
@@ -1024,6 +1217,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn f1_provider_failure_preserves_completed_tool_activity() {
+        let temporary = TempDir::new().unwrap();
+        let marker = temporary.path().join("marker");
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: String::new(),
+                tool_calls: vec![shell_call(
+                    "effect",
+                    &format!("printf done > {}", marker.display()),
+                )],
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        };
+        let mut history = vec![ChatMessage::system("test")];
+
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "mutate".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("script exhausted"));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "done");
+        assert!(history.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("effect")
+                && message.content.contains("exit status")
+        }));
+        assert!(history.last().unwrap().content.contains("provider failed"));
+        assert_eq!(adapter.requests.len(), 2);
+        assert!(
+            adapter.requests[1]
+                .messages
+                .iter()
+                .any(|message| { message.tool_call_id.as_deref() == Some("effect") })
+        );
+
+        let mut resumed = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: "reconciled".into(),
+                tool_calls: Vec::new(),
+            }]),
+            requests: Vec::new(),
+        };
+        run_agent_turn(
+            &mut resumed,
+            &mut history,
+            "continue safely".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            resumed.requests[0]
+                .messages
+                .iter()
+                .any(|message| { message.tool_call_id.as_deref() == Some("effect") })
+        );
+        assert!(
+            resumed.requests[0]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("provider failed"))
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_wait_wakes_promptly_from_another_thread() {
         let flag = CancellationFlag::default();
         let remote = flag.clone();
@@ -1091,6 +1363,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn f2_cancellation_kills_agent_shell_pipeline_before_delayed_effect() {
+        let temporary = TempDir::new().unwrap();
+        let started = temporary.path().join("started");
+        let delayed = temporary.path().join("delayed");
+        let command = format!(
+            "printf ready > {}; (sleep 0.4; printf late > {}) & wait",
+            started.display(),
+            delayed.display()
+        );
+        let cancellation = CancellationFlag::default();
+        let cancel = cancellation.clone();
+        let started_for_task = started.clone();
+        let signal = tokio::spawn(async move {
+            while !started_for_task.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+        });
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: String::new(),
+                tool_calls: vec![shell_call("cancelled", &command)],
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation,
+            cancel_on_decision: false,
+        };
+        let mut history = Vec::new();
+
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "start work".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+        signal.await.unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled during tool execution")
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !delayed.exists(),
+            "F2 delayed agent-tool effect survived cancellation"
+        );
+        assert!(history.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("cancelled")
+                && message.content.contains("killed and reaped")
+        }));
+    }
+
+    #[tokio::test]
+    async fn f2_cancellation_kills_captured_shell_pipeline_before_delayed_effect() {
+        let temporary = TempDir::new().unwrap();
+        let started = temporary.path().join("started");
+        let delayed = temporary.path().join("delayed");
+        let command = format!(
+            "printf ready > {}; (sleep 0.4; printf late > {}) & wait",
+            started.display(),
+            delayed.display()
+        );
+        let cancellation = CancellationFlag::default();
+        let cancel = cancellation.clone();
+        let started_for_task = started.clone();
+        let signal = tokio::spawn(async move {
+            while !started_for_task.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+        });
+
+        let error = run_direct_shell_streaming_cancellable(
+            &command,
+            temporary.path(),
+            cancellation,
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        signal.await.unwrap();
+        assert!(error.to_string().contains("killed and reaped"));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !delayed.exists(),
+            "F2 delayed captured-shell effect survived cancellation"
+        );
+    }
+
+    #[tokio::test]
     async fn direct_shell_streams_output_and_tracks_cd() {
         let temporary = TempDir::new().unwrap();
         let mut chunks = Vec::new();
@@ -1110,5 +1480,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(changed.cwd, child.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn f11_cd_rejects_files_and_compound_commands_stay_in_the_shell() {
+        let temporary = TempDir::new().unwrap();
+        let file = temporary.path().join("file");
+        std::fs::write(&file, "text").unwrap();
+        let error = run_direct_shell("cd file", temporary.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not a directory"));
+
+        let child = temporary.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let result = run_direct_shell("cd child && pwd", temporary.path())
+            .await
+            .unwrap();
+        assert_eq!(result.cwd, temporary.path());
+        assert_eq!(
+            Path::new(result.stdout.trim()),
+            child.canonicalize().unwrap()
+        );
     }
 }

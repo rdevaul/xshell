@@ -1,6 +1,6 @@
 # FutureShell status
 
-**Last reviewed:** 2026-09-10
+**Last reviewed:** 2026-09-13
 
 **Overall status:** Pre-alpha design and planning prototype. FutureShell is not
 an executable language or runtime.
@@ -9,6 +9,10 @@ This page is the current progress ledger for FutureShell. The
 [roadmap](futureshell-roadmap.md) is the canonical product and semantics plan;
 the [implementation plan](futureshell-implementation-plan.md) expands its
 architecture, acceptance criteria, and backlog. The
+[xshell development roadmap](xshell-development-roadmap.md) governs
+cross-product delivery order and currently prioritizes shared xshell lifecycle,
+authorization, and shared-workflow proofs before the remaining FS1 frontend
+work. The
 [original concept note](futureshell.md) is historical context rather than a
 current specification.
 
@@ -25,9 +29,10 @@ Two provisional crates exercise the authoring and planning model:
 
 Four Flow fixture families cover a linear pipeline, contract branch, parallel
 join, and bounded refinement loop. Their golden Plan V0 artifacts test stable
-lowering and hashing. These plans are inspectable but are not authorized or
-executable. Normalized JSON is a prototype encoding, not a stable wire or disk
-format.
+lowering and hashing. [ADR 0004](adr/0004-explicit-canonical-plan-encoding.md)
+fixes explicit canonical Plan V0 bytes and a domain-separated hash, with exact
+golden vectors for every plan fixture. These plans are inspectable but are not
+authorized or executable; their JSON form remains an inspection format.
 
 The existing xshell execution engine, audit service, session fabric, platform
 support, and adapters are reusable substrate. None currently implements the
@@ -39,7 +44,7 @@ verifier, or agent gateway.
 | Milestone | State | Implemented evidence | Exit blockers | Next proof point |
 |---|---|---|---|---|
 | FS0 — Semantics and threat model | **Complete** | [FS0 package](futureshell-fs0.md), [review record](futureshell-fs0-review.md), accepted ADRs, reviewed language examples, threat/guarantee model, schema drafts, platform probe, and deterministic FEA matrix | None; schema stability and runtime proofs belong to later milestones | Preserve the accepted semantics while FS1 proves the textual toolchain and canonical plan identity |
-| FS1 — Language toolchain and dry-run planner | **Prototype only** | Flow IR validation and hashing; Plan V0 lowering, hashing, capability normalization, basic conflict checks, pure fixture-catalog resolution | Text parser, spans and diagnostics, formatter, module loader and source verification, canonical plan encoding, `xshell-run check\|fmt\|plan`, conformance and fuzz corpora | One textual FEA program produces a fully resolved stable plan without execution or network access |
+| FS1 — Language toolchain and dry-run planner | **Prototype only** | Flow IR validation and hashing; Plan V0 lowering, explicit canonical encoding and golden hash vectors; capability normalization, basic conflict checks, pure fixture-catalog resolution | Text parser, spans and diagnostics, formatter, module loader and source verification, `xshell-run check\|fmt\|plan`, conformance and fuzz corpora | One textual FEA program produces a fully resolved stable plan without execution or network access |
 | FS2 — Deterministic local task runtime | **Not started** | Reusable xshell process and audit infrastructure only | Scheduler, argv-native runner integration, shell blocks, structured concurrency, resource bounds, task evidence, authorization preview | A concurrent local workflow produces attributable typed evidence and cancels complete process groups |
 | FS3 — Transactional workspaces | **Not started** | Design and acceptance matrix only | Portable staging backend, manifests, change sets, preview, discard, selective promotion, conflict detection, journal and recovery | Invalid work leaves the destination unchanged; accepted allowlisted outputs are hash-verified after promotion |
 | FS4 — Deterministic contracts and receipts | **Not started** | Contract expressions represented in Flow IR and Plan V0 only | Predicate evaluator, evidence model, clause reports, taint policy, receipts, audit binding and offline verifier | The deterministic FEA slice promotes only schema-valid `analysis.json` and rejects every specified failure case |
@@ -57,7 +62,7 @@ xshell components.
 | Product semantics and milestone exits | [Roadmap](futureshell-roadmap.md) | Roadmap sections 1–14 | [FS0 review record](futureshell-fs0-review.md) and later milestone exits | FS0 baseline accepted |
 | Detailed architecture and backlog | [Implementation plan](futureshell-implementation-plan.md) | Implementation plan sections 2–17 | Milestone acceptance criteria | Draft for review |
 | Flow authoring graph | Roadmap §5.4; implementation plan §2 | [`crates/xshell-flow`](../crates/xshell-flow), [Flow IR notes](futureshell-flow-ir.md), `fixtures/futureshell/flows` | `cargo test -p xshell-flow` | Executable provisional prototype |
-| Checked plan lowering | Implementation plan §5 | [`crates/xshell-plan`](../crates/xshell-plan), [Plan V0 notes](futureshell-plan-v0.md), `fixtures/futureshell/plans` | `cargo test -p xshell-plan` | Executable provisional prototype |
+| Checked plan lowering | Implementation plan §5 | [`crates/xshell-plan`](../crates/xshell-plan), [Plan V0 notes](futureshell-plan-v0.md), [ADR 0004](adr/0004-explicit-canonical-plan-encoding.md), `fixtures/futureshell/plans` | Exact canonical byte/hash vectors; `cargo test -p xshell-plan` | Canonical Plan V0 identity implemented; broader planner remains provisional |
 | Language and source conformance | Implementation plan §4 | [Language reference](futureshell-language.md), paired human/agent-authored FEA sources, `fixtures/futureshell/syntax` | [FS0 language review](futureshell-fs0-review.md); later parser/formatter properties, diagnostics and fuzzing | FS0 semantics accepted; implementation pending |
 | Program and predicate resolution | Implementation plan §§5.1 and 16 | Plan V0 resolver and `fixtures/futureshell/catalogs` | Resolver fixtures bind declared pinned identities without side effects and reject interface, predicate, and capability mismatches | Executable provisional prototype |
 | Transaction and promotion safety | Roadmap §7; implementation plan §6 | [Threat model](futureshell-threat-model.md), [platform spike](futureshell-platform-spikes.md), change-set schema, promotion ADR | [FS0 security review](futureshell-fs0-review.md); later FS3 acceptance matrix | Requirements accepted; implementation pending |
@@ -66,14 +71,12 @@ xshell components.
 
 ## Immediate sequence
 
-1. Test canonical serialization candidates against the fixture corpus and
-   record the selection as an ADR.
-2. Add `xshell-language` with bounded lexing, spans, parsing, diagnostics, and
-   formatter round-trip properties.
-3. Add `xshell-run check`, `fmt`, and `plan`, preserving the pure planning
-   boundary fixed by ADR 0001.
-4. Complete FS1 through a stable resolved plan before starting an executable
-   runtime.
+1. Complete the shared M1 lifecycle and access corrections and establish the
+   M2 authorization/provider boundary.
+2. Prove one bounded structured-plan workflow under the personal and
+   controlled profiles as the narrow M5 slice; this does not complete FS1–FS4.
+3. Resume `xshell-language` and `xshell-run check|fmt|plan`; the textual
+   frontend remains required before FS1 can be declared complete.
 
 FS2 through FS4 form the first useful local release. Agent and remote execution
 remain later milestones so they do not enter the trusted transaction and

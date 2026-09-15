@@ -2035,6 +2035,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "tempfile",
  "tokio",
  "toml",
  "xshell-adapters",
