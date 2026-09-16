@@ -6,3 +6,7 @@
 # prevent exposure of development config information
 current.config.toml
 
+# Graphviz artifacts from docs/futureshell-flow-ir.md
+flow.dot
+flow.png
+flow.svg
