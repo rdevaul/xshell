@@ -3,3 +3,6 @@
 .env
 *.log
 
+# prevent exposure of development config information
+current.config.toml
+
