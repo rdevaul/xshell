@@ -118,4 +118,4 @@ else
 fi
 
 echo "ready — starting CLI"
-exec cargo run -p xshell-cli --bin xshell -- --approval ${APPROVAL}
+exec cargo run -p xshell-cli --bin xshell -- --approval "${APPROVAL}"
