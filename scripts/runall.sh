@@ -6,9 +6,10 @@
 ## Checks for source changes via cargo build, restarts services if needed,
 ## and then runs the CLI interactively.
 
-CONFIGDIR=~/.config/xshell
-AUDITDIR=/tmp/xshell-audit
-AUDITSOCK=/tmp/xshell-audit.sock
+# One source of truth for all three services. Audit directory and socket are
+# read from [audit] rather than duplicated here, so the script cannot drift
+# from the configuration the daemons actually use.
+CONFIG="${XSHELL_CONFIG:-$HOME/.config/xshell/config.toml}"
 
 # Kill a service gracefully: SIGTERM, wait up to 5s, then SIGKILL.
 # $1 = exact binary name
@@ -75,9 +76,9 @@ fi
 # Start if we rebuilt or if it wasn't already running
 if [ $_rebuild -eq 1 ] || ! pgrep -x xshell-auditd >/dev/null 2>&1; then
     echo "starting audit service"
-    cargo run -p xshell-audit --bin xshell-auditd -- \
-        --directory ${AUDITDIR} \
-        --socket ${AUDITSOCK} &
+    # auditd has no config auto-discovery (unlike xshelld and the CLI), so
+    # --config must be explicit; it derives directory and socket from [audit].
+    cargo run -p xshell-audit --bin xshell-auditd -- --config "$CONFIG" &
     sleep 1
 fi
 
@@ -100,7 +101,7 @@ fi
 if [ $_rebuild -eq 1 ] || ! pgrep -x xshelld >/dev/null 2>&1; then
     echo "starting session service"
     cargo run -p xshell-session --bin xshelld -- \
-        --config ${CONFIGDIR}/config.toml &
+        --config "$CONFIG" &
     sleep 1
 fi
 
