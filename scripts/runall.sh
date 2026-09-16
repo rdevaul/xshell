@@ -49,7 +49,9 @@ check_build() {
         echo "$_output"
         exit 1
     fi
-    if echo "$_output" | grep -q "^Compiling "; then
+    # cargo pads status to 12 columns ("   Compiling ..."), so the pattern
+    # must tolerate leading whitespace.
+    if echo "$_output" | grep -qE '^[[:space:]]*Compiling '; then
         _rebuild=1
     else
         _rebuild=0
