@@ -10,8 +10,6 @@ CONFIGDIR=~/.config/xshell
 AUDITDIR=/tmp/xshell-audit
 AUDITSOCK=/tmp/xshell-audit.sock
 
-APPROVAL="${XSHELL_APPROVAL:-ask}"
-
 # Kill a service gracefully: SIGTERM, wait up to 5s, then SIGKILL.
 # $1 = exact binary name
 kill_service() {
@@ -120,4 +118,6 @@ else
 fi
 
 echo "ready — starting CLI"
-exec cargo run -p xshell-cli --bin xshell -- --approval "${APPROVAL}"
+# --approval is not passed explicitly: the CLI binds it to $XSHELL_APPROVAL,
+# so an override is inherited without masking the configured default.
+exec cargo run -p xshell-cli --bin xshell
