@@ -1,8 +1,23 @@
 use std::path::{Path, PathBuf};
 use xshell_flow::{Flow, JoinStrategy, NodeKind};
 use xshell_plan::{
-    PlanArtifact, PlanGateOutcome, ReadinessMode, ResolutionBlocker, TaskOperation, ValueSelection,
+    CanonicalEncodeError, PlanArtifact, PlanGateOutcome, ReadinessMode, ResolutionBlocker,
+    TaskOperation, ValueSelection,
 };
+
+#[derive(serde::Deserialize)]
+struct CanonicalVectors {
+    format: String,
+    hash_domain: String,
+    vectors: Vec<CanonicalVector>,
+}
+
+#[derive(serde::Deserialize)]
+struct CanonicalVector {
+    fixture: String,
+    canonical_hex: String,
+    plan_hash: String,
+}
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/futureshell")
@@ -39,11 +54,43 @@ fn golden_plan_artifacts_are_stable_and_readable() {
 }
 
 #[test]
+fn canonical_byte_and_hash_vectors_are_stable() {
+    let source = std::fs::read(fixture_root().join("plans/canonical-v1-vectors.json")).unwrap();
+    let vectors: CanonicalVectors = serde_json::from_slice(&source).unwrap();
+    assert_eq!(vectors.format, "xshell.plan.canonical/v1");
+    assert_eq!(vectors.hash_domain, "xshell.plan.semantic.fsplan-v1\0");
+    assert_eq!(vectors.vectors.len(), 5);
+
+    for vector in vectors.vectors {
+        let source = std::fs::read(fixture_root().join("plans").join(&vector.fixture)).unwrap();
+        let artifact: PlanArtifact = serde_json::from_slice(&source).unwrap();
+        assert_eq!(
+            hex::encode(xshell_plan::canonical_plan_bytes(&artifact.plan).unwrap()),
+            vector.canonical_hex,
+            "canonical bytes changed for {}",
+            vector.fixture
+        );
+        assert_eq!(artifact.plan.hash().unwrap().to_string(), vector.plan_hash);
+        assert_eq!(artifact.plan_hash, vector.plan_hash);
+    }
+}
+
+#[test]
 fn artifact_hash_verification_detects_tampering() {
     let mut artifact = lower("linear.json").artifact().unwrap();
     assert!(artifact.verify_hash().unwrap());
     artifact.plan.tasks[0].resources.timeout_ms = Some(1);
     assert!(!artifact.verify_hash().unwrap());
+}
+
+#[test]
+fn canonical_encoding_rejects_unknown_plan_schemas() {
+    let mut plan = lower("linear.json");
+    plan.schema = "xshell.plan/v1".into();
+    assert!(matches!(
+        xshell_plan::canonical_plan_bytes(&plan),
+        Err(CanonicalEncodeError::UnsupportedSchema { .. })
+    ));
 }
 
 #[test]

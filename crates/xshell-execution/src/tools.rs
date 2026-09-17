@@ -1,4 +1,6 @@
 use crate::SensitivePaths;
+use crate::engine::CancellationFlag;
+use crate::process::{ProcessGroupGuard, configure_process_group};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -7,7 +9,6 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::time::timeout;
 use xshell_core::{ToolCall, ToolDefinition};
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -131,17 +132,29 @@ pub fn tool_summary(call: &ToolCall) -> String {
 }
 
 pub async fn execute_tool(call: &ToolCall, root: &Path) -> String {
-    match execute_inner(call, root).await {
+    execute_tool_cancellable(call, root, CancellationFlag::default()).await
+}
+
+pub(crate) async fn execute_tool_cancellable(
+    call: &ToolCall,
+    root: &Path,
+    cancellation: CancellationFlag,
+) -> String {
+    match execute_inner(call, root, cancellation).await {
         Ok(output) => truncate(output),
         Err(error) => format!("tool error: {error:#}"),
     }
 }
 
-async fn execute_inner(call: &ToolCall, root: &Path) -> Result<String> {
+async fn execute_inner(
+    call: &ToolCall,
+    root: &Path,
+    cancellation: CancellationFlag,
+) -> Result<String> {
     match call.name.as_str() {
         "read_file" => read_file(&call.arguments, root),
         "list_directory" => list_directory(&call.arguments, root),
-        "run_shell" => run_shell(&call.arguments, root).await,
+        "run_shell" => run_shell(&call.arguments, root, cancellation).await,
         _ => bail!("unknown tool {}", call.name),
     }
 }
@@ -196,7 +209,11 @@ fn list_directory(arguments: &Value, root: &Path) -> Result<String> {
     Ok(output)
 }
 
-async fn run_shell(arguments: &Value, root: &Path) -> Result<String> {
+async fn run_shell(
+    arguments: &Value,
+    root: &Path,
+    cancellation: CancellationFlag,
+) -> Result<String> {
     let command = required_string(arguments, "command")?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let mut process = Command::new(&shell);
@@ -213,43 +230,52 @@ async fn run_shell(arguments: &Value, root: &Path) -> Result<String> {
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
+    configure_process_group(&mut process);
     let mut child = process
         .spawn()
         .with_context(|| format!("could not launch shell {shell}"))?;
-    let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+    let mut group = ProcessGroupGuard::for_child(&child);
     let stdout = child.stdout.take().context("cannot capture shell stdout")?;
     let stderr = child.stderr.take().context("cannot capture shell stderr")?;
-    match timeout(SHELL_TOOL_TIMEOUT, async move {
-        let (stdout, stderr, status) = tokio::try_join!(
-            read_bounded_output(stdout),
-            read_bounded_output(stderr),
-            child.wait()
-        )?;
-        Ok::<_, std::io::Error>((stdout, stderr, status))
-    })
-    .await
-    {
-        Ok(Ok((stdout, stderr, status))) => Ok(format!(
-            "exit status: {}\nstdout:\n{}\nstderr:\n{}",
-            status,
-            stdout.render(),
-            stderr.render()
-        )),
-        Ok(Err(error)) => {
-            kill_process_group(group);
-            Err(error).context("could not collect shell tool output")
-        }
-        Err(_) => {
-            kill_process_group(group);
+    let stdout_task = tokio::spawn(read_bounded_output(stdout));
+    let stderr_task = tokio::spawn(read_bounded_output(stderr));
+    let wait = tokio::select! {
+        status = child.wait() => Some(status.context("could not wait for shell tool")),
+        () = cancellation.wait() => None,
+        () = tokio::time::sleep(SHELL_TOOL_TIMEOUT) => None,
+    };
+    let status = match wait {
+        Some(status) => status?,
+        None => {
+            let cancelled = cancellation.is_cancelled();
+            group.kill();
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            group.disarm();
+            if cancelled {
+                bail!("shell tool cancelled; the process group was killed and reaped");
+            }
             bail!(
-                "shell tool timed out after {} seconds; the process group was killed",
+                "shell tool timed out after {} seconds; the process group was killed and reaped",
                 SHELL_TOOL_TIMEOUT.as_secs()
-            )
+            );
         }
-    }
+    };
+    group.disarm();
+    let stdout = stdout_task
+        .await
+        .context("shell stdout reader task failed")??;
+    let stderr = stderr_task
+        .await
+        .context("shell stderr reader task failed")??;
+    Ok(format!(
+        "exit status: {}\nstdout:\n{}\nstderr:\n{}",
+        status,
+        stdout.render(),
+        stderr.render()
+    ))
 }
 
 struct BoundedOutput {
@@ -283,18 +309,6 @@ async fn read_bounded_output(mut reader: impl AsyncRead + Unpin) -> std::io::Res
         let retained = count.min(remaining);
         bytes.extend_from_slice(&buffer[..retained]);
         truncated |= retained < count;
-    }
-}
-
-/// Kill every process in the group led by `pid`. `process_group(0)` makes the
-/// child its own group leader, so its pgid equals its pid.
-fn kill_process_group(pid: Option<i32>) {
-    if let Some(pid) = pid.filter(|pid| *pid > 0) {
-        // SAFETY: kill(2) with a negative pid targets a process group; it has
-        // no memory-safety preconditions and errors are irrelevant here.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
     }
 }
 
@@ -346,6 +360,7 @@ fn truncate(mut output: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     #[test]
     fn blocks_paths_outside_root() {
@@ -385,6 +400,7 @@ mod tests {
         let output = run_shell(
             &json!({"command": "printf out; printf err >&2; exit 3"}),
             root,
+            CancellationFlag::default(),
         )
         .await
         .unwrap();
@@ -409,11 +425,10 @@ mod tests {
             .current_dir(temporary.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
+        configure_process_group(&mut process);
         let mut child = process.spawn().unwrap();
-        let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+        let mut group = ProcessGroupGuard::for_child(&child);
         // Wait for the grandchild's pid to be recorded.
         let grandchild = loop {
             if let Ok(text) = std::fs::read_to_string(&marker)
@@ -428,8 +443,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        kill_process_group(group);
+        group.kill();
         let _ = child.wait().await;
+        group.disarm();
         // The grandchild must be gone. Poll briefly for the kernel to reap it.
         let mut alive = true;
         for _ in 0..100 {

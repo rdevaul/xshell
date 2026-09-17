@@ -242,6 +242,7 @@ pub(crate) fn session_activity_label(activity: &xshell_session::SessionActivity)
         xshell_session::SessionActivity::AgentTurn { phase, .. } => match phase {
             xshell_session::AgentTurnPhase::Running => "agent running".into(),
             xshell_session::AgentTurnPhase::WaitingApproval => "agent waiting for approval".into(),
+            xshell_session::AgentTurnPhase::Stopping => "agent stopping".into(),
         },
         xshell_session::SessionActivity::InteractiveProcess { command, attached } => {
             let focus = if *attached { "attached" } else { "detached" };

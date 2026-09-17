@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use xshell_execution::validate_working_directory;
 
 #[derive(Debug)]
 struct SessionRecord {
@@ -24,12 +25,22 @@ pub struct SessionRegistry {
     user: String,
     state_directory: PathBuf,
     sessions: HashMap<String, SessionRecord>,
+    in_flight: HashMap<String, DurableInFlight>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DurableState {
     format_version: u32,
     sessions: Vec<SessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    in_flight: Vec<DurableInFlight>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableInFlight {
+    session_id: String,
+    operation_id: String,
+    route: String,
 }
 
 impl SessionRegistry {
@@ -43,6 +54,7 @@ impl SessionRegistry {
         let state_path = state_directory.join("sessions.json");
         let mut sessions = HashMap::new();
         let mut names = HashSet::new();
+        let mut recovered_in_flight = false;
         if state_path.exists() {
             let source = fs::read_to_string(&state_path)
                 .with_context(|| format!("cannot read session state {}", state_path.display()))?;
@@ -53,6 +65,13 @@ impl SessionRegistry {
             }
             for mut snapshot in state.sessions {
                 validate_name(&snapshot.descriptor.name)?;
+                snapshot.descriptor.cwd = validate_working_directory(&snapshot.descriptor.cwd)
+                    .with_context(|| {
+                        format!(
+                            "invalid working directory for durable session {:?}",
+                            snapshot.descriptor.name
+                        )
+                    })?;
                 if snapshot.descriptor.persistence != PersistenceMode::Durable {
                     bail!("non-durable session found in durable state");
                 }
@@ -78,14 +97,45 @@ impl SessionRegistry {
                     bail!("duplicate session ID in durable state");
                 }
             }
+            for operation in state.in_flight {
+                let record = sessions.get_mut(&operation.session_id).with_context(|| {
+                    format!(
+                        "in-flight operation {:?} references an unknown durable session",
+                        operation.operation_id
+                    )
+                })?;
+                let recovery = format!(
+                    "[xshell recovery] outcome_unknown: {route} operation {operation_id} was interrupted before a terminal outcome was persisted; inspect external effects before retrying",
+                    route = operation.route,
+                    operation_id = operation.operation_id,
+                );
+                if record
+                    .snapshot
+                    .history
+                    .last()
+                    .map(|message| message.content.as_str())
+                    != Some(recovery.as_str())
+                {
+                    record
+                        .snapshot
+                        .history
+                        .push(xshell_core::ChatMessage::system(recovery));
+                }
+                recovered_in_flight = true;
+            }
         }
-        Ok(Self {
+        let registry = Self {
             host_id,
             host_alias,
             user,
             state_directory,
             sessions,
-        })
+            in_flight: HashMap::new(),
+        };
+        if recovered_in_flight {
+            registry.persist()?;
+        }
+        Ok(registry)
     }
 
     pub fn host_id(&self) -> &str {
@@ -113,9 +163,10 @@ impl SessionRegistry {
     pub fn create(
         &mut self,
         client_id: &str,
-        creation: SessionCreation,
+        mut creation: SessionCreation,
     ) -> Result<SessionSnapshot> {
         validate_name(&creation.name)?;
+        creation.cwd = validate_working_directory(&creation.cwd)?;
         if self
             .sessions
             .values()
@@ -204,6 +255,7 @@ impl SessionRegistry {
         cwd: PathBuf,
         history: Vec<xshell_core::ChatMessage>,
     ) -> Result<SessionDescriptor> {
+        let cwd = validate_working_directory(&cwd)?;
         let record = self
             .sessions
             .get_mut(session_id)
@@ -223,12 +275,56 @@ impl SessionRegistry {
         Ok(descriptor)
     }
 
+    pub fn begin_execution(
+        &mut self,
+        session_id: &str,
+        operation_id: &str,
+        route: &str,
+    ) -> Result<()> {
+        let record = self
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id:?}"))?;
+        if record.snapshot.descriptor.persistence != PersistenceMode::Durable {
+            return Ok(());
+        }
+        if self.in_flight.contains_key(session_id) {
+            bail!("durable session already has an in-flight operation");
+        }
+        self.in_flight.insert(
+            session_id.to_owned(),
+            DurableInFlight {
+                session_id: session_id.to_owned(),
+                operation_id: operation_id.to_owned(),
+                route: route.to_owned(),
+            },
+        );
+        if let Err(error) = self.persist() {
+            self.in_flight.remove(session_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn finish_execution(&mut self, session_id: &str, operation_id: &str) -> Result<()> {
+        if self
+            .in_flight
+            .get(session_id)
+            .is_some_and(|operation| operation.operation_id == operation_id)
+        {
+            self.in_flight.remove(session_id);
+            self.persist()?;
+        }
+        Ok(())
+    }
+
     pub fn update_execution_state(
         &mut self,
         session_id: &str,
         cwd: PathBuf,
         history: Vec<xshell_core::ChatMessage>,
     ) -> Result<SessionDescriptor> {
+        let cwd = validate_working_directory(&cwd)?;
         let record = self
             .sessions
             .get_mut(session_id)
@@ -237,6 +333,7 @@ impl SessionRegistry {
         record.snapshot.descriptor.last_active_at_unix_ms = timestamp_ms()?;
         record.snapshot.history = history;
         let descriptor = descriptor_with_status(record);
+        self.in_flight.remove(session_id);
         self.persist()?;
         Ok(descriptor)
     }
@@ -299,6 +396,11 @@ impl SessionRegistry {
         let encoded = serde_json::to_vec_pretty(&DurableState {
             format_version: 1,
             sessions,
+            in_flight: {
+                let mut operations = self.in_flight.values().cloned().collect::<Vec<_>>();
+                operations.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+                operations
+            },
         })?;
         let temporary = self.state_directory.join("sessions.json.new");
         let final_path = self.state_directory.join("sessions.json");
@@ -466,5 +568,52 @@ mod tests {
         let snapshot = restored.snapshot("ornithopter").unwrap();
         assert_eq!(snapshot.history, vec![ChatMessage::user("retain me")]);
         assert_eq!(snapshot.descriptor.status, SessionStatus::Detached);
+    }
+
+    #[test]
+    fn f3_interrupted_durable_operation_recovers_as_outcome_unknown() {
+        let temp = TempDir::new().unwrap();
+        let mut registry = SessionRegistry::load(
+            temp.path().into(),
+            "host".into(),
+            "local".into(),
+            "rich".into(),
+        )
+        .unwrap();
+        let durable = registry
+            .create(
+                "client",
+                creation(
+                    "interrupted",
+                    temp.path(),
+                    PersistenceMode::Durable,
+                    Visibility::Fabric,
+                    vec![ChatMessage::user("before")],
+                ),
+            )
+            .unwrap();
+        registry
+            .begin_execution(&durable.descriptor.id, "turn-123", "shell")
+            .unwrap();
+        drop(registry);
+
+        let restored = SessionRegistry::load(
+            temp.path().into(),
+            "host".into(),
+            "local".into(),
+            "rich".into(),
+        )
+        .unwrap();
+        let snapshot = restored.snapshot("interrupted").unwrap();
+        let recovery = snapshot.history.last().unwrap();
+        assert!(recovery.content.contains("outcome_unknown"));
+        assert!(recovery.content.contains("turn-123"));
+        assert!(recovery.content.contains("inspect external effects"));
+
+        let persisted = std::fs::read_to_string(temp.path().join("sessions.json")).unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert!(persisted.get("in_flight").is_none());
+        let persisted = serde_json::to_string(&persisted).unwrap();
+        assert_eq!(persisted.matches("outcome_unknown").count(), 1);
     }
 }

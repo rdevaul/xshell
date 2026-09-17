@@ -6,7 +6,7 @@ mod lower;
 mod model;
 mod resolve;
 
-pub use hash::{PlanHash, canonical_plan_bytes};
+pub use hash::{CanonicalEncodeError, PlanHash, canonical_plan_bytes};
 pub use lower::{PlanDiagnostic, PlanError, lower};
 pub use model::*;
 pub use resolve::*;

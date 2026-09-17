@@ -113,9 +113,7 @@ async fn main() -> Result<()> {
             api_key_env: args.api_key_env.clone(),
         },
     )?;
-    let mut cwd = args
-        .cwd
-        .canonicalize()
+    let mut cwd = xshell_execution::validate_working_directory(&args.cwd)
         .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
     let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
     let (mut sessions, restored) = SessionRuntime::start(

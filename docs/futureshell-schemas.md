@@ -6,16 +6,18 @@ The machine-readable bundle at
 `fixtures/futureshell/schemas/fs0.schema.json` uses JSON Schema 2020-12 and
 defines the initial capability, evidence, change-set, clause-report, receipt,
 agent-target, connector-capability, gateway-policy, autonomy-grant, and usage
-report shapes. The bundle exists to make examples and reviews precise before
-canonical encoding is selected.
+report shapes. The bundle exists to make examples and reviews precise while
+their durable encodings are selected. Plan encoding is fixed separately by
+[ADR 0004](adr/0004-explicit-canonical-plan-encoding.md).
 
 All durable objects carry an exact `schema` discriminator. Unknown versions and
 unknown fields fail closed. SHA-256 values are lowercase hex. IDs are opaque,
 bounded UTF-8 strings; runtimes assign them and language code cannot fabricate
 handles from IDs. Timestamps are evidence metadata, never canonical ordering.
 
-Plans and receipts must eventually define canonical byte encoding separately
-from this human-readable JSON representation. Secret values, raw credentials,
+Receipts must eventually define canonical byte encoding separately from this
+human-readable JSON representation; plans already do so through ADR 0004.
+Secret values, raw credentials,
 unbounded output, prompts containing secrets, and artifact bytes never belong
 in these objects. Content is referenced by hash, size, media type, and optional
 policy-approved locator.

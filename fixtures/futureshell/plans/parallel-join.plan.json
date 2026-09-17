@@ -1,5 +1,5 @@
 {
-  "plan_hash": "9748f5d42dde33345a5c1a4bc4d3f5737c04dec26794241fd360eae73eaf1039",
+  "plan_hash": "e923db294c33ad77dd91d957e77faa80b66bdc0ceab88e8048ce116c4184341e",
   "schema": "xshell.plan/v0",
   "name": "parallel_join",
   "flow": {

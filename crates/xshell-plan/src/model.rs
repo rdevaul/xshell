@@ -20,11 +20,11 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn hash(&self) -> Result<crate::PlanHash, serde_json::Error> {
+    pub fn hash(&self) -> Result<crate::PlanHash, crate::CanonicalEncodeError> {
         crate::hash::plan_hash(self)
     }
 
-    pub fn artifact(&self) -> Result<PlanArtifact, serde_json::Error> {
+    pub fn artifact(&self) -> Result<PlanArtifact, crate::CanonicalEncodeError> {
         Ok(PlanArtifact {
             plan_hash: self.hash()?.to_string(),
             plan: self.clone(),
@@ -33,7 +33,7 @@ impl Plan {
 }
 
 impl PlanArtifact {
-    pub fn verify_hash(&self) -> Result<bool, serde_json::Error> {
+    pub fn verify_hash(&self) -> Result<bool, crate::CanonicalEncodeError> {
         Ok(self.plan.hash()?.to_string() == self.plan_hash)
     }
 }

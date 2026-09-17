@@ -10,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_platform::LockExt;
 use xshell_session::{
@@ -24,6 +24,7 @@ use xshell_session::{
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 const VIEW_TIMEOUT: Duration = Duration::from_secs(3);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -120,7 +121,7 @@ fn main() -> Result<()> {
         config.sensitive_paths(),
         config.compaction.clone(),
     );
-    let ptys = PtyCoordinator::default();
+    let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
 
     prepare_socket(&socket)?;
     let listener = UnixListener::bind(&socket)
@@ -155,11 +156,19 @@ fn main() -> Result<()> {
         }
     );
 
-    install_shutdown_handler(execution.audit().clone());
+    let shutdown = install_shutdown_handler()?;
+    listener.set_nonblocking(true)?;
 
-    for connection in listener.incoming() {
-        match connection {
-            Ok(stream) => {
+    loop {
+        if shutdown.try_recv().is_ok() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _address)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("xshelld: cannot configure accepted client socket: {error}");
+                    continue;
+                }
                 // The daemon runs commands as the invoking user. Socket mode
                 // is not a sufficient control on every platform, so verify
                 // the peer explicitly before reading a single request byte.
@@ -176,9 +185,29 @@ fn main() -> Result<()> {
                     }
                 });
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => eprintln!("xshelld accept error: {error}"),
         }
     }
+    execution.stop_accepting_and_cancel();
+    let shutdown_started = Instant::now();
+    let ptys_drained = ptys.shutdown_all(SHUTDOWN_TIMEOUT);
+    let remaining = SHUTDOWN_TIMEOUT.saturating_sub(shutdown_started.elapsed());
+    let execution_drained = execution.wait_for_shutdown(remaining);
+    let drained = ptys_drained && execution_drained;
+    if !drained {
+        eprintln!(
+            "xshelld: shutdown deadline elapsed; active outcomes require recovery reconciliation"
+        );
+    }
+    execution.audit().close_all(if drained {
+        "xshelld shutdown"
+    } else {
+        "xshelld forced shutdown with unresolved outcomes"
+    });
     Ok(())
 }
 
@@ -216,30 +245,24 @@ fn print_probe(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-/// On SIGINT/SIGTERM, finalize open audit sessions with signed checkpoints and
-/// exit. Without this, `launchctl stop` or Ctrl-C would leave every daemon
-/// audit log without a final checkpoint, which the verifier reports as
-/// possibly truncated.
-fn install_shutdown_handler(audit: DaemonAudit) {
+/// Convert SIGINT/SIGTERM into an ordinary main-loop shutdown request. The main
+/// thread owns admission stop, worker cleanup, persistence, and audit closure.
+fn install_shutdown_handler() -> Result<mpsc::Receiver<()>> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])
+    .context("cannot install xshelld shutdown signals")?;
+    let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("xshelld-shutdown".into())
         .spawn(move || {
-            let mut signals = match signal_hook::iterator::Signals::new([
-                signal_hook::consts::SIGINT,
-                signal_hook::consts::SIGTERM,
-            ]) {
-                Ok(signals) => signals,
-                Err(error) => {
-                    eprintln!("xshelld: cannot install shutdown handler: {error}");
-                    return;
-                }
-            };
             if signals.forever().next().is_some() {
-                audit.close_all("xshelld shutdown");
-                std::process::exit(0);
+                let _ = sender.send(());
             }
         })
-        .expect("cannot spawn shutdown handler thread");
+        .context("cannot spawn xshelld shutdown handler")?;
+    Ok(receiver)
 }
 
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
@@ -687,6 +710,7 @@ fn process_request(
                 bail!("cannot replace session state while a turn is active");
             }
             if ptys.has_session(&session_id) {
+                let cwd = xshell_execution::validate_working_directory(&cwd)?;
                 let snapshot = registry.lock_recover().snapshot(&session_id)?;
                 if snapshot.descriptor.model == model
                     && snapshot.descriptor.cwd == cwd

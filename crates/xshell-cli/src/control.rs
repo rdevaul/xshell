@@ -6,8 +6,7 @@ use crate::model::*;
 use crate::session::SessionRuntime;
 use crate::sessions_ui::*;
 use crate::tools;
-use crate::util::*;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -169,23 +168,8 @@ pub(crate) fn run_shell(command: &str, cwd: &mut PathBuf) -> Result<String> {
         return Ok("empty command".into());
     }
 
-    let words = shell_words::split(command).context("could not parse shell command")?;
-    if words.first().map(String::as_str) == Some("cd") {
-        if words.len() > 2 {
-            bail!("cd expects zero or one path");
-        }
-        let destination = match words.get(1) {
-            Some(path) => expand_tilde(path)?,
-            None => home_dir()?,
-        };
-        let next = if destination.is_absolute() {
-            destination
-        } else {
-            cwd.join(destination)
-        };
-        *cwd = next
-            .canonicalize()
-            .with_context(|| format!("cannot cd to {}", next.display()))?;
+    if let Some(next) = xshell_execution::captured_cd_destination(command, cwd)? {
+        *cwd = xshell_execution::validate_working_directory(&next)?;
         return Ok("working directory changed".into());
     }
 
@@ -229,5 +213,15 @@ mod tests {
             InputRoute::Agent("explain this".into())
         );
         assert!(!sticky);
+    }
+
+    #[test]
+    fn f11_cli_cd_rejects_a_regular_file_without_changing_cwd() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        std::fs::write(temporary.path().join("file"), "text").unwrap();
+        let mut cwd = temporary.path().to_owned();
+        let before = cwd.clone();
+        assert!(run_shell("cd file", &mut cwd).is_err());
+        assert_eq!(cwd, before);
     }
 }

@@ -1,8 +1,8 @@
 # xshell development roadmap: daily driver and controlled deployment
 
-**Updated:** 11 September 2026
+**Updated:** 13 September 2026
 
-**Status:** agreed architectural direction; implementation milestones below are planned, not completed.
+**Status:** M0 baseline recorded; F1–F3 and F11 corrected; later milestones remain planned.
 
 **Companion:** [Design, security, and usability review](xshell-design-security-usability-review.md).
 
@@ -50,6 +50,12 @@ Use the existing Rust workspace as the modular starting point. Keep orchestratio
 *These are responsibility areas, not assigned people or a requirement for separate teams. Name an accountable owner when opening each milestone. Sequence by acceptance evidence rather than speculative calendar dates. M3 and M4 are independent workstreams; M5's personal experiment can advance while the controlled provider is being completed.
 
 ## M0 — Record the architecture and establish the baseline
+
+The shared decisions are recorded in
+[ADR 0005](adr/0005-shared-execution-semantics-across-deployment-profiles.md).
+The [finding ledger](xshell-security-findings.md) and
+[mode-conformance matrix](xshell-mode-conformance.md) preserve implementation
+status and required evidence without changing the historical review.
 
 **Work:**
 
@@ -181,8 +187,8 @@ Do not allow a connector to bypass shared authorization because it supplies its 
 
 ## Immediate actionable backlog
 
-1. Land this review/roadmap and record D1–D9 in an ADR; create the F1–F11 tracking entries.
-2. Convert F1–F3 probes into lifecycle regression tests and repair history preservation, cancellation, and shutdown ordering.
+1. Preserve the recorded D1–D9 ADR, finding ledger, and mode-conformance matrix as the M0 baseline.
+2. Preserve the landed F1–F3 lifecycle corrections and F11 cwd boundary while completing the remaining findings.
 3. Implement prepared bounded file reads and stable sensitivity semantics for F4/F5/F8; correct cwd validation in the same boundary where appropriate.
 4. Remove blocking global audit I/O and add deadline/failure tests; then correct stream-completion and whole-turn budget handling.
 5. Draft the M2 operation/grant/provider contract and run one operation through personal and restrictive mock policies.

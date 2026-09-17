@@ -1,11 +1,16 @@
-use crate::{PtySize, PtyTicket, SessionActivity, SessionAuditHandle, TerminalStreamPolicy};
+use crate::{
+    PtySize, PtyTicket, SessionActivity, SessionAuditHandle, SessionRegistry, TerminalStreamPolicy,
+};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_audit::AuditEvent;
 use xshell_platform::LockExt;
@@ -26,9 +31,21 @@ const MAX_TERMINAL_TYPE_BYTES: usize = 128;
 /// Keeps each record comfortably inside the audit service's request bound.
 const STREAM_RECORD_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PtyCoordinator {
     inner: Arc<Mutex<HashMap<String, Arc<ManagedPty>>>>,
+    accepting: Arc<AtomicBool>,
+    registry: Option<Arc<Mutex<SessionRegistry>>>,
+}
+
+impl Default for PtyCoordinator {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            accepting: Arc::new(AtomicBool::new(true)),
+            registry: None,
+        }
+    }
 }
 
 impl Drop for PtyCoordinator {
@@ -52,6 +69,8 @@ struct ManagedPty {
     session_id: String,
     command: String,
     cwd: String,
+    operation_id: String,
+    registry: Option<Arc<Mutex<SessionRegistry>>>,
     audit: Option<SessionAuditHandle>,
     /// Opt-in byte-stream capture; `None` records lifecycle only.
     capture: Option<Mutex<StreamCapture>>,
@@ -154,6 +173,14 @@ pub struct PtyReadResult {
 }
 
 impl PtyCoordinator {
+    pub fn with_registry(registry: Arc<Mutex<SessionRegistry>>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            accepting: Arc::new(AtomicBool::new(true)),
+            registry: Some(registry),
+        }
+    }
+
     pub fn start(
         &self,
         session_id: &str,
@@ -189,6 +216,9 @@ impl PtyCoordinator {
         terminal_type: Option<String>,
         audit: Option<PtyAudit>,
     ) -> Result<PtyTicket> {
+        if !self.accepting.load(Ordering::Acquire) {
+            bail!("terminal execution is shutting down");
+        }
         validate_command(&command)?;
         validate_size(size)?;
         validate_terminal_type(terminal_type.as_deref())?;
@@ -206,6 +236,7 @@ impl PtyCoordinator {
             Some(PtyAudit { handle, stream }) => (Some(handle), stream),
             None => (None, None),
         };
+        let pty_id = Uuid::new_v4().to_string();
         if let Some(audit) = &audit {
             // This is the final boundary before process creation. In required
             // mode a failed append returns here and the command never starts.
@@ -214,8 +245,13 @@ impl PtyCoordinator {
                 text: format!("${command}"),
             })?;
         }
+        if let Some(registry) = &self.registry {
+            registry
+                .lock_recover()
+                .begin_execution(session_id, &pty_id, "shell_terminal")?;
+        }
 
-        let process = RemotePtyProcess::spawn(
+        let process = match RemotePtyProcess::spawn(
             &command,
             cwd,
             ProcessSize {
@@ -223,8 +259,17 @@ impl PtyCoordinator {
                 columns: size.columns,
             },
             terminal_type.as_deref(),
-        )?;
-        let pty_id = Uuid::new_v4().to_string();
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                if let Some(registry) = &self.registry {
+                    let _ = registry
+                        .lock_recover()
+                        .finish_execution(session_id, &pty_id);
+                }
+                return Err(error);
+            }
+        };
         let ticket = Uuid::new_v4().to_string();
         let capture = match (&audit, stream) {
             (Some(_), Some(policy)) => Some(Mutex::new(StreamCapture::new(policy))),
@@ -234,6 +279,8 @@ impl PtyCoordinator {
             session_id: session_id.to_owned(),
             command,
             cwd: cwd.display().to_string(),
+            operation_id: pty_id.clone(),
+            registry: self.registry.clone(),
             audit,
             capture,
             stream: Mutex::new(StreamAuthorization {
@@ -255,9 +302,22 @@ impl PtyCoordinator {
         });
         {
             let mut ptys = self.inner.lock_recover();
+            if !self.accepting.load(Ordering::Acquire) {
+                if let Some(registry) = &self.registry {
+                    let _ = registry
+                        .lock_recover()
+                        .finish_execution(session_id, &pty_id);
+                }
+                bail!("terminal execution is shutting down");
+            }
             if ptys.len() >= MAX_ACTIVE_PTYS
                 || ptys.values().any(|pty| pty.session_id == session_id)
             {
+                if let Some(registry) = &self.registry {
+                    let _ = registry
+                        .lock_recover()
+                        .finish_execution(session_id, &pty_id);
+                }
                 bail!("session acquired another terminal job while this one was starting");
             }
             ptys.insert(pty_id.clone(), Arc::clone(&managed));
@@ -420,6 +480,26 @@ impl PtyCoordinator {
             shutdown(managed);
         }
         !removed.is_empty()
+    }
+
+    pub fn stop_accepting(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    pub fn shutdown_all(&self, timeout: Duration) -> bool {
+        self.stop_accepting();
+        let deadline = Instant::now() + timeout;
+        let managed = self
+            .inner
+            .lock_recover()
+            .drain()
+            .map(|(_, pty)| pty)
+            .collect::<Vec<_>>();
+        let mut drained = true;
+        for pty in managed {
+            drained &= shutdown_until(&pty, deadline);
+        }
+        drained
     }
 
     pub fn has_session(&self, session_id: &str) -> bool {
@@ -633,6 +713,13 @@ fn finish(managed: &ManagedPty, status: String) {
     {
         eprintln!("xshelld audit warning: cannot record terminal completion: {error:#}");
     }
+    if let Some(registry) = &managed.registry
+        && let Err(error) = registry
+            .lock_recover()
+            .finish_execution(&managed.session_id, &managed.operation_id)
+    {
+        eprintln!("xshelld warning: cannot persist terminal completion: {error:#}");
+    }
     let mut state = managed.state.lock_recover();
     state.worker_finished = true;
     managed.changed.notify_all();
@@ -650,6 +737,29 @@ fn shutdown(managed: &ManagedPty) {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
+}
+
+fn shutdown_until(managed: &ManagedPty, deadline: Instant) -> bool {
+    let mut state = managed.state.lock_recover();
+    if state.worker_finished {
+        return true;
+    }
+    state.shutdown = true;
+    managed.changed.notify_all();
+    while !state.worker_finished {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        let (updated, result) = managed
+            .changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = updated;
+        if result.timed_out() && !state.worker_finished {
+            return false;
+        }
+    }
+    true
 }
 
 fn validate_command(command: &str) -> Result<()> {
