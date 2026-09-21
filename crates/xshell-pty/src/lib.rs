@@ -45,6 +45,30 @@ pub fn parse_escape_prefix(value: &str) -> Result<u8> {
     bail!("PTY escape must be a single ASCII key or ctrl-KEY (for example ctrl-])")
 }
 
+/// Name the terminal function an escape prefix takes over, if any.
+///
+/// The prefix is consumed before anything else sees it: `route_escape_input`
+/// intercepts the raw byte ahead of an attached full-screen program, and the
+/// session prompt binds the same key ahead of the line editor. Choosing one of
+/// these bytes is allowed — a user may well be driving an editor that does not
+/// privilege them — but that key stops doing its usual job everywhere in
+/// xshell, so the caller should say so rather than let it fail silently.
+///
+/// Returns `None` for prefixes that shadow nothing, such as the `ctrl-]`
+/// default.
+#[must_use]
+pub fn shadowed_terminal_key(escape_prefix: u8) -> Option<&'static str> {
+    match escape_prefix {
+        0x03 => Some("Ctrl-C (interrupt)"),
+        0x04 => Some("Ctrl-D (end of input)"),
+        0x08 => Some("Backspace"),
+        0x09 => Some("Tab (completion)"),
+        0x0d => Some("Enter (submit)"),
+        0x1b => Some("Esc"),
+        _ => None,
+    }
+}
+
 impl From<PtySize> for Winsize {
     fn from(size: PtySize) -> Self {
         Self {
@@ -976,6 +1000,55 @@ mod tests {
             (vec![prefix], None)
         );
         assert!(parse_escape_prefix("not-a-key").is_err());
+    }
+
+    /// Prefixes that take over a terminal function stay configurable, but every
+    /// one of them must be reportable so the CLI can warn instead of letting the
+    /// key quietly stop working.
+    #[test]
+    fn escape_prefixes_that_take_over_a_terminal_function_are_named() {
+        let shadowed =
+            |configured: &str| shadowed_terminal_key(parse_escape_prefix(configured).unwrap());
+
+        assert_eq!(shadowed("ctrl-c"), Some("Ctrl-C (interrupt)"));
+        assert_eq!(shadowed("ctrl-d"), Some("Ctrl-D (end of input)"));
+        assert_eq!(shadowed("ctrl-h"), Some("Backspace"));
+        assert_eq!(shadowed("ctrl-i"), Some("Tab (completion)"));
+        assert_eq!(shadowed("ctrl-m"), Some("Enter (submit)"));
+        assert_eq!(shadowed("ctrl-["), Some("Esc"));
+
+        // The shipped default and other ordinary choices shadow nothing.
+        assert_eq!(shadowed("ctrl-]"), None);
+        assert_eq!(shadowed("ctrl-a"), None);
+        assert_eq!(shadowed("ctrl-x"), None);
+        assert_eq!(shadowed("x"), None);
+    }
+
+    /// The prefix is still routed normally after a warning: choosing a shadowing
+    /// key degrades that key, it does not disable the controller.
+    #[test]
+    fn a_shadowing_prefix_still_routes_controller_actions() {
+        let prefix = parse_escape_prefix("ctrl-m").unwrap();
+        assert_eq!(prefix, 0x0d);
+        assert!(shadowed_terminal_key(prefix).is_some());
+
+        let mut pending = false;
+        assert_eq!(
+            route_escape_input(&[prefix], prefix, &mut pending),
+            (Vec::new(), None)
+        );
+        assert!(pending);
+        assert_eq!(
+            route_escape_input(b"d", prefix, &mut pending),
+            (Vec::new(), Some(ControllerAction::Detach))
+        );
+
+        // Doubling it still sends the literal byte through, so Enter remains
+        // reachable as prefix-prefix.
+        assert_eq!(
+            route_escape_input(&[prefix, prefix], prefix, &mut pending),
+            (vec![prefix], None)
+        );
     }
 
     #[test]

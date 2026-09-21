@@ -113,4 +113,16 @@ max_approval = "ask"
 # max_history_bytes = 262144
 # Prefix for interactive-process commands: d detach, s switch, l last, n/p cycle,
 # q terminate, ? help, or repeat the prefix to send it literally.
+#
+# Accepts a single ASCII key or ctrl-KEY. The prefix is consumed before the line
+# editor and before any attached full-screen program, so a prefix that shares a
+# byte with a terminal function takes that function over everywhere in xshell:
+#
+#   ctrl-c  Ctrl-C (interrupt)      ctrl-i  Tab (completion)
+#   ctrl-d  Ctrl-D (end of input)   ctrl-m  Enter (submit)
+#   ctrl-h  Backspace               ctrl-[  Esc
+#
+# These stay configurable — an editing environment that does not privilege those
+# keys is a legitimate setup — but xshell warns at startup when you pick one.
+# Pressing the prefix twice always sends the literal byte through.
 pty_escape = "ctrl-]"
