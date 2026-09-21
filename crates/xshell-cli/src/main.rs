@@ -98,6 +98,9 @@ async fn main() -> Result<()> {
     let render_options =
         RenderOptions::resolve(&model_config.rendering, args.markdown, args.color)?;
     let pty_escape = xshell_pty::parse_escape_prefix(&model_config.session_fabric.pty_escape)?;
+    if let Some(warning) = pty_escape_warning(&model_config.session_fabric.pty_escape, pty_escape) {
+        eprintln!("{warning}");
+    }
     // Approval and sensitive paths are fixed for the process; the history
     // budget is resolved per turn from the active model so `//model` switches
     // are honoured (see `turn_policy_for`).
@@ -694,10 +697,53 @@ async fn main() -> Result<()> {
     audit.close(exit_reason)
 }
 
+/// Warn when the configured PTY escape prefix takes over a terminal function.
+///
+/// Such a prefix stays valid: the user may be driving an environment that does
+/// not privilege that key. But it is consumed before the line editor and before
+/// any attached full-screen program, so it is worth saying out loud instead of
+/// leaving the user to discover that Enter or Tab stopped working.
+fn pty_escape_warning(configured: &str, escape_prefix: u8) -> Option<String> {
+    let shadowed = xshell_pty::shadowed_terminal_key(escape_prefix)?;
+    Some(format!(
+        "xshell: warning: pty_escape = \"{configured}\" takes over {shadowed}; \
+         that key no longer reaches the prompt or an attached program. \
+         Press it twice to send it literally, or choose another prefix."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::ValueEnum;
+
+    #[test]
+    fn pty_escape_warns_only_when_it_takes_over_a_terminal_function() {
+        let warning_for = |configured: &str| {
+            let prefix = xshell_pty::parse_escape_prefix(configured).unwrap();
+            pty_escape_warning(configured, prefix)
+        };
+
+        // The shipped default and ordinary alternatives stay quiet.
+        assert_eq!(warning_for("ctrl-]"), None);
+        assert_eq!(warning_for("ctrl-a"), None);
+        assert_eq!(warning_for("x"), None);
+
+        let enter = warning_for("ctrl-m").expect("ctrl-m takes over Enter");
+        assert!(enter.contains("pty_escape = \"ctrl-m\""));
+        assert!(enter.contains("Enter (submit)"));
+        assert!(
+            enter.contains("twice"),
+            "the warning must point at the literal-send escape hatch: {enter}"
+        );
+
+        for configured in ["ctrl-c", "ctrl-d", "ctrl-h", "ctrl-i", "ctrl-["] {
+            assert!(
+                warning_for(configured).is_some(),
+                "{configured} takes over a terminal function and must warn"
+            );
+        }
+    }
 
     #[test]
     fn approval_modes_parse() {

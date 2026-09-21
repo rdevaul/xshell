@@ -635,12 +635,13 @@ mod tests {
         );
     }
 
-    /// Characterises escape prefixes that `parse_escape_prefix` accepts but
-    /// rustyline folds into a named editing key, so the controller prefix would
-    /// take over Esc, Tab, Enter, or Backspace at the prompt. This documents
-    /// today's behaviour; it is not an endorsement of it.
+    /// Escape prefixes that rustyline folds into a named editing key remain
+    /// configurable on purpose — the user may be driving an environment that
+    /// does not privilege them — so this pins the binding rustyline actually
+    /// registers. `pty_escape_warning` reports the same set at startup; keep
+    /// the two in step.
     #[test]
-    fn characterizes_escape_prefixes_that_collide_with_editing_keys() {
+    fn escape_prefixes_that_take_over_an_editing_key_bind_to_that_key() {
         let prefix_event = |configured: &str| {
             let byte = xshell_pty::parse_escape_prefix(configured).unwrap();
             KeyEvent::from(char::from(byte))
@@ -662,6 +663,15 @@ mod tests {
             prefix_event("ctrl-h"),
             KeyEvent(KeyCode::Backspace, Modifiers::NONE)
         );
+
+        // Each of these is reported at startup rather than silently accepted.
+        for configured in ["ctrl-[", "ctrl-i", "ctrl-m", "ctrl-h"] {
+            let byte = xshell_pty::parse_escape_prefix(configured).unwrap();
+            assert!(
+                xshell_pty::shadowed_terminal_key(byte).is_some(),
+                "{configured} binds over an editing key and must be warned about"
+            );
+        }
     }
 
     /// The prompt binding and the in-PTY decoder must agree, otherwise the same

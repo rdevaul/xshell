@@ -65,6 +65,29 @@ attached. The default is `Ctrl-]`, configured as `pty_escape = "ctrl-]"` under
 | `Ctrl-] ?` | Show key help |
 | `Ctrl-] Ctrl-]` | Send a literal prefix byte to a focused PTY |
 
+### Choosing a prefix
+
+`pty_escape` accepts a single ASCII key or `ctrl-KEY`. Because the router
+consumes the prefix before the line editor and before the focused program, a
+prefix that shares a byte with a terminal function takes that function over
+throughout xshell — at the prompt, during an agent turn, and inside an attached
+PTY:
+
+| Configured | Function it takes over |
+|---|---|
+| `ctrl-c` | Ctrl-C (interrupt) |
+| `ctrl-d` | Ctrl-D (end of input) |
+| `ctrl-h` | Backspace |
+| `ctrl-i` | Tab (completion) |
+| `ctrl-m` | Enter (submit) |
+| `ctrl-[` | Esc |
+
+These remain configurable: an editing environment that does not privilege those
+keys is a legitimate setup, and the choice belongs to the user rather than to
+xshell. The CLI reports the conflict at startup rather than rejecting it or
+letting the key quietly stop working. Doubling the prefix still sends the
+literal byte, so the shadowed key stays reachable inside a PTY.
+
 The keystroke is a local data-plane escape; listing, switching sessions,
 minting a fresh ticket, and claiming the selected stream remain authenticated
 control-plane operations. Every visible session is a switch target, and the

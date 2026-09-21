@@ -310,6 +310,12 @@ sent to the process:
 | `Ctrl-] ?` | Show key help |
 | `Ctrl-] Ctrl-]` | Send a literal prefix byte to a focused PTY |
 
+The prefix is configurable via `pty_escape`. It is consumed before the line
+editor and before the focused program, so choosing a key such as `ctrl-m` or
+`ctrl-i` takes Enter or Tab over throughout xshell. Those choices stay
+available — xshell warns at startup instead of rejecting them — and doubling the
+prefix still sends the literal byte. See [PTY sessions](docs/pty.md#choosing-a-prefix).
+
 Switching releases focus without cancelling work or answering a pending
 approval; returning to the session replays and resumes it. Daemon and durable
 sessions retain the process across stream or controller disconnects and keep up
