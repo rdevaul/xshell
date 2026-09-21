@@ -1525,4 +1525,199 @@ mod tests {
         assert!(text.contains("┌ code: python"));
         assert!(text.contains("│ print('bee')"));
     }
+
+    // Full-document coverage for the Markdown renderer, driven by
+    // fixtures/test-markdown-rendering.md. Embedded with include_str! so a
+    // moved or deleted fixture breaks the build instead of silently dropping
+    // this coverage. These tests assert structural invariants (every construct
+    // present and legible), not byte-for-byte output, so cosmetic changes to
+    // markers, borders, or wrapping do not churn them.
+    const MARKDOWN_FIXTURE: &str = include_str!("../../../fixtures/test-markdown-rendering.md");
+
+    fn render_fixture_at(width: usize) -> String {
+        let mut renderer = AgentRenderer::new(options(true, false, width));
+        let mut output = Vec::new();
+        renderer.push(MARKDOWN_FIXTURE, &mut output).unwrap();
+        renderer.finish(&mut output).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    /// Source lines inside ``` fences: the one content class the renderer must
+    /// never re-wrap, used to exempt them from width assertions.
+    fn fixture_fenced_lines() -> Vec<String> {
+        let mut inside = false;
+        MARKDOWN_FIXTURE
+            .lines()
+            .filter_map(|line| {
+                if line.trim_start().starts_with("```") {
+                    inside = !inside;
+                    return None;
+                }
+                inside.then(|| line.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renders_every_construct_in_the_markdown_fixture() {
+        let text = render_fixture_at(200);
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Headings, in both levels and the h1 form.
+        assert!(text.contains("▌ xshell Markdown Rendering Test Suite"));
+        assert!(text.contains("▸ Paragraphs and Text Formatting"));
+        assert!(text.contains("▸ 2.1 Unordered List"));
+
+        // Lists: bullets at every source depth and a decimal sequence.
+        assert!(text.contains("• Alpha component"));
+        assert!(text.contains("• Sub-item bravo-one"));
+        assert!(text.contains("• Nested sub-item"));
+        assert!(text.contains("1. Initialize the session daemon"));
+        assert!(text.contains("5. Await approval or stream response"));
+
+        // Quotes keep a visible marker; the horizontal rule stays a rule.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with('│') && l.contains("single-line rendering")),
+            "blockquote text lost its marker"
+        );
+        assert!(lines.iter().any(|l| l.starts_with("────")), "rule missing");
+
+        // Links resolve to label plus destination; inline styles resolve to
+        // text without leaking Markdown syntax.
+        assert!(text.contains("xshell specification (xshell-specification.md)"));
+        assert!(
+            text.contains("A single paragraph with bold, italic, strikethrough, and inline code.")
+        );
+        assert!(!text.contains("**"), "bold markers leaked");
+        assert!(!text.contains("~~"), "strikethrough markers leaked");
+        assert!(!text.contains("```"), "fence markers leaked");
+        assert!(
+            !text.contains("`inline code`"),
+            "inline code kept its backticks"
+        );
+
+        // Fenced code: labeled fences announce their language and bodies stay
+        // verbatim, while an unlabeled fence still renders its content.
+        assert!(text.contains("┌ code: rust"));
+        assert!(text.contains("┌ code: toml"));
+        assert!(text.contains("┌ code: bash"));
+        assert!(text.contains("pub async fn classify_input(line: &str) -> InputForm {"));
+        assert!(text.contains("This is a plain fenced block with no language tag."));
+
+        // Tables: bordered, with cell content contiguous when there is room.
+        assert!(text.contains("Session State"));
+        assert!(text.contains("├──"));
+        for cell in [
+            "multi-user",
+            "role-based",
+            "openai-compatible",
+            "Secret Service",
+            "ycpkg",
+            "openrc / systemd",
+        ] {
+            assert!(text.contains(cell), "table cell {cell:?} not contiguous");
+        }
+    }
+
+    #[test]
+    fn fixture_prose_wraps_to_width_while_code_stays_verbatim() {
+        let width = 60;
+        let text = render_fixture_at(width);
+        let code = fixture_fenced_lines();
+
+        for line in text.lines() {
+            let is_code_body = line.starts_with('│')
+                && code
+                    .iter()
+                    .any(|src| !src.trim().is_empty() && line.contains(src.trim_end()));
+            if is_code_body {
+                continue;
+            }
+            assert!(
+                visible_width(line) <= width,
+                "non-code line exceeds width {width}: {}",
+                visible_width(line)
+            );
+        }
+
+        // The longest fenced line must survive intact rather than re-wrap.
+        let longest = code
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .max_by_key(|l| visible_width(l))
+            .expect("fixture has fenced code");
+        assert!(
+            visible_width(longest) > width,
+            "fixture needs an over-wide code line"
+        );
+        assert!(
+            text.contains(longest.trim_end()),
+            "long code line was wrapped"
+        );
+    }
+
+    // The three tests below pin *known defects* found by the fixture, not
+    // desired behavior. Each links the issue tracking the fix; when that fix
+    // lands, update the test to assert the corrected rendering.
+
+    #[test]
+    fn characterizes_nested_blockquote_flattening() {
+        // Known defect, tracked in #64. Assert the flattening so the test
+        // fails (and reminds us) once nested depth renders correctly.
+        let text = render_fixture_at(200);
+        let outer = text
+            .lines()
+            .find(|l| l.contains("Here is a blockquote that contains inline code"))
+            .expect("outer quote missing");
+        let inner = text
+            .lines()
+            .find(|l| l.contains("This is a nested blockquote inside the outer blockquote"))
+            .expect("inner quote missing");
+        let prefix = |line: &str| -> String {
+            line.chars().take_while(|&c| c == '│' || c == ' ').collect()
+        };
+        assert_eq!(
+            prefix(outer),
+            prefix(inner),
+            "quote prefixes now differ by depth; update this test with the fix"
+        );
+        assert!(
+            !text.contains("│ │"),
+            "nesting now renders a second marker; update this test with the fix"
+        );
+    }
+
+    #[test]
+    fn characterizes_table_word_splitting_at_narrow_widths() {
+        // Known defect, tracked in #65. Splitting stops being universal once
+        // column budgets respect unbreakable words.
+        let text = render_fixture_at(60);
+        // Long phrases and ordinary single words both split at this width.
+        for (whole, fragment) in [
+            ("multi-user", "multi-us"),
+            ("ephemeral", "ephemera"),
+            ("Transport", "Transpor"),
+        ] {
+            assert!(
+                !text.contains(whole),
+                "{whole:?} is now contiguous; update this test with the fix"
+            );
+            assert!(text.contains(fragment), "expected {fragment:?} missing");
+        }
+    }
+
+    #[test]
+    fn characterizes_heading_ordered_marker_loss() {
+        // Known defect, tracked in #66. Headings should keep authored text.
+        let text = render_fixture_at(200);
+        assert!(
+            !text.contains("▸ 1. Paragraphs"),
+            "heading numbering survives; update this test with the fix"
+        );
+        assert!(text.contains("▸ Paragraphs and Text Formatting"));
+        // A dotted subsection is not a list marker and keeps its text.
+        assert!(text.contains("▸ 2.1 Unordered List"));
+    }
 }
