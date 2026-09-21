@@ -90,6 +90,20 @@ impl ConditionalEventHandler for PromptControllerBinding {
     }
 }
 
+/// Keys that trigger a controller action once the escape prefix is pending.
+/// `xshell_pty::controller_action_for_key` decodes the same keys inside an
+/// attached PTY; the two must agree so a prefix sequence means the same thing
+/// at the session prompt and in a full-screen program.
+const CONTROLLER_ACTION_KEYS: &[(char, xshell_pty::ControllerAction)] = &[
+    ('d', xshell_pty::ControllerAction::Detach),
+    ('s', xshell_pty::ControllerAction::Switcher),
+    ('l', xshell_pty::ControllerAction::Last),
+    ('n', xshell_pty::ControllerAction::Next),
+    ('p', xshell_pty::ControllerAction::Previous),
+    ('q', xshell_pty::ControllerAction::Terminate),
+    ('?', xshell_pty::ControllerAction::Help),
+];
+
 pub(crate) fn bind_controller_keys(
     editor: &mut Editor<XshellHelper, DefaultHistory>,
     escape_prefix: u8,
@@ -103,15 +117,7 @@ pub(crate) fn bind_controller_keys(
             kind: PromptBindingKind::Prefix,
         })),
     );
-    for (key, action) in [
-        ('d', xshell_pty::ControllerAction::Detach),
-        ('s', xshell_pty::ControllerAction::Switcher),
-        ('l', xshell_pty::ControllerAction::Last),
-        ('n', xshell_pty::ControllerAction::Next),
-        ('p', xshell_pty::ControllerAction::Previous),
-        ('q', xshell_pty::ControllerAction::Terminate),
-        ('?', xshell_pty::ControllerAction::Help),
-    ] {
+    for &(key, action) in CONTROLLER_ACTION_KEYS {
         editor.bind_sequence(
             KeyEvent::from(key),
             EventHandler::Conditional(Box::new(PromptControllerBinding {
@@ -492,6 +498,7 @@ pub(crate) fn is_simple_cd(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::{KeyCode, Modifiers};
     use xshell_session::{PersistenceMode, Visibility};
     fn session_descriptor(id: &str, name: &str) -> xshell_session::SessionDescriptor {
         xshell_session::SessionDescriptor {
@@ -596,5 +603,130 @@ mod tests {
             Some(Cmd::Interrupt)
         );
         assert_eq!(state.action, Some(xshell_pty::ControllerAction::Switcher));
+    }
+
+    /// `bind_controller_keys` hands the escape prefix to rustyline as
+    /// `KeyEvent::from(char)`, which silently normalises control bytes. If that
+    /// normalisation ever changes, the prefix binds to a key the user cannot
+    /// type and the controller becomes unreachable with no compile error, so
+    /// pin the mapping for the prefixes `parse_escape_prefix` accepts.
+    #[test]
+    fn escape_prefix_normalises_to_the_key_event_the_binding_registers() {
+        let prefix_event = |configured: &str| {
+            let byte = xshell_pty::parse_escape_prefix(configured).unwrap();
+            KeyEvent::from(char::from(byte))
+        };
+
+        // The shipped default (config.example.toml, SessionFabric::default).
+        assert_eq!(prefix_event("ctrl-]"), KeyEvent::ctrl(']'));
+        assert_eq!(
+            prefix_event("ctrl-]"),
+            KeyEvent(KeyCode::Char(']'), Modifiers::CTRL)
+        );
+
+        // Control letters normalise to an uppercase char plus CTRL.
+        assert_eq!(prefix_event("ctrl-a"), KeyEvent::ctrl('A'));
+        assert_eq!(prefix_event("ctrl-x"), KeyEvent::ctrl('X'));
+
+        // A plain graphic key stays an unmodified character.
+        assert_eq!(
+            prefix_event("x"),
+            KeyEvent(KeyCode::Char('x'), Modifiers::NONE)
+        );
+    }
+
+    /// Characterises escape prefixes that `parse_escape_prefix` accepts but
+    /// rustyline folds into a named editing key, so the controller prefix would
+    /// take over Esc, Tab, Enter, or Backspace at the prompt. This documents
+    /// today's behaviour; it is not an endorsement of it.
+    #[test]
+    fn characterizes_escape_prefixes_that_collide_with_editing_keys() {
+        let prefix_event = |configured: &str| {
+            let byte = xshell_pty::parse_escape_prefix(configured).unwrap();
+            KeyEvent::from(char::from(byte))
+        };
+
+        assert_eq!(
+            prefix_event("ctrl-["),
+            KeyEvent(KeyCode::Esc, Modifiers::NONE)
+        );
+        assert_eq!(
+            prefix_event("ctrl-i"),
+            KeyEvent(KeyCode::Tab, Modifiers::NONE)
+        );
+        assert_eq!(
+            prefix_event("ctrl-m"),
+            KeyEvent(KeyCode::Enter, Modifiers::NONE)
+        );
+        assert_eq!(
+            prefix_event("ctrl-h"),
+            KeyEvent(KeyCode::Backspace, Modifiers::NONE)
+        );
+    }
+
+    /// The prompt binding and the in-PTY decoder must agree, otherwise the same
+    /// prefix sequence means one thing at the session prompt and another inside
+    /// a full-screen program.
+    #[test]
+    fn controller_action_keys_agree_with_the_pty_decoder() {
+        for &(key, action) in CONTROLLER_ACTION_KEYS {
+            assert_eq!(
+                xshell_pty::controller_action_for_key(u8::try_from(key).unwrap()),
+                Some(action),
+                "prompt binding for {key:?} disagrees with the PTY decoder"
+            );
+        }
+
+        // Every action a user can reach in a PTY is also reachable at the prompt.
+        for action in [
+            xshell_pty::ControllerAction::Detach,
+            xshell_pty::ControllerAction::Last,
+            xshell_pty::ControllerAction::Next,
+            xshell_pty::ControllerAction::Previous,
+            xshell_pty::ControllerAction::Switcher,
+            xshell_pty::ControllerAction::Terminate,
+            xshell_pty::ControllerAction::Help,
+        ] {
+            assert!(
+                CONTROLLER_ACTION_KEYS
+                    .iter()
+                    .any(|(_, bound)| *bound == action),
+                "{action:?} has no prompt binding"
+            );
+        }
+    }
+
+    /// Guards the rustyline surface `main` depends on at startup: constructing
+    /// an editor and registering conditional bindings must work with no
+    /// controlling terminal, which is how CI and any redirected run invoke it.
+    #[test]
+    fn binding_controller_keys_succeeds_without_a_terminal() {
+        let mut editor = Editor::<XshellHelper, DefaultHistory>::new()
+            .expect("editor construction must not require a tty");
+        let escape = xshell_pty::parse_escape_prefix("ctrl-]").unwrap();
+
+        let mailbox = bind_controller_keys(&mut editor, escape);
+
+        assert_eq!(mailbox.take(), None, "no action before any key is handled");
+    }
+
+    /// `//history` prints `editor.history()` with a 1-based index, so its output
+    /// depends on rustyline's retention rules rather than on xshell code.
+    #[test]
+    fn history_listing_keeps_insertion_order_and_collapses_repeats() {
+        let mut editor = Editor::<XshellHelper, DefaultHistory>::new().unwrap();
+
+        editor.add_history_entry("//status").unwrap();
+        editor.add_history_entry("$ls -la").unwrap();
+        editor.add_history_entry("$ls -la").unwrap();
+        editor.add_history_entry("//sessions").unwrap();
+
+        let listed: Vec<&str> = editor.history().iter().map(String::as_str).collect();
+
+        assert_eq!(
+            listed,
+            ["//status", "$ls -la", "//sessions"],
+            "history must stay in insertion order with consecutive repeats collapsed"
+        );
     }
 }
