@@ -108,7 +108,7 @@ Start M1.1–M1.3 first, while correcting small independent defects such as F11 
 **Work:**
 
 - Provide a documented short setup path for a configured local or hosted model, with no mandatory enterprise setup. Expose effective authority and persistence without crowding the prompt.
-- Keep the [home-lab runner](runall.md) usable for source checkouts: owned service processes, readiness probes, explicit restarts, and per-instance logs. It is a single-user development convenience with the user's own OS authority, not an installed-service or controlled-deployment supervision path, and it does not by itself satisfy any acceptance journey below.
+- Keep the [home-lab runner](runall.md) usable for source checkouts: owned service processes, readiness probes, explicit restarts, and per-instance logs. It is a single-user development convenience with the user's own OS authority, not a controlled-deployment supervision path, and it does not by itself satisfy any acceptance journey below. Installed daemons use `xshelld service` instead, which manages a per-user launchd or systemd unit.
 - Preserve easy shell and PTY access. Publish exactly what persists across commands: cwd, environment, shell state, conversation, and processes.
 - Add user-owned reusable grants where useful, scoped by host/session/workspace, capability, and lifetime. Make scope inspection and revocation straightforward. Every use still goes through M2.
 - Improve SSH status/reconnect behavior using bounded I/O and submission identities. Reattach to existing work after an interrupted connection; never retry a side effect merely because an acknowledgement was lost.
