@@ -455,6 +455,7 @@ rollback guarantees.
 - [Dual-mandate development roadmap](docs/xshell-development-roadmap.md)
 - [Security finding ledger](docs/xshell-security-findings.md)
 - [Execution mode conformance](docs/xshell-mode-conformance.md)
+- [Home-lab service runner](docs/runall.md)
 - [Original implementation plan and detailed backlog](xshell-implementation-plan.md)
 - [Release artifacts and signing](docs/releasing.md)
 - [FutureShell status and traceability](docs/futureshell-status.md)

@@ -1,8 +1,9 @@
 # xshell development roadmap: daily driver and controlled deployment
 
-**Updated:** 13 September 2026
+**Updated:** 6 October 2026
 
-**Status:** M0 baseline recorded; F1–F3 and F11 corrected; later milestones remain planned.
+**Status:** M0 baseline recorded; F1–F3 and F11 corrected; M1.3 prepared file
+access (F4, F5, F8) is the active work; later milestones remain planned.
 
 **Companion:** [Design, security, and usability review](xshell-design-security-usability-review.md).
 
@@ -107,6 +108,7 @@ Start M1.1–M1.3 first, while correcting small independent defects such as F11 
 **Work:**
 
 - Provide a documented short setup path for a configured local or hosted model, with no mandatory enterprise setup. Expose effective authority and persistence without crowding the prompt.
+- Keep the [home-lab runner](runall.md) usable for source checkouts: owned service processes, readiness probes, explicit restarts, and per-instance logs. It is a single-user development convenience with the user's own OS authority, not an installed-service or controlled-deployment supervision path, and it does not by itself satisfy any acceptance journey below.
 - Preserve easy shell and PTY access. Publish exactly what persists across commands: cwd, environment, shell state, conversation, and processes.
 - Add user-owned reusable grants where useful, scoped by host/session/workspace, capability, and lifetime. Make scope inspection and revocation straightforward. Every use still goes through M2.
 - Improve SSH status/reconnect behavior using bounded I/O and submission identities. Reattach to existing work after an interrupted connection; never retry a side effect merely because an acknowledgement was lost.
@@ -189,7 +191,7 @@ Do not allow a connector to bypass shared authorization because it supplies its 
 
 1. Preserve the recorded D1–D9 ADR, finding ledger, and mode-conformance matrix as the M0 baseline.
 2. Preserve the landed F1–F3 lifecycle corrections and F11 cwd boundary while completing the remaining findings.
-3. Implement prepared bounded file reads and stable sensitivity semantics for F4/F5/F8; correct cwd validation in the same boundary where appropriate.
+3. **Active:** implement prepared bounded file reads and stable sensitivity semantics for F4/F5/F8 as one boundary in `xshell-execution`: a policy root independent of navigational cwd, ancestry-based sensitivity classification, descriptor-bound prepared operations that authorization and acquisition share, and acquisition bounded before allocation.
 4. Remove blocking global audit I/O and add deadline/failure tests; then correct stream-completion and whole-turn budget handling.
 5. Draft the M2 operation/grant/provider contract and run one operation through personal and restrictive mock policies.
 6. Baseline the M3 home-lab journeys while the controlled deployment owner selects the M4 target environment.
