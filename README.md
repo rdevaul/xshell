@@ -195,6 +195,23 @@ cargo run -p xshell-session --bin xshelld -- \
 cargo run -p xshell-cli -- --session default
 ```
 
+To keep the daemon running without a terminal, install it as a per-user service
+— a `launchd` agent on macOS, a `systemd --user` unit on Linux:
+
+```sh
+xshelld service install     # write the unit, start it, report readiness
+xshelld service status      # unit state plus whether the daemon answers
+xshelld service restart     # replace the daemon, draining its work first
+xshelld service uninstall
+```
+
+The unit runs the installing binary and pins the configuration file it
+resolved, since a service does not inherit `XSHELL_CONFIG` from your shell;
+reinstall after moving either. Nothing is installed system-wide or as root. On
+Linux, `loginctl enable-linger` is required for the service to outlive your
+login session; on macOS a launch agent runs only while the user is logged in.
+See [session fabric](docs/session-fabric.md#per-user-service-management).
+
 Give each host a distinct `host_alias` and restart its daemon after changing
 the value. If aliases still collide, xshell adds a short stable host-ID suffix
 in catalogs, completion, and the session picker so every target remains

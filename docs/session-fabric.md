@@ -125,6 +125,66 @@ The `xshelld serve-stdio` boundary exports only `fabric` descriptors and rejects
 remote create, attach, switch, and named-close operations involving `host_only`
 sessions.
 
+## Per-user service management
+
+`xshelld service` installs and supervises the daemon through the platform's own
+per-user service manager, so a host keeps a session fabric across logins without
+anyone leaving a terminal open.
+
+| Command | Effect |
+|---|---|
+| `xshelld service install` | Write the unit, activate it, and report readiness |
+| `xshelld service status` | Report the unit's state and whether the daemon answers |
+| `xshelld service start` / `stop` | Load or unload an installed unit |
+| `xshelld service restart` | Replace the daemon, draining its work first |
+| `xshelld service uninstall` | Stop the service and remove the unit |
+
+| Platform | Manager | Unit |
+|---|---|---|
+| macOS | `launchd` user agent | `~/Library/LaunchAgents/com.xshell.xshelld.plist` |
+| Linux | `systemd --user` | `~/.config/systemd/user/xshelld.service` |
+
+Everything is per-user. There is no system-wide unit, no root, and no inbound
+network port, which is the same trust boundary the daemon's peer-credential
+check already assumes. Units are written `0600`.
+
+The unit runs the installing binary by absolute path and pins the configuration
+file with `--config`. A launch agent or user unit does not inherit the shell
+environment that normally supplies `XSHELL_CONFIG`, so an unpinned unit would
+silently run the daemon against different settings than the user's own
+invocations. Reinstall after moving the binary or changing which configuration
+file is active.
+
+`restart` asks the service manager to signal the running daemon rather than
+start a second one, so the daemon performs its own graceful drain — the SIGTERM
+path that stops admission, finishes agent, shell, and PTY work within a
+deadline, and closes audit last. A restart still interrupts work the daemon
+owns, including sessions belonging to other controllers attached to that host.
+
+Both service managers return before they have finished acting: `launchctl
+kickstart` reports success while the process is still being spawned through
+`xpcproxy`, and `launchctl bootout` returns while the old service is still
+listed. Each verb therefore waits for the state it asked for, bounded, rather
+than reading status once.
+
+A running process is not a reachable daemon — `xshelld` binds its socket after
+launch — so `install`, `start`, `restart`, and a running `status` additionally
+report whether the socket completes a handshake. Anything driving this remotely
+needs that distinction before it tries to connect.
+
+### Surviving logout
+
+A per-user service is torn down with the user's session unless the platform is
+told otherwise, which matters most for the case this exists to serve: a daemon
+installed over SSH is useless if it dies with the installing connection.
+
+- **Linux.** `systemd --user` stops the user manager when the last session ends.
+  `install` reports this and names the fix: `loginctl enable-linger USER`.
+- **macOS.** `launchd` user agents run only while the user has an active login
+  session. A Mac with nobody logged in will not keep `xshelld` running, and
+  there is no per-agent equivalent of lingering. `install` says so rather than
+  implying a guarantee the platform does not offer.
+
 ## SSH transport
 
 The client starts `ssh -T -- DEST xshelld serve-stdio` for control traffic.

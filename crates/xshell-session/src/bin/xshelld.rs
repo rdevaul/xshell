@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_platform::LockExt;
+use xshell_platform::service::{ServiceDefinition, ServiceManager, ServiceState, ServiceVerb};
 use xshell_session::{
     ClientPtyFrame, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonAudit, DaemonProbeReport,
     DaemonProbeStatus, ExecutionCoordinator, PersistenceMode, PtyAudit, PtyClaim, PtyCoordinator,
@@ -25,6 +26,11 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 const VIEW_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded wait for a service manager to finish starting or stopping a unit.
+const SERVICE_SETTLE_ATTEMPTS: usize = 20;
+const SERVICE_SETTLE_INTERVAL: Duration = Duration::from_millis(100);
+/// Bounded wait for a started daemon to begin accepting connections.
+const DAEMON_READY_ATTEMPTS: usize = 30;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -65,6 +71,25 @@ enum DaemonCommand {
     ServeStdio,
     /// Claim a PTY ticket and proxy its framed binary stream over stdin/stdout.
     ServePtyStdio,
+    /// Manage this user's xshelld service (launchd or systemd --user).
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Write the per-user unit and start the daemon.
+    Install,
+    /// Stop the daemon and remove the per-user unit.
+    Uninstall,
+    /// Start an installed service.
+    Start,
+    /// Stop a running service without removing its unit.
+    Stop,
+    /// Restart the daemon, draining its work before the replacement starts.
+    Restart,
+    /// Report the installed service's state.
+    Status,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,6 +108,14 @@ fn main() -> Result<()> {
         resolve_config_path(args.config)?
     };
     let (config, audit_config) = load_config(config_path.as_deref())?;
+    // Service management must stay usable on a host whose state directory does
+    // not exist yet — installing the service is what creates it — so this runs
+    // before the directory is required, with a best-effort socket path used
+    // only to confirm the daemon came up.
+    if let Some(DaemonCommand::Service(command)) = &args.command {
+        let socket = args.socket.clone().or_else(|| config.resolved_socket());
+        return run_service_command(command, config_path.as_deref(), socket.as_deref());
+    }
     let state_directory = args
         .state_directory
         .or_else(|| config.resolved_state_directory())
@@ -277,6 +310,253 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
     };
     let path = PathBuf::from(home).join(".config/xshell/config.toml");
     Ok(path.exists().then_some(path))
+}
+
+/// Build the service definition describing how this binary should be run.
+///
+/// The program path is this executable rather than whatever happens to be on
+/// `PATH`, so installing from a freshly bootstrapped binary registers that
+/// binary. The configuration path is pinned because a launchd agent or systemd
+/// user unit does not inherit the shell environment that normally supplies
+/// `XSHELL_CONFIG`.
+fn service_definition(config_path: Option<&Path>) -> Result<(ServiceDefinition, PathBuf)> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is required to locate this user's service directory")?;
+    let program = std::env::current_exe().context("cannot determine the running xshelld path")?;
+    let program = program.canonicalize().unwrap_or(program);
+    let log_directory = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/xshell")
+    } else {
+        home.join(".local/state/xshell")
+    };
+    Ok((
+        ServiceDefinition {
+            program,
+            config: config_path.map(Path::to_path_buf),
+            log_directory,
+        },
+        home,
+    ))
+}
+
+fn run_service_command(
+    command: &ServiceCommand,
+    config_path: Option<&Path>,
+    socket: Option<&Path>,
+) -> Result<()> {
+    let manager = ServiceManager::detect()?;
+    let (definition, home) = service_definition(config_path)?;
+    let uid = xshell_platform::effective_uid();
+    let unit_path = manager.unit_path(&home);
+
+    match command {
+        ServiceCommand::Install => {
+            let plan = manager.install_plan(&home, uid, &definition);
+            if let Some(parent) = plan.unit_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("cannot create unit directory {}", parent.display())
+                })?;
+            }
+            fs::create_dir_all(&definition.log_directory).with_context(|| {
+                format!(
+                    "cannot create log directory {}",
+                    definition.log_directory.display()
+                )
+            })?;
+            fs::write(&plan.unit_path, &plan.unit_contents)
+                .with_context(|| format!("cannot write {}", plan.unit_path.display()))?;
+            fs::set_permissions(&plan.unit_path, fs::Permissions::from_mode(0o600))?;
+            println!("wrote {}", plan.unit_path.display());
+            println!("runs: {}", definition.program_arguments().join(" "));
+            if definition.config.is_none() {
+                println!(
+                    "note: no configuration file was found, so the service runs with built-in \
+                     defaults; create ~/.config/xshell/config.toml and reinstall to pin one"
+                );
+            }
+            for spec in &plan.activate {
+                ServiceManager::run(spec)?;
+            }
+            report_service_state(manager, uid, &unit_path, Expect::Running)?;
+            report_daemon_readiness(socket);
+            report_persistence_caveat(manager);
+            Ok(())
+        }
+        ServiceCommand::Uninstall => {
+            let (teardown, reload) = manager.uninstall_commands(uid);
+            for spec in &teardown {
+                ServiceManager::run(spec)?;
+            }
+            match fs::remove_file(&unit_path) {
+                Ok(()) => println!("removed {}", unit_path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("no unit at {}", unit_path.display());
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot remove {}", unit_path.display()));
+                }
+            }
+            for spec in &reload {
+                ServiceManager::run(spec)?;
+            }
+            Ok(())
+        }
+        ServiceCommand::Status => {
+            let state = report_service_state(manager, uid, &unit_path, Expect::Settled)?;
+            if matches!(state, ServiceState::Running { .. }) {
+                report_daemon_readiness(socket);
+            }
+            Ok(())
+        }
+        ServiceCommand::Start | ServiceCommand::Stop | ServiceCommand::Restart => {
+            let (verb, expect) = match command {
+                ServiceCommand::Start => (ServiceVerb::Start, Expect::Running),
+                ServiceCommand::Stop => (ServiceVerb::Stop, Expect::NotRunning),
+                _ => (ServiceVerb::Restart, Expect::Running),
+            };
+            if !unit_path.exists() {
+                bail!(
+                    "no {} unit at {}; run `xshelld service install` first",
+                    manager.name(),
+                    unit_path.display()
+                );
+            }
+            for spec in &manager.verb_commands(verb, uid, &unit_path) {
+                ServiceManager::run(spec)?;
+            }
+            report_service_state(manager, uid, &unit_path, expect)?;
+            if expect == Expect::Running {
+                report_daemon_readiness(socket);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// What a caller is waiting for the service manager to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// Any state that is not a transition.
+    Settled,
+    Running,
+    NotRunning,
+}
+
+impl Expect {
+    fn satisfied_by(self, state: &ServiceState) -> bool {
+        match self {
+            Self::Settled => !state.is_settling(),
+            Self::Running => matches!(state, ServiceState::Running { .. }),
+            Self::NotRunning => matches!(
+                state,
+                ServiceState::Stopped | ServiceState::Installed | ServiceState::NotInstalled
+            ),
+        }
+    }
+}
+
+/// Poll until the service manager reports what the verb asked for.
+///
+/// Both service managers return before they have finished acting: `launchctl
+/// kickstart` reports success while the process is still being spawned through
+/// `xpcproxy`, and `launchctl bootout` returns while the old service is still
+/// listed. Reading status once therefore reports the previous state as if it
+/// were the result. Bounded, so a unit that never reaches the expected state
+/// still answers with whatever it actually is.
+fn service_state(
+    manager: ServiceManager,
+    uid: u32,
+    unit_path: &Path,
+    expect: Expect,
+) -> Result<ServiceState> {
+    let spec = manager.status_command(uid);
+    let mut state = ServiceState::NotInstalled;
+    for attempt in 0..SERVICE_SETTLE_ATTEMPTS {
+        let (success, output) = ServiceManager::run(&spec)?;
+        state = manager.parse_state(unit_path.exists(), success, &output);
+        if expect.satisfied_by(&state) {
+            return Ok(state);
+        }
+        if attempt + 1 < SERVICE_SETTLE_ATTEMPTS {
+            thread::sleep(SERVICE_SETTLE_INTERVAL);
+        }
+    }
+    Ok(state)
+}
+
+fn report_service_state(
+    manager: ServiceManager,
+    uid: u32,
+    unit_path: &Path,
+    expect: Expect,
+) -> Result<ServiceState> {
+    let state = service_state(manager, uid, unit_path, expect)?;
+    println!("service: {} ({})", state, manager.name());
+    Ok(state)
+}
+
+/// Report whether the started daemon is actually accepting connections.
+///
+/// A running process is not a serving daemon: `xshelld` binds its socket after
+/// launch, so a caller that connects the moment the service manager reports
+/// success gets a connection refused. Anything driving this remotely needs to
+/// know the difference between "the service manager started something" and
+/// "the session fabric is reachable".
+fn report_daemon_readiness(socket: Option<&Path>) {
+    let Some(socket) = socket else {
+        println!("daemon: socket path unknown; run `xshelld probe` to confirm readiness");
+        return;
+    };
+    for attempt in 0..DAEMON_READY_ATTEMPTS {
+        if let Ok(SessionHandshake::Opened {
+            protocol_version, ..
+        }) = xshell_session::SessionClient::probe(socket, env!("CARGO_PKG_VERSION"))
+        {
+            println!(
+                "daemon: ready on {} (protocol {protocol_version})",
+                socket.display()
+            );
+            return;
+        }
+        if attempt + 1 < DAEMON_READY_ATTEMPTS {
+            thread::sleep(SERVICE_SETTLE_INTERVAL);
+        }
+    }
+    println!(
+        "daemon: not accepting connections on {} yet; check `xshelld probe` and the service log",
+        socket.display()
+    );
+}
+
+/// Report the one thing that stops a per-user service from surviving logout.
+///
+/// This matters most for the case the service exists to serve: a daemon
+/// installed over SSH is useless if it dies with the installing session.
+fn report_persistence_caveat(manager: ServiceManager) {
+    match manager {
+        ServiceManager::Systemd => {
+            let user = system_user();
+            let Ok((_, output)) = ServiceManager::run(&ServiceManager::linger_command(&user))
+            else {
+                return;
+            };
+            if ServiceManager::parse_linger(&output) == Some(false) {
+                println!(
+                    "note: lingering is off for {user}, so this service stops when your last \
+                     session ends; run `loginctl enable-linger {user}` to keep it running for \
+                     remote connections"
+                );
+            }
+        }
+        ServiceManager::Launchd => {
+            println!(
+                "note: launchd user agents run only while this user has an active login session; \
+                 a Mac with nobody logged in will not keep xshelld running"
+            );
+        }
+    }
 }
 
 fn serve_stdio(socket: &Path) -> Result<()> {
@@ -1072,4 +1352,70 @@ fn validate_host_alias(alias: String) -> Result<String> {
 
 fn system_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| unsafe { libc::geteuid() }.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both service managers return before they have finished acting, so a verb
+    /// has to wait for the state it asked for rather than for any settled
+    /// state. Observed on macOS 15: `launchctl bootout` returns while
+    /// `launchctl print` still reports the old service as running, which made
+    /// `service stop` print "running" immediately after stopping it.
+    #[test]
+    fn stop_waits_for_the_service_to_stop_not_merely_to_settle() {
+        let running = ServiceState::Running { pid: Some(42) };
+
+        assert!(
+            !Expect::NotRunning.satisfied_by(&running),
+            "a still-running service must not satisfy a stop"
+        );
+        // `Running` is a settled state, so a settle-only wait would have
+        // returned it and reported the stop as a no-op.
+        assert!(Expect::Settled.satisfied_by(&running));
+
+        for stopped in [
+            ServiceState::Stopped,
+            ServiceState::Installed,
+            ServiceState::NotInstalled,
+        ] {
+            assert!(Expect::NotRunning.satisfied_by(&stopped), "{stopped}");
+        }
+    }
+
+    #[test]
+    fn start_waits_for_running_and_ignores_the_spawn_transition() {
+        let spawning = ServiceState::Starting {
+            detail: "xpcproxy".to_owned(),
+        };
+        assert!(!Expect::Running.satisfied_by(&spawning));
+        assert!(!Expect::Settled.satisfied_by(&spawning));
+        assert!(Expect::Running.satisfied_by(&ServiceState::Running { pid: Some(1) }));
+        // A failed unit is settled; the caller reports it rather than spinning.
+        assert!(Expect::Settled.satisfied_by(&ServiceState::Failed {
+            detail: "boom".to_owned()
+        }));
+    }
+
+    /// The unit must run the binary that installed it and pin the configuration
+    /// the daemon would otherwise read from an environment a service does not
+    /// inherit.
+    #[test]
+    fn service_definition_pins_this_binary_and_the_resolved_config() {
+        let config = PathBuf::from("/etc/xshell/config.toml");
+        let (definition, home) = service_definition(Some(&config)).unwrap();
+
+        assert_eq!(definition.config.as_deref(), Some(config.as_path()));
+        assert_eq!(definition.program, std::env::current_exe().unwrap());
+        assert!(definition.program.is_absolute());
+        assert!(definition.log_directory.starts_with(&home));
+
+        let arguments = definition.program_arguments();
+        assert_eq!(arguments[arguments.len() - 2], "--config");
+        assert_eq!(arguments[arguments.len() - 1], config.display().to_string());
+
+        let (bare, _) = service_definition(None).unwrap();
+        assert_eq!(bare.program_arguments().len(), 1);
+    }
 }
