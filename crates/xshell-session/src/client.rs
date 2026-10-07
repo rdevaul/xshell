@@ -18,6 +18,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A repair waits for the remote service manager to settle and for the daemon
+/// to accept a connection, so it needs a longer bound than a read-only probe.
+const REMOTE_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_REMOTE_PROBE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +59,51 @@ pub enum RemoteBootstrapAction {
         code: String,
         message: String,
     },
+}
+
+/// A bootstrap repair that needs no new bytes on the remote host.
+///
+/// `Start` and `Restart` act on an `xshelld` that is already installed and
+/// already speaks this protocol, using the SSH authority the controller
+/// exercises on every connect. They are therefore separable from `Install` and
+/// `Upgrade`, which place and execute new binaries and wait on the deployment
+/// authorization contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteRepair {
+    Start,
+    Restart,
+}
+
+impl RemoteRepair {
+    /// The `xshelld service` verb that performs this repair.
+    #[must_use]
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Restart => "restart",
+        }
+    }
+
+    /// The remote argument vector, passed to `ssh` as separate arguments.
+    ///
+    /// Every element is a fixed string. Nothing derived from the destination,
+    /// the probe response, or any other remote-controlled value reaches the
+    /// command, so a hostile probe reply cannot extend what runs on the host.
+    #[must_use]
+    pub fn remote_command(self) -> [&'static str; 3] {
+        ["xshelld", "service", self.verb()]
+    }
+
+    /// The repair a decision calls for, if it is one of the two that are in
+    /// scope without an installation step.
+    #[must_use]
+    pub fn for_action(action: &RemoteBootstrapAction) -> Option<Self> {
+        match action {
+            RemoteBootstrapAction::Start => Some(Self::Start),
+            RemoteBootstrapAction::Restart { .. } => Some(Self::Restart),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +260,39 @@ impl SessionClient {
         )?;
         parse_remote_probe(status, &bytes)
             .with_context(|| format!("invalid xshelld probe response from {destination:?}"))
+    }
+
+    /// Ask a remote host's service manager to start or restart its `xshelld`.
+    ///
+    /// This is the only remote-mutating operation the controller performs
+    /// without an installation step, and it changes no bytes on that host: it
+    /// runs an already-installed binary's own `service` subcommand, which waits
+    /// for the daemon to accept a connection before reporting success.
+    ///
+    /// Callers must authorize this first. A restart in particular terminates
+    /// work the remote daemon owns, including sessions belonging to other
+    /// controllers attached to that host.
+    pub fn repair_ssh(destination: &str, repair: RemoteRepair) -> Result<String> {
+        validate_ssh_destination(destination)?;
+        let (status, bytes) = run_bounded_ssh(
+            destination,
+            &repair.remote_command(),
+            MAX_REMOTE_PROBE_BYTES,
+            REMOTE_REPAIR_TIMEOUT,
+            "service repair",
+        )?;
+        let output = String::from_utf8_lossy(&bytes).trim().to_owned();
+        if !status.success() {
+            bail!(
+                "`xshelld service {}` on {destination:?} exited with {status}; an xshelld older \
+                 than the service subcommand cannot be repaired remotely and needs its daemon \
+                 started by hand{}{}",
+                repair.verb(),
+                if output.is_empty() { "" } else { ": " },
+                output
+            );
+        }
+        Ok(output)
     }
 
     /// Detect the release target for a remote macOS or Linux host without
@@ -804,5 +885,63 @@ mod tests {
         );
         assert!(parse_remote_target(b"FreeBSD amd64\n").is_err());
         assert!(parse_remote_target(b"Linux\n").is_err());
+    }
+
+    /// A repair runs a fixed argument vector. The destination is handed to
+    /// `ssh` separately and after `--`, and nothing from the probe response
+    /// reaches the remote command, so a hostile or malformed probe reply cannot
+    /// extend what executes on the host.
+    #[test]
+    fn a_repair_runs_a_fixed_remote_command() {
+        assert_eq!(
+            RemoteRepair::Start.remote_command(),
+            ["xshelld", "service", "start"]
+        );
+        assert_eq!(
+            RemoteRepair::Restart.remote_command(),
+            ["xshelld", "service", "restart"]
+        );
+
+        for repair in [RemoteRepair::Start, RemoteRepair::Restart] {
+            for argument in repair.remote_command() {
+                assert!(
+                    argument
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric()),
+                    "{argument:?} must stay a bare token with no shell metacharacters"
+                );
+            }
+        }
+    }
+
+    /// The repair set is derived from the decision matrix, so a future action
+    /// variant cannot silently become remotely repairable.
+    #[test]
+    fn repairs_cover_exactly_the_actions_that_need_no_new_bytes() {
+        assert_eq!(
+            RemoteRepair::for_action(&RemoteBootstrapAction::Start),
+            Some(RemoteRepair::Start)
+        );
+        assert_eq!(
+            RemoteRepair::for_action(&RemoteBootstrapAction::Restart {
+                reason: "protocol drift".into()
+            }),
+            Some(RemoteRepair::Restart)
+        );
+        assert_eq!(
+            RemoteRepair::for_action(&RemoteBootstrapAction::Install),
+            None
+        );
+        assert_eq!(
+            RemoteRepair::for_action(&RemoteBootstrapAction::Upgrade {
+                binary_version: "0.1.0".into(),
+                supported_protocol_version: 9,
+            }),
+            None
+        );
+        assert_eq!(
+            RemoteRepair::for_action(&RemoteBootstrapAction::Connect),
+            None
+        );
     }
 }

@@ -1,14 +1,17 @@
 use crate::config::ActiveModel;
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy};
 use xshell_session::{
     AgentTurnPhase, EventBatch, PersistenceMode, PtySize, PtyStreamClient, PtyTicket,
-    RemoteBootstrapAction, SessionActivity, SessionClient, SessionConfig, SessionCreation,
-    SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput, ViewResource, Visibility,
+    RemoteBootstrapAction, RemoteRepair, SessionActivity, SessionClient, SessionConfig,
+    SessionCreation, SessionDescriptor, SessionSnapshot, SessionStatus, TurnInput, ViewResource,
+    Visibility,
 };
+use xshell_view::sanitize_terminal_text;
 
 struct HostConnection {
     client: SessionClient,
@@ -201,7 +204,7 @@ impl SessionRuntime {
         system_prompt: &str,
     ) -> Result<SessionSnapshot> {
         match SessionClient::probe_ssh(destination) {
-            Ok(probe) => require_connectable_remote(probe.required_action())?,
+            Ok(probe) => prepare_remote_host(destination, probe.required_action())?,
             Err(error) => eprintln!(
                 "xshell: remote capability probe unavailable; trying the legacy direct connection: {error:#}"
             ),
@@ -699,6 +702,112 @@ session's interactive process is running; stop it first"
     }
 }
 
+/// Bring a remote host to a connectable state, repairing it once if the user
+/// authorizes the repair.
+///
+/// A repair runs the remote `xshelld`'s own `service` verb; it installs
+/// nothing. The host is re-probed afterwards rather than assumed fixed, because
+/// a service manager reporting success is not the same fact as a daemon
+/// answering the protocol.
+fn prepare_remote_host(destination: &str, action: RemoteBootstrapAction) -> Result<()> {
+    let Some(repair) = RemoteRepair::for_action(&action) else {
+        return require_connectable_remote(action);
+    };
+    describe_repair(destination, &action, repair);
+    if !confirm_remote_repair(destination, repair)? {
+        // Declining is an ordinary outcome, so report the state the user is
+        // choosing to leave in place rather than a bare refusal.
+        return require_connectable_remote(action);
+    }
+
+    let output = SessionClient::repair_ssh(destination, repair)?;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        println!("  {}", sanitize_terminal_text(line));
+    }
+
+    let action = SessionClient::probe_ssh(destination)
+        .with_context(|| {
+            format!(
+                "cannot re-probe {destination:?} after `xshelld service {}`",
+                repair.verb()
+            )
+        })?
+        .required_action();
+    if action == RemoteBootstrapAction::Connect {
+        println!("xshell: {destination} is ready");
+        return Ok(());
+    }
+    // One attempt only: repeating a repair that did not take would just wait
+    // out the same timeout again.
+    require_connectable_remote(action).with_context(|| {
+        format!(
+            "`xshelld service {}` on {destination:?} did not make the host connectable",
+            repair.verb()
+        )
+    })
+}
+
+/// State the repair and its blast radius before asking for it.
+fn describe_repair(destination: &str, action: &RemoteBootstrapAction, repair: RemoteRepair) {
+    match action {
+        RemoteBootstrapAction::Start => {
+            println!("xshell: {destination} has xshelld installed but its daemon is not running");
+        }
+        RemoteBootstrapAction::Restart { reason } => {
+            println!("xshell: {destination} needs its daemon restarted: {reason}");
+            println!(
+                "  a restart ends work that daemon owns, including sessions held by other \
+                 controllers attached to {destination}"
+            );
+        }
+        _ => {}
+    }
+    println!(
+        "  proposed: ssh {destination} xshelld service {}",
+        repair.verb()
+    );
+}
+
+/// Ask before mutating another host.
+///
+/// `//connect` is user-initiated, but starting or restarting a service on a
+/// different machine is still a remote effect with its own blast radius, and it
+/// is deliberately not governed by the agent approval policy: `--approval off`
+/// expresses trust in the model, not authority to restart another host's
+/// daemon. A non-interactive controller cannot answer, so it is told what to
+/// run instead of having the repair performed on its behalf.
+fn confirm_remote_repair(destination: &str, repair: RemoteRepair) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!(
+            "{destination:?} needs `xshelld service {}` but this controller is not interactive; \
+             run it on that host, or connect from a terminal to authorize it",
+            repair.verb()
+        );
+    }
+    loop {
+        print!(
+            "Run `xshelld service {}` on {destination}? [y/N] ",
+            repair.verb()
+        );
+        io::stdout()
+            .flush()
+            .context("could not flush repair prompt")?;
+        let mut answer = String::new();
+        if io::stdin()
+            .read_line(&mut answer)
+            .context("could not read repair approval")?
+            == 0
+        {
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => eprintln!("Please answer y (repair) or n (leave the host alone)."),
+        }
+    }
+}
+
 fn require_connectable_remote(action: RemoteBootstrapAction) -> Result<()> {
     match action {
         RemoteBootstrapAction::Connect => Ok(()),
@@ -713,11 +822,11 @@ fn require_connectable_remote(action: RemoteBootstrapAction) -> Result<()> {
             xshell_session::SESSION_PROTOCOL_VERSION
         ),
         RemoteBootstrapAction::Start => bail!(
-            "the remote xshelld binary is compatible but its daemon is unavailable; start or install its user service"
+            "the remote xshelld binary is compatible but its daemon is unavailable; run `xshelld service start` on that host, or reconnect and authorize the repair"
         ),
         RemoteBootstrapAction::Restart { reason } => {
             bail!(
-                "the installed remote xshelld is compatible but its daemon must be restarted: {reason}"
+                "the installed remote xshelld is compatible but its daemon must be restarted ({reason}); run `xshelld service restart` on that host, or reconnect and authorize the repair"
             )
         }
         RemoteBootstrapAction::Rejected { code, message } => {
@@ -848,6 +957,73 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("supports protocol 10")
+        );
+    }
+
+    /// Only the two repairs that need no new bytes on the remote host are in
+    /// scope. Install and upgrade place and execute binaries and wait on the
+    /// deployment authorization contract, so they must not become repairable
+    /// by accident when a new action variant is added.
+    #[test]
+    fn only_start_and_restart_are_repairable_without_installing() {
+        assert_eq!(
+            RemoteRepair::for_action(&RemoteBootstrapAction::Start),
+            Some(RemoteRepair::Start)
+        );
+        assert_eq!(
+            RemoteRepair::for_action(&RemoteBootstrapAction::Restart {
+                reason: "old daemon".into()
+            }),
+            Some(RemoteRepair::Restart)
+        );
+
+        for action in [
+            RemoteBootstrapAction::Connect,
+            RemoteBootstrapAction::Install,
+            RemoteBootstrapAction::Upgrade {
+                binary_version: "0.1.0".into(),
+                supported_protocol_version: 10,
+            },
+            RemoteBootstrapAction::Rejected {
+                code: "handshake".into(),
+                message: "no".into(),
+            },
+        ] {
+            assert_eq!(
+                RemoteRepair::for_action(&action),
+                None,
+                "{action:?} must not be repaired by a service verb"
+            );
+        }
+    }
+
+    /// The repair runs an `xshelld service` verb and nothing else, so a
+    /// destination can never be interpreted as part of the remote command.
+    #[test]
+    fn repair_verbs_name_the_service_subcommand() {
+        assert_eq!(RemoteRepair::Start.verb(), "start");
+        assert_eq!(RemoteRepair::Restart.verb(), "restart");
+    }
+
+    /// Declining a repair must leave the user with the same actionable
+    /// diagnosis they would get with repair unavailable, including how to fix
+    /// the host by hand.
+    #[test]
+    fn declining_a_repair_still_explains_how_to_fix_the_host() {
+        let start = require_connectable_remote(RemoteBootstrapAction::Start)
+            .unwrap_err()
+            .to_string();
+        assert!(start.contains("xshelld service start"), "{start}");
+
+        let restart = require_connectable_remote(RemoteBootstrapAction::Restart {
+            reason: "running daemon speaks protocol 11".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(restart.contains("xshelld service restart"), "{restart}");
+        assert!(
+            restart.contains("running daemon speaks protocol 11"),
+            "the probe's reason must survive into the message: {restart}"
         );
     }
 }

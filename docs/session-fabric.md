@@ -227,10 +227,47 @@ six explicit controller actions:
 | compatible binary and daemon | connect |
 | structured non-version rejection | stop and report |
 
-This decision is read-only. `//connect` now preflights a remote host, proceeds
-when it is ready, and reports the exact repair needed otherwise. It falls back
+The decision itself is read-only. `//connect` preflights a remote host, proceeds
+when it is ready, and otherwise reports the exact repair needed. It falls back
 to the legacy direct stdio connection when an older helper cannot produce a
 valid probe, preserving compatibility with already working deployments.
+
+### Authorized remote repair
+
+Two of those actions — **start** and **restart** — place no new bytes on the
+remote host. They run an already-installed, already-compatible binary's own
+[`service`](#per-user-service-management) verb, using the SSH authority the
+controller exercises on every connect. `//connect` can therefore offer to
+perform them, while install and upgrade remain out of scope pending the
+deployment authorization contract.
+
+The flow is: probe, describe, ask, repair once, re-probe, then connect. The host
+is re-probed rather than assumed fixed, because a service manager reporting
+success is not the same fact as a daemon answering the protocol — the remote
+`service` verb waits for a handshake, and the controller confirms it
+independently.
+
+Authorization is explicit and separate from the agent approval policy.
+`--approval off` expresses trust in the model, not authority to restart another
+host's daemon, so a repair always prompts. A non-interactive controller cannot
+answer and is told what to run instead of having the repair performed for it.
+Declining is an ordinary outcome: it reports the same diagnosis and manual fix
+the user would get if repair were unavailable.
+
+The prompt states the blast radius before asking. A restart ends work the remote
+daemon owns, **including sessions held by other controllers attached to that
+host**. Only one repair attempt is made; repeating a repair that did not take
+would just wait out the same timeout again.
+
+The remote command is a fixed argument vector (`xshelld service start` or
+`xshelld service restart`) passed to `ssh` after `--`, with the destination as a
+separate argument. Nothing from the probe response reaches it. The repair is
+bounded at 64 KiB of output and a sixty-second deadline — longer than the
+read-only probe because it waits for the service manager to settle and for the
+daemon to accept a connection. Remote output is sanitized before display.
+
+An `xshelld` older than the `service` subcommand cannot be repaired this way;
+the failure says so and names the manual fix.
 
 The trusted-artifact foundation is implemented separately from remote
 mutation. `xshell-release` accepts a configured HTTPS manifest URL and pinned

@@ -11,7 +11,8 @@ mod view;
 
 pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy};
 pub use client::{
-    RemoteBootstrapAction, RemoteDaemonProbe, RemoteTarget, SessionClient, SessionHandshake,
+    RemoteBootstrapAction, RemoteDaemonProbe, RemoteRepair, RemoteTarget, SessionClient,
+    SessionHandshake,
 };
 pub use completion::complete_shell;
 pub use execution::ExecutionCoordinator;

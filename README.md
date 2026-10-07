@@ -86,13 +86,15 @@ daily-driver milestones, and the separate controlled-deployment acceptance gates
 | Safety | Exact-command approval, remote-host approval ceilings, cwd-confined file tools, sensitive-path gating, execution time/output limits, and process-group cleanup |
 | Audit | Separate append-only service, hash-chained JSONL, Ed25519-signed checkpoints, daemon-side execution events, and opt-in bounded byte-for-byte PTY stream capture |
 
-The major pieces that are **not** implemented yet are automatic installation
-and service setup on remote hosts, resilient SSH supervision, a shared
-`/xshell` filesystem namespace, binary/media viewer plugins and CAD rendering,
-multi-user sessions and ACLs, and restoration of an in-flight process across an
-`xshelld` restart. FutureShell—the contractual workflow and bounded-rollback
-language planned on top of this fabric—is currently a design and roadmap, not
-an executable language.
+`//connect` can start or restart an already-installed remote daemon for you,
+with explicit authorization and a re-probe before it connects. The major pieces
+that are **not** implemented yet are automatic *installation* and upgrade of
+`xshelld` on remote hosts, resilient SSH supervision, a shared `/xshell`
+filesystem namespace, binary/media viewer plugins and CAD rendering, multi-user
+sessions and ACLs, and restoration of an in-flight process across an `xshelld`
+restart. FutureShell—the contractual workflow and bounded-rollback language
+planned on top of this fabric—is currently a design and roadmap, not an
+executable language.
 
 An experimental typed dataflow representation for FutureShell is available in
 `crates/xshell-flow`. It models tasks, contract-gated branches, parallel joins,
