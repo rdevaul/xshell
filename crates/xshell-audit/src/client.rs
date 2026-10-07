@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -16,8 +17,24 @@ pub struct AuditClient {
 
 impl AuditClient {
     pub fn connect(socket: &Path, client_version: &str) -> Result<Self> {
+        Self::connect_with_timeout(socket, client_version, None)
+    }
+
+    pub fn probe(socket: &Path, client_version: &str) -> Result<()> {
+        Self::connect_with_timeout(socket, client_version, Some(Duration::from_secs(2)))?
+            .close()?;
+        Ok(())
+    }
+
+    fn connect_with_timeout(
+        socket: &Path,
+        client_version: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
         let stream = UnixStream::connect(socket)
             .with_context(|| format!("cannot connect to audit service at {}", socket.display()))?;
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
         set_close_on_exec(&stream)?;
         let writer = stream.try_clone().context("cannot clone audit socket")?;
         set_close_on_exec(&writer)?;

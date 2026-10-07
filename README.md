@@ -116,6 +116,11 @@ cd xshell
 cargo run -p xshell-cli
 ```
 
+For persistent home-lab services, enable the session fabric in your config and
+use `./scripts/runall.sh --config /absolute/path/to/config.toml`. The
+[home-lab runner guide](docs/runall.md) covers service ownership, readiness,
+explicit restarts, and logs. The runner also requires Python 3.11 or newer.
+
 The standalone mode keeps execution inside the CLI and is the shortest path to
 trying the agent/shell REPL. The three input routes are always explicit:
 

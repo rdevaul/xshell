@@ -28,6 +28,12 @@ struct Args {
 
     #[arg(long)]
     checkpoint_interval: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Check a running service by opening and closing an audit log"
+    )]
+    probe: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,14 +45,17 @@ struct ConfigFile {
 fn main() -> Result<()> {
     let args = Args::parse();
     let config = load_config(args.config.as_deref())?;
-    let directory = args
-        .directory
-        .or(config.directory)
-        .context("audit directory is required (--directory or audit.directory)")?;
     let socket = args
         .socket
         .or(config.socket)
         .context("audit socket is required (--socket or audit.socket)")?;
+    if args.probe {
+        return xshell_audit::AuditClient::probe(&socket, env!("CARGO_PKG_VERSION"));
+    }
+    let directory = args
+        .directory
+        .or(config.directory)
+        .context("audit directory is required (--directory or audit.directory)")?;
     let checkpoint_interval = args
         .checkpoint_interval
         .unwrap_or(config.checkpoint_interval);
