@@ -2,7 +2,7 @@
 
 **Status:** M0 baseline; unsupported and unverified cells are explicit
 
-**Updated:** 13 September 2026
+**Updated:** 6 October 2026
 
 This matrix identifies which shared lifecycle guarantees each current mode
 must satisfy. It is not a claim that all guarantees are implemented today.
@@ -58,7 +58,7 @@ or not a directory; it does not silently substitute another directory.
 | Agent/captured-shell cancellation | Pipeline and grandchild delayed-marker regressions tagged F2 | Repeat on supported macOS/Linux targets |
 | Daemon shutdown | SIGTERM all-mode, audit-ordering, and SIGKILL recovery tests tagged F3 | Repeat on supported macOS/Linux targets |
 | PTY termination | PTY coordinator and daemon SIGTERM integration tests | Bound audit-stall behavior under F6 |
-| Required audit failure | Existing reservation/audit failure test | Add non-acknowledging peer deadline test for F6 |
+| Required audit failure | Existing reservation/audit failure test; `AuditClient::probe` deadline test | Add the equivalent non-acknowledging peer deadline to the session append path for F6 |
 | Cwd validation | Shared engine/CLI/registry tests tagged F11 | Repeat mode matrix on supported targets |
 
 The controlled deployment adds authorization, data-domain, provider, and

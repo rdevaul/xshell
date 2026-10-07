@@ -1,6 +1,6 @@
 # FutureShell status
 
-**Last reviewed:** 2026-09-13
+**Last reviewed:** 2026-10-06
 
 **Overall status:** Pre-alpha design and planning prototype. FutureShell is not
 an executable language or runtime.
@@ -71,12 +71,19 @@ xshell components.
 
 ## Immediate sequence
 
-1. Complete the shared M1 lifecycle and access corrections and establish the
-   M2 authorization/provider boundary.
-2. Prove one bounded structured-plan workflow under the personal and
+1. Complete the shared M1 lifecycle and access corrections. M1.3 prepared file
+   access (F4, F5, F8) is the active work; F6, F7, F9, and F10 follow.
+2. Establish the M2 authorization/provider boundary. Its grants bind to the
+   prepared operations produced by M1.3.
+3. Prove one bounded structured-plan workflow under the personal and
    controlled profiles as the narrow M5 slice; this does not complete FS1–FS4.
-3. Resume `xshell-language` and `xshell-run check|fmt|plan`; the textual
+4. Resume `xshell-language` and `xshell-run check|fmt|plan`; the textual
    frontend remains required before FS1 can be declared complete.
+
+No FutureShell milestone artifact has landed since 2026-09-13. Work in that
+interval was shared xshell substrate and daily-driver infrastructure, which
+advances the M1–M3 prerequisites without changing any state in the milestone
+ledger above.
 
 FS2 through FS4 form the first useful local release. Agent and remote execution
 remain later milestones so they do not enter the trusted transaction and

@@ -1,6 +1,6 @@
 # xshell security finding ledger
 
-**Updated:** 13 September 2026
+**Updated:** 6 October 2026
 
 **Authority:** The evidence and acceptance conditions in the
 [design, security, and usability review](xshell-design-security-usability-review.md)
@@ -48,6 +48,18 @@ PTYs, including descendant-process cleanup and audit-close ordering. A durable
 pre-dispatch marker converts SIGKILL leftovers into an explicit
 `outcome_unknown` recovery record. Audit-peer responsiveness remains the
 separate F6 correction.
+
+F4, F5, and F8 are the current P1/P2 work. They share one cause — authorization
+and acquisition resolve the path independently — so M1.3 corrects them as a
+single prepared-operation boundary in `xshell-execution` rather than three
+separate patches.
+
+`AuditClient::probe` adds bounded socket read/write waits and has a
+non-acknowledging-peer regression test, but it is a readiness check for the
+[home-lab runner](runall.md), not an F6 correction. `AuditClient::connect` still
+sets no deadlines, and `SessionAuditHandle::append`
+(`crates/xshell-session/src/audit.rs:234`) still holds the global session map
+lock across socket I/O. F6 remains Open.
 
 The [development roadmap](xshell-development-roadmap.md) remains the
 cross-product sequencing authority.
