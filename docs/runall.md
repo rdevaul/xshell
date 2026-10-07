@@ -2,9 +2,10 @@
 
 `scripts/runall.sh` builds xshell and manages the services enabled in one TOML
 configuration. It requires macOS or Linux, Rust, and Python 3.11 or newer.
-It is intended for source-checkout development. Use an OS service manager
-for an installed daemon; give it separate sockets and data directories from
-any runner instance.
+It is intended for source-checkout development. For an installed daemon use
+`xshelld service` ([session fabric](session-fabric.md#per-user-service-management)),
+which manages a per-user launchd or systemd unit; give it separate sockets and
+data directories from any runner instance.
 
 Enable `[session_fabric]` and, optionally, `[audit]` in your configuration.
 Use absolute socket and data-directory paths. Each directory must belong to
