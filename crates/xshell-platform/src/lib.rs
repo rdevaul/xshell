@@ -10,6 +10,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+pub mod service;
+
 /// The effective user ID of this process.
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid(2) has no preconditions and cannot fail.
