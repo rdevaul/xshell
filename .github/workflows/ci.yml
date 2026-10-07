@@ -31,6 +31,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run tests
         run: cargo test --workspace --all-targets
+      - name: Test home-lab runner lifecycle
+        env:
+          XSHELL_RUNALL_REAL_BIN_DIR: target/debug
+        run: |
+          cargo build --locked -p xshell-audit -p xshell-session -p xshell-cli --bins
+          python3 -B -m unittest discover -s scripts/tests -v
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

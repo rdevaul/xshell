@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -100,4 +100,79 @@ fn daemon_accepts_a_session_and_produces_a_verifiable_log() {
     .unwrap();
     assert_eq!(report.records, 1);
     assert!(report.final_checkpoint);
+}
+
+#[test]
+fn probe_checks_audit_writes_without_replacing_the_listener() {
+    let temp = TempDir::new().unwrap();
+    let directory = temp.path().join("logs");
+    let socket = temp.path().join("audit.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshell-auditd"))
+        .arg("--directory")
+        .arg(&directory)
+        .arg("--socket")
+        .arg(&socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _guard = ChildGuard(child);
+    for _ in 0..100 {
+        if UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_xshell-auditd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--probe")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let logs = std::fs::read_dir(directory.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 1);
+    let report = verify_log(&logs[0], &directory.join("signing-key.pub")).unwrap();
+    assert_eq!(report.records, 0);
+    assert!(report.final_checkpoint);
+    AuditClient::connect(&socket, "after-probe")
+        .unwrap()
+        .close()
+        .unwrap();
+}
+
+#[test]
+fn probe_fails_for_an_unavailable_service() {
+    let temp = TempDir::new().unwrap();
+    let socket = temp.path().join("missing.sock");
+    let output = Command::new(env!("CARGO_BIN_EXE_xshell-auditd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--probe")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!socket.exists());
+}
+
+#[test]
+fn probe_times_out_when_the_service_stops_replying() {
+    let temp = TempDir::new().unwrap();
+    let socket = temp.path().join("hung.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (finished, wait) = std::sync::mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (_connection, _) = listener.accept().unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(5));
+    });
+    let started = std::time::Instant::now();
+    let result = AuditClient::probe(&socket, "test");
+    let elapsed = started.elapsed();
+    finished.send(()).unwrap();
+    server.join().unwrap();
+    assert!(result.is_err());
+    assert!(elapsed < Duration::from_secs(4));
 }
