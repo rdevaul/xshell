@@ -10,3 +10,6 @@ current.config.toml
 flow.dot
 flow.png
 flow.svg
+
+# pyenv
+.python-version
