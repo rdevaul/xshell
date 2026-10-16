@@ -9,12 +9,15 @@ use std::path::PathBuf;
 /// - 2: adds `AuditEvent::HistoryCompacted`.
 /// - 3: adds `AuditEvent::TerminalStream` and the `terminal_stream` field on
 ///   `AuditEvent::LogicalSessionAttached`.
-pub const AUDIT_FORMAT_VERSION: u32 = 3;
+/// - 4: adds `AuditEvent::AutoContinued` and the `reasoning` and
+///   `finish_reason` fields on `AuditEvent::AgentResponse`.
+pub const AUDIT_FORMAT_VERSION: u32 = 4;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 // Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
-// `AuditEvent::TerminalStream`. Tagged enum variants are not
-// forward-compatible in serde, so mixed-version peers must fail at handshake.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 4;
+// `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`.
+// Tagged enum variants are not forward-compatible in serde, so mixed-version
+// peers must fail at handshake.
+pub const AUDIT_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -104,6 +107,21 @@ pub enum AuditEvent {
         content: String,
         tool_call_count: usize,
         partial: bool,
+        /// The model's reasoning for this response, when the provider streams
+        /// it separately. Skipped when absent so records written before
+        /// format 4 re-serialize, and therefore hash, unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        /// The provider's reason for ending generation, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
+    /// The model ended a response without a tool call while apparently
+    /// mid-task, so xshell sent `prompt` as a user message and kept the turn
+    /// going. `reason` names the heuristic that fired.
+    AutoContinued {
+        reason: String,
+        prompt: String,
     },
     AgentError {
         message: String,

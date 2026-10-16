@@ -512,6 +512,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_responses_written_before_reasoning_existed_hash_unchanged() {
+        // Byte-for-byte the shape format-3 writers produced. The verifier
+        // re-serializes each body to check its hash, so the optional fields
+        // added in format 4 must not appear when absent.
+        let old = r#"{"format_version":3,"session_id":"s","sequence":7,"daemon_timestamp_unix_ms":1,"client_uid":501,"previous_hash":"00","event":{"type":"agent_response","content":"Let me check.","tool_call_count":0,"partial":false}}"#;
+        let body: AuditRecordBody = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&body).unwrap(), old);
+
+        let new = old.replace(
+            r#""partial":false}"#,
+            r#""partial":false,"reasoning":"the tests","finish_reason":"stop"}"#,
+        );
+        let body: AuditRecordBody = serde_json::from_str(&new).unwrap();
+        assert_eq!(serde_json::to_string(&body).unwrap(), new);
+    }
+
+    #[test]
     fn verifier_rejects_a_future_format() {
         let temp = TempDir::new().unwrap();
         let identity = SigningIdentity::load_or_create(temp.path()).unwrap();

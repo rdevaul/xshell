@@ -20,9 +20,17 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::{Notify, mpsc};
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
-use xshell_core::{AgentEvent, ChatMessage, ChatRequest, ToolCall};
+use xshell_core::{AgentEvent, AssistantResponse, ChatMessage, ChatRequest, ToolCall};
 
 const MAX_AGENT_STEPS: usize = 64;
+/// How many times one turn may be nudged to keep going after the model ends a
+/// response without a tool call while apparently mid-task.
+const MAX_AUTO_CONTINUES: usize = 2;
+const ANNOUNCED_STEP_PROMPT: &str = "[xshell] Your last message announced another step but \
+contained no tool call, so the turn would have ended there. If you meant to use a tool, call it \
+now. If you are finished, give your final answer.";
+const EMPTY_RESPONSE_PROMPT: &str = "[xshell] Your last message was empty. Continue the task: \
+call a tool if you need one, or give your final answer.";
 const DIRECT_SHELL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DIRECT_SHELL_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -85,6 +93,19 @@ pub enum ExecutionEvent {
         content: String,
         tool_call_count: usize,
         partial: bool,
+        /// Reasoning the provider streamed apart from `content`. Absent in
+        /// journals written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
+    /// The model ended a response without a tool call while apparently
+    /// mid-task; `prompt` was added to the history as a user message and the
+    /// turn continued.
+    AutoContinued {
+        reason: String,
+        prompt: String,
     },
     ToolRequested {
         call: ToolCall,
@@ -266,6 +287,62 @@ pub fn compact_history(
     }
 }
 
+/// Whether a response that ends without a tool call looks like the model
+/// stopped mid-task rather than finished, and if so which nudge to send.
+///
+/// Reasoning models occasionally emit end-of-turn right after announcing their
+/// next action ("Let me check the tests.") or after reasoning with no visible
+/// output. Either would otherwise end the turn silently. A truncated response
+/// (`finish_reason` "length") is not retried: the same request would hit the
+/// same limit.
+fn auto_continue_reason(response: &AssistantResponse) -> Option<(&'static str, &'static str)> {
+    if !response.tool_calls.is_empty() || response.finish_reason.as_deref() == Some("length") {
+        return None;
+    }
+    let content = response.content.trim();
+    if content.is_empty() {
+        return Some(("empty_response", EMPTY_RESPONSE_PROMPT));
+    }
+    let last_line = content
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    announces_next_step(last_line)
+        .then_some(("announced_step_without_tool_call", ANNOUNCED_STEP_PROMPT))
+}
+
+/// True when the last sentence of `line` announces an action the model is
+/// about to take, e.g. "Tests pass. Let me check the docs next."
+fn announces_next_step(line: &str) -> bool {
+    const OPENERS: [&str; 12] = [
+        "let me ",
+        "let's ",
+        "i'll ",
+        "i will ",
+        "i'm going to ",
+        "i am going to ",
+        "now let me ",
+        "now i'll ",
+        "next, ",
+        "next i'll ",
+        "first, let me ",
+        "first i'll ",
+    ];
+    if line.len() > 400 || line.ends_with('?') {
+        return false;
+    }
+    let line = line.to_lowercase().replace('\u{2019}', "'");
+    let body = line.trim_end_matches(['.', ':', '!', ' ']);
+    let sentence = body
+        .rfind(". ")
+        .or_else(|| body.rfind("! "))
+        .map_or(body, |index| &body[index + 2..])
+        .trim_start_matches(|c: char| c.is_whitespace() || "*_#->".contains(c));
+    !sentence.starts_with("let me know")
+        && OPENERS.iter().any(|opener| sentence.starts_with(opener))
+}
+
 pub async fn run_agent_turn(
     agent: &mut dyn AgentAdapter,
     history: &mut Vec<ChatMessage>,
@@ -283,6 +360,7 @@ pub async fn run_agent_turn(
     let mut request_compaction = policy.compactor.compact(history);
     let tools = definitions();
     let mut observed_tool_activity = false;
+    let mut auto_continues = 0;
 
     for _ in 0..MAX_AGENT_STEPS {
         let mut streamed_text = String::new();
@@ -323,6 +401,8 @@ pub async fn run_agent_turn(
                         content: streamed_text,
                         tool_call_count: 0,
                         partial: true,
+                        reasoning: None,
+                        finish_reason: None,
                     });
                 }
                 preserve_or_rollback_failed_turn(
@@ -346,15 +426,29 @@ pub async fn run_agent_turn(
             content: response.content.clone(),
             tool_call_count: response.tool_calls.len(),
             partial: false,
+            reasoning: response.reasoning.clone(),
+            finish_reason: response.finish_reason.clone(),
         });
         for call in &response.tool_calls {
             observer.emit(ExecutionEvent::ToolRequested { call: call.clone() });
         }
-        history.push(ChatMessage::assistant_with_tools(
-            response.content,
-            response.tool_calls.clone(),
-        ));
+        let continue_reason = auto_continue_reason(&response);
+        history.push(
+            ChatMessage::assistant_with_tools(response.content, response.tool_calls.clone())
+                .with_reasoning(response.reasoning),
+        );
         if response.tool_calls.is_empty() {
+            if let Some((reason, prompt)) = continue_reason
+                && auto_continues < MAX_AUTO_CONTINUES
+            {
+                auto_continues += 1;
+                observer.emit(ExecutionEvent::AutoContinued {
+                    reason: reason.into(),
+                    prompt: prompt.into(),
+                });
+                history.push(ChatMessage::user(prompt));
+                continue;
+            }
             compact_history(policy, history, observer);
             return Ok(());
         }
@@ -849,6 +943,7 @@ mod tests {
                 ExecutionEvent::ToolResult { .. } => "result",
                 ExecutionEvent::TurnAborted => "aborted",
                 ExecutionEvent::HistoryCompacted { .. } => "compacted",
+                ExecutionEvent::AutoContinued { .. } => "continued",
             })
             .collect()
     }
@@ -872,10 +967,12 @@ mod tests {
                 AssistantResponse {
                     content: "looking".into(),
                     tool_calls: vec![list_call("a"), shell_call("b", "printf hi")],
+                    ..Default::default()
                 },
                 AssistantResponse {
                     content: "done".into(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 },
             ]),
             requests: Vec::new(),
@@ -943,6 +1040,7 @@ mod tests {
                     shell_call("b", "true"),
                     list_call("c"),
                 ],
+                ..Default::default()
             }]),
             requests: Vec::new(),
         };
@@ -1002,10 +1100,12 @@ mod tests {
                 AssistantResponse {
                     content: String::new(),
                     tool_calls: vec![shell_call("a", "true")],
+                    ..Default::default()
                 },
                 AssistantResponse {
                     content: "ok".into(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 },
             ]),
             requests: Vec::new(),
@@ -1046,14 +1146,17 @@ mod tests {
                 AssistantResponse {
                     content: big.clone(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 },
                 AssistantResponse {
                     content: big.clone(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 },
                 AssistantResponse {
                     content: big.clone(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 },
             ]),
             requests: Vec::new(),
@@ -1123,6 +1226,7 @@ mod tests {
             responses: VecDeque::from([AssistantResponse {
                 content: "recovered".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             }]),
             requests: Vec::new(),
         };
@@ -1227,6 +1331,7 @@ mod tests {
                     "effect",
                     &format!("printf done > {}", marker.display()),
                 )],
+                ..Default::default()
             }]),
             requests: Vec::new(),
         };
@@ -1268,6 +1373,7 @@ mod tests {
             responses: VecDeque::from([AssistantResponse {
                 content: "reconciled".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             }]),
             requests: Vec::new(),
         };
@@ -1335,6 +1441,7 @@ mod tests {
                     "a",
                     &format!("touch {}", marker.to_string_lossy()),
                 )],
+                ..Default::default()
             }]),
             requests: Vec::new(),
         };
@@ -1385,6 +1492,7 @@ mod tests {
             responses: VecDeque::from([AssistantResponse {
                 content: String::new(),
                 tool_calls: vec![shell_call("cancelled", &command)],
+                ..Default::default()
             }]),
             requests: Vec::new(),
         };
@@ -1502,5 +1610,205 @@ mod tests {
             Path::new(result.stdout.trim()),
             child.canonicalize().unwrap()
         );
+    }
+
+    fn scripted_observer() -> RecordingObserver {
+        RecordingObserver {
+            events: Vec::new(),
+            decisions: VecDeque::new(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_reasoning_is_kept_in_history_and_reported() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![list_call("a")],
+                    reasoning: Some("list the directory first".into()),
+                    finish_reason: Some("tool_calls".into()),
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    finish_reason: Some("stop".into()),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = scripted_observer();
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            history[1].reasoning.as_deref(),
+            Some("list the directory first")
+        );
+        assert_eq!(history[3].reasoning, None);
+        // The second request replays the first step's reasoning.
+        assert_eq!(
+            adapter.requests[1].messages[1].reasoning.as_deref(),
+            Some("list the directory first")
+        );
+        assert!(observer.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::AgentResponse { reasoning: Some(text), finish_reason: Some(reason), .. }
+                if text == "list the directory first" && reason == "tool_calls"
+        )));
+    }
+
+    #[tokio::test]
+    async fn announced_step_without_tool_call_is_continued() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    content: "Tests pass. Let me check a few final things: tracked files.".into(),
+                    finish_reason: Some("stop".into()),
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    tool_calls: vec![list_call("a")],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "All checked.".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = scripted_observer();
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "assess".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adapter.requests.len(), 3);
+        assert_eq!(
+            kinds(&observer.events),
+            [
+                "delta",
+                "response",
+                "continued",
+                "response",
+                "requested",
+                "decision",
+                "result",
+                "delta",
+                "response",
+            ]
+        );
+        // user, assistant, nudge, assistant(tool), tool, assistant
+        assert_eq!(history.len(), 6);
+        assert_eq!(history[2].role, xshell_core::MessageRole::User);
+        assert_eq!(history[2].content, ANNOUNCED_STEP_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn auto_continue_is_bounded_per_turn() {
+        let temporary = TempDir::new().unwrap();
+        let stalled = || AssistantResponse {
+            reasoning: Some("thinking only".into()),
+            ..Default::default()
+        };
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([stalled(), stalled(), stalled(), stalled()]),
+            requests: Vec::new(),
+        };
+        let mut observer = scripted_observer();
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "go".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adapter.requests.len(), 1 + MAX_AUTO_CONTINUES);
+        let continued = observer
+            .events
+            .iter()
+            .filter(|event| matches!(event, ExecutionEvent::AutoContinued { reason, .. } if reason == "empty_response"))
+            .count();
+        assert_eq!(continued, MAX_AUTO_CONTINUES);
+    }
+
+    #[tokio::test]
+    async fn final_answers_and_truncated_responses_end_the_turn() {
+        for response in [
+            AssistantResponse {
+                content: "Here is the summary.\n\nLet me know if you want more detail.".into(),
+                ..Default::default()
+            },
+            AssistantResponse {
+                content: "Let me check the logs".into(),
+                finish_reason: Some("length".into()),
+                ..Default::default()
+            },
+        ] {
+            let temporary = TempDir::new().unwrap();
+            let mut adapter = ScriptedAdapter {
+                responses: VecDeque::from([response]),
+                requests: Vec::new(),
+            };
+            let mut observer = scripted_observer();
+            run_agent_turn(
+                &mut adapter,
+                &mut Vec::new(),
+                "go".into(),
+                temporary.path(),
+                &TurnPolicy::new(ApprovalPolicy::Auto),
+                &mut observer,
+            )
+            .await
+            .unwrap();
+            assert_eq!(adapter.requests.len(), 1);
+        }
+    }
+
+    #[test]
+    fn announced_step_heuristic() {
+        for line in [
+            "Let me check a few final things: tracked files, total test count, and the reviewer note dated 2026-11-05.",
+            "Isolated run passes 32/32. Let me reproduce and identify it.",
+            "Now I\u{2019}ll run the release build.",
+            "**Next, I'll verify the docs.**",
+            "I'm going to inspect the audit log:",
+        ] {
+            assert!(announces_next_step(line), "{line}");
+        }
+        for line in [
+            "Let me know if you want me to fix it.",
+            "Should I run the tests?",
+            "The build is clean and all 254 tests pass.",
+            "I'll leave the decision to you?",
+        ] {
+            assert!(!announces_next_step(line), "{line}");
+        }
     }
 }

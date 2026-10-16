@@ -189,6 +189,7 @@ impl AgentAdapter for OllamaAdapter {
         Ok(AssistantResponse {
             content,
             tool_calls,
+            ..Default::default()
         })
     }
 }

@@ -185,7 +185,9 @@ is complete.
 
 History-compaction events advanced the audit client/daemon protocol to version
 3 and the on-disk audit format to version 2; terminal-stream events advance
-them to protocol 4 and format 3. Upgrade and restart `xshell-auditd` together
+them to protocol 4 and format 3; auto-continue events and the `reasoning` and
+`finish_reason` fields on agent responses advance them to protocol 5 and format
+4. Upgrade and restart `xshell-auditd` together
 with `xshelld` and the CLI — a version mismatch is reported at handshake with
 the expected and received versions. The verifier remains able to read every
 format from version 1 onward.
