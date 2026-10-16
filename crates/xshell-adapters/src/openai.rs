@@ -52,6 +52,12 @@ struct OpenAiMessage<'a> {
     tool_calls: Vec<OpenAiToolCallRef<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    /// Prior reasoning, in the `reasoning_content` field used by vLLM,
+    /// SGLang, llama.cpp, TabbyAPI and DeepSeek. Templates such as Qwen3.x
+    /// re-render it; without it every earlier step looks like an empty
+    /// `<think>` block to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
 }
 
 impl<'a> From<&'a ChatMessage> for OpenAiMessage<'a> {
@@ -73,6 +79,7 @@ impl<'a> From<&'a ChatMessage> for OpenAiMessage<'a> {
                 })
                 .collect(),
             tool_call_id: message.tool_call_id.as_deref(),
+            reasoning_content: message.reasoning.as_deref(),
         }
     }
 }
@@ -106,12 +113,21 @@ struct OpenAiChunk {
 
 #[derive(Deserialize)]
 struct OpenAiChoice {
+    #[serde(default)]
     delta: OpenAiDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct OpenAiDelta {
     content: Option<String>,
+    /// Reasoning streamed apart from the answer. `reasoning` is OpenRouter's
+    /// spelling of the same thing.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<OpenAiToolCallDelta>,
 }
@@ -176,6 +192,8 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
             .map_err(|error| AdapterError::Transport(error.to_string()))?;
 
         let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut finish_reason = None;
         let mut partial_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
         let mut tool_argument_bytes = 0_usize;
         stream_lines(response, |line| {
@@ -189,6 +207,12 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
             let chunk: OpenAiChunk = serde_json::from_str(data)
                 .map_err(|error| AdapterError::InvalidResponse(error.to_string()))?;
             for choice in chunk.choices {
+                if choice.finish_reason.is_some() {
+                    finish_reason = choice.finish_reason;
+                }
+                if let Some(delta) = choice.delta.reasoning_content.or(choice.delta.reasoning) {
+                    reasoning.push_str(&delta);
+                }
                 if let Some(delta) = choice.delta.content {
                     content.push_str(&delta);
                     events(AgentEvent::TextDelta(delta));
@@ -257,6 +281,8 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         Ok(AssistantResponse {
             content,
             tool_calls,
+            reasoning: Some(reasoning).filter(|text| !text.is_empty()),
+            finish_reason,
         })
     }
 }
@@ -312,6 +338,52 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.tool_calls[0].arguments["path"], "README.md");
         assert!(request.contains("\"stream\":true"));
+    }
+
+    #[tokio::test]
+    async fn collects_reasoning_and_finish_reason_apart_from_content() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"more\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, server) = serve_once("text/event-stream", body.into());
+        let mut adapter = OpenAiCompatibleAdapter::new(base_url, "test-model", None);
+        let mut deltas = String::new();
+        let response = adapter
+            .chat_stream(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    tools: Vec::new(),
+                },
+                &mut |event| match event {
+                    AgentEvent::TextDelta(delta) => deltas.push_str(&delta),
+                },
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(deltas, "answer");
+        assert_eq!(response.content, "answer");
+        assert_eq!(response.reasoning.as_deref(), Some("think more"));
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn replays_assistant_reasoning_as_reasoning_content() {
+        let message =
+            ChatMessage::assistant("done").with_reasoning(Some("checked the file".into()));
+        let encoded = serde_json::to_value(OpenAiMessage::from(&message)).unwrap();
+        assert_eq!(encoded["reasoning_content"], "checked the file");
+
+        let plain =
+            serde_json::to_value(OpenAiMessage::from(&ChatMessage::assistant("x"))).unwrap();
+        assert!(plain.get("reasoning_content").is_none());
     }
 
     #[test]

@@ -123,6 +123,12 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Reasoning ("thinking") the model produced alongside an assistant
+    /// message. Replayed to providers whose chat templates expect prior
+    /// reasoning in context; absent for other roles and in sessions written
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -133,6 +139,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
     }
 
@@ -143,6 +150,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
     }
 
@@ -153,6 +161,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
     }
 
@@ -163,7 +172,15 @@ impl ChatMessage {
             tool_calls,
             tool_call_id: None,
             tool_name: None,
+            reasoning: None,
         }
+    }
+
+    /// Attach the model's reasoning to an assistant message; empty reasoning
+    /// is stored as `None`.
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning = reasoning.filter(|text| !text.trim().is_empty());
+        self
     }
 
     pub fn tool_result(call: &ToolCall, content: impl Into<String>) -> Self {
@@ -173,6 +190,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: Some(call.id.clone()),
             tool_name: Some(call.name.clone()),
+            reasoning: None,
         }
     }
 }
@@ -197,10 +215,16 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AssistantResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Reasoning streamed separately from `content`, when the provider
+    /// reports it.
+    pub reasoning: Option<String>,
+    /// The provider's stated reason for ending generation ("stop",
+    /// "tool_calls", "length", ...), when reported.
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

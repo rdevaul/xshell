@@ -45,6 +45,7 @@ pub trait Compactor: Send + Sync {
 /// counts are model-specific and not worth a tokenizer dependency here.
 pub fn message_bytes(message: &ChatMessage) -> usize {
     message.content.len()
+        + message.reasoning.as_ref().map_or(0, String::len)
         + message
             .tool_calls
             .iter()

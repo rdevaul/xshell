@@ -660,11 +660,21 @@ impl TurnObserver for DaemonObserver {
                 content,
                 tool_call_count,
                 partial,
+                reasoning,
+                finish_reason,
             } => self.audit(AuditEvent::AgentResponse {
                 content: content.clone(),
                 tool_call_count: *tool_call_count,
                 partial: *partial,
+                reasoning: reasoning.clone(),
+                finish_reason: finish_reason.clone(),
             }),
+            ExecutionEvent::AutoContinued { reason, prompt } => {
+                self.audit(AuditEvent::AutoContinued {
+                    reason: reason.clone(),
+                    prompt: prompt.clone(),
+                })
+            }
             ExecutionEvent::ToolRequested { call } => self.audit(AuditEvent::ToolRequested {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
