@@ -73,6 +73,11 @@ original snapshot until then. A failed build leaves the existing services
 running. Environment credentials are inherited at service startup; restart
 to apply changed credentials or other daemon environment settings.
 
+`runall.sh` exports the variables in the checkout's `.env` file, when one
+exists, before starting the runner, so model API keys named by `api_key_env`
+can live there instead of in your shell profile. `.env` is gitignored. Set
+`XSHELL_ENV_FILE` to load a different file.
+
 State and logs live in `~/.local/state/xshell/runall/<checkout-config-id>/`.
 `--state-root /short/private/path` selects a different root, which must be used
 consistently for subsequent commands. The script prints the instance directory.
