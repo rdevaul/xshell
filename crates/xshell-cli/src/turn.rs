@@ -83,17 +83,26 @@ requested \"{requested}\" was not applied"
                         content,
                         tool_call_count,
                         partial,
+                        reasoning,
+                        finish_reason,
                     } => {
                         if !renderer.received_delta() && !content.is_empty() {
                             renderer.push(&content, &mut stdout)?;
                         }
                         renderer.finish(&mut stdout)?;
                         renderer = AgentRenderer::new(render_options);
+                        warn_if_truncated(finish_reason.as_deref());
                         audit.append_execution(AuditEvent::AgentResponse {
                             content,
                             tool_call_count,
                             partial,
+                            reasoning,
+                            finish_reason,
                         })?;
+                    }
+                    ExecutionEvent::AutoContinued { reason, prompt } => {
+                        print_auto_continue(&reason);
+                        audit.append_execution(AuditEvent::AutoContinued { reason, prompt })?;
                     }
                     ExecutionEvent::ToolRequested { call } => {
                         println!(
@@ -384,6 +393,8 @@ impl TurnObserver for LocalObserver<'_> {
                 content,
                 tool_call_count,
                 partial,
+                reasoning,
+                finish_reason,
             } => {
                 let mut result = Ok(());
                 if !self.renderer.received_delta() && !content.is_empty() {
@@ -401,11 +412,19 @@ impl TurnObserver for LocalObserver<'_> {
                 if !partial && tool_call_count == 0 {
                     println!();
                 }
+                warn_if_truncated(finish_reason.as_deref());
                 result.and(self.audit.append(AuditEvent::AgentResponse {
                     content,
                     tool_call_count,
                     partial,
+                    reasoning,
+                    finish_reason,
                 }))
+            }
+            ExecutionEvent::AutoContinued { reason, prompt } => {
+                print_auto_continue(&reason);
+                self.audit
+                    .append(AuditEvent::AutoContinued { reason, prompt })
             }
             ExecutionEvent::ToolRequested { call } => {
                 self.last_prompted = false;
@@ -510,6 +529,17 @@ pub(crate) fn turn_policy_for(
 ) -> TurnPolicy {
     base.clone()
         .with_compaction(&session_default.for_model(active.max_history_bytes))
+}
+
+/// The model's output hit the provider's token limit; the turn ends there.
+pub(crate) fn warn_if_truncated(finish_reason: Option<&str>) {
+    if finish_reason == Some("length") {
+        eprintln!("xshell: the model's response was cut off by the provider's output token limit");
+    }
+}
+
+pub(crate) fn print_auto_continue(reason: &str) {
+    eprintln!("xshell: model stopped mid-task ({reason}); asking it to continue");
 }
 
 pub(crate) fn print_compaction(report: &xshell_execution::CompactionReport) {
