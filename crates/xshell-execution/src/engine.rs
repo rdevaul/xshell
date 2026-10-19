@@ -380,7 +380,7 @@ pub async fn run_agent_turn(
 ) -> Result<()> {
     let approval = policy.approval;
     // Keep the exact prior history for failed/cancelled-turn rollback.
-    let mut rollback_history = history.clone();
+    let rollback_history = history.clone();
     history.push(ChatMessage::user(message));
     let tools = definitions();
     let mut observed_tool_activity = false;
@@ -435,28 +435,47 @@ pub async fn run_agent_turn(
                 // The provider's own measurement outranks our estimate. Shrink
                 // past the steady-state budget and retry this request once.
                 overflow_retry_used = true;
+                let measured = match (prompt_tokens, available_tokens) {
+                    (Some(prompt), Some(available)) => format!(
+                        "the prompt ({prompt} tokens) exceeded the model's \
+                         {available}-token context window"
+                    ),
+                    _ => "the prompt exceeded the model's context window".to_owned(),
+                };
                 match policy.compactor.compact_overflow(history) {
                     Some(report) => {
                         observer.emit(ExecutionEvent::HistoryCompacted { report });
-                        // This shrink is durable on purpose: rolling it back
-                        // would leave the session oversized and guaranteed to
-                        // fail the same way on every later turn.
-                        rollback_history = history.clone();
+                        // `rollback_history` deliberately still points at the
+                        // pre-turn snapshot. If the retry fails or the user
+                        // cancels, `preserve_or_rollback_failed_turn` must
+                        // restore the history as it stood before this turn,
+                        // not this turn's own prompt — otherwise a cancelled
+                        // turn leaves its user message behind and the next
+                        // turn pushes a second consecutive user message.
                         continue;
                     }
                     None => {
-                        // Nothing left to remove: the current turn is itself
-                        // larger than the window. Retain the history we do
-                        // have and stop, rather than failing with the oversized
-                        // transcript still attached.
-                        history.push(ChatMessage::system(format!(
-                            "xshell execution record: the previous turn was rejected because the prompt \
-({prompt_tokens} tokens) exceeded the model's context window ({available_tokens} tokens). \
-Older context was compacted as far as it can go."
-                        )));
+                        // Nothing can shrink further, so the payload that just
+                        // arrived is itself larger than the window. Rolling the
+                        // turn back returns the session to the size it had
+                        // before; leaving the oversized prompt attached would
+                        // make every later turn overflow the same way. Completed
+                        // tool effects are still preserved, and the reason is
+                        // recorded either way.
+                        preserve_or_rollback_failed_turn(
+                            history,
+                            &rollback_history,
+                            observed_tool_activity,
+                            &format!("{measured} and history could not be shrunk further"),
+                        );
+                        if !observed_tool_activity {
+                            history.push(ChatMessage::system(format!(
+                                "xshell execution record: the previous turn was rejected because \
+{measured}. Older context was compacted as far as it can go and the turn was rolled back."
+                            )));
+                        }
                         bail!(
-                            "the prompt ({prompt_tokens} tokens) exceeds the model's \
-{available_tokens}-token context window; the transcript is now estimated at {} tokens. \
+                            "{measured}; the transcript is now estimated at {} tokens. \
 Start a new session with //new or lower max_history_bytes to continue.",
                             estimate_history_tokens(history)
                         );
@@ -985,8 +1004,8 @@ mod tests {
             self.requests.push(request);
             if index < self.overflow_times {
                 return Err(AdapterError::ContextOverflow {
-                    prompt_tokens: 262_159,
-                    available_tokens: 262_144,
+                    prompt_tokens: Some(262_159),
+                    available_tokens: Some(262_144),
                 });
             }
             self.responses
@@ -1686,18 +1705,25 @@ mod tests {
             1,
             "a hopeless request is not retried"
         );
-        // The failure is recorded in the transcript instead of being rolled
-        // back, so the session cannot stay oversized and fail forever.
+        // The session is rolled back rather than left oversized, and the
+        // reason is recorded so the model knows why the turn stopped.
+        assert_eq!(
+            history.len(),
+            2,
+            "the oversized turn is rolled back to [system, record]"
+        );
         assert!(history.iter().any(|message| {
             message.role == xshell_core::MessageRole::System
-                && message
-                    .content
-                    .contains("exceeded the model's context window")
+                && message.content.contains("context window")
         }));
+        assert!(
+            crate::history_bytes(&history) < 1000,
+            "the transcript must fit inside the budget again"
+        );
     }
 
     #[tokio::test]
-    async fn failed_overflow_retry_keeps_the_shrunk_transcript() {
+    async fn failed_overflow_retry_rolls_back_to_the_pre_turn_history() {
         let temporary = TempDir::new().unwrap();
         let first = ToolCall {
             id: "first".into(),
@@ -1740,12 +1766,29 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(adapter.requests.len(), 2, "one shrink, one retry");
-        // The durable shrink is *not* rolled back: restoring the oversized
-        // transcript would guarantee the same failure on every later turn.
-        assert!(
-            crate::history_bytes(&history) < crate::history_bytes(&rollback_of(&first)),
-            "oversized transcript was restored after the failed retry"
+        // The failed retry rolls the turn back to the pre-turn snapshot. The
+        // shrink is *not* used as the rollback target: it still carries this
+        // turn's user prompt, and restoring it would leave two consecutive
+        // user messages once the next turn pushes its own. The pre-request
+        // compaction pass re-derives the shrink on the next turn, so the
+        // session is not left oversized.
+        assert_eq!(
+            history,
+            rollback_of(&first),
+            "the failed turn is rolled back to the pre-turn history"
         );
+        let mut user_runs = 0;
+        for message in &history {
+            user_runs = if message.role == xshell_core::MessageRole::User {
+                user_runs + 1
+            } else {
+                0
+            };
+            assert!(
+                user_runs < 2,
+                "rollback must not leave consecutive user messages"
+            );
+        }
     }
 
     fn rollback_of(call: &ToolCall) -> Vec<ChatMessage> {

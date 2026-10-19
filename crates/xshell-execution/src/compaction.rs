@@ -30,6 +30,21 @@ pub const BYTES_PER_TOKEN: usize = 3;
 /// Token allowance for everything conversation history does not cover: tool
 /// definitions, chat-template markup, and role markers.
 pub const REQUEST_OVERHEAD_TOKENS: usize = 1024;
+
+/// The request carries the tool definitions on every call, so their size is
+/// overhead rather than history. `REQUEST_OVERHEAD_TOKENS` alone is a guess;
+/// this measures the real serialized schema once so that growing the tool
+/// surface cannot silently push an "in budget" request over the window. The
+/// constant stays as a floor for chat-template markup we cannot measure.
+fn tool_schema_overhead_tokens() -> usize {
+    static OVERHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OVERHEAD.get_or_init(|| {
+        serde_json::to_string(&crate::tools::definitions())
+            .map(|schema| estimate_tokens(schema.len()))
+            .unwrap_or(0)
+            .max(REQUEST_OVERHEAD_TOKENS)
+    })
+}
 /// A derived budget is never smaller than this. A model declared with a window
 /// barely larger than the overhead still gets a usable conversation instead of
 /// a zero budget that silently disables compaction.
@@ -45,6 +60,7 @@ const MINIMUM_HISTORY_BYTES: usize = 1024;
 /// Replacement text for an elided tool result. Messages are never removed, so
 /// `tool_call_id` pairing survives; only the payload goes.
 const ELIDED_MARKER: &str = "[xshell: tool result elided by history compaction]";
+const TRUNCATED_MARKER: &str = "\n[xshell: tool result truncated to fit the history budget]";
 
 /// What a compaction pass did, for transcripts and audit records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,12 +151,18 @@ fn elide_oversized_bodies(history: &mut [ChatMessage], max_bytes: usize) -> usiz
     if total <= max_bytes {
         return 0;
     }
-    let mut elided = 0;
-    // Oldest first: the newest tool result is the one the model most likely
-    // still needs to decide its next step.
-    for message in history.iter_mut() {
-        if total <= max_bytes {
-            break;
+    let mut changed = 0;
+    // The newest tool result is handled last, and truncated rather than
+    // elided. Replacing the result the model just asked for with a marker
+    // tells it nothing, so it re-runs the same call and can burn the whole
+    // turn (MAX_AGENT_STEPS) reading the same file again.
+    let newest_tool = history.iter().rposition(|m| m.role == MessageRole::Tool);
+    for (index, message) in history.iter_mut().enumerate() {
+        if total <= max_bytes || Some(index) == newest_tool {
+            if total <= max_bytes {
+                break;
+            }
+            continue;
         }
         if message.role != MessageRole::Tool || message.content.len() <= ELIDED_MARKER.len() {
             continue;
@@ -148,7 +170,26 @@ fn elide_oversized_bodies(history: &mut [ChatMessage], max_bytes: usize) -> usiz
         total -= message.content.len();
         message.content = ELIDED_MARKER.to_owned();
         total += message.content.len();
-        elided += 1;
+        changed += 1;
+    }
+    // Truncating the newest result keeps a useful prefix, so it is preferred
+    // over discarding reasoning replay.
+    if total > max_bytes
+        && let Some(index) = newest_tool
+    {
+        let message = &mut history[index];
+        let budget = max_bytes.saturating_sub(total - message_bytes(message));
+        if message.content.len() > budget && budget > TRUNCATED_MARKER.len() {
+            let mut cut = (budget - TRUNCATED_MARKER.len()).min(message.content.len());
+            while cut > 0 && !message.content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let before = message.content.len();
+            message.content.truncate(cut);
+            message.content.push_str(TRUNCATED_MARKER);
+            total = total - before + message.content.len();
+            changed += 1;
+        }
     }
     // Reasoning replay is the largest remaining consumer for thinking models
     // and is not needed to keep the conversation coherent.
@@ -159,11 +200,11 @@ fn elide_oversized_bodies(history: &mut [ChatMessage], max_bytes: usize) -> usiz
             }
             if let Some(reasoning) = message.reasoning.take() {
                 total -= reasoning.len();
-                elided += 1;
+                changed += 1;
             }
         }
     }
-    elided
+    changed
 }
 
 /// Drop the oldest whole turns until the history fits in `max_bytes`.
@@ -312,7 +353,7 @@ impl CompactionConfig {
         let derived = self.context_tokens.map(|tokens| {
             let usable = tokens
                 .saturating_sub(self.reserve_output_tokens)
-                .saturating_sub(REQUEST_OVERHEAD_TOKENS)
+                .saturating_sub(tool_schema_overhead_tokens())
                 .max(MINIMUM_HISTORY_TOKENS);
             usable
                 .saturating_mul(HISTORY_NUMERATOR)
@@ -345,8 +386,7 @@ impl CompactionConfig {
             context_tokens: model.context_tokens.or(self.context_tokens),
             reserve_output_tokens: model
                 .reserve_output_tokens
-                .or(Some(self.reserve_output_tokens))
-                .unwrap_or(DEFAULT_RESERVE_OUTPUT_TOKENS),
+                .unwrap_or(self.reserve_output_tokens),
         }
     }
 }
@@ -445,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_last_turn_and_elides_its_oversized_tool_result() {
+    fn keeps_the_last_turn_and_truncates_its_oversized_tool_result() {
         // One in-flight turn whose tool result alone blows the budget: this is
         // the mid-turn overflow case that whole-turn eviction cannot reach.
         let call = ToolCall {
@@ -468,10 +508,13 @@ mod tests {
         assert_eq!(h.len(), 4, "elision never removes messages");
         assert!(history_bytes(&h) <= 1024, "still over budget");
         assert!(is_well_formed(&h), "elision must not orphan tool results");
-        // The payload is gone but the pairing and the reasoning survive.
+        // The newest result is truncated, not elided: the model still sees a
+        // real prefix of the file it asked for, so it does not re-run the call.
         assert_eq!(h[3].role, MessageRole::Tool);
         assert_eq!(h[3].tool_call_id.as_deref(), Some("call-live"));
-        assert_eq!(h[3].content, ELIDED_MARKER);
+        assert!(h[3].content.contains(TRUNCATED_MARKER));
+        assert!(h[3].content.starts_with('s'), "a useful prefix survives");
+        assert!(h[3].content.len() < 8192);
         assert_eq!(h[2].tool_calls.len(), 1);
         assert_eq!(h[2].reasoning.as_deref(), Some("look at the file first"));
         // The user's own message is never elided.
@@ -485,20 +528,28 @@ mod tests {
             name: "read_file".into(),
             arguments: json!({"path": "big.txt"}),
         };
+        let newer = ToolCall {
+            id: "call-newer".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "newer.txt"}),
+        };
         let mut h = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user("read the log"),
             ChatMessage::assistant_with_tools("", vec![call.clone()])
                 .with_reasoning(Some("r".repeat(4096))),
             ChatMessage::tool_result(&call, "s".repeat(4096)),
+            ChatMessage::assistant_with_tools("", vec![newer.clone()]),
+            ChatMessage::tool_result(&newer, "t".repeat(4096)),
         ];
         // Budget below one marker: everything shrinkable must go.
         let report = MaxBytesCompactor { max_bytes: 1 }
             .compact(&mut h)
             .expect("over budget must compact");
         assert!(report.bytes_after < report.bytes_before);
-        assert_eq!(h[3].content, ELIDED_MARKER);
+        assert_eq!(h[3].content, ELIDED_MARKER, "older results go first");
         assert!(h[2].reasoning.is_none(), "reasoning is elided last");
+        assert_eq!(h[5].content.len(), 4096, "the newest result is exempt");
         assert!(is_well_formed(&h));
     }
 
@@ -549,7 +600,11 @@ mod tests {
             .compact_overflow(&mut h)
             .expect("the overflow pass must shrink further");
         assert!(history_bytes(&h) < after_steady);
-        assert_eq!(h[5].content, ELIDED_MARKER);
+        assert!(
+            h[5].content.contains(TRUNCATED_MARKER),
+            "the overflow pass truncates the newest result rather than eliding it"
+        );
+        assert!(h[5].content.starts_with('b'), "a prefix survives");
         assert!(is_well_formed(&h));
         assert_eq!(report.bytes_after, history_bytes(&h));
     }

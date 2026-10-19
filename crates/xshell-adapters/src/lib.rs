@@ -131,27 +131,64 @@ async fn stream_lines(
 /// `code: "context_length_exceeded"` and the numbers in the message text.
 /// Unknown shapes stay plain `Http` errors: guessing at an overflow we cannot
 /// confirm would retry a request that was rejected for another reason.
-fn context_overflow(body: &str) -> Option<(usize, usize)> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let error = value.get("error")?;
-    let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+/// Smallest number we will accept as a token count. Below this, digits in an
+/// error message belong to a model name ("qwen3:8b"), not to a window.
+const MIN_PLAUSIBLE_CONTEXT_TOKENS: usize = 1024;
+
+/// Recognize a provider's "prompt too long" rejection.
+///
+/// Returns `Some` as soon as the overflow is recognized, even when the token
+/// counts cannot be read: recovering from the overflow matters more than
+/// describing it. Unknown counts are reported as `None`.
+///
+/// The counts are *not* taken positionally. llama.cpp writes "Prompt length
+/// 262159 exceeds the available context size of 262144", but OpenAI and vLLM
+/// write "maximum context length is 32768 tokens. However, you requested
+/// 33000 tokens" — limit first. An overflow always means the prompt is larger
+/// than the window, so the two largest plausible numbers are the prompt and
+/// the window, in that order, whichever way round the sentence puts them.
+fn context_overflow(body: &str) -> Option<(Option<usize>, Option<usize>)> {
+    // Native Ollama errors are `{"error": "..."}`, a bare string rather than
+    // an object; non-JSON bodies (see `read_bounded_error`, which truncates
+    // large errors) and plain-text gateways are scanned as raw text.
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let error = parsed.as_ref().map(|value| &value["error"]);
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let message = error
+        .and_then(|error| {
+            error
+                .get("message")
+                .or(Some(error))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or(body);
     let recognized = code == "context_length_exceeded"
         || message.contains("context_length_exceeded")
         || message.contains("exceeds the available context size")
-        || message.contains("exceeds the model's maximum context");
+        || message.contains("exceeds the model's maximum context")
+        || message.contains("maximum context length")
+        // Ollama's own wording, e.g. "prompt is too long: 42000 tokens > 32768 maximum".
+        || message.contains("prompt is too long");
     if !recognized {
         return None;
     }
-    let found: Vec<usize> = message
+    let mut counts: Vec<usize> = message
         .split(|c: char| !c.is_ascii_digit())
         .filter(|part| !part.is_empty())
         .filter_map(|part| part.parse::<usize>().ok())
+        .filter(|tokens| *tokens >= MIN_PLAUSIBLE_CONTEXT_TOKENS)
         .collect();
-    if found.len() < 2 {
-        return None;
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    // Providers repeat the limit (OpenAI restates it when splitting prompt and
+    // completion tokens), and a repeated value is not a second measurement.
+    counts.dedup();
+    if counts.len() < 2 {
+        return Some((None, None));
     }
-    Some((found[0], found[1]))
+    Some((Some(counts[0]), Some(counts[1])))
 }
 
 fn stream_duration_error() -> AdapterError {
@@ -263,8 +300,78 @@ mod bounds_tests {
         let body = r#"{"error":{"message":"Prompt length 262159 exceeds the available context size of 262144 tokens","type":"invalid_request_error","param":null,"code":"context_length_exceeded"}}"#;
         assert_eq!(
             context_overflow(body),
-            Some((262_159, 262_144)),
+            Some((Some(262_159), Some(262_144))),
             "the provider's own token counts must survive the round trip"
+        );
+    }
+
+    #[test]
+    fn reads_openai_style_counts_limit_first() {
+        // OpenAI and vLLM put the limit *first*. Taking the numbers in
+        // reading order would report a prompt smaller than the window.
+        let body = r#"{"error":{"message":"This model's maximum context length is 32768 tokens. However, you requested 33000 tokens in your messages.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((Some(33_000), Some(32_768))),
+            "the larger number is the prompt, whichever way round the sentence puts it"
+        );
+    }
+
+    #[test]
+    fn reads_openai_counts_when_the_limit_is_repeated() {
+        // OpenAI restates the limit when splitting prompt and completion
+        // tokens. The repeated value is not a second measurement.
+        let body = r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, you requested 8300 tokens (8000 in the messages, 300 in the completion).","code":"context_length_exceeded"}}"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((Some(8_300), Some(8_192))),
+            "a repeated limit must not be read as the prompt size"
+        );
+    }
+
+    #[test]
+    fn ignores_digits_in_model_names() {
+        // "qwen3:8b" contributes 3 and 8; neither is a token count.
+        let body = r#"{"error":{"message":"Prompt length 262159 for qwen3:8b exceeds the available context size","code":"context_length_exceeded"}}"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((None, None)),
+            "model-name digits must not be read as token counts"
+        );
+    }
+
+    #[test]
+    fn recognizes_native_ollama_string_errors() {
+        // Ollama answers with `{"error": "..."}`, a bare string, not an object.
+        let body = r#"{"error":"prompt is too long: 42000 tokens > 32768 maximum"}"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((Some(42_000), Some(32_768))),
+            "the bare-string error shape must still be recognized"
+        );
+    }
+
+    #[test]
+    fn recognizes_overflow_in_a_truncated_body() {
+        // read_bounded_error appends a truncation notice, which makes the
+        // body invalid JSON. The overflow must survive that.
+        let body = r#"{"error":{"message":"Prompt length 262190 exceeds the available context size of 262144 tokens"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((Some(262_190), Some(262_144))),
+            "a truncated error body must not downgrade the overflow to a plain Http error"
+        );
+    }
+
+    #[test]
+    fn recognizes_overflow_when_the_counts_are_unreadable() {
+        // The counts only describe the failure; recovering from it matters
+        // more, so an unrecognized number layout still yields the variant.
+        let body = r#"{"error":{"code":"context_length_exceeded","message":"Input is too long"}}"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((None, None)),
+            "a recognized overflow is never dropped for want of numbers"
         );
     }
 

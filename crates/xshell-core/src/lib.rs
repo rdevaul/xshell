@@ -252,12 +252,14 @@ pub enum AdapterError {
     /// Carried as its own variant (rather than a plain `Http` error) so the
     /// engine can compact and retry instead of failing the turn, and so a
     /// rejected turn cannot leave the session permanently oversized.
-    #[error(
-        "the prompt ({prompt_tokens} tokens) exceeds the model's context window ({available_tokens} tokens)"
-    )]
+    /// The token counts are `Option`s because several providers report the
+    /// rejection without usable numbers (a truncated error body, or Ollama's
+    /// bare-string error). Recognising the overflow matters far more than the
+    /// counts, which are only used to describe the failure.
+    #[error("the prompt exceeds the model's context window")]
     ContextOverflow {
-        prompt_tokens: usize,
-        available_tokens: usize,
+        prompt_tokens: Option<usize>,
+        available_tokens: Option<usize>,
     },
 }
 
