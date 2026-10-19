@@ -472,6 +472,8 @@ mod tests {
             base_url: "http://localhost:11434".into(),
             api_key_env: None,
             max_history_bytes: None,
+            context_tokens: None,
+            reserve_output_tokens: None,
         }
     }
 

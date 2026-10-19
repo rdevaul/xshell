@@ -59,6 +59,12 @@ async fn stream_lines(
     let status = response.status();
     if !status.is_success() {
         let body = read_bounded_error(response).await?;
+        if let Some((prompt_tokens, available_tokens)) = context_overflow(&body) {
+            return Err(AdapterError::ContextOverflow {
+                prompt_tokens,
+                available_tokens,
+            });
+        }
         return Err(AdapterError::Http {
             status: status.as_u16(),
             body,
@@ -117,6 +123,35 @@ async fn stream_lines(
         consume(line)?;
     }
     Ok(())
+}
+
+/// Recognize a provider's "prompt too long" rejection and report the token
+/// counts it gave us. OpenAI-compatible endpoints (OpenAI, vLLM, llama.cpp,
+/// SGLang, Ollama's OpenAI shim) all answer this case with
+/// `code: "context_length_exceeded"` and the numbers in the message text.
+/// Unknown shapes stay plain `Http` errors: guessing at an overflow we cannot
+/// confirm would retry a request that was rejected for another reason.
+fn context_overflow(body: &str) -> Option<(usize, usize)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let recognized = code == "context_length_exceeded"
+        || message.contains("context_length_exceeded")
+        || message.contains("exceeds the available context size")
+        || message.contains("exceeds the model's maximum context");
+    if !recognized {
+        return None;
+    }
+    let found: Vec<usize> = message
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<usize>().ok())
+        .collect();
+    if found.len() < 2 {
+        return None;
+    }
+    Some((found[0], found[1]))
 }
 
 fn stream_duration_error() -> AdapterError {
@@ -221,6 +256,35 @@ mod test_support {
 #[cfg(test)]
 mod bounds_tests {
     use super::*;
+
+    #[test]
+    fn recognizes_a_provider_context_overflow() {
+        // The exact llama.cpp/vLLM-shaped rejection from the field.
+        let body = r#"{"error":{"message":"Prompt length 262159 exceeds the available context size of 262144 tokens","type":"invalid_request_error","param":null,"code":"context_length_exceeded"}}"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((262_159, 262_144)),
+            "the provider's own token counts must survive the round trip"
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_http_errors() {
+        // Retrying these would re-send a request that was rejected for a
+        // different reason entirely.
+        for body in [
+            r#"{"error":{"message":"invalid api key","code":"invalid_api_key"}}"#,
+            r#"{"error":{"message":"model not loaded"}}"#,
+            "upstream gateway timeout",
+            "",
+        ] {
+            assert_eq!(
+                context_overflow(body),
+                None,
+                "must not treat {body:?} as a context overflow"
+            );
+        }
+    }
 
     #[test]
     fn total_response_budget_applies_across_newline_terminated_chunks() {

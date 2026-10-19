@@ -14,8 +14,8 @@ use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, CompactionConfig,
-    ExecutionEvent, GateReason, SensitivePaths, TurnObserver, TurnPolicy, build_adapter,
-    run_agent_turn, run_direct_shell_streaming_cancellable,
+    ExecutionEvent, GateReason, ModelBudget, SensitivePaths, TurnObserver, TurnPolicy,
+    build_adapter, run_agent_turn, run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
 
@@ -429,7 +429,11 @@ impl ExecutionCoordinator {
                     })?;
                     let policy = TurnPolicy::new(approval)
                         .with_sensitive_paths(self.inner.sensitive_paths.clone())
-                        .with_compaction(&self.inner.compaction.for_model(model.max_history_bytes));
+                        .with_compaction(&self.inner.compaction.for_model(ModelBudget {
+                            max_history_bytes: model.max_history_bytes,
+                            context_tokens: model.context_tokens,
+                            reserve_output_tokens: model.reserve_output_tokens,
+                        }));
                     let outcome = run_agent_turn(
                         agent.as_mut(),
                         &mut snapshot.history,

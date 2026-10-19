@@ -126,6 +126,14 @@ pub(crate) fn print_model(active: &ActiveModel, daemon_owned: bool) {
         Some(bytes) => println!("history budget: {bytes} bytes (profile)"),
         None => println!("history budget: session default"),
     }
+    if let Some(tokens) = active.context_tokens {
+        match active.reserve_output_tokens {
+            Some(reserve) => {
+                println!("context window: {tokens} tokens ({reserve} held back for replies)")
+            }
+            None => println!("context window: {tokens} tokens"),
+        }
+    }
     if active.provider == Provider::Openai {
         if daemon_owned {
             println!("credentials: resolved by xshelld");

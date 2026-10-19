@@ -5,8 +5,9 @@ mod sensitive;
 mod tools;
 
 pub use compaction::{
-    CompactionConfig, CompactionReport, Compactor, MaxBytesCompactor, NoCompaction, history_bytes,
-    message_bytes,
+    BYTES_PER_TOKEN, CompactionConfig, CompactionReport, Compactor, DEFAULT_RESERVE_OUTPUT_TOKENS,
+    MINIMUM_HISTORY_TOKENS, MaxBytesCompactor, ModelBudget, NoCompaction, REQUEST_OVERHEAD_TOKENS,
+    estimate_history_tokens, estimate_tokens, history_bytes, message_bytes,
 };
 pub use engine::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, DirectShellResult,
