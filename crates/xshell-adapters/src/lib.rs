@@ -144,9 +144,12 @@ const MIN_PLAUSIBLE_CONTEXT_TOKENS: usize = 1024;
 /// The counts are *not* taken positionally. llama.cpp writes "Prompt length
 /// 262159 exceeds the available context size of 262144", but OpenAI and vLLM
 /// write "maximum context length is 32768 tokens. However, you requested
-/// 33000 tokens" — limit first. An overflow always means the prompt is larger
-/// than the window, so the two largest plausible numbers are the prompt and
-/// the window, in that order, whichever way round the sentence puts them.
+/// 33000 tokens" — limit first. Each count is read from the number after the
+/// phrase that names it. Only when a phrase is missing do we fall back to the
+/// two largest plausible numbers: an overflow means the prompt is larger than
+/// the window, but a message may also carry a breakdown ("9000 in the
+/// messages") that is larger than the window, which is why the anchored read
+/// comes first.
 fn context_overflow(body: &str) -> Option<(Option<usize>, Option<usize>)> {
     // Native Ollama errors are `{"error": "..."}`, a bare string rather than
     // an object; non-JSON bodies (see `read_bounded_error`, which truncates
@@ -175,6 +178,12 @@ fn context_overflow(body: &str) -> Option<(Option<usize>, Option<usize>)> {
     if !recognized {
         return None;
     }
+    if let (Some(prompt), Some(available)) = (
+        number_after(message, PROMPT_PHRASES),
+        number_after(message, WINDOW_PHRASES),
+    ) {
+        return Some((Some(prompt), Some(available)));
+    }
     let mut counts: Vec<usize> = message
         .split(|c: char| !c.is_ascii_digit())
         .filter(|part| !part.is_empty())
@@ -189,6 +198,29 @@ fn context_overflow(body: &str) -> Option<(Option<usize>, Option<usize>)> {
         return Some((None, None));
     }
     Some((Some(counts[0]), Some(counts[1])))
+}
+
+/// Phrases that precede the prompt's token count, lowercase.
+const PROMPT_PHRASES: &[&str] = &["you requested", "prompt length", "resulted in"];
+/// Phrases that precede the context window's token count, lowercase.
+const WINDOW_PHRASES: &[&str] = &[
+    "maximum context length is",
+    "available context size of",
+    "context window of",
+];
+
+/// The first number following any of `phrases` (matched case-insensitively).
+fn number_after(message: &str, phrases: &[&str]) -> Option<usize> {
+    let lower = message.to_ascii_lowercase();
+    phrases.iter().find_map(|phrase| {
+        let rest = &lower[lower.find(phrase)? + phrase.len()..];
+        let digits: String = rest
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    })
 }
 
 fn stream_duration_error() -> AdapterError {
@@ -326,6 +358,18 @@ mod bounds_tests {
             context_overflow(body),
             Some((Some(8_300), Some(8_192))),
             "a repeated limit must not be read as the prompt size"
+        );
+    }
+
+    #[test]
+    fn reads_openai_counts_when_the_messages_alone_exceed_the_limit() {
+        // The message breakdown (9000) is larger than the window (8192), so
+        // "the two largest numbers" would report a 9000-token window.
+        let body = r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, you requested 10000 tokens (9000 in the messages, 1000 in the completion).","code":"context_length_exceeded"}}"#;
+        assert_eq!(
+            context_overflow(body),
+            Some((Some(10_000), Some(8_192))),
+            "each count is read from the phrase that names it"
         );
     }
 

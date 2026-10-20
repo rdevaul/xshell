@@ -61,6 +61,10 @@ const MINIMUM_HISTORY_BYTES: usize = 1024;
 /// `tool_call_id` pairing survives; only the payload goes.
 const ELIDED_MARKER: &str = "[xshell: tool result elided by history compaction]";
 const TRUNCATED_MARKER: &str = "\n[xshell: tool result truncated to fit the history budget]";
+/// Replacement text for a tool result dropped because the provider rejected
+/// the request carrying it and nothing else could shrink.
+const OVERFLOW_DROPPED_MARKER: &str =
+    "[xshell: tool result dropped because the request exceeded the model's context window]";
 
 /// What a compaction pass did, for transcripts and audit records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +206,30 @@ fn elide_oversized_bodies(history: &mut [ChatMessage], max_bytes: usize) -> usiz
                 total -= reasoning.len();
                 changed += 1;
             }
+        }
+    }
+    changed
+}
+
+/// Replace every tool result payload in `messages` with a marker and drop
+/// their reasoning replay, regardless of any budget.
+///
+/// This is the last resort for a turn that already ran tools when the
+/// provider rejects it and the compactor cannot shrink further (always the
+/// case under [`NoCompaction`]). The turn cannot be rolled back, because its
+/// tool effects happened, but keeping the payloads would send the same
+/// oversized request on every later turn. Messages stay in place, so every
+/// `tool_call_id` stays paired. Returns the number of messages changed.
+pub fn drop_tool_payloads(messages: &mut [ChatMessage]) -> usize {
+    let mut changed = 0;
+    for message in messages.iter_mut() {
+        let mut touched = message.reasoning.take().is_some();
+        if message.role == MessageRole::Tool && message.content != OVERFLOW_DROPPED_MARKER {
+            message.content = OVERFLOW_DROPPED_MARKER.to_owned();
+            touched = true;
+        }
+        if touched {
+            changed += 1;
         }
     }
     changed
