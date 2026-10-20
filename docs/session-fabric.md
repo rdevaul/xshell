@@ -61,17 +61,29 @@ selects the built-in defaults; an empty list disables the check.
 
 Every provider request carries the full conversation, so an unbounded history
 costs tokens on every step and eventually exceeds the model's context window.
-`session_fabric.compaction` selects a compaction strategy. It runs before the
-first provider request, after staging the new user prompt, and again after a
-successfully completed turn. The pre-request pass lets a restored session or a
-newly selected smaller-context model recover immediately. A failed or
-cancelled turn restores the exact history from before that turn.
+`session_fabric.compaction` selects a compaction strategy. It runs before
+**every** provider request — including each step of a multi-tool turn — and
+again after a successfully completed turn. Guarding each request rather than
+only the first one matters: tool results appended during a turn grow the
+prompt mid-flight, and that is where context windows are actually exceeded. The
+pre-request pass lets a restored session or a newly selected smaller-context
+model recover immediately.
+
+The pre-request pass is staged on a copy. Durable history is replaced only once
+the provider has accepted the compacted request, so a failed or cancelled turn
+cannot leave the transcript changed.
 
 Strategies implement the `Compactor` trait in `xshell-execution` and operate
 on whole turns — a `user` message through its final `assistant` reply,
 including any tool calls and results — because OpenAI-compatible APIs reject a
 `tool` result whose calling `assistant` message is missing. The leading
 `system` message is always preserved, as is the most recent turn.
+
+When whole-turn eviction cannot reach the budget on its own — the usual case
+mid-turn, where the single in-flight turn is what overflowed — the built-in
+strategy elides the *content* of oversized tool results, oldest first, and then
+the model's reasoning replay. Eliding content keeps every message in place, so
+no `tool_call_id` is ever orphaned and the transcript stays protocol-valid.
 
 The built-in strategy is `max_history_bytes`: drop the oldest whole turns until
 content plus tool-call arguments fit the budget. Bytes are a deliberate proxy
@@ -85,6 +97,21 @@ precedence because the appropriate depth follows that model's context window.
 The value travels with the session's model binding, so `//model` switches and
 remote daemons apply the budget of the model actually in use. A profile may
 set `0` to disable compaction for that model.
+
+A profile can also declare the model's window with `context_tokens` (and
+`reserve_output_tokens`, default 1024). When it does, the enforced budget is
+additionally capped by what that window can hold — `(context_tokens − reserve −
+1024 for tool definitions and template markup) × 0.9 × 3 bytes` — so a
+`max_history_bytes` that is too large for the model cannot overflow it. The
+conversion is deliberately pessimistic (3 bytes per token); the provider's own
+measurement stays the final authority.
+
+If the provider rejects a request anyway with `context_length_exceeded`, the
+engine shrinks past the steady-state budget and retries that request once. The
+shrink is durable on purpose: rolling it back would leave the session oversized
+and failing identically on every later turn. When nothing can shrink further —
+the current turn is itself larger than the window — the turn ends with a clear
+error and the failure is recorded in the transcript.
 
 Each compaction is reported to the client as a `history_compacted` execution
 event and recorded in the audit log, so a reader of the trail can see from

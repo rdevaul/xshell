@@ -65,6 +65,15 @@ base_url = "http://127.0.0.1:11434"
 # a 200K-context cloud model. Overrides session_fabric.compaction. 0 = never
 # compact for this model.
 max_history_bytes = 32768
+# The model's context window in tokens. When set, the enforced budget is
+# additionally capped by what this window can actually hold, so a
+# max_history_bytes that is too large for the model cannot overflow it. Set
+# this to match the server (llama.cpp: -c / --ctx-size; vLLM: --max-model-len;
+# Ollama: num_ctx).
+# context_tokens = 32768
+# Tokens held back for the model's own reply when context_tokens is set.
+# Default 1024.
+# reserve_output_tokens = 1024
 
 [models.openrouter-free]
 provider = "openai"
@@ -104,13 +113,20 @@ max_approval = "ask"
 # sensitive_paths = [".env", ".env.*", "*.pem", "*.key", ".ssh/**", "secrets.*"]
 # Session-wide default conversation-history budget. Every model request
 # carries the whole history; once its content plus tool-call arguments exceed
-# this many bytes, the oldest whole turns are dropped after the turn completes
-# (the system prompt and the most recent turn are always kept). A model
-# profile's own max_history_bytes overrides this, since the right depth depends
-# on that model's context window. Omit to keep full history. Compaction is
-# reported in the transcript and recorded in the audit log.
+# this many bytes, the oldest whole turns are dropped before each provider
+# request and after the turn completes (the system prompt and the most recent
+# turn are always kept, and oversized tool results in the current turn are
+# elided when no whole turn can be dropped). A model profile's own
+# max_history_bytes overrides this, since the right depth depends on that
+# model's context window. Omit to fall back to the model's declared
+# context_tokens; set to 0 to keep full history. Compaction is reported in the
+# transcript and recorded in the audit log.
+#
+# max_history_bytes is BYTES, not tokens. Roughly 3 bytes per token for code
+# and JSON; do not size it to the window itself - leave room for the reply and
+# for tool definitions. For a 262144-token model, 200000 is a safe default.
 # [session_fabric.compaction]
-# max_history_bytes = 262144
+# max_history_bytes = 200000
 # Prefix for interactive-process commands: d detach, s switch, l last, n/p cycle,
 # q terminate, ? help, or repeat the prefix to send it literally.
 #

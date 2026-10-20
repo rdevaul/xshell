@@ -248,6 +248,19 @@ pub enum AdapterError {
     Http { status: u16, body: String },
     #[error("the agent returned an invalid response: {0}")]
     InvalidResponse(String),
+    /// The provider said the prompt is larger than the model's context window.
+    /// Carried as its own variant (rather than a plain `Http` error) so the
+    /// engine can compact and retry instead of failing the turn, and so a
+    /// rejected turn cannot leave the session permanently oversized.
+    /// The token counts are `Option`s because several providers report the
+    /// rejection without usable numbers (a truncated error body, or Ollama's
+    /// bare-string error). Recognising the overflow matters far more than the
+    /// counts, which are only used to describe the failure.
+    #[error("the prompt exceeds the model's context window")]
+    ContextOverflow {
+        prompt_tokens: Option<usize>,
+        available_tokens: Option<usize>,
+    },
 }
 
 #[cfg(test)]

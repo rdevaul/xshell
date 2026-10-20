@@ -29,6 +29,15 @@ pub struct ModelProfile {
     /// Size it to the model's context window; 0 disables compaction.
     #[serde(default)]
     pub max_history_bytes: Option<usize>,
+    /// The model's context window in tokens. When set, the enforced history
+    /// budget is additionally capped by what this window can hold, so a
+    /// `max_history_bytes` that is too large for the model cannot overflow it.
+    #[serde(default)]
+    pub context_tokens: Option<usize>,
+    /// Tokens held back for the model's own reply when `context_tokens` is
+    /// set. Defaults to `DEFAULT_RESERVE_OUTPUT_TOKENS`.
+    #[serde(default)]
+    pub reserve_output_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -61,6 +70,8 @@ impl ActiveModel {
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
             max_history_bytes: self.max_history_bytes,
+            context_tokens: self.context_tokens,
+            reserve_output_tokens: self.reserve_output_tokens,
         }
     }
 
@@ -81,6 +92,8 @@ impl ActiveModel {
             base_url: binding.base_url,
             api_key_env,
             max_history_bytes: binding.max_history_bytes,
+            context_tokens: binding.context_tokens,
+            reserve_output_tokens: binding.reserve_output_tokens,
         })
     }
 }
@@ -101,6 +114,8 @@ pub struct ActiveModel {
     pub base_url: String,
     pub api_key_env: Option<String>,
     pub max_history_bytes: Option<usize>,
+    pub context_tokens: Option<usize>,
+    pub reserve_output_tokens: Option<usize>,
 }
 
 impl XshellConfig {
@@ -172,6 +187,8 @@ impl XshellConfig {
             base_url,
             api_key_env,
             max_history_bytes: selected.and_then(|profile| profile.max_history_bytes),
+            context_tokens: selected.and_then(|profile| profile.context_tokens),
+            reserve_output_tokens: selected.and_then(|profile| profile.reserve_output_tokens),
         })
     }
 
@@ -191,6 +208,8 @@ impl XshellConfig {
                 .map(|value| validate_api_key_env(value, Some(name)))
                 .transpose()?,
             max_history_bytes: profile.max_history_bytes,
+            context_tokens: profile.context_tokens,
+            reserve_output_tokens: profile.reserve_output_tokens,
         })
     }
 
@@ -316,13 +335,63 @@ api_key_env = "OPENROUTER_API_KEY"
         // Resolution: profile overrides the session default; absent falls back.
         let session = &config.session_fabric.compaction;
         assert_eq!(
-            session.for_model(small.max_history_bytes).max_history_bytes,
+            session
+                .for_model(xshell_execution::ModelBudget {
+                    max_history_bytes: small.max_history_bytes,
+                    ..Default::default()
+                })
+                .max_history_bytes,
             Some(8192)
         );
         assert_eq!(
-            session.for_model(big.max_history_bytes).max_history_bytes,
+            session
+                .for_model(xshell_execution::ModelBudget {
+                    max_history_bytes: big.max_history_bytes,
+                    ..Default::default()
+                })
+                .max_history_bytes,
             Some(1_000_000)
         );
+    }
+
+    #[test]
+    fn a_models_context_window_caps_its_history_budget() {
+        // The misconfiguration this guardrail exists for: a byte budget that
+        // reads like a token count, paired with a model that cannot hold it.
+        let config: XshellConfig = toml::from_str(
+            r#"
+            [session_fabric.compaction]
+            max_history_bytes = 262144
+            [models.small]
+            provider = "openai"
+            model = "qwen3:8b"
+            base_url = "http://127.0.0.1:8080/v1"
+            context_tokens = 8192
+            "#,
+        )
+        .unwrap();
+        let small = config.resolve_profile("small").unwrap();
+        assert_eq!(small.context_tokens, Some(8192));
+
+        let enforced = config
+            .session_fabric
+            .compaction
+            .for_model(xshell_execution::ModelBudget {
+                max_history_bytes: small.max_history_bytes,
+                context_tokens: small.context_tokens,
+                reserve_output_tokens: small.reserve_output_tokens,
+            })
+            .effective_max_bytes()
+            .expect("a declared window always enforces a budget");
+        let derived = (8192 - 2 * 1024) * 9 / 10 * xshell_execution::BYTES_PER_TOKEN;
+        assert_eq!(enforced, derived, "the declared window must cap the budget");
+        assert!(enforced < 262144);
+
+        // The window travels with the session binding too.
+        let binding = small.to_session_binding();
+        assert_eq!(binding.context_tokens, Some(8192));
+        let restored = ActiveModel::from_session_binding(binding).unwrap();
+        assert_eq!(restored.context_tokens, Some(8192));
     }
 
     #[test]

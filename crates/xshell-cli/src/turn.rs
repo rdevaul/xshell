@@ -528,7 +528,11 @@ pub(crate) fn turn_policy_for(
     active: &ActiveModel,
 ) -> TurnPolicy {
     base.clone()
-        .with_compaction(&session_default.for_model(active.max_history_bytes))
+        .with_compaction(&session_default.for_model(xshell_execution::ModelBudget {
+            max_history_bytes: active.max_history_bytes,
+            context_tokens: active.context_tokens,
+            reserve_output_tokens: active.reserve_output_tokens,
+        }))
 }
 
 /// The model's output hit the provider's token limit; the turn ends there.
@@ -543,10 +547,16 @@ pub(crate) fn print_auto_continue(reason: &str) {
 }
 
 pub(crate) fn print_compaction(report: &xshell_execution::CompactionReport) {
+    // `turns_removed == 0` with a size change means oversized tool results
+    // were elided from the current turn instead of whole turns being dropped.
+    let action = if report.turns_removed > 0 {
+        format!("dropped {} older turn(s)", report.turns_removed)
+    } else {
+        "elided oversized tool results".to_owned()
+    };
     eprintln!(
-        "xshell: history compacted ({}): dropped {} older turn(s), {} -> {} messages, {} -> {} bytes",
+        "xshell: history compacted ({}): {action}, {} -> {} messages, {} -> {} bytes",
         report.compactor,
-        report.turns_removed,
         report.messages_before,
         report.messages_after,
         report.bytes_before,

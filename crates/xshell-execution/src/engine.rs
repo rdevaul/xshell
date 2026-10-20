@@ -2,7 +2,7 @@ use crate::process::{ProcessGroupGuard, configure_process_group};
 use crate::tools::execute_tool_cancellable;
 use crate::{
     CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, definitions,
-    requires_approval,
+    drop_tool_payloads, estimate_history_tokens, history_bytes, requires_approval,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -20,7 +20,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::{Notify, mpsc};
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
-use xshell_core::{AgentEvent, AssistantResponse, ChatMessage, ChatRequest, ToolCall};
+use xshell_core::{
+    AdapterError, AgentEvent, AssistantResponse, ChatMessage, ChatRequest, MessageRole, ToolCall,
+};
 
 const MAX_AGENT_STEPS: usize = 64;
 /// How many times one turn may be nudged to keep going after the model ends a
@@ -133,8 +135,10 @@ pub enum ExecutionEvent {
         result: String,
     },
     TurnAborted,
-    /// Older turns were removed from the conversation after this turn
-    /// completed, to keep the history within the configured budget.
+    /// The conversation was shrunk to stay within the configured budget:
+    /// either older whole turns were removed, or oversized tool results in the
+    /// current turn had their content elided. Emitted before a provider
+    /// request that needed it and after a turn completed.
     HistoryCompacted {
         report: CompactionReport,
     },
@@ -229,8 +233,9 @@ fn resolve_api_key(config: &AdapterConfig) -> Result<Option<String>> {
 pub struct TurnPolicy {
     pub approval: ApprovalPolicy,
     pub sensitive_paths: SensitivePaths,
-    /// Applied before the first provider request and after a turn completes.
-    /// Failed and cancelled turns restore the pre-turn history.
+    /// Applied before every provider request (staged on a copy and committed
+    /// once the provider accepts) and after a turn completes. Failed and
+    /// cancelled turns restore the pre-turn history.
     pub compactor: Arc<dyn Compactor>,
 }
 
@@ -343,6 +348,28 @@ fn announces_next_step(line: &str) -> bool {
         && OPENERS.iter().any(|opener| sentence.starts_with(opener))
 }
 
+/// Compact a copy of `history` for the next provider request.
+///
+/// Returns the compacted payload together with its report, or `None` when the
+/// history is already within budget. Staging keeps durable history untouched
+/// until the provider has accepted the compacted request.
+fn stage_compaction(
+    compactor: &dyn Compactor,
+    history: &[ChatMessage],
+) -> Option<(Vec<ChatMessage>, CompactionReport)> {
+    // Skip the copy for the common case: a history already inside the budget
+    // needs no staging pass. Compactors that cannot state a budget are always
+    // given the chance to compact.
+    if let Some(max_bytes) = compactor.max_bytes()
+        && history_bytes(history) <= max_bytes
+    {
+        return None;
+    }
+    let mut staged = history.to_vec();
+    let report = compactor.compact(&mut staged)?;
+    Some((staged, report))
+}
+
 pub async fn run_agent_turn(
     agent: &mut dyn AgentAdapter,
     history: &mut Vec<ChatMessage>,
@@ -352,19 +379,25 @@ pub async fn run_agent_turn(
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
     let approval = policy.approval;
-    // Compact after staging the new user message so the compactor can discard
-    // every older turn when necessary while preserving the prompt about to be
-    // sent. Keep the exact prior history for failed/cancelled-turn rollback.
-    let rollback_history = history.clone();
+    // Keep the exact prior history for failed/cancelled-turn rollback.
+    let mut rollback_history = history.clone();
     history.push(ChatMessage::user(message));
-    let mut request_compaction = policy.compactor.compact(history);
     let tools = definitions();
     let mut observed_tool_activity = false;
     let mut auto_continues = 0;
+    let mut overflow_retry_used = false;
 
     for _ in 0..MAX_AGENT_STEPS {
         let mut streamed_text = String::new();
         let cancellation = observer.cancellation();
+        // Guard every provider request, not just the first one. Tool results
+        // appended during this turn grow the prompt mid-flight, and that is
+        // where context windows are actually exceeded.
+        let staged = stage_compaction(policy.compactor.as_ref(), history);
+        let request_messages = match &staged {
+            Some((compacted, _)) => compacted.clone(),
+            None => history.clone(),
+        };
         let response = {
             let observer = &mut *observer;
             let mut emit = |event| match event {
@@ -376,7 +409,7 @@ pub async fn run_agent_turn(
             tokio::select! {
                 response = agent.chat_stream(
                     ChatRequest {
-                        messages: history.clone(),
+                        messages: request_messages,
                         tools: tools.clone(),
                     },
                     &mut emit,
@@ -395,6 +428,82 @@ pub async fn run_agent_turn(
         };
         let response = match response {
             Ok(response) => response,
+            Err(AdapterError::ContextOverflow {
+                prompt_tokens,
+                available_tokens,
+            }) if !overflow_retry_used => {
+                // The provider's own measurement outranks our estimate. Shrink
+                // past the steady-state budget and retry this request once.
+                overflow_retry_used = true;
+                let measured = match (prompt_tokens, available_tokens) {
+                    (Some(prompt), Some(available)) => format!(
+                        "the prompt ({prompt} tokens) exceeded the model's \
+                         {available}-token context window"
+                    ),
+                    _ => "the prompt exceeded the model's context window".to_owned(),
+                };
+                match policy.compactor.compact_overflow(history) {
+                    Some(report) => {
+                        observer.emit(ExecutionEvent::HistoryCompacted { report });
+                        // `rollback_history` deliberately stays the pre-turn
+                        // snapshot. If the retry fails or the user cancels,
+                        // `preserve_or_rollback_failed_turn` must restore the
+                        // history as it stood before this turn, not this
+                        // turn's own prompt — otherwise a cancelled turn
+                        // leaves its user message behind and the next turn
+                        // pushes a second consecutive user message.
+                        //
+                        // The snapshot is shrunk the same way, though. The
+                        // provider has just said the full history is too
+                        // large, and restoring it unshrunk would repeat the
+                        // same overflow-shrink-fail cycle on every later turn
+                        // without the session ever getting smaller.
+                        policy.compactor.compact_overflow(&mut rollback_history);
+                        continue;
+                    }
+                    None => {
+                        // Nothing can shrink further, so the payload that just
+                        // arrived is itself larger than the window. Rolling the
+                        // turn back returns the session to the size it had
+                        // before; leaving the oversized prompt attached would
+                        // make every later turn overflow the same way. Completed
+                        // tool effects are still preserved, and the reason is
+                        // recorded either way.
+                        //
+                        // A turn that ran tools cannot be rolled back, and its
+                        // tool output is the likeliest thing that overflowed,
+                        // so its payloads are dropped instead. The calls stay
+                        // on record; only their output goes.
+                        if observed_tool_activity {
+                            let turn_start = history
+                                .iter()
+                                .rposition(|message| message.role == MessageRole::User)
+                                .unwrap_or(0);
+                            drop_tool_payloads(&mut history[turn_start..]);
+                        }
+                        preserve_or_rollback_failed_turn(
+                            history,
+                            &rollback_history,
+                            observed_tool_activity,
+                            &format!(
+                                "{measured} and history could not be shrunk further; \
+this turn's tool output was dropped from the transcript"
+                            ),
+                        );
+                        if !observed_tool_activity {
+                            history.push(ChatMessage::system(format!(
+                                "xshell execution record: the previous turn was rejected because \
+{measured}. Older context was compacted as far as it can go and the turn was rolled back."
+                            )));
+                        }
+                        bail!(
+                            "{measured}; the transcript is now estimated at {} tokens. \
+Start a new session with //new or lower max_history_bytes to continue.",
+                            estimate_history_tokens(history)
+                        );
+                    }
+                }
+            }
             Err(error) => {
                 if !streamed_text.is_empty() {
                     observer.emit(ExecutionEvent::AgentResponse {
@@ -415,11 +524,12 @@ pub async fn run_agent_turn(
             }
         };
 
-        // Do not claim that durable history changed until the provider has
-        // accepted the compacted request. If this was a restored oversized
-        // session, this event records exactly what the provider first saw.
-        if let Some(report) = request_compaction.take() {
+        // The provider accepted this request, so its compaction is now
+        // durable. If this was a restored oversized session, this event
+        // records exactly what the provider first saw.
+        if let Some((compacted, report)) = staged {
             observer.emit(ExecutionEvent::HistoryCompacted { report });
+            *history = compacted;
         }
 
         observer.emit(ExecutionEvent::AgentResponse {
@@ -888,6 +998,48 @@ mod tests {
         }
     }
 
+    /// Serves `succeed_first` scripted responses, then rejects the next
+    /// `overflow_times` requests with the provider's context-window error,
+    /// then serves the rest of the script.
+    struct OverflowingAdapter {
+        succeed_first: usize,
+        overflow_times: usize,
+        requests: Vec<ChatRequest>,
+        responses: VecDeque<AssistantResponse>,
+    }
+
+    #[async_trait]
+    impl AgentAdapter for OverflowingAdapter {
+        fn descriptor(&self) -> AgentDescriptor {
+            AgentDescriptor {
+                id: "overflowing".into(),
+                display_name: "overflowing".into(),
+                model: "test".into(),
+                capabilities: Vec::new(),
+            }
+        }
+
+        async fn chat_stream(
+            &mut self,
+            request: ChatRequest,
+            _events: &mut (dyn FnMut(AgentEvent) + Send),
+        ) -> Result<AssistantResponse, AdapterError> {
+            let index = self.requests.len();
+            self.requests.push(request);
+            if (self.succeed_first..self.succeed_first.saturating_add(self.overflow_times))
+                .contains(&index)
+            {
+                return Err(AdapterError::ContextOverflow {
+                    prompt_tokens: Some(262_159),
+                    available_tokens: Some(262_144),
+                });
+            }
+            self.responses
+                .pop_front()
+                .ok_or_else(|| AdapterError::Transport("script exhausted".into()))
+        }
+    }
+
     /// Records every event and answers approvals from a script.
     struct RecordingObserver {
         events: Vec<ExecutionEvent>,
@@ -1169,6 +1321,7 @@ mod tests {
         };
         let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
             max_history_bytes: Some(1000),
+            ..Default::default()
         });
         let mut history = vec![ChatMessage::system("sys")];
         for n in 0..3 {
@@ -1238,6 +1391,7 @@ mod tests {
         };
         let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
             max_history_bytes: Some(100),
+            ..Default::default()
         });
         let mut history = vec![ChatMessage::system("sys")];
         for n in 0..3 {
@@ -1290,6 +1444,7 @@ mod tests {
         };
         let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_compaction(&CompactionConfig {
             max_history_bytes: Some(10),
+            ..Default::default()
         });
         let mut history = vec![
             ChatMessage::system("sys"),
@@ -1399,6 +1554,355 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("provider failed"))
         );
+    }
+
+    #[tokio::test]
+    async fn history_is_compacted_before_every_provider_request() {
+        // The pre-turn pass cannot see tool results appended later in the
+        // same turn. Guarding each request individually is what stops a
+        // mid-turn tool result from carrying the next request over budget.
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    content: String::new(),
+                    tool_calls: vec![shell_call("a", "printf hello")],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    tool_calls: Vec::new(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = scripted_observer();
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(300),
+            ..Default::default()
+        });
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant_with_tools("x".repeat(200), Vec::new()),
+        ];
+
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "read it".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adapter.requests.len(), 2);
+        assert!(
+            crate::history_bytes(&adapter.requests[0].messages) <= 300,
+            "the first request must be within budget"
+        );
+        assert!(
+            crate::history_bytes(&adapter.requests[1].messages) <= 300,
+            "the second request grew past the budget with the tool result"
+        );
+        // Pairing survives: the tool result is still attached to its call.
+        assert!(
+            adapter.requests[1]
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn context_overflow_shrinks_and_retries_once() {
+        let temporary = TempDir::new().unwrap();
+        let first = ToolCall {
+            id: "first".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        };
+        let second = ToolCall {
+            id: "second".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "b.txt"}),
+        };
+        let mut adapter = OverflowingAdapter {
+            succeed_first: 0,
+            overflow_times: 1,
+            requests: Vec::new(),
+            responses: VecDeque::from([AssistantResponse {
+                content: "recovered".into(),
+                tool_calls: Vec::new(),
+                ..Default::default()
+            }]),
+        };
+        let mut observer = scripted_observer();
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(5000),
+            ..Default::default()
+        });
+        // Two oversized tool results: the steady-state pass elides the older
+        // one and stops, so the provider can still reject the request.
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("read both"),
+            ChatMessage::assistant_with_tools("", vec![first.clone()]),
+            ChatMessage::tool_result(&first, "a".repeat(4000)),
+            ChatMessage::assistant_with_tools("", vec![second.clone()]),
+            ChatMessage::tool_result(&second, "b".repeat(4000)),
+        ];
+
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "keep going".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adapter.requests.len(), 2, "the retry must happen once");
+        assert!(
+            observer
+                .events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::HistoryCompacted { .. }))
+        );
+        // The retry recovers the turn instead of failing it.
+        assert!(
+            history.iter().any(|message| message.content == "recovered"),
+            "the retry did not deliver the model's answer"
+        );
+        // The shrink is durable: the transcript stays compacted and remains
+        // well formed, so the provider can still read the conversation.
+        assert!(crate::history_bytes(&history) < 5000);
+        let paired: Vec<&str> = history
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .map(|call| call.id.as_str())
+            .collect();
+        for message in history.iter().filter(|m| m.tool_call_id.is_some()) {
+            assert!(
+                paired.contains(&message.tool_call_id.as_deref().unwrap()),
+                "compaction orphaned a tool result"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_context_overflow_marks_the_transcript_and_stops() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = OverflowingAdapter {
+            succeed_first: 0,
+            overflow_times: usize::MAX,
+            requests: Vec::new(),
+            responses: VecDeque::new(),
+        };
+        let mut observer = scripted_observer();
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(1000),
+            ..Default::default()
+        });
+        // One turn, no tool results and no reasoning: there is nothing left to
+        // shrink, so retrying cannot help.
+        let mut history = vec![ChatMessage::system("sys")];
+
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "u".repeat(5000),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("context window"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            adapter.requests.len(),
+            1,
+            "a hopeless request is not retried"
+        );
+        // The session is rolled back rather than left oversized, and the
+        // reason is recorded so the model knows why the turn stopped.
+        assert_eq!(
+            history.len(),
+            2,
+            "the oversized turn is rolled back to [system, record]"
+        );
+        assert!(history.iter().any(|message| {
+            message.role == xshell_core::MessageRole::System
+                && message.content.contains("context window")
+        }));
+        assert!(
+            crate::history_bytes(&history) < 1000,
+            "the transcript must fit inside the budget again"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_overflow_retry_rolls_back_to_the_pre_turn_history() {
+        let temporary = TempDir::new().unwrap();
+        let first = ToolCall {
+            id: "first".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        };
+        let mut adapter = OverflowingAdapter {
+            succeed_first: 0,
+            overflow_times: usize::MAX,
+            requests: Vec::new(),
+            responses: VecDeque::new(),
+        };
+        let mut observer = scripted_observer();
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(5000),
+            ..Default::default()
+        });
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("read it"),
+            ChatMessage::assistant_with_tools("", vec![first.clone()]),
+            ChatMessage::tool_result(&first, "a".repeat(8000)),
+        ];
+
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "keep going".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error.downcast_ref::<AdapterError>(),
+                Some(AdapterError::ContextOverflow { .. })
+            ) || error.to_string().contains("context window"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(adapter.requests.len(), 2, "one shrink, one retry");
+        // The failed retry rolls the turn back to the pre-turn snapshot, not
+        // to the shrunk in-flight history: that still carries this turn's
+        // user prompt, and restoring it would leave two consecutive user
+        // messages once the next turn pushes its own.
+        let pre_turn = rollback_of(&first);
+        assert_eq!(
+            history.len(),
+            pre_turn.len(),
+            "the turn's messages are gone"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|message| message.content == "keep going"),
+            "the failed turn's prompt must not survive the rollback"
+        );
+        // But the snapshot carries the shrink. Restoring it at full size
+        // would repeat the same overflow on every later turn, and a shrink
+        // that is not enough on its own could never accumulate.
+        assert!(
+            crate::history_bytes(&history) < crate::history_bytes(&pre_turn),
+            "the rollback restored the oversized pre-turn history"
+        );
+        assert_eq!(history[3].tool_call_id.as_deref(), Some("first"));
+        assert!(history[3].content.starts_with('a'), "a prefix survives");
+        let mut user_runs = 0;
+        for message in &history {
+            user_runs = if message.role == xshell_core::MessageRole::User {
+                user_runs + 1
+            } else {
+                0
+            };
+            assert!(
+                user_runs < 2,
+                "rollback must not leave consecutive user messages"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unshrinkable_overflow_after_tool_activity_drops_the_tool_output() {
+        let temporary = TempDir::new().unwrap();
+        std::fs::write(temporary.path().join("big.txt"), "x".repeat(20_000)).unwrap();
+        let call = ToolCall {
+            id: "big".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "big.txt"}),
+        };
+        // The model reads a large file, and the request carrying its contents
+        // overflows. The default policy has no compactor, so nothing can
+        // shrink: this is the common way an overflow first happens.
+        let mut adapter = OverflowingAdapter {
+            succeed_first: 1,
+            overflow_times: usize::MAX,
+            requests: Vec::new(),
+            responses: VecDeque::from([AssistantResponse {
+                content: String::new(),
+                tool_calls: vec![call.clone()],
+                ..Default::default()
+            }]),
+        };
+        let mut observer = scripted_observer();
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto);
+        let mut history = vec![ChatMessage::system("sys")];
+
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "read big.txt".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("context window"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(adapter.requests.len(), 2, "the overflow is not retried");
+        // The tool ran, so the turn is kept on record, but its output is not:
+        // keeping it would send the same oversized request on every later turn.
+        let result = history
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("big"))
+            .expect("the tool call stays paired with a result");
+        assert!(
+            !result.content.contains("xxxx"),
+            "the oversized output survived"
+        );
+        assert!(
+            crate::history_bytes(&history) < 1000,
+            "the transcript must be small enough to send again"
+        );
+        assert!(history.iter().any(|message| {
+            message.role == xshell_core::MessageRole::System
+                && message.content.contains("tool output was dropped")
+        }));
+    }
+
+    fn rollback_of(call: &ToolCall) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("read it"),
+            ChatMessage::assistant_with_tools("", vec![call.clone()]),
+            ChatMessage::tool_result(call, "a".repeat(8000)),
+        ]
     }
 
     #[tokio::test]

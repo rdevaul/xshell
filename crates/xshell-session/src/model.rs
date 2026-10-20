@@ -256,6 +256,14 @@ pub struct ModelBinding {
     /// model is compacted for that model, wherever the daemon runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_history_bytes: Option<usize>,
+    /// The model's context window in tokens. Travels with the binding for the
+    /// same reason `max_history_bytes` does: the enforced budget must follow
+    /// the model, not the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<usize>,
+    /// Tokens held back for the model's reply when `context_tokens` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_output_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
