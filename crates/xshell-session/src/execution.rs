@@ -198,8 +198,7 @@ impl ExecutionCoordinator {
                 .registry
                 .lock_recover()
                 .finish_execution(&snapshot.descriptor.id, &turn_id)?;
-            execution.append(&turn_id, SessionEventKind::TurnCancelled);
-            execution.finish(&turn_id);
+            execution.conclude(&turn_id, SessionEventKind::TurnCancelled);
             bail!("session execution is shutting down");
         }
         let worker = thread::Builder::new()
@@ -223,13 +222,12 @@ impl ExecutionCoordinator {
                     .registry
                     .lock_recover()
                     .finish_execution(&marker_session_id, &turn_id);
-                execution.append(
+                execution.conclude(
                     &turn_id,
                     SessionEventKind::TurnFailed {
                         message: error.to_string(),
                     },
                 );
-                execution.finish(&turn_id);
                 persistence.context("cannot clear unstarted session operation")?;
                 return Err(error).context("cannot start session turn");
             }
@@ -400,13 +398,12 @@ impl ExecutionCoordinator {
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                execution.append(
+                execution.conclude(
                     &turn_id,
                     SessionEventKind::TurnFailed {
                         message: error.to_string(),
                     },
                 );
-                execution.finish(&turn_id);
                 return;
             }
         };
@@ -513,33 +510,24 @@ impl ExecutionCoordinator {
             snapshot.descriptor.cwd,
             snapshot.history,
         );
-        if let Err(error) = persistence {
-            execution.append(
-                &turn_id,
-                SessionEventKind::TurnFailed {
-                    message: format!("cannot persist terminal turn state: {error:#}"),
-                },
-            );
+        let terminal = if let Err(error) = persistence {
+            SessionEventKind::TurnFailed {
+                message: format!("cannot persist terminal turn state: {error:#}"),
+            }
         } else if let Some(error) = audit_failure {
-            execution.append(
-                &turn_id,
-                SessionEventKind::TurnFailed {
-                    message: format!("{error:#}"),
-                },
-            );
+            SessionEventKind::TurnFailed {
+                message: format!("{error:#}"),
+            }
         } else if cancellation.is_cancelled() {
-            execution.append(&turn_id, SessionEventKind::TurnCancelled);
+            SessionEventKind::TurnCancelled
         } else if let Err(error) = result {
-            execution.append(
-                &turn_id,
-                SessionEventKind::TurnFailed {
-                    message: format!("{error:#}"),
-                },
-            );
+            SessionEventKind::TurnFailed {
+                message: format!("{error:#}"),
+            }
         } else {
-            execution.append(&turn_id, SessionEventKind::TurnCompleted);
-        }
-        execution.finish(&turn_id);
+            SessionEventKind::TurnCompleted
+        };
+        execution.conclude(&turn_id, terminal);
     }
 }
 
@@ -561,25 +549,16 @@ impl SessionExecution {
 
     fn append(&self, turn_id: &str, event: SessionEventKind) {
         let mut state = self.state.lock_recover();
-        let sequence = state.next_sequence;
-        state.next_sequence = state.next_sequence.saturating_add(1);
-        let record = SessionEvent {
-            sequence,
-            turn_id: turn_id.to_owned(),
-            timestamp_unix_ms: timestamp_ms(),
-            event,
-        };
-        state.event_bytes = state
-            .event_bytes
-            .saturating_add(serde_json::to_vec(&record).map_or(0, |encoded| encoded.len()));
-        state.events.push_back(record);
-        while state.events.len() > MAX_JOURNAL_EVENTS || state.event_bytes > MAX_JOURNAL_BYTES {
-            if let Some(removed) = state.events.pop_front() {
-                state.event_bytes = state.event_bytes.saturating_sub(
-                    serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len()),
-                );
-            }
-        }
+        append_locked(&mut state, turn_id, event);
+        self.changed.notify_all();
+    }
+
+    /// Record a turn's terminal event and release the turn in one step, so a
+    /// client that sees the event can immediately start the next operation.
+    fn conclude(&self, turn_id: &str, event: SessionEventKind) {
+        let mut state = self.state.lock_recover();
+        append_locked(&mut state, turn_id, event);
+        finish_locked(&mut state, turn_id);
         self.changed.notify_all();
     }
 
@@ -620,15 +599,7 @@ impl SessionExecution {
 
     fn finish(&self, turn_id: &str) {
         let mut state = self.state.lock_recover();
-        if state.active.as_ref().map(|turn| turn.id.as_str()) == Some(turn_id) {
-            state.active = None;
-        }
-        state
-            .pending_approvals
-            .retain(|(pending_turn, _)| pending_turn != turn_id);
-        state
-            .approvals
-            .retain(|(pending_turn, _), _| pending_turn != turn_id);
+        finish_locked(&mut state, turn_id);
         self.changed.notify_all();
     }
 }
@@ -762,4 +733,38 @@ fn timestamp_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn append_locked(state: &mut ExecutionState, turn_id: &str, event: SessionEventKind) {
+    let sequence = state.next_sequence;
+    state.next_sequence = state.next_sequence.saturating_add(1);
+    let record = SessionEvent {
+        sequence,
+        turn_id: turn_id.to_owned(),
+        timestamp_unix_ms: timestamp_ms(),
+        event,
+    };
+    state.event_bytes = state
+        .event_bytes
+        .saturating_add(serde_json::to_vec(&record).map_or(0, |encoded| encoded.len()));
+    state.events.push_back(record);
+    while state.events.len() > MAX_JOURNAL_EVENTS || state.event_bytes > MAX_JOURNAL_BYTES {
+        if let Some(removed) = state.events.pop_front() {
+            state.event_bytes = state
+                .event_bytes
+                .saturating_sub(serde_json::to_vec(&removed).map_or(0, |encoded| encoded.len()));
+        }
+    }
+}
+
+fn finish_locked(state: &mut ExecutionState, turn_id: &str) {
+    if state.active.as_ref().map(|turn| turn.id.as_str()) == Some(turn_id) {
+        state.active = None;
+    }
+    state
+        .pending_approvals
+        .retain(|(pending_turn, _)| pending_turn != turn_id);
+    state
+        .approvals
+        .retain(|(pending_turn, _), _| pending_turn != turn_id);
 }
