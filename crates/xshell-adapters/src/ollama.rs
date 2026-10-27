@@ -133,7 +133,7 @@ impl AgentAdapter for OllamaAdapter {
                 function,
             })
             .collect();
-        let response = self
+        let request = self
             .client
             .post(format!("{}/api/chat", self.base_url))
             .json(&OllamaRequest {
@@ -141,10 +141,8 @@ impl AgentAdapter for OllamaAdapter {
                 messages,
                 tools,
                 stream: true,
-            })
-            .send()
-            .await
-            .map_err(|error| AdapterError::Transport(error.to_string()))?;
+            });
+        let response = crate::send_with_retry(request).await?;
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
