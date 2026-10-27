@@ -186,10 +186,7 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         if let Some(api_key) = &self.api_key {
             builder = builder.bearer_auth(api_key);
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| AdapterError::Transport(error.to_string()))?;
+        let response = crate::send_with_retry(builder).await?;
 
         let mut content = String::new();
         let mut reasoning = String::new();

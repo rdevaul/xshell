@@ -242,7 +242,7 @@ pub struct AgentDescriptor {
 
 #[derive(Debug, Error)]
 pub enum AdapterError {
-    #[error("the agent endpoint could not be reached: {0}")]
+    #[error("the connection to the agent endpoint failed: {0}")]
     Transport(String),
     #[error("the agent endpoint rejected the request ({status}): {body}")]
     Http { status: u16, body: String },

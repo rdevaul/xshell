@@ -26,6 +26,9 @@ const MAX_PENDING_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// bounds accumulated model text and tool-call data even when every event is
 /// individually well formed and newline terminated.
 const MAX_STREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Pause before the single retry of a request whose send failed, long enough
+/// for a transient route change or reset to settle.
+const SEND_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Error pages are diagnostic only and should never consume arbitrary memory.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TOOL_CALLS: usize = 256;
@@ -39,6 +42,83 @@ pub(crate) fn http_client() -> reqwest::Client {
         .read_timeout(STREAM_IDLE_TIMEOUT)
         .build()
         .expect("static reqwest client configuration is valid")
+}
+
+/// Send a provider request, retrying once if it failed before any response
+/// arrived.
+///
+/// A pooled connection can die while it sits idle between requests, for
+/// example when a network route changes or a middlebox drops its state. The
+/// next request on it then fails at once, although a fresh connection would
+/// succeed. Such a request never produced a response, and a chat completion
+/// has no side effects beyond its cost, so one retry is safe. Timeouts are
+/// not retried: a second wait of the same length rarely helps and doubles the
+/// delay before the user sees the error.
+pub(crate) async fn send_with_retry(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, AdapterError> {
+    let retry = request.try_clone();
+    let first = match request.send().await {
+        Ok(response) => return Ok(response),
+        Err(error) => error,
+    };
+    let Some(retry) = retry.filter(|_| is_retryable_send_error(&first)) else {
+        return Err(transport_error(&first));
+    };
+    tokio::time::sleep(SEND_RETRY_DELAY).await;
+    retry.send().await.map_err(|second| {
+        let (first, second) = (
+            describe_transport_error(&first),
+            describe_transport_error(&second),
+        );
+        AdapterError::Transport(if first == second {
+            format!("{second} (retried once with the same result)")
+        } else {
+            format!("{second} (retried once; the first attempt: {first})")
+        })
+    })
+}
+
+fn is_retryable_send_error(error: &reqwest::Error) -> bool {
+    (error.is_connect() || error.is_request()) && !error.is_timeout()
+}
+
+pub(crate) fn transport_error(error: &reqwest::Error) -> AdapterError {
+    AdapterError::Transport(describe_transport_error(error))
+}
+
+/// Describe a transport failure: the phase it happened in, the URL, and the
+/// underlying cause.
+///
+/// `reqwest::Error`'s own `Display` stops at "error sending request for url
+/// (...)" and leaves the cause, such as "Connection reset by peer" or "No
+/// route to host", in its `source()` chain, which is the part that says what
+/// actually went wrong.
+fn describe_transport_error(error: &reqwest::Error) -> String {
+    let url = error
+        .url()
+        .map_or_else(|| "the agent endpoint".to_owned(), ToString::to_string);
+    let mut description = if error.is_timeout() {
+        format!("timed out waiting for {url}")
+    } else if error.is_connect() {
+        format!("could not connect to {url}")
+    } else if error.is_request() {
+        format!("the request to {url} could not be sent")
+    } else if error.is_body() || error.is_decode() {
+        format!("the response from {url} was cut off")
+    } else {
+        url
+    };
+    // The intermediate layers ("client error (Connect)", "tcp connect error")
+    // only restate the phase; the innermost cause is the one that explains it.
+    let mut root = std::error::Error::source(error);
+    while let Some(cause) = root.and_then(std::error::Error::source) {
+        root = Some(cause);
+    }
+    if let Some(cause) = root {
+        description.push_str(&format!(": {cause}"));
+    }
+    description
 }
 
 #[async_trait]
@@ -97,7 +177,7 @@ async fn stream_lines(
                     )));
                 }
             };
-        let chunk = chunk.map_err(|error| AdapterError::Transport(error.to_string()))?;
+        let chunk = chunk.map_err(|error| transport_error(&error))?;
         account_response_bytes(&mut total_bytes, chunk.len())?;
         if pending.len().saturating_add(chunk.len()) > MAX_PENDING_LINE_BYTES {
             return Err(AdapterError::InvalidResponse(format!(
@@ -253,7 +333,7 @@ async fn read_bounded_error(response: reqwest::Response) -> Result<String, Adapt
             ))
         })?
     {
-        let chunk = chunk.map_err(|error| AdapterError::Transport(error.to_string()))?;
+        let chunk = chunk.map_err(|error| transport_error(&error))?;
         let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
         if remaining == 0 {
             truncated = true;
@@ -276,7 +356,7 @@ async fn read_bounded_error(response: reqwest::Response) -> Result<String, Adapt
 #[cfg(test)]
 mod test_support {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     pub fn serve_once(
@@ -286,39 +366,125 @@ mod test_support {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let header_end = loop {
-                let count = socket.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..count]);
-                if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                        .and_then(|value| value.parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            while request.len() - header_end < content_length {
-                let count = socket.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..count]);
-            }
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).unwrap();
-            String::from_utf8(request[header_end..header_end + content_length].to_vec()).unwrap()
+            let (socket, _) = listener.accept().unwrap();
+            respond(socket, content_type, &body)
         });
         (format!("http://{address}"), handle)
+    }
+
+    /// Read the first request in full and close the connection without
+    /// answering, as a connection that died while pooled does, then serve
+    /// `body` on the next connection. Returns how many connections it saw.
+    pub fn serve_after_dropping_first(
+        content_type: &'static str,
+        body: String,
+    ) -> (String, thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            read_request(&mut first);
+            drop(first);
+            let (second, _) = listener.accept().unwrap();
+            respond(second, content_type, &body);
+            2
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn respond(mut socket: TcpStream, content_type: &str, body: &str) -> String {
+        let request = read_request(&mut socket);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).unwrap();
+        request
+    }
+
+    /// Read one HTTP request and return its body.
+    fn read_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let count = socket.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while request.len() - header_end < content_length {
+            let count = socket.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(request[header_end..header_end + content_length].to_vec()).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::test_support::serve_after_dropping_first;
+    use super::*;
+    use xshell_core::ChatMessage;
+
+    fn request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![ChatMessage::user("hello")],
+            tools: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_once_when_the_connection_dies_before_a_response() {
+        // A pooled connection that died while idle fails the next request at
+        // once. A fresh connection succeeds, so the turn must not fail.
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, server) = serve_after_dropping_first("text/event-stream", body.into());
+        let mut adapter = OpenAiCompatibleAdapter::new(base_url, "test-model", None);
+
+        let response = adapter.chat_stream(request(), &mut |_| {}).await.unwrap();
+
+        assert_eq!(response.content, "recovered");
+        assert_eq!(server.join().unwrap(), 2, "exactly one retry");
+    }
+
+    #[tokio::test]
+    async fn names_the_cause_of_a_connection_failure() {
+        // Bind and release a port so nothing listens on it.
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut adapter = OpenAiCompatibleAdapter::new(format!("http://{address}"), "m", None);
+
+        let error = adapter
+            .chat_stream(request(), &mut |_| {})
+            .await
+            .unwrap_err()
+            .to_string();
+
+        // reqwest's own text stops at "error sending request for url"; the
+        // reason it failed lives in the source chain and must reach the user.
+        assert!(
+            error.contains(&format!("could not connect to http://{address}/")),
+            "missing phase and url: {error}"
+        );
+        assert!(
+            error.to_ascii_lowercase().contains("refused"),
+            "missing the underlying cause: {error}"
+        );
+        assert!(error.contains("retried once"), "missing the retry: {error}");
     }
 }
 
