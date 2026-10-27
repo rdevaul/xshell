@@ -178,6 +178,11 @@ pub(crate) fn resume_active_session(
         return Ok(());
     }
     loop {
+        // Showing past output is a convenience; never let it block following
+        // the session's live turn.
+        if let Err(error) = crate::backlog::redraw_if_pending(sessions, render_options) {
+            eprintln!("xshell: could not redraw session output: {error:#}");
+        }
         if let Some(turn_id) = sessions.active_turn_id().map(str::to_owned) {
             println!("reattaching to active turn {turn_id}");
             match follow_daemon_turn(sessions, audit, render_options, escape_prefix)? {

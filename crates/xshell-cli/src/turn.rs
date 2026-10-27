@@ -536,17 +536,28 @@ pub(crate) fn turn_policy_for(
 }
 
 /// The model's output hit the provider's token limit; the turn ends there.
+pub(crate) const TRUNCATED_RESPONSE_NOTICE: &str =
+    "xshell: the model's response was cut off by the provider's output token limit";
+
 pub(crate) fn warn_if_truncated(finish_reason: Option<&str>) {
     if finish_reason == Some("length") {
-        eprintln!("xshell: the model's response was cut off by the provider's output token limit");
+        eprintln!("{TRUNCATED_RESPONSE_NOTICE}");
     }
 }
 
 pub(crate) fn print_auto_continue(reason: &str) {
-    eprintln!("xshell: model stopped mid-task ({reason}); asking it to continue");
+    eprintln!("{}", format_auto_continue(reason));
+}
+
+pub(crate) fn format_auto_continue(reason: &str) -> String {
+    format!("xshell: model stopped mid-task ({reason}); asking it to continue")
 }
 
 pub(crate) fn print_compaction(report: &xshell_execution::CompactionReport) {
+    eprintln!("{}", format_compaction(report));
+}
+
+pub(crate) fn format_compaction(report: &xshell_execution::CompactionReport) -> String {
     // `turns_removed == 0` with a size change means oversized tool results
     // were elided from the current turn instead of whole turns being dropped.
     let action = if report.turns_removed > 0 {
@@ -554,14 +565,14 @@ pub(crate) fn print_compaction(report: &xshell_execution::CompactionReport) {
     } else {
         "elided oversized tool results".to_owned()
     };
-    eprintln!(
+    format!(
         "xshell: history compacted ({}): {action}, {} -> {} messages, {} -> {} bytes",
         report.compactor,
         report.messages_before,
         report.messages_after,
         report.bytes_before,
         report.bytes_after
-    );
+    )
 }
 
 pub(crate) fn compaction_audit_event(report: &xshell_execution::CompactionReport) -> AuditEvent {
@@ -623,13 +634,18 @@ pub(crate) fn parse_approval_response(answer: &str) -> Option<ApprovalDecision> 
 }
 
 pub(crate) fn print_tool_result(result: &str) {
+    print!("{}", format_tool_result(result));
+}
+
+pub(crate) fn format_tool_result(result: &str) -> String {
     const DISPLAY_LIMIT: usize = 4 * 1024;
     let end = floor_char_boundary(result, result.len().min(DISPLAY_LIMIT));
     // Tool output (file contents, command stdout) is untrusted terminal text.
-    println!("tool result:\n{}", sanitize_terminal_text(&result[..end]));
+    let mut text = format!("tool result:\n{}\n", sanitize_terminal_text(&result[..end]));
     if end < result.len() {
-        println!("[terminal display truncated; full result returned to agent]");
+        text.push_str("[terminal display truncated; full result returned to agent]\n");
     }
+    text
 }
 
 pub(crate) fn floor_char_boundary(value: &str, mut index: usize) -> usize {
