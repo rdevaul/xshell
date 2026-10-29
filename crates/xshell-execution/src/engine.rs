@@ -1,3 +1,4 @@
+use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
 use crate::tools::execute_tool_cancellable;
@@ -25,7 +26,6 @@ use xshell_core::{
     AdapterError, AgentEvent, AssistantResponse, ChatMessage, ChatRequest, MessageRole, ToolCall,
 };
 
-const MAX_AGENT_STEPS: usize = 64;
 /// How many times one turn may be nudged to keep going after the model ends a
 /// response without a tool call while apparently mid-task.
 const MAX_AUTO_CONTINUES: usize = 2;
@@ -245,6 +245,9 @@ pub struct TurnPolicy {
     /// root turn never collide in events, approvals, or audit records.
     /// `None` for the root agent.
     pub agent_scope: Option<String>,
+    /// Limits for a root turn. A child agent draws from its root turn's
+    /// [`TurnBudget`] instead (see [`run_agent_turn_with_budget`]).
+    pub limits: TurnLimits,
 }
 
 impl std::fmt::Debug for TurnPolicy {
@@ -255,6 +258,7 @@ impl std::fmt::Debug for TurnPolicy {
             .field("compactor", &self.compactor.name())
             .field("tools", &self.tools)
             .field("agent_scope", &self.agent_scope)
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -267,6 +271,7 @@ impl Clone for TurnPolicy {
             compactor: Arc::clone(&self.compactor),
             tools: self.tools,
             agent_scope: self.agent_scope.clone(),
+            limits: self.limits,
         }
     }
 }
@@ -279,6 +284,7 @@ impl TurnPolicy {
             compactor: Arc::from(CompactionConfig::default().build()),
             tools: ToolSet::all(),
             agent_scope: None,
+            limits: TurnLimits::default(),
         }
     }
 
@@ -289,6 +295,11 @@ impl TurnPolicy {
 
     pub fn with_agent_scope(mut self, scope: impl Into<String>) -> Self {
         self.agent_scope = Some(scope.into());
+        self
+    }
+
+    pub fn with_limits(mut self, limits: TurnLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -394,12 +405,29 @@ fn stage_compaction(
     Some((staged, report))
 }
 
+/// Run one root turn with a fresh budget built from `policy.limits`.
 pub async fn run_agent_turn(
     agent: &mut dyn AgentAdapter,
     history: &mut Vec<ChatMessage>,
     message: String,
     cwd: &Path,
     policy: &TurnPolicy,
+    observer: &mut dyn TurnObserver,
+) -> Result<()> {
+    let budget = TurnBudget::new(policy.limits);
+    run_agent_turn_with_budget(agent, history, message, cwd, policy, &budget, observer).await
+}
+
+/// Run one turn drawing from `budget`, which may be shared with the turn's
+/// parent and siblings. `policy.limits` is ignored; the budget's own limits
+/// apply. Exhaustion fails the turn with a [`BudgetExhausted`] error.
+pub async fn run_agent_turn_with_budget(
+    agent: &mut dyn AgentAdapter,
+    history: &mut Vec<ChatMessage>,
+    message: String,
+    cwd: &Path,
+    policy: &TurnPolicy,
+    budget: &TurnBudget,
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
     let approval = policy.approval;
@@ -412,7 +440,16 @@ pub async fn run_agent_turn(
     let mut auto_continues = 0;
     let mut overflow_retry_used = false;
 
-    for _ in 0..MAX_AGENT_STEPS {
+    loop {
+        if let Err(exhausted) = budget.charge_provider_request() {
+            preserve_or_rollback_failed_turn(
+                history,
+                &rollback_history,
+                observed_tool_activity,
+                &exhausted.to_string(),
+            );
+            return Err(exhausted.into());
+        }
         let mut streamed_text = String::new();
         let cancellation = observer.cancellation();
         // Guard every provider request, not just the first one. Tool results
@@ -423,7 +460,7 @@ pub async fn run_agent_turn(
             Some((compacted, _)) => compacted.clone(),
             None => history.clone(),
         };
-        let response = {
+        let outcome = {
             let observer = &mut *observer;
             let mut emit = |event| match event {
                 AgentEvent::TextDelta(text) => {
@@ -438,18 +475,33 @@ pub async fn run_agent_turn(
                         tools: tools.clone(),
                     },
                     &mut emit,
-                ) => Some(response),
-                () = cancellation.wait() => None,
+                ) => ProviderOutcome::Response(response),
+                () = cancellation.wait() => ProviderOutcome::Cancelled,
+                () = budget.expired() => ProviderOutcome::Expired,
             }
         };
-        let Some(response) = response else {
-            preserve_or_rollback_failed_turn(
-                history,
-                &rollback_history,
-                observed_tool_activity,
-                "agent turn cancelled",
-            );
-            bail!("agent turn cancelled");
+        let response = match outcome {
+            ProviderOutcome::Response(response) => response,
+            ProviderOutcome::Cancelled => {
+                preserve_or_rollback_failed_turn(
+                    history,
+                    &rollback_history,
+                    observed_tool_activity,
+                    "agent turn cancelled",
+                );
+                bail!("agent turn cancelled");
+            }
+            ProviderOutcome::Expired => {
+                let exhausted = BudgetExhausted::WallTime(budget.limits().wall_time);
+                emit_partial_response(observer, streamed_text);
+                preserve_or_rollback_failed_turn(
+                    history,
+                    &rollback_history,
+                    observed_tool_activity,
+                    &exhausted.to_string(),
+                );
+                return Err(exhausted.into());
+            }
         };
         let response = match response {
             Ok(response) => response,
@@ -530,15 +582,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 }
             }
             Err(error) => {
-                if !streamed_text.is_empty() {
-                    observer.emit(ExecutionEvent::AgentResponse {
-                        content: streamed_text,
-                        tool_call_count: 0,
-                        partial: true,
-                        reasoning: None,
-                        finish_reason: None,
-                    });
-                }
+                emit_partial_response(observer, streamed_text);
                 preserve_or_rollback_failed_turn(
                     history,
                     &rollback_history,
@@ -612,6 +656,43 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 );
                 bail!("agent turn cancelled");
             }
+            // An oversized batch is truncated, not rejected: the calls
+            // within the limit run and the rest tell the model to resend.
+            let per_response = budget.limits().tool_calls_per_response;
+            if index >= per_response {
+                refuse_tool_call(
+                    observer,
+                    history,
+                    call,
+                    scoped,
+                    format!(
+                        "tool error: not run; the response exceeded the limit of \
+{per_response} tool calls per response"
+                    ),
+                );
+                continue;
+            }
+            if let Err(exhausted) = budget.charge_tool_call() {
+                for (call, scoped) in response.tool_calls[index..]
+                    .iter()
+                    .zip(&scoped_calls[index..])
+                {
+                    refuse_tool_call(
+                        observer,
+                        history,
+                        call,
+                        scoped,
+                        format!("tool error: not run; {exhausted}"),
+                    );
+                }
+                preserve_or_rollback_failed_turn(
+                    history,
+                    &rollback_history,
+                    observed_tool_activity,
+                    &exhausted.to_string(),
+                );
+                return Err(exhausted.into());
+            }
             // The toolset bounds authority, not just the prompt: a call to a
             // tool this agent was not offered, or to no tool at all, is
             // refused without approval and without counting as tool activity.
@@ -621,16 +702,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 } else {
                     format!("tool error: unknown tool {}", call.name)
                 };
-                observer.emit(ExecutionEvent::ToolDecision {
-                    call_id: scoped.id.clone(),
-                    decision: ApprovalDecision::Deny,
-                });
-                observer.emit(ExecutionEvent::ToolResult {
-                    call_id: scoped.id.clone(),
-                    name: call.name.clone(),
-                    result: result.clone(),
-                });
-                history.push(ChatMessage::tool_result(call, result));
+                refuse_tool_call(observer, history, call, scoped, result);
                 continue;
             }
             let gate = requires_approval(scoped, cwd, &policy.sensitive_paths);
@@ -722,13 +794,46 @@ Start a new session with //new or lower max_history_bytes to continue.",
             }
         }
     }
-    preserve_or_rollback_failed_turn(
-        history,
-        &rollback_history,
-        observed_tool_activity,
-        &format!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit"),
-    );
-    bail!("agent exceeded the {MAX_AGENT_STEPS}-step tool-call limit")
+}
+
+enum ProviderOutcome {
+    Response(Result<AssistantResponse, AdapterError>),
+    Cancelled,
+    Expired,
+}
+
+/// Record text a provider streamed before its request failed or was cut off.
+fn emit_partial_response(observer: &mut dyn TurnObserver, streamed_text: String) {
+    if !streamed_text.is_empty() {
+        observer.emit(ExecutionEvent::AgentResponse {
+            content: streamed_text,
+            tool_call_count: 0,
+            partial: true,
+            reasoning: None,
+            finish_reason: None,
+        });
+    }
+}
+
+/// Answer a call without evaluating it: a policy denial with `result` as the
+/// tool's output, so history stays consistent and the record says why.
+fn refuse_tool_call(
+    observer: &mut dyn TurnObserver,
+    history: &mut Vec<ChatMessage>,
+    call: &ToolCall,
+    scoped: &ToolCall,
+    result: String,
+) {
+    observer.emit(ExecutionEvent::ToolDecision {
+        call_id: scoped.id.clone(),
+        decision: ApprovalDecision::Deny,
+    });
+    observer.emit(ExecutionEvent::ToolResult {
+        call_id: scoped.id.clone(),
+        name: call.name.clone(),
+        result: result.clone(),
+    });
+    history.push(ChatMessage::tool_result(call, result));
 }
 
 fn stub_unfinished_tool_calls(history: &mut Vec<ChatMessage>, calls: &[ToolCall], message: &str) {
@@ -1460,6 +1565,267 @@ mod tests {
             .filter_map(|message| message.tool_call_id.as_deref())
             .collect();
         assert_eq!(resent, ["call_1", "call_2"]);
+    }
+
+    /// Never answers, so only cancellation or the time budget ends a request.
+    struct HangingAdapter;
+
+    #[async_trait]
+    impl AgentAdapter for HangingAdapter {
+        fn descriptor(&self) -> AgentDescriptor {
+            AgentDescriptor {
+                id: "hanging".into(),
+                display_name: "hanging".into(),
+                model: "test".into(),
+                capabilities: Vec::new(),
+            }
+        }
+
+        async fn chat_stream(
+            &mut self,
+            _request: ChatRequest,
+            events: &mut (dyn FnMut(AgentEvent) + Send),
+        ) -> Result<AssistantResponse, AdapterError> {
+            events(AgentEvent::TextDelta("thinking".into()));
+            std::future::pending().await
+        }
+    }
+
+    fn listing_responses(responses: usize, calls_each: usize) -> ScriptedAdapter {
+        ScriptedAdapter {
+            responses: (0..responses)
+                .map(|response| AssistantResponse {
+                    tool_calls: (0..calls_each)
+                        .map(|call| list_call(&format!("r{response}c{call}")))
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            requests: Vec::new(),
+        }
+    }
+
+    fn exhaustion(error: &anyhow::Error) -> BudgetExhausted {
+        *error
+            .downcast_ref::<BudgetExhausted>()
+            .unwrap_or_else(|| panic!("not a budget error: {error:#}"))
+    }
+
+    /// Every assistant tool call has exactly one tool result.
+    fn assert_tool_results_complete(history: &[ChatMessage]) {
+        let calls: Vec<_> = history
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .map(|call| call.id.as_str())
+            .collect();
+        let results: Vec<_> = history
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(calls, results);
+    }
+
+    #[tokio::test]
+    async fn provider_request_budget_stops_an_endless_tool_loop() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = listing_responses(10, 1);
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_limits(TurnLimits {
+                provider_requests: 3,
+                ..TurnLimits::default()
+            }),
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(exhaustion(&error), BudgetExhausted::ProviderRequests(3));
+        assert_eq!(adapter.requests.len(), 3);
+        // Tools ran, so the turn is kept and the reason recorded.
+        assert_tool_results_complete(&history);
+        assert!(
+            history
+                .last()
+                .unwrap()
+                .content
+                .contains("exhausted its budget of 3 provider requests")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_budget_spans_responses_and_answers_every_call() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = listing_responses(3, 2);
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_limits(TurnLimits {
+                tool_calls: 3,
+                ..TurnLimits::default()
+            }),
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(exhaustion(&error), BudgetExhausted::ToolCalls(3));
+        assert_eq!(adapter.requests.len(), 2);
+        let results = tool_results(&observer.events);
+        assert_eq!(results.len(), 4);
+        assert!(
+            results[..3]
+                .iter()
+                .all(|(_, result)| !result.starts_with("tool error"))
+        );
+        assert_eq!(
+            results[3],
+            (
+                "r1c1",
+                "tool error: not run; agent turn exhausted its budget of 3 tool calls"
+            )
+        );
+        assert_tool_results_complete(&history);
+    }
+
+    #[tokio::test]
+    async fn oversized_batches_run_only_the_calls_within_the_limit() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![
+                        list_call("a"),
+                        list_call("b"),
+                        shell_call("c", "touch marker"),
+                    ],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto).with_limits(TurnLimits {
+                tool_calls_per_response: 2,
+                ..TurnLimits::default()
+            }),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert!(!temporary.path().join("marker").exists());
+        assert_eq!(
+            tool_results(&observer.events)[2],
+            (
+                "c",
+                "tool error: not run; the response exceeded the limit of 2 tool calls per response"
+            )
+        );
+        assert_tool_results_complete(&history);
+    }
+
+    #[tokio::test]
+    async fn time_budget_interrupts_a_hung_provider_and_rolls_back() {
+        let temporary = TempDir::new().unwrap();
+        let mut observer = recording_observer([]);
+        let mut history = vec![ChatMessage::system("prompt")];
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_agent_turn(
+                &mut HangingAdapter,
+                &mut history,
+                "hello".into(),
+                temporary.path(),
+                &TurnPolicy::new(ApprovalPolicy::Ask).with_limits(TurnLimits {
+                    wall_time: Duration::from_millis(50),
+                    ..TurnLimits::default()
+                }),
+                &mut observer,
+            ),
+        )
+        .await
+        .expect("the time budget did not interrupt the provider")
+        .unwrap_err();
+
+        assert_eq!(
+            exhaustion(&error),
+            BudgetExhausted::WallTime(Duration::from_millis(50))
+        );
+        assert_eq!(history, [ChatMessage::system("prompt")]);
+        // Text streamed before the cutoff is still on record.
+        assert!(observer.events.contains(&ExecutionEvent::AgentResponse {
+            content: "thinking".into(),
+            tool_call_count: 0,
+            partial: true,
+            reasoning: None,
+            finish_reason: None,
+        }));
+    }
+
+    #[tokio::test]
+    async fn turns_sharing_a_budget_draw_from_the_same_counters() {
+        let temporary = TempDir::new().unwrap();
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask);
+        let budget = TurnBudget::new(TurnLimits {
+            provider_requests: 3,
+            ..TurnLimits::default()
+        });
+        // A parent's two requests and a child's would-be second request
+        // exhaust one budget of three.
+        let mut parent = listing_responses(1, 1);
+        parent.responses.push_back(AssistantResponse {
+            content: "done".into(),
+            ..Default::default()
+        });
+        let mut history = Vec::new();
+        run_agent_turn_with_budget(
+            &mut parent,
+            &mut history,
+            "parent".into(),
+            temporary.path(),
+            &policy,
+            &budget,
+            &mut recording_observer([]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(budget.provider_requests_used(), 2);
+
+        let mut child = listing_responses(5, 1);
+        let error = run_agent_turn_with_budget(
+            &mut child,
+            &mut Vec::new(),
+            "child".into(),
+            temporary.path(),
+            // The child's own policy limits do not grant a fresh budget.
+            &policy.clone().with_limits(TurnLimits::default()),
+            &budget,
+            &mut recording_observer([]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(exhaustion(&error), BudgetExhausted::ProviderRequests(3));
+        assert_eq!(child.requests.len(), 1);
     }
 
     #[tokio::test]

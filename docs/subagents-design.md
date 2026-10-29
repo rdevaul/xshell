@@ -1,8 +1,8 @@
 # Subagents: design and staged plan
 
 Status: **proposed**. Step 1 (per-agent toolsets and scoped tool-call
-identities) is prototyped on the `subagents-step1` branch; later steps are
-design only.
+identities) and step 2 (the shared whole-turn budget) are prototyped; later
+steps are design only.
 
 This document assesses what the xshell harness needs in order to create and
 manage subagents — agents started by another agent to do a bounded piece of
@@ -172,7 +172,24 @@ This is designed as FS5's `xshell-session` connector so its lifecycle
 ### Budgets
 
 A root turn owns one budget, shared by reference with every descendant:
-model rounds, tool dispatches, child starts, and wall time. Exhaustion stops
+model rounds, tool dispatches, child starts, and wall time.
+
+The step 2 prototype implements this as `TurnLimits` (on `TurnPolicy`) and
+`TurnBudget` (clones share atomic counters) in `xshell-execution`:
+
+| Limit | Default | Counts | On exhaustion |
+|---|---|---|---|
+| `provider_requests` | 64 | Every provider request, including auto-continues and the overflow retry | Turn fails before the request |
+| `tool_calls` | 128 | Every evaluated call: approved, denied, or refused by toolset | This and the remaining calls in the response are answered with a refusal; turn fails |
+| `tool_calls_per_response` | 32 | Calls in one response | Calls past the limit are refused; the turn continues so the model can resend |
+| `wall_time` | 60 min | Elapsed time since the root turn started | Checked before every request and call, and enforced during provider requests; a running tool is bounded by its own timeout |
+
+Exhaustion fails the turn with a typed `BudgetExhausted` error and follows the
+usual failure rules: rolled back if no tool ran, otherwise kept with an
+execution record. `run_agent_turn` builds a fresh budget from the policy;
+`run_agent_turn_with_budget` lets a child draw from its root's budget and
+ignores the child policy's own limits. The 64-request default preserves the
+former 64-step limit. Per-session and global budgets from F10 remain open. Exhaustion stops
 new dispatch and is reported as the child's outcome, then as the root turn's
 failure if the root also cannot continue. Token and cost limits wait for
 usage reporting from adapters (`AgentEvent` carries only text deltas today);

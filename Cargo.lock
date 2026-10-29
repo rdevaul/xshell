@@ -1968,6 +1968,7 @@ dependencies = [
  "serde_json",
  "shell-words",
  "tempfile",
+ "thiserror",
  "tokio",
  "xshell-adapters",
  "xshell-core",

@@ -1,3 +1,4 @@
+mod budget;
 mod call_id;
 mod compaction;
 mod engine;
@@ -5,6 +6,7 @@ mod process;
 mod sensitive;
 mod tools;
 
+pub use budget::{BudgetExhausted, TurnBudget, TurnLimits};
 pub use compaction::{
     BYTES_PER_TOKEN, CompactionConfig, CompactionReport, Compactor, DEFAULT_RESERVE_OUTPUT_TOKENS,
     MINIMUM_HISTORY_TOKENS, MaxBytesCompactor, ModelBudget, NoCompaction, REQUEST_OVERHEAD_TOKENS,
@@ -13,7 +15,7 @@ pub use compaction::{
 pub use engine::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, DirectShellResult,
     ExecutionEvent, TurnObserver, TurnPolicy, build_adapter, captured_cd_destination,
-    run_agent_turn, run_direct_shell, run_direct_shell_streaming,
+    run_agent_turn, run_agent_turn_with_budget, run_direct_shell, run_direct_shell_streaming,
     run_direct_shell_streaming_cancellable, validate_working_directory,
 };
 pub use sensitive::{DEFAULT_SENSITIVE_PATTERNS, SensitivePaths};
