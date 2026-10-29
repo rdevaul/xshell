@@ -1,7 +1,8 @@
+use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
 use crate::tools::execute_tool_cancellable;
 use crate::{
-    CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, definitions,
+    CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, Tool, ToolSet,
     drop_tool_payloads, estimate_history_tokens, history_bytes, requires_approval,
 };
 use anyhow::{Context, Result, bail};
@@ -237,6 +238,13 @@ pub struct TurnPolicy {
     /// once the provider accepts) and after a turn completes. Failed and
     /// cancelled turns restore the pre-turn history.
     pub compactor: Arc<dyn Compactor>,
+    /// The tools this agent is offered and may dispatch. Calls outside the
+    /// set are refused before approval.
+    pub tools: ToolSet,
+    /// Prefix for this agent's scoped tool-call ids, so agents sharing one
+    /// root turn never collide in events, approvals, or audit records.
+    /// `None` for the root agent.
+    pub agent_scope: Option<String>,
 }
 
 impl std::fmt::Debug for TurnPolicy {
@@ -245,6 +253,8 @@ impl std::fmt::Debug for TurnPolicy {
             .field("approval", &self.approval)
             .field("sensitive_paths", &self.sensitive_paths)
             .field("compactor", &self.compactor.name())
+            .field("tools", &self.tools)
+            .field("agent_scope", &self.agent_scope)
             .finish()
     }
 }
@@ -255,6 +265,8 @@ impl Clone for TurnPolicy {
             approval: self.approval,
             sensitive_paths: self.sensitive_paths.clone(),
             compactor: Arc::clone(&self.compactor),
+            tools: self.tools,
+            agent_scope: self.agent_scope.clone(),
         }
     }
 }
@@ -265,7 +277,19 @@ impl TurnPolicy {
             approval,
             sensitive_paths: SensitivePaths::default(),
             compactor: Arc::from(CompactionConfig::default().build()),
+            tools: ToolSet::all(),
+            agent_scope: None,
         }
+    }
+
+    pub fn with_tools(mut self, tools: ToolSet) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn with_agent_scope(mut self, scope: impl Into<String>) -> Self {
+        self.agent_scope = Some(scope.into());
+        self
     }
 
     pub fn with_sensitive_paths(mut self, sensitive_paths: SensitivePaths) -> Self {
@@ -382,7 +406,8 @@ pub async fn run_agent_turn(
     // Keep the exact prior history for failed/cancelled-turn rollback.
     let mut rollback_history = history.clone();
     history.push(ChatMessage::user(message));
-    let tools = definitions();
+    let tools = policy.tools.definitions();
+    let mut call_ids = CallIds::new(policy.agent_scope.as_deref());
     let mut observed_tool_activity = false;
     let mut auto_continues = 0;
     let mut overflow_retry_used = false;
@@ -539,7 +564,14 @@ Start a new session with //new or lower max_history_bytes to continue.",
             reasoning: response.reasoning.clone(),
             finish_reason: response.finish_reason.clone(),
         });
-        for call in &response.tool_calls {
+        // History keeps the provider's ids; everything a client or auditor
+        // sees uses the scoped ids, which are unique within the root turn.
+        let scoped_calls: Vec<ToolCall> = response
+            .tool_calls
+            .iter()
+            .map(|call| call_ids.scoped(call))
+            .collect();
+        for call in &scoped_calls {
             observer.emit(ExecutionEvent::ToolRequested { call: call.clone() });
         }
         let continue_reason = auto_continue_reason(&response);
@@ -563,7 +595,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
             return Ok(());
         }
 
-        for (index, call) in response.tool_calls.iter().enumerate() {
+        for (index, (call, scoped)) in response.tool_calls.iter().zip(&scoped_calls).enumerate() {
             if observer.cancellation().is_cancelled() {
                 if observed_tool_activity {
                     stub_unfinished_tool_calls(
@@ -580,7 +612,28 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 );
                 bail!("agent turn cancelled");
             }
-            let gate = requires_approval(call, cwd, &policy.sensitive_paths);
+            // The toolset bounds authority, not just the prompt: a call to a
+            // tool this agent was not offered, or to no tool at all, is
+            // refused without approval and without counting as tool activity.
+            if policy.tools.get(&call.name).is_none() {
+                let result = if Tool::from_name(&call.name).is_some() {
+                    format!("tool error: {} is not available to this agent", call.name)
+                } else {
+                    format!("tool error: unknown tool {}", call.name)
+                };
+                observer.emit(ExecutionEvent::ToolDecision {
+                    call_id: scoped.id.clone(),
+                    decision: ApprovalDecision::Deny,
+                });
+                observer.emit(ExecutionEvent::ToolResult {
+                    call_id: scoped.id.clone(),
+                    name: call.name.clone(),
+                    result: result.clone(),
+                });
+                history.push(ChatMessage::tool_result(call, result));
+                continue;
+            }
+            let gate = requires_approval(scoped, cwd, &policy.sensitive_paths);
             let decision = match gate {
                 None => ApprovalDecision::Approve,
                 Some(reason) => match approval {
@@ -588,15 +641,15 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     ApprovalPolicy::Off => ApprovalDecision::Deny,
                     ApprovalPolicy::Ask => {
                         observer.emit(ExecutionEvent::ApprovalRequested {
-                            call: call.clone(),
+                            call: scoped.clone(),
                             reason: Some(reason),
                         });
-                        observer.approve(call, reason).await
+                        observer.approve(scoped, reason).await
                     }
                 },
             };
             observer.emit(ExecutionEvent::ToolDecision {
-                call_id: call.id.clone(),
+                call_id: scoped.id.clone(),
                 decision,
             });
             // A decision is the last audit boundary before the action. An
@@ -625,7 +678,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                         "tool execution aborted by user; agent turn stopped",
                     ));
                 }
-                for skipped in &response.tool_calls[index + 1..] {
+                for skipped in &scoped_calls[index + 1..] {
                     observer.emit(ExecutionEvent::ToolSkipped {
                         call_id: skipped.id.clone(),
                         name: skipped.name.clone(),
@@ -642,13 +695,13 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 "tool denied by user".into()
             };
             observer.emit(ExecutionEvent::ToolResult {
-                call_id: call.id.clone(),
+                call_id: scoped.id.clone(),
                 name: call.name.clone(),
                 result: result.clone(),
             });
             history.push(ChatMessage::tool_result(call, result));
             if observer.cancellation().is_cancelled() {
-                for skipped in &response.tool_calls[index + 1..] {
+                for skipped in &scoped_calls[index + 1..] {
                     observer.emit(ExecutionEvent::ToolSkipped {
                         call_id: skipped.id.clone(),
                         name: skipped.name.clone(),
@@ -1179,6 +1232,234 @@ mod tests {
         // user, assistant(2 tools), tool, tool, assistant
         assert_eq!(history.len(), 5);
         assert_eq!(adapter.requests.len(), 2);
+    }
+
+    fn recording_observer(
+        decisions: impl IntoIterator<Item = ApprovalDecision>,
+    ) -> RecordingObserver {
+        RecordingObserver {
+            events: Vec::new(),
+            decisions: decisions.into_iter().collect(),
+            cancellation: CancellationFlag::default(),
+            cancel_on_decision: false,
+        }
+    }
+
+    fn tool_results(events: &[ExecutionEvent]) -> Vec<(&str, &str)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id.as_str(), result.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tools_outside_the_toolset_are_neither_offered_nor_run() {
+        let temporary = TempDir::new().unwrap();
+        let marker = temporary.path().join("marker");
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![shell_call("a", "touch marker"), list_call("b")],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        // No scripted decisions: any approval prompt would panic. Even `auto`
+        // must not run a tool the agent was not given.
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto).with_tools(ToolSet::read_only()),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert!(!marker.exists(), "the refused shell command ran");
+        let offered: Vec<_> = adapter.requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(offered, ["read_file", "list_directory"]);
+        assert!(!kinds(&observer.events).contains(&"approval"));
+        let results = tool_results(&observer.events);
+        assert_eq!(
+            results[0],
+            ("a", "tool error: run_shell is not available to this agent")
+        );
+        assert_eq!(results[1].0, "b");
+        assert!(!results[1].1.starts_with("tool error"));
+        assert!(observer.events.contains(&ExecutionEvent::ToolDecision {
+            call_id: "a".into(),
+            decision: ApprovalDecision::Deny,
+        }));
+    }
+
+    #[tokio::test]
+    async fn refused_and_unknown_tools_do_not_count_as_tool_activity() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            // The provider fails after the refused calls, so the turn rolls
+            // back only if nothing was treated as having run.
+            responses: VecDeque::from([AssistantResponse {
+                tool_calls: vec![
+                    shell_call("a", "true"),
+                    ToolCall {
+                        id: "b".into(),
+                        name: "delete_everything".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                ..Default::default()
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = vec![ChatMessage::system("prompt")];
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_tools(ToolSet::read_only()),
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("script exhausted"));
+        assert_eq!(history, [ChatMessage::system("prompt")]);
+        assert_eq!(
+            tool_results(&observer.events)[1],
+            ("b", "tool error: unknown tool delete_everything")
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_provider_ids_get_distinct_scoped_ids_but_history_keeps_them() {
+        let temporary = TempDir::new().unwrap();
+        // Ollama numbers each response's calls from zero.
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![list_call("ollama-call-0")],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    tool_calls: vec![list_call("ollama-call-0")],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        let scoped: Vec<_> = tool_results(&observer.events)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(scoped, ["ollama-call-0", "ollama-call-0~2"]);
+        let provider: Vec<_> = history
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(provider, ["ollama-call-0", "ollama-call-0"]);
+        for message in &history {
+            for call in &message.tool_calls {
+                assert_eq!(call.id, "ollama-call-0");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_scope_prefixes_every_client_visible_id() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![shell_call("call_1", "true"), list_call("call_2")],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([ApprovalDecision::Deny]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_agent_scope("delegate-1"),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        let mut visible = Vec::new();
+        for event in &observer.events {
+            match event {
+                ExecutionEvent::ToolRequested { call }
+                | ExecutionEvent::ApprovalRequested { call, .. } => visible.push(call.id.as_str()),
+                ExecutionEvent::ToolDecision { call_id, .. }
+                | ExecutionEvent::ToolResult { call_id, .. }
+                | ExecutionEvent::ToolSkipped { call_id, .. } => visible.push(call_id.as_str()),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            visible,
+            [
+                "delegate-1/call_1",
+                "delegate-1/call_2",
+                "delegate-1/call_1",
+                "delegate-1/call_1",
+                "delegate-1/call_1",
+                "delegate-1/call_2",
+                "delegate-1/call_2",
+            ]
+        );
+        // The provider is sent back exactly the ids it issued.
+        let resent: Vec<_> = adapter.requests[1]
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(resent, ["call_1", "call_2"]);
     }
 
     #[tokio::test]

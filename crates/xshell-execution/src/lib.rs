@@ -1,3 +1,4 @@
+mod call_id;
 mod compaction;
 mod engine;
 mod process;
@@ -17,6 +18,6 @@ pub use engine::{
 };
 pub use sensitive::{DEFAULT_SENSITIVE_PATTERNS, SensitivePaths};
 pub use tools::{
-    GateReason, definitions, execute_tool, requires_approval, requires_approval_by_name,
-    tool_summary,
+    GateReason, Tool, ToolSet, definitions, execute_tool, requires_approval,
+    requires_approval_by_name, tool_summary,
 };

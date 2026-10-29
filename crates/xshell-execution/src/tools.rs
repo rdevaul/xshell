@@ -15,6 +15,114 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 500;
 const SHELL_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Every tool the engine can dispatch. Closed on purpose: adding a tool is a
+/// new variant, and exhaustive matches find every place that must handle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    ReadFile,
+    ListDirectory,
+    RunShell,
+}
+
+impl Tool {
+    pub const ALL: [Self; 3] = [Self::ReadFile, Self::ListDirectory, Self::RunShell];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ReadFile => "read_file",
+            Self::ListDirectory => "list_directory",
+            Self::RunShell => "run_shell",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.name() == name)
+    }
+
+    /// Whether the tool can change state outside xshell. Read-only tools may
+    /// still be gated by the sensitive-path policy.
+    pub fn is_read_only(self) -> bool {
+        match self {
+            Self::ReadFile | Self::ListDirectory => true,
+            Self::RunShell => false,
+        }
+    }
+
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// The tools one agent may use: both what is advertised to the model and what
+/// the engine will dispatch. A call outside the set is refused before
+/// approval, so narrowing a set narrows authority, not just the prompt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ToolSet(u8);
+
+impl ToolSet {
+    pub fn all() -> Self {
+        Self::from_tools(Tool::ALL)
+    }
+
+    pub fn none() -> Self {
+        Self(0)
+    }
+
+    pub fn read_only() -> Self {
+        Self::from_tools(Tool::ALL.into_iter().filter(|tool| tool.is_read_only()))
+    }
+
+    pub fn from_tools(tools: impl IntoIterator<Item = Tool>) -> Self {
+        Self(tools.into_iter().fold(0, |bits, tool| bits | tool.bit()))
+    }
+
+    pub fn contains(self, tool: Tool) -> bool {
+        self.0 & tool.bit() != 0
+    }
+
+    /// The tool named `name`, if it exists and is in this set.
+    pub fn get(self, name: &str) -> Option<Tool> {
+        Tool::from_name(name).filter(|tool| self.contains(*tool))
+    }
+
+    pub fn without(self, tool: Tool) -> Self {
+        Self(self.0 & !tool.bit())
+    }
+
+    /// The tools in both sets: how a child's request is bounded by its
+    /// parent's authority.
+    pub fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub fn tools(self) -> impl Iterator<Item = Tool> {
+        Tool::ALL
+            .into_iter()
+            .filter(move |tool| self.contains(*tool))
+    }
+
+    /// Definitions for the tools in this set, in the stable `Tool::ALL` order.
+    pub fn definitions(self) -> Vec<ToolDefinition> {
+        definitions()
+            .into_iter()
+            .filter(|definition| self.get(&definition.name).is_some())
+            .collect()
+    }
+}
+
+impl Default for ToolSet {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl std::fmt::Debug for ToolSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.tools().map(Tool::name)).finish()
+    }
+}
+
+/// Definitions for every tool, in `Tool::ALL` order.
 pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -114,7 +222,7 @@ pub fn requires_approval(
 
 /// Whether a tool is gated regardless of its arguments.
 pub fn requires_approval_by_name(name: &str) -> bool {
-    name == "run_shell"
+    Tool::from_name(name) == Some(Tool::RunShell)
 }
 
 pub fn tool_summary(call: &ToolCall) -> String {
@@ -151,11 +259,11 @@ async fn execute_inner(
     root: &Path,
     cancellation: CancellationFlag,
 ) -> Result<String> {
-    match call.name.as_str() {
-        "read_file" => read_file(&call.arguments, root),
-        "list_directory" => list_directory(&call.arguments, root),
-        "run_shell" => run_shell(&call.arguments, root, cancellation).await,
-        _ => bail!("unknown tool {}", call.name),
+    match Tool::from_name(&call.name) {
+        Some(Tool::ReadFile) => read_file(&call.arguments, root),
+        Some(Tool::ListDirectory) => list_directory(&call.arguments, root),
+        Some(Tool::RunShell) => run_shell(&call.arguments, root, cancellation).await,
+        None => bail!("unknown tool {}", call.name),
     }
 }
 
@@ -361,6 +469,51 @@ fn truncate(mut output: String) -> String {
 mod tests {
     use super::*;
     use tokio::time::timeout;
+
+    #[test]
+    fn tool_names_match_their_definitions() {
+        let names: Vec<_> = definitions().into_iter().map(|tool| tool.name).collect();
+        let expected: Vec<_> = Tool::ALL.iter().map(|tool| tool.name()).collect();
+        assert_eq!(names, expected);
+        for tool in Tool::ALL {
+            assert_eq!(Tool::from_name(tool.name()), Some(tool));
+        }
+        assert_eq!(Tool::from_name("delete_everything"), None);
+    }
+
+    #[test]
+    fn toolsets_select_definitions_and_dispatch() {
+        let read_only = ToolSet::read_only();
+        assert!(read_only.contains(Tool::ReadFile));
+        assert!(read_only.contains(Tool::ListDirectory));
+        assert!(!read_only.contains(Tool::RunShell));
+        assert_eq!(read_only.get("run_shell"), None);
+        assert_eq!(read_only.get("read_file"), Some(Tool::ReadFile));
+        assert_eq!(
+            read_only
+                .definitions()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            ["read_file", "list_directory"]
+        );
+        assert_eq!(ToolSet::default(), ToolSet::all());
+        assert_eq!(ToolSet::all().definitions(), definitions());
+        assert!(ToolSet::none().definitions().is_empty());
+        assert_eq!(ToolSet::all().without(Tool::RunShell), read_only);
+        assert_eq!(
+            ToolSet::all().intersect(ToolSet::from_tools([Tool::ReadFile, Tool::RunShell])),
+            ToolSet::from_tools([Tool::ReadFile, Tool::RunShell])
+        );
+        assert_eq!(
+            read_only.intersect(ToolSet::from_tools([Tool::RunShell])),
+            ToolSet::none()
+        );
+        assert_eq!(
+            format!("{read_only:?}"),
+            r#"{"read_file", "list_directory"}"#
+        );
+    }
 
     #[test]
     fn blocks_paths_outside_root() {
