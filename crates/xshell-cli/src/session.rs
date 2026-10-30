@@ -31,6 +31,9 @@ pub struct SessionRuntime {
     navigation_history: Vec<String>,
     event_cursors: HashMap<String, u64>,
     pty_cursors: HashMap<String, u64>,
+    /// Set when focus moves to another session, so the next resume redraws
+    /// that session's recent output instead of leaving the previous one's.
+    redraw_pending: bool,
 }
 
 impl SessionRuntime {
@@ -84,6 +87,7 @@ impl SessionRuntime {
             navigation_history: Vec::new(),
             event_cursors,
             pty_cursors: HashMap::new(),
+            redraw_pending: false,
         };
         runtime.rebuild_display_host_aliases();
         Ok((runtime, Some(snapshot)))
@@ -98,6 +102,7 @@ impl SessionRuntime {
             navigation_history: Vec::new(),
             event_cursors: HashMap::new(),
             pty_cursors: HashMap::new(),
+            redraw_pending: false,
         }
     }
 
@@ -328,6 +333,7 @@ session's interactive process is running; stop it first"
         }
         self.active = Some(snapshot.descriptor.clone());
         self.ensure_event_cursor(&snapshot.descriptor.id)?;
+        self.redraw_pending = true;
         Ok(snapshot)
     }
 
@@ -504,6 +510,22 @@ session's interactive process is running; stop it first"
         let after_sequence = self.event_cursors.get(&session_id).copied().unwrap_or(0);
         self.client_mut()?
             .events(session_id, after_sequence, wait_ms)
+    }
+
+    /// The active session's whole retained event journal, without moving its
+    /// cursor.
+    pub fn journal(&mut self) -> Result<EventBatch> {
+        let session_id = self.active_session_id()?;
+        self.client_mut()?.events(session_id, 0, 0)
+    }
+
+    pub fn event_cursor(&self) -> Option<u64> {
+        let session_id = self.active.as_ref()?.id.as_str();
+        self.event_cursors.get(session_id).copied()
+    }
+
+    pub fn take_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.redraw_pending)
     }
 
     /// Commit one event after the controller has handled it. In particular an

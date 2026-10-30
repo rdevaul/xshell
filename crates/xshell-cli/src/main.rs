@@ -1,4 +1,5 @@
 mod audit;
+mod backlog;
 mod completion;
 mod config;
 mod control;
@@ -572,6 +573,9 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
+                if let Err(error) = backlog::redraw_if_pending(&mut sessions, render_options) {
+                    eprintln!("xshell: could not redraw session output: {error:#}");
+                }
                 audit_logical_session_detached(&mut audit, closed.as_ref(), "close")?;
                 println!(
                     "closed session {}",
