@@ -629,7 +629,50 @@ impl DaemonObserver {
 #[async_trait]
 impl TurnObserver for DaemonObserver {
     fn emit(&mut self, event: ExecutionEvent) {
-        match &event {
+        self.audit_execution(&event);
+        // A subagent's approval is registered under its scoped call id, the
+        // same id the client replies with.
+        if let ExecutionEvent::ApprovalRequested { call, .. } = event.innermost() {
+            self.execution
+                .state
+                .lock_recover()
+                .pending_approvals
+                .insert((self.turn_id.clone(), call.id.clone()));
+        }
+        self.execution
+            .append(&self.turn_id, SessionEventKind::Execution { event });
+    }
+
+    fn cancellation(&self) -> CancellationFlag {
+        self.cancellation.clone()
+    }
+
+    async fn approve(&mut self, call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
+        let key = (self.turn_id.clone(), call.id.clone());
+        loop {
+            if self.cancellation.is_cancelled() {
+                return ApprovalDecision::AbortTurn;
+            }
+            // Register for the wake-up before checking, so a reply that
+            // arrives between the check and the await is not missed.
+            let notified = self.execution.approvals_ready.notified();
+            if let Some(decision) = self.execution.state.lock_recover().approvals.remove(&key) {
+                return decision;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = self.cancellation.wait() => {}
+            }
+        }
+    }
+}
+
+impl DaemonObserver {
+    /// Record `event` at the execution boundary. A subagent's events are
+    /// recorded like the parent's, between its `SubagentStarted` and
+    /// `SubagentFinished` records.
+    fn audit_execution(&mut self, event: &ExecutionEvent) {
+        match event {
             ExecutionEvent::TextDelta { .. } | ExecutionEvent::ApprovalRequested { .. } => {}
             ExecutionEvent::AgentResponse {
                 content,
@@ -690,38 +733,23 @@ impl TurnObserver for DaemonObserver {
                     turns_removed: report.turns_removed,
                 })
             }
-        }
-        if let ExecutionEvent::ApprovalRequested { call, .. } = &event {
-            self.execution
-                .state
-                .lock_recover()
-                .pending_approvals
-                .insert((self.turn_id.clone(), call.id.clone()));
-        }
-        self.execution
-            .append(&self.turn_id, SessionEventKind::Execution { event });
-    }
-
-    fn cancellation(&self) -> CancellationFlag {
-        self.cancellation.clone()
-    }
-
-    async fn approve(&mut self, call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
-        let key = (self.turn_id.clone(), call.id.clone());
-        loop {
-            if self.cancellation.is_cancelled() {
-                return ApprovalDecision::AbortTurn;
+            ExecutionEvent::SubagentStarted { agent, task, tools } => {
+                self.audit(AuditEvent::SubagentStarted {
+                    agent: agent.clone(),
+                    task: task.clone(),
+                    tools: tools.clone(),
+                })
             }
-            // Register for the wake-up before checking, so a reply that
-            // arrives between the check and the await is not missed.
-            let notified = self.execution.approvals_ready.notified();
-            if let Some(decision) = self.execution.state.lock_recover().approvals.remove(&key) {
-                return decision;
-            }
-            tokio::select! {
-                () = notified => {}
-                () = self.cancellation.wait() => {}
-            }
+            ExecutionEvent::Subagent { event, .. } => self.audit_execution(event),
+            ExecutionEvent::SubagentFinished {
+                agent,
+                outcome,
+                message,
+            } => self.audit(AuditEvent::SubagentFinished {
+                agent: agent.clone(),
+                outcome: outcome.clone(),
+                message: message.clone(),
+            }),
         }
     }
 }

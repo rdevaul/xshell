@@ -1657,6 +1657,164 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
     model_server.join().unwrap();
 }
 
+/// One streamed Chat Completions response carrying a single tool call.
+fn sse_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> String {
+    let chunk = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {"name": name, "arguments": arguments.to_string()},
+    }]}}]});
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+fn sse_text(content: &str) -> String {
+    let chunk = serde_json::json!({"choices": [{"delta": {"content": content}}]});
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+#[test]
+fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
+    // Parent delegates; the subagent asks to run a command; the subagent
+    // answers; the parent answers. One fake provider serves all four requests.
+    let (base_url, model_server) = serve_sse(vec![
+        sse_tool_call(
+            "call_1",
+            "delegate_task",
+            serde_json::json!({"task": "print a word", "tools": "inherit"}),
+        ),
+        sse_tool_call(
+            "call_1",
+            "run_shell",
+            serde_json::json!({"command": "printf approved"}),
+        ),
+        sse_text("the subagent printed approved"),
+        sse_text("parent finished"),
+    ]);
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "delegation".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+                max_history_bytes: None,
+                context_tokens: None,
+                reserve_output_tokens: None,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    let turn_id = client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Agent {
+                message: "delegate it".into(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+
+    let mut after = 0;
+    let call_id = loop {
+        let batch = client
+            .events(session.descriptor.id.clone(), after, 500)
+            .unwrap();
+        let mut requested = None;
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::Execution { event } => {
+                    if let ExecutionEvent::ApprovalRequested { call, .. } = event.innermost() {
+                        assert!(
+                            matches!(event, ExecutionEvent::Subagent { ref agent, .. } if agent == "delegate-1"),
+                            "the approval should arrive wrapped as the subagent's"
+                        );
+                        requested = Some(call.id.clone());
+                    }
+                }
+                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+        if let Some(call_id) = requested {
+            break call_id;
+        }
+    };
+    // Scoped, so it cannot collide with the parent's own `call_1`.
+    assert_eq!(call_id, "delegate-1/call_1");
+    client
+        .approve(
+            session.descriptor.id.clone(),
+            turn_id,
+            call_id,
+            ApprovalDecision::Approve,
+        )
+        .unwrap();
+
+    let mut completed = false;
+    let mut parent_results = Vec::new();
+    let mut child_results = Vec::new();
+    let mut outcomes = Vec::new();
+    for _ in 0..100 {
+        let batch = client
+            .events(session.descriptor.id.clone(), after, 500)
+            .unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::Execution { event } => match event {
+                    ExecutionEvent::ToolResult { result, .. } => parent_results.push(result),
+                    ExecutionEvent::SubagentFinished { outcome, .. } => outcomes.push(outcome),
+                    ExecutionEvent::Subagent { event, .. } => {
+                        if let ExecutionEvent::ToolResult { result, .. } = *event {
+                            child_results.push(result);
+                        }
+                    }
+                    _ => {}
+                },
+                SessionEventKind::TurnCompleted => completed = true,
+                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    assert!(completed);
+    assert_eq!(child_results.len(), 1);
+    assert!(child_results[0].contains("approved"));
+    assert_eq!(outcomes, ["completed"]);
+    assert_eq!(parent_results, ["the subagent printed approved"]);
+    let history = client.snapshot(session.descriptor.id).unwrap().history;
+    assert_eq!(history.last().unwrap().content, "parent finished");
+    // The subagent's own request never enters the parent's conversation.
+    assert!(
+        !history
+            .iter()
+            .any(|message| message.content == "print a word")
+    );
+    model_server.join().unwrap();
+}
+
 #[test]
 fn f1_failed_agent_effect_survives_durable_session_reload() {
     let temporary = TempDir::new().unwrap();

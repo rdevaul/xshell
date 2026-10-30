@@ -8,7 +8,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // cancellation request as complete while owned process cleanup is still in
 // progress. Version 13 adds `ExecutionEvent::AutoContinued` and the
 // `reasoning` and `finish_reason` fields on `ExecutionEvent::AgentResponse`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 13;
+// Version 14 adds the `delegate_task` subagent events (`SubagentStarted`,
+// `Subagent`, `SubagentFinished`).
+pub const SESSION_PROTOCOL_VERSION: u32 = 14;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
