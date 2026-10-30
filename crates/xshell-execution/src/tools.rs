@@ -22,16 +22,25 @@ pub enum Tool {
     ReadFile,
     ListDirectory,
     RunShell,
+    /// Starts a subagent. Dispatched by the engine rather than
+    /// [`execute_tool`], because it runs a nested agent turn.
+    DelegateTask,
 }
 
 impl Tool {
-    pub const ALL: [Self; 3] = [Self::ReadFile, Self::ListDirectory, Self::RunShell];
+    pub const ALL: [Self; 4] = [
+        Self::ReadFile,
+        Self::ListDirectory,
+        Self::RunShell,
+        Self::DelegateTask,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::ReadFile => "read_file",
             Self::ListDirectory => "list_directory",
             Self::RunShell => "run_shell",
+            Self::DelegateTask => "delegate_task",
         }
     }
 
@@ -44,7 +53,7 @@ impl Tool {
     pub fn is_read_only(self) -> bool {
         match self {
             Self::ReadFile | Self::ListDirectory => true,
-            Self::RunShell => false,
+            Self::RunShell | Self::DelegateTask => false,
         }
     }
 
@@ -165,6 +174,28 @@ Files that look like credentials or keys require user approval."
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "delegate_task".into(),
+            description: "Start a subagent to complete one self-contained task and return its \
+final answer. The subagent starts with no conversation context, so `task` must contain \
+everything it needs. It works in the same directory with the same or fewer permissions and \
+cannot start subagents of its own. Use it for bounded investigation whose details you do not \
+need to keep in your own context."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Complete instructions for the subagent"},
+                    "tools": {
+                        "type": "string",
+                        "enum": ["read_only", "inherit"],
+                        "description": "read_only (default): read_file and list_directory only. inherit: your tools, including run_shell under the same approval policy"
+                    }
+                },
+                "required": ["task"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -227,6 +258,19 @@ pub fn requires_approval_by_name(name: &str) -> bool {
 
 pub fn tool_summary(call: &ToolCall) -> String {
     match call.name.as_str() {
+        "delegate_task" => {
+            let task = call
+                .arguments
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let first_line = task.lines().next().unwrap_or_default();
+            let mut summary: String = first_line.chars().take(120).collect();
+            if summary.len() < task.len() {
+                summary.push('…');
+            }
+            format!("delegate: {summary}")
+        }
         "run_shell" => call
             .arguments
             .get("command")
@@ -263,6 +307,7 @@ async fn execute_inner(
         Some(Tool::ReadFile) => read_file(&call.arguments, root),
         Some(Tool::ListDirectory) => list_directory(&call.arguments, root),
         Some(Tool::RunShell) => run_shell(&call.arguments, root, cancellation).await,
+        Some(Tool::DelegateTask) => bail!("delegate_task is dispatched by the agent engine"),
         None => bail!("unknown tool {}", call.name),
     }
 }
@@ -452,7 +497,7 @@ fn resolve_existing_with_root(root: &Path, requested: &str) -> Result<(PathBuf, 
     Ok((root, candidate))
 }
 
-fn truncate(mut output: String) -> String {
+pub(crate) fn truncate(mut output: String) -> String {
     if output.len() <= MAX_TOOL_OUTPUT_BYTES {
         return output;
     }
@@ -500,7 +545,12 @@ mod tests {
         assert_eq!(ToolSet::default(), ToolSet::all());
         assert_eq!(ToolSet::all().definitions(), definitions());
         assert!(ToolSet::none().definitions().is_empty());
-        assert_eq!(ToolSet::all().without(Tool::RunShell), read_only);
+        assert_eq!(
+            ToolSet::all()
+                .without(Tool::RunShell)
+                .without(Tool::DelegateTask),
+            read_only
+        );
         assert_eq!(
             ToolSet::all().intersect(ToolSet::from_tools([Tool::ReadFile, Tool::RunShell])),
             ToolSet::from_tools([Tool::ReadFile, Tool::RunShell])

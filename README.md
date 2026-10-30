@@ -76,7 +76,7 @@ daily-driver milestones, and the separate controlled-deployment acceptance gates
 
 | Area | Current capability |
 |---|---|
-| Agent loop | Streaming Ollama and OpenAI-compatible Chat Completions, including OpenRouter; tool calling bounded by a whole-turn budget of provider requests, tool calls, calls per response, and elapsed time |
+| Agent loop | Streaming Ollama and OpenAI-compatible Chat Completions, including OpenRouter; tool calling bounded by a whole-turn budget of provider requests, tool calls, calls per response, and elapsed time; `delegate_task` subagents that run with at most the parent's tools and approval policy |
 | Shell access | Direct `$` commands, sticky `$$` mode, persistent `cd`, command/path completion, pipelines, colors, pagers, and full-screen PTY applications |
 | Sessions | Multiple named sessions per user and host; ephemeral, daemon-lifetime, and durable lifecycle modes; common switching for idle prompts, active agent turns, and interactive processes |
 | Network fabric | SSH-connected macOS and Linux hosts in the same session catalog; remote creation, switching, execution, completion, viewing, detach, and manual reconnect |

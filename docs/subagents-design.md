@@ -1,8 +1,8 @@
 # Subagents: design and staged plan
 
 Status: **proposed**. Step 1 (per-agent toolsets and scoped tool-call
-identities) and step 2 (the shared whole-turn budget) are prototyped; later
-steps are design only.
+identities), step 2 (the shared whole-turn budget), and step 3 (the blocking
+`delegate_task` tool) are implemented; step 4 is design only.
 
 This document assesses what the xshell harness needs in order to create and
 manage subagents — agents started by another agent to do a bounded piece of
@@ -138,23 +138,55 @@ need runtime-registered tools.
 A `delegate_task` tool:
 
 ```json
-{"prompt": "…", "tools": "read_only" | "inherit", "model_profile": "…"}
+{"task": "…", "tools": "read_only" | "inherit"}
 ```
 
-runs a nested `run_agent_turn` (boxed future) with a fresh history and task
-system prompt, the parent's cancellation flag, the narrowed toolset (no
-`delegate_task`, so depth is 1), the clamped approval, scope
-`<parent-scope>/delegate-<n>`, and a child observer that tags and forwards
-events and forwards approvals to the parent observer. The child's final
-message is the tool result; its transcript goes to the audit trail.
+runs a nested turn (`run_agent_turn_with_budget`, boxed because it recurses)
+with:
 
-Gating: under `ask`, starting a child is one approval and the child's own
-gated calls prompt as usual; under `off`, only read-only children may start;
-under `auto`, children run unattended within the budget.
+| Aspect | Child receives |
+|---|---|
+| History | A fresh one: the default system prompt plus subagent instructions, then `task` as its user message |
+| Model | The parent's adapter, reused; the parent is not using it while a tool runs |
+| Tools | `read_only` (the default): `read_file`, `list_directory`. `inherit`: the parent's tools. Either is intersected with the parent's set and loses `delegate_task`, so depth is 1 |
+| Approval, sensitive paths, compaction | The parent's, unchanged |
+| Budget and cancellation | The root turn's, shared |
+| Scope | `<parent-scope>/delegate-<n>`, so its call ids are `delegate-<n>/<id>` |
 
-Failure: the parent records the delegate call as executed tool activity (so
-its turn is not silently rolled back), and the tool result states the child
-outcome — completed, failed with reason, cancelled, or budget exhausted.
+A `SubagentObserver` wraps every child event in `ExecutionEvent::Subagent`
+for the parent observer and forwards approvals to it, so the human attached
+to the parent decides them under the child's scoped call id. The parent
+observer brackets the child with `SubagentStarted` and `SubagentFinished`.
+The child's final assistant message is the tool result (truncated like any
+tool output); its transcript reaches the parent only as events and audit
+records, never the parent's history.
+
+**Gating.** `delegate_task` is not gated itself. The child can never exceed
+the parent's authority (its tools are a subset, its approval policy is the
+parent's), so every gated action the child attempts is approved on its own,
+exactly as if the parent had attempted it. Under `off`, a child's shell calls
+are denied just as the parent's would be. A start-of-delegation prompt would
+add a decision without adding protection.
+
+**Outcomes.** The parent records the delegation as executed tool activity, so
+its turn is never rolled back over a child's effects. The tool result states
+the outcome: the answer when `completed`, otherwise a sentence for
+`budget_exhausted`, `cancelled`, `failed`, or `aborted`. When the user answers
+`q` to one of the child's prompts, the child stops and the parent's turn is
+aborted too, with its remaining calls skipped, as for one of its own tools.
+Budget exhaustion in the child also leaves the parent unable to continue,
+since the budget is shared.
+
+**Rendering and audit.** Both CLI paths tag child output with
+`[delegate-<n>]`, show the child's tool requests, prompts, and results, and do
+not stream the child's text, whose answer arrives as the tool result. The
+audit trail gains `SubagentStarted` and `SubagentFinished` (audit format 5,
+audit protocol 6); every record between them belongs to the child, and its
+tool-call ids carry the scope. The session protocol is version 14.
+
+**Deferred.** Choosing a different model for the child (a `model_profile`
+argument) needs a profile resolver on the daemon side, where credentials
+live; parallel children need concurrent dispatch within one response.
 
 ### Child sessions (step 4)
 
@@ -220,5 +252,7 @@ until then budgets are reported as `steps`-based, never as cost assurance.
   via `//history`) or only in the audit trail?
 - Should approval of `delegate_task` under `ask` pre-authorize some of the
   child's read-only work, or should every child gate apply independently?
+  (Step 3 answers: delegation is not gated, and every child gate applies
+  independently.)
 - What is the default per-root-turn budget for personal profiles, and is it
   user-configurable per model profile?

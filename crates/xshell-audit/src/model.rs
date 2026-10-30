@@ -11,13 +11,15 @@ use std::path::PathBuf;
 ///   `AuditEvent::LogicalSessionAttached`.
 /// - 4: adds `AuditEvent::AutoContinued` and the `reasoning` and
 ///   `finish_reason` fields on `AuditEvent::AgentResponse`.
-pub const AUDIT_FORMAT_VERSION: u32 = 4;
+/// - 5: adds `AuditEvent::SubagentStarted` and `AuditEvent::SubagentFinished`.
+pub const AUDIT_FORMAT_VERSION: u32 = 5;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 // Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
-// `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`.
+// `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`;
+// version 6 adds `AuditEvent::SubagentStarted` and `SubagentFinished`.
 // Tagged enum variants are not forward-compatible in serde, so mixed-version
 // peers must fail at handshake.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 5;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -178,6 +180,22 @@ pub enum AuditEvent {
         bytes_before: usize,
         bytes_after: usize,
         turns_removed: usize,
+    },
+    /// A `delegate_task` call started a subagent. Turns run sequentially, so
+    /// every record up to the matching `SubagentFinished` belongs to `agent`;
+    /// its tool-call ids are also prefixed with `agent/`.
+    SubagentStarted {
+        agent: String,
+        task: String,
+        tools: Vec<String>,
+    },
+    /// `outcome` is `completed`, `aborted`, `cancelled`, `budget_exhausted`,
+    /// or `failed`.
+    SubagentFinished {
+        agent: String,
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     SessionEnded {
         reason: String,

@@ -1,7 +1,7 @@
 use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
-use crate::tools::execute_tool_cancellable;
+use crate::tools::{execute_tool_cancellable, truncate};
 use crate::{
     CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, Tool, ToolSet,
     drop_tool_payloads, estimate_history_tokens, history_bytes, requires_approval,
@@ -23,7 +23,8 @@ use tokio::process::Command;
 use tokio::sync::{Notify, mpsc};
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{
-    AdapterError, AgentEvent, AssistantResponse, ChatMessage, ChatRequest, MessageRole, ToolCall,
+    AdapterError, AgentEvent, AssistantResponse, ChatMessage, ChatRequest, DEFAULT_SYSTEM_PROMPT,
+    MessageRole, ToolCall,
 };
 
 /// How many times one turn may be nudged to keep going after the model ends a
@@ -143,6 +144,52 @@ pub enum ExecutionEvent {
     HistoryCompacted {
         report: CompactionReport,
     },
+    /// A `delegate_task` call started a subagent. Its events follow wrapped in
+    /// [`ExecutionEvent::Subagent`] until the matching `SubagentFinished`.
+    SubagentStarted {
+        /// The subagent's scope, which also prefixes its scoped tool-call ids.
+        agent: String,
+        task: String,
+        tools: Vec<String>,
+    },
+    /// An event emitted by the subagent named `agent`.
+    Subagent {
+        agent: String,
+        event: Box<ExecutionEvent>,
+    },
+    SubagentFinished {
+        agent: String,
+        /// `completed`, `aborted`, `cancelled`, `budget_exhausted`, or `failed`.
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+impl ExecutionEvent {
+    /// The event with every [`ExecutionEvent::Subagent`] wrapper removed, and
+    /// the subagent that emitted it (`None` for the root agent).
+    pub fn into_innermost(self) -> (Option<String>, ExecutionEvent) {
+        let mut agent = None;
+        let mut event = self;
+        while let Self::Subagent {
+            agent: inner_agent,
+            event: inner,
+        } = event
+        {
+            agent = Some(inner_agent);
+            event = *inner;
+        }
+        (agent, event)
+    }
+
+    /// The event with every [`ExecutionEvent::Subagent`] wrapper removed.
+    pub fn innermost(&self) -> &ExecutionEvent {
+        match self {
+            Self::Subagent { event, .. } => event.innermost(),
+            event => event,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +483,7 @@ pub async fn run_agent_turn_with_budget(
     history.push(ChatMessage::user(message));
     let tools = policy.tools.definitions();
     let mut call_ids = CallIds::new(policy.agent_scope.as_deref());
+    let mut delegations = 0;
     let mut observed_tool_activity = false;
     let mut auto_continues = 0;
     let mut overflow_retry_used = false;
@@ -696,7 +744,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
             // The toolset bounds authority, not just the prompt: a call to a
             // tool this agent was not offered, or to no tool at all, is
             // refused without approval and without counting as tool activity.
-            if policy.tools.get(&call.name).is_none() {
+            let Some(tool) = policy.tools.get(&call.name) else {
                 let result = if Tool::from_name(&call.name).is_some() {
                     format!("tool error: {} is not available to this agent", call.name)
                 } else {
@@ -704,7 +752,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 };
                 refuse_tool_call(observer, history, call, scoped, result);
                 continue;
-            }
+            };
             let gate = requires_approval(scoped, cwd, &policy.sensitive_paths);
             let decision = match gate {
                 None => ApprovalDecision::Approve,
@@ -760,11 +808,30 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 return Ok(());
             }
 
-            let result = if decision == ApprovalDecision::Approve {
+            let mut subagent_aborted = false;
+            let result = if decision != ApprovalDecision::Approve {
+                "tool denied by user".into()
+            } else if tool == Tool::DelegateTask {
+                // A delegation counts as tool activity even if the subagent
+                // ran nothing, so the parent's turn never rolls back over
+                // effects a subagent may have had.
+                observed_tool_activity = true;
+                delegations += 1;
+                let delegation = run_delegation(
+                    &mut *agent,
+                    call,
+                    cwd,
+                    policy,
+                    budget,
+                    observer,
+                    delegations,
+                )
+                .await;
+                subagent_aborted = delegation.aborted;
+                delegation.result
+            } else {
                 observed_tool_activity = true;
                 execute_tool_cancellable(call, cwd, observer.cancellation()).await
-            } else {
-                "tool denied by user".into()
             };
             observer.emit(ExecutionEvent::ToolResult {
                 call_id: scoped.id.clone(),
@@ -772,6 +839,24 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 result: result.clone(),
             });
             history.push(ChatMessage::tool_result(call, result));
+            // The user aborting a subagent's tool aborts the whole turn, as
+            // it would for one of the parent's own tools.
+            if subagent_aborted {
+                for skipped in &response.tool_calls[index + 1..] {
+                    history.push(ChatMessage::tool_result(
+                        skipped,
+                        "tool execution aborted by user; agent turn stopped",
+                    ));
+                }
+                for skipped in &scoped_calls[index + 1..] {
+                    observer.emit(ExecutionEvent::ToolSkipped {
+                        call_id: skipped.id.clone(),
+                        name: skipped.name.clone(),
+                    });
+                }
+                observer.emit(ExecutionEvent::TurnAborted);
+                return Ok(());
+            }
             if observer.cancellation().is_cancelled() {
                 for skipped in &scoped_calls[index + 1..] {
                     observer.emit(ExecutionEvent::ToolSkipped {
@@ -812,6 +897,166 @@ fn emit_partial_response(observer: &mut dyn TurnObserver, streamed_text: String)
             reasoning: None,
             finish_reason: None,
         });
+    }
+}
+
+/// Instructions for a subagent, ahead of its task. The task itself arrives as
+/// the subagent's user message.
+const SUBAGENT_SYSTEM_PROMPT: &str = "You are a subagent started by another agent to complete \
+one bounded task. Work only on that task. You cannot ask the user questions. Your final message \
+is returned to the other agent as the task's result, so make it a complete, self-contained \
+answer that states what you found and anything you could not determine.";
+
+struct Delegation {
+    result: String,
+    aborted: bool,
+}
+
+/// Run a `delegate_task` call as a nested turn and return its tool result.
+///
+/// The subagent reuses the parent's adapter (the parent is not using it while
+/// a tool runs), draws from the parent's budget and cancellation, inherits
+/// the parent's approval policy and sensitive paths, and gets at most the
+/// parent's tools minus `delegate_task`, so it cannot exceed the parent's
+/// authority or start agents of its own. Delegation is therefore not gated
+/// itself; each gated call the subagent makes is approved on its own.
+async fn run_delegation(
+    agent: &mut dyn AgentAdapter,
+    call: &ToolCall,
+    cwd: &Path,
+    policy: &TurnPolicy,
+    budget: &TurnBudget,
+    observer: &mut dyn TurnObserver,
+    number: usize,
+) -> Delegation {
+    let refused = |message: String| Delegation {
+        result: format!("tool error: {message}"),
+        aborted: false,
+    };
+    let task = match call
+        .arguments
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(task) if !task.trim().is_empty() => task.to_owned(),
+        _ => return refused("delegate_task requires a non-empty string argument \"task\"".into()),
+    };
+    let requested = match call
+        .arguments
+        .get("tools")
+        .and_then(serde_json::Value::as_str)
+    {
+        None | Some("read_only") => ToolSet::read_only(),
+        Some("inherit") => ToolSet::all(),
+        Some(other) => {
+            return refused(format!(
+                "delegate_task \"tools\" must be \"read_only\" or \"inherit\", not {other:?}"
+            ));
+        }
+    };
+    let tools = requested
+        .intersect(policy.tools)
+        .without(Tool::DelegateTask);
+    let name = match &policy.agent_scope {
+        Some(scope) => format!("{scope}/delegate-{number}"),
+        None => format!("delegate-{number}"),
+    };
+    let child_policy = policy
+        .clone()
+        .with_tools(tools)
+        .with_agent_scope(name.clone());
+    observer.emit(ExecutionEvent::SubagentStarted {
+        agent: name.clone(),
+        task: task.clone(),
+        tools: tools.tools().map(|tool| tool.name().to_owned()).collect(),
+    });
+
+    let mut history = vec![ChatMessage::system(format!(
+        "{DEFAULT_SYSTEM_PROMPT}\n\n{SUBAGENT_SYSTEM_PROMPT}"
+    ))];
+    let mut child = SubagentObserver {
+        parent: &mut *observer,
+        agent: name.clone(),
+        aborted: false,
+    };
+    let outcome = Box::pin(run_agent_turn_with_budget(
+        agent,
+        &mut history,
+        task,
+        cwd,
+        &child_policy,
+        budget,
+        &mut child,
+    ))
+    .await;
+    let aborted = child.aborted;
+
+    let (status, message, result) = match outcome {
+        Ok(()) if aborted => (
+            "aborted",
+            None,
+            format!("subagent {name} stopped: the user aborted its turn"),
+        ),
+        Ok(()) => {
+            let answer = history
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::Assistant)
+                .map(|message| message.content.trim())
+                .filter(|content| !content.is_empty())
+                .unwrap_or("(the subagent finished without a final answer)");
+            ("completed", None, answer.to_owned())
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            if error.downcast_ref::<BudgetExhausted>().is_some() {
+                let result = format!("subagent {name} stopped: {detail}");
+                ("budget_exhausted", Some(detail), result)
+            } else if observer.cancellation().is_cancelled() {
+                ("cancelled", None, format!("subagent {name} was cancelled"))
+            } else {
+                let result = format!("subagent {name} failed: {detail}");
+                ("failed", Some(detail), result)
+            }
+        }
+    };
+    observer.emit(ExecutionEvent::SubagentFinished {
+        agent: name,
+        outcome: status.into(),
+        message,
+    });
+    Delegation {
+        result: truncate(result),
+        aborted,
+    }
+}
+
+/// Wraps a subagent's events for its parent's observer and forwards its
+/// approvals there, so the human attached to the parent decides them.
+struct SubagentObserver<'a> {
+    parent: &'a mut dyn TurnObserver,
+    agent: String,
+    aborted: bool,
+}
+
+#[async_trait]
+impl TurnObserver for SubagentObserver<'_> {
+    fn emit(&mut self, event: ExecutionEvent) {
+        if event == ExecutionEvent::TurnAborted {
+            self.aborted = true;
+        }
+        self.parent.emit(ExecutionEvent::Subagent {
+            agent: self.agent.clone(),
+            event: Box::new(event),
+        });
+    }
+
+    fn cancellation(&self) -> CancellationFlag {
+        self.parent.cancellation()
+    }
+
+    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalDecision {
+        self.parent.approve(call, reason).await
     }
 }
 
@@ -1254,6 +1499,9 @@ mod tests {
                 ExecutionEvent::TurnAborted => "aborted",
                 ExecutionEvent::HistoryCompacted { .. } => "compacted",
                 ExecutionEvent::AutoContinued { .. } => "continued",
+                ExecutionEvent::SubagentStarted { .. } => "subagent_started",
+                ExecutionEvent::Subagent { .. } => "subagent",
+                ExecutionEvent::SubagentFinished { .. } => "subagent_finished",
             })
             .collect()
     }
@@ -1826,6 +2074,351 @@ mod tests {
         .unwrap_err();
         assert_eq!(exhaustion(&error), BudgetExhausted::ProviderRequests(3));
         assert_eq!(child.requests.len(), 1);
+    }
+
+    fn delegate_call(id: &str, task: &str, tools: Option<&str>) -> ToolCall {
+        let mut arguments = json!({"task": task});
+        if let Some(tools) = tools {
+            arguments["tools"] = json!(tools);
+        }
+        ToolCall {
+            id: id.into(),
+            name: "delegate_task".into(),
+            arguments,
+        }
+    }
+
+    fn calls(tool_calls: Vec<ToolCall>) -> AssistantResponse {
+        AssistantResponse {
+            tool_calls,
+            ..Default::default()
+        }
+    }
+
+    fn answer(content: &str) -> AssistantResponse {
+        AssistantResponse {
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    fn offered(request: &ChatRequest) -> Vec<&str> {
+        request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect()
+    }
+
+    /// The events a subagent emitted, unwrapped.
+    fn subagent_events<'a>(events: &'a [ExecutionEvent], name: &str) -> Vec<&'a ExecutionEvent> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::Subagent { agent, event } if agent == name => Some(&**event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn finished(events: &[ExecutionEvent]) -> Vec<(&str, &str)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::SubagentFinished { agent, outcome, .. } => {
+                    Some((agent.as_str(), outcome.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_delegated_task_returns_the_subagents_final_answer() {
+        let temporary = TempDir::new().unwrap();
+        // One adapter serves both agents, in request order.
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![delegate_call("d", "Find the config files.", None)]),
+                calls(vec![list_call("c1")]),
+                answer("There is one config file: app.toml."),
+                answer("Done."),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = vec![ChatMessage::system("parent prompt")];
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        // The subagent starts fresh: its own system prompt, the task as its
+        // user message, read-only tools by default, and no delegate_task.
+        let child_request = &adapter.requests[1];
+        assert_eq!(child_request.messages.len(), 2);
+        assert!(
+            child_request.messages[0]
+                .content
+                .contains("You are a subagent")
+        );
+        assert_eq!(child_request.messages[1].content, "Find the config files.");
+        assert_eq!(offered(child_request), ["read_file", "list_directory"]);
+        assert!(offered(&adapter.requests[0]).contains(&"delegate_task"));
+
+        assert!(observer.events.contains(&ExecutionEvent::SubagentStarted {
+            agent: "delegate-1".into(),
+            task: "Find the config files.".into(),
+            tools: vec!["read_file".into(), "list_directory".into()],
+        }));
+        let child = subagent_events(&observer.events, "delegate-1");
+        assert!(child.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::ToolResult { call_id, .. } if call_id == "delegate-1/c1"
+        )));
+        assert_eq!(finished(&observer.events), [("delegate-1", "completed")]);
+        assert_eq!(
+            tool_results(&observer.events),
+            [("d", "There is one config file: app.toml.")]
+        );
+        // The parent's history holds the result, not the subagent's transcript.
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[3].content, "There is one config file: app.toml.");
+        assert_tool_results_complete(&history);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_never_exceeds_its_parents_tools() {
+        let temporary = TempDir::new().unwrap();
+        let marker = temporary.path().join("marker");
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![delegate_call("d", "task", Some("inherit"))]),
+                calls(vec![
+                    shell_call("s", "touch marker"),
+                    delegate_call("nested", "task", None),
+                ]),
+                answer("could not"),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto)
+                .with_tools(ToolSet::from_tools([Tool::ReadFile, Tool::DelegateTask])),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        // "inherit" means the parent's tools, minus delegate_task.
+        assert_eq!(offered(&adapter.requests[1]), ["read_file"]);
+        assert!(!marker.exists(), "the subagent ran a tool its parent lacks");
+        let child_results: Vec<_> = subagent_events(&observer.events, "delegate-1")
+            .into_iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::ToolResult { result, .. } => Some(result.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_results,
+            [
+                "tool error: run_shell is not available to this agent",
+                "tool error: delegate_task is not available to this agent",
+            ]
+        );
+        assert_eq!(finished(&observer.events), [("delegate-1", "completed")]);
+    }
+
+    #[tokio::test]
+    async fn subagent_approvals_reach_the_parent_under_scoped_ids() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![delegate_call("d", "task", Some("inherit"))]),
+                calls(vec![shell_call("s", "touch marker")]),
+                answer("touched"),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([ApprovalDecision::Approve]);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert!(temporary.path().join("marker").exists());
+        assert!(observer.decisions.is_empty(), "the approval was not asked");
+        let child = subagent_events(&observer.events, "delegate-1");
+        assert!(child.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::ApprovalRequested { call, .. } if call.id == "delegate-1/s"
+        )));
+        // The delegation itself was not gated: the only approval was the
+        // subagent's own shell call.
+        assert_eq!(
+            observer
+                .events
+                .iter()
+                .filter(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_a_subagents_tool_aborts_the_whole_turn() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![
+                    delegate_call("d", "task", Some("inherit")),
+                    list_call("after"),
+                ]),
+                calls(vec![shell_call("s", "touch marker")]),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([ApprovalDecision::AbortTurn]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert!(!temporary.path().join("marker").exists());
+        assert_eq!(adapter.requests.len(), 2, "the parent kept going");
+        assert_eq!(finished(&observer.events), [("delegate-1", "aborted")]);
+        assert_eq!(observer.events.last(), Some(&ExecutionEvent::TurnAborted));
+        assert!(observer.events.contains(&ExecutionEvent::ToolSkipped {
+            call_id: "after".into(),
+            name: "list_directory".into(),
+        }));
+        assert_tool_results_complete(&history);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_draws_from_its_parents_budget() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![delegate_call("d", "task", None)]),
+                calls(vec![list_call("c1")]),
+                calls(vec![list_call("c2")]),
+                calls(vec![list_call("c3")]),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_limits(TurnLimits {
+                provider_requests: 3,
+                ..TurnLimits::default()
+            }),
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(adapter.requests.len(), 3);
+        assert_eq!(
+            finished(&observer.events),
+            [("delegate-1", "budget_exhausted")]
+        );
+        assert_eq!(
+            tool_results(&observer.events),
+            [(
+                "d",
+                "subagent delegate-1 stopped: agent turn exhausted its budget of 3 provider requests"
+            )]
+        );
+        // The parent cannot continue on the same exhausted budget.
+        assert_eq!(exhaustion(&error), BudgetExhausted::ProviderRequests(3));
+        assert_tool_results_complete(&history);
+    }
+
+    #[tokio::test]
+    async fn malformed_delegations_are_refused_without_starting_a_subagent() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![
+                    delegate_call("empty", "   ", None),
+                    delegate_call("bad", "task", Some("everything")),
+                ]),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adapter.requests.len(), 2);
+        assert!(!kinds(&observer.events).contains(&"subagent_started"));
+        let results = tool_results(&observer.events);
+        assert!(results[0].1.contains("non-empty string argument \"task\""));
+        assert!(results[1].1.contains("not \"everything\""));
+    }
+
+    #[test]
+    fn subagent_events_unwrap_to_the_innermost_event() {
+        let inner = ExecutionEvent::TurnAborted;
+        let wrapped = ExecutionEvent::Subagent {
+            agent: "delegate-1".into(),
+            event: Box::new(inner.clone()),
+        };
+        assert_eq!(wrapped.innermost(), &inner);
+        assert_eq!(
+            wrapped.clone().into_innermost(),
+            (Some("delegate-1".into()), inner.clone())
+        );
+        assert_eq!(inner.clone().into_innermost(), (None, inner));
+        let encoded = serde_json::to_value(&wrapped).unwrap();
+        assert_eq!(encoded["type"], "subagent");
+        assert_eq!(encoded["event"]["type"], "turn_aborted");
+        assert_eq!(
+            serde_json::from_value::<ExecutionEvent>(encoded).unwrap(),
+            wrapped
+        );
     }
 
     #[tokio::test]
