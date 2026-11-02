@@ -12,11 +12,11 @@ historical review.
 | F1 | [#51](https://github.com/rdevaul/xshell/issues/51) | P1 | M1.1 effects and recovery | Corrected | Completed tool effect and terminal failure survive reload and appear in the next request |
 | F2 | [#52](https://github.com/rdevaul/xshell/issues/52) | P1 | M1.2 cancellation and shutdown | Corrected | Agent and captured-shell pipelines/grandchildren cannot write delayed markers after cancellation |
 | F3 | [#53](https://github.com/rdevaul/xshell/issues/53) | P1 | M1.2 cancellation and shutdown | Corrected | SIGTERM drains agent, shell, and PTY work before audit closure; forced interruption is recovered as uncertain |
-| F4 | [#54](https://github.com/rdevaul/xshell/issues/54) | P1 | M1.3 prepared file access | Open | Sensitivity is stable across cwd changes, nesting, aliases, and sensitive ancestors |
-| F5 | [#55](https://github.com/rdevaul/xshell/issues/55) | P1 | M1.3 prepared file access | Open | Replacement hooks cannot substitute sensitive or outside-root bytes after authorization |
+| F4 | [#54](https://github.com/rdevaul/xshell/issues/54) | P1 | M1.3 prepared file access | Corrected | Sensitivity is stable across cwd changes, nesting, aliases, and sensitive ancestors |
+| F5 | [#55](https://github.com/rdevaul/xshell/issues/55) | P1 | M1.3 prepared file access | Corrected | Replacement hooks cannot substitute sensitive or outside-root bytes after authorization |
 | F6 | [#56](https://github.com/rdevaul/xshell/issues/56) | P1 | M1.4 service bounds | Open | A non-acknowledging audit peer cannot freeze unrelated sessions, control, or shutdown |
 | F7 | [#57](https://github.com/rdevaul/xshell/issues/57) | P2 | M1.1 effects and recovery | Open | Injected write/sync/rename failures leave response, memory, and restarted state consistent |
-| F8 | [#58](https://github.com/rdevaul/xshell/issues/58) | P2 | M1.3 prepared file access | Open | File and directory acquisition remain bounded before allocation and control stays responsive |
+| F8 | [#58](https://github.com/rdevaul/xshell/issues/58) | P2 | M1.3 prepared file access | Corrected | File and directory acquisition remain bounded before allocation and control stays responsive |
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Open | Incomplete/error/refusal streams cannot produce executable tool calls |
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn budget landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
@@ -39,7 +39,7 @@ historical review.
 
 1. Complete M0 contracts and the mode matrix.
 2. Correct F1, F2, F3, and the independent F11 defect.
-3. Implement prepared file operations for F4, F5, and F8.
+3. Implement prepared file operations for F4, F5, and F8. (Done.)
 4. Correct audit/provider/resource bounds for F6, F9, and F10.
 5. Complete F7 transactional persistence and crash-durability injection.
 
@@ -61,10 +61,29 @@ response, and elapsed time, and a maximal repeated batch stops at a
 deterministic limit. Byte, worker, retained-state, per-session, and global
 budgets remain, so F10 stays open.
 
-F4, F5, and F8 are the current P1/P2 work. They share one cause — authorization
-and acquisition resolve the path independently — so M1.3 corrects them as a
-single prepared-operation boundary in `xshell-execution` rather than three
-separate patches.
+F4, F5, and F8 are corrected together by M1.3, a single prepared-operation
+boundary in `xshell-execution` (`prepared.rs`), because they shared one cause:
+authorization and acquisition resolved the path independently.
+
+- **F5.** A read-only tool call is prepared before its approval decision: the
+  path is walked from the tool root one component at a time with `openat` and
+  `O_NOFOLLOW`, symlinks are resolved by the walk and must stay inside the
+  root, and the walk ends holding a descriptor. The decision is about that
+  object and the read uses that descriptor. An engine test swaps the file, and
+  separately an ancestor directory, between the decision and the read; the
+  prepared object is still what is returned. With re-resolution the same test
+  returns the secret. Approval binds the object, not its bytes: writes to the
+  same file can still change them, and a hard link to a credential under an
+  innocent name is classified by that name.
+- **F4.** Sensitivity is decided from the object's canonical absolute path.
+  Patterns containing `/` match at any depth and a leading `/` anchors one, so
+  the same file is classified the same from every cwd, nested repositories'
+  `.git/config` and everything under `.aws` are covered, and a project inside
+  a sensitive directory stays sensitive.
+- **F8.** Reads take at most `max_bytes + 1` bytes from the descriptor (tested
+  against a 1 GiB sparse file), listings stop reading entries after their
+  limit, and preparation and reads run on a blocking worker with a deadline so
+  a stalled filesystem returns an error instead of holding the turn.
 
 `AuditClient::probe` adds bounded socket read/write waits and has a
 non-acknowledging-peer regression test, but it is a readiness check for the

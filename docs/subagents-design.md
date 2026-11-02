@@ -101,7 +101,7 @@ request:
 | Tools | `child.tools ⊆ parent.tools`; the spawn tool is removed unless depth allows another level |
 | Approval | `child.approval = requested.clamp_to(parent.approval)` |
 | Sensitive paths | Inherited unchanged; a child cannot remove patterns |
-| Working directory | Must resolve inside the parent's policy root (the M1.3 root, independent of navigational cwd) |
+| Working directory | The parent's cwd. Read-only tools are confined beneath it by M1.3's prepared walk, and sensitivity is judged on absolute paths, so a child sees exactly the parent's file policy |
 | Model | Any profile the parent's daemon could resolve; credentials never cross the protocol |
 | Budget | Drawn from the root turn's shared budget, never a fresh one |
 

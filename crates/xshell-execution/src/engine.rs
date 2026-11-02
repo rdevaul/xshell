@@ -1,10 +1,10 @@
 use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
-use crate::tools::{execute_tool_cancellable, truncate};
+use crate::tools::{execute_prepared, gate, prepare_call, truncate};
 use crate::{
     CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, Tool, ToolSet,
-    drop_tool_payloads, estimate_history_tokens, history_bytes, requires_approval,
+    drop_tool_payloads, estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -757,8 +757,11 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 refuse_tool_call(observer, history, call, scoped, result);
                 continue;
             };
-            let gate = requires_approval(scoped, cwd, &policy.sensitive_paths);
-            let decision = match gate {
+            // Read-only tools are prepared here: the object they will read is
+            // opened and classified once, the decision below is about that
+            // object, and execution reads from it (F5).
+            let preparation = prepare_call(call, cwd, &policy.sensitive_paths).await;
+            let decision = match gate(call, &preparation) {
                 None => ApprovalDecision::Approve,
                 Some(reason) => match approval {
                     ApprovalPolicy::Auto => ApprovalDecision::Approve,
@@ -835,7 +838,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 delegation.result
             } else {
                 observed_tool_activity = true;
-                execute_tool_cancellable(call, cwd, observer.cancellation()).await
+                execute_prepared(call, preparation, cwd, observer.cancellation()).await
             };
             observer.emit(ExecutionEvent::ToolResult {
                 call_id: scoped.id.clone(),
@@ -2484,6 +2487,105 @@ mod tests {
             serde_json::from_value::<ExecutionEvent>(encoded).unwrap(),
             wrapped
         );
+    }
+
+    /// Runs `swap` at the decision event: after the call was authorized and
+    /// before it executes, the window F5 is about.
+    struct SwappingObserver<F: FnMut() + Send> {
+        events: Vec<ExecutionEvent>,
+        swap: Option<F>,
+        cancellation: CancellationFlag,
+    }
+
+    #[async_trait]
+    impl<F: FnMut() + Send> TurnObserver for SwappingObserver<F> {
+        fn emit(&mut self, event: ExecutionEvent) {
+            if matches!(event, ExecutionEvent::ToolDecision { .. })
+                && let Some(mut swap) = self.swap.take()
+            {
+                swap();
+            }
+            self.events.push(event);
+        }
+
+        fn cancellation(&self) -> CancellationFlag {
+            self.cancellation.clone()
+        }
+
+        async fn approve(&mut self, _call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
+            panic!("the prepared object was not sensitive; nothing should prompt")
+        }
+    }
+
+    #[tokio::test]
+    async fn f5_a_swap_after_authorization_cannot_substitute_another_object() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "harmless notes").unwrap();
+        std::fs::write(root.join(".env"), "SECRET=hunter2").unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/inner.txt"), "inner notes").unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("inner.txt"), "OUTSIDE BYTES").unwrap();
+
+        for (path, expected, swap) in [
+            // The original probe: replace the authorized file with a link to
+            // a secret inside the root.
+            (
+                "notes.txt",
+                "harmless notes",
+                Box::new({
+                    let root = root.clone();
+                    move || {
+                        std::fs::remove_file(root.join("notes.txt")).unwrap();
+                        std::os::unix::fs::symlink(root.join(".env"), root.join("notes.txt"))
+                            .unwrap();
+                    }
+                }) as Box<dyn FnMut() + Send>,
+            ),
+            // Replace an ancestor directory with a link outside the root.
+            (
+                "dir/inner.txt",
+                "inner notes",
+                Box::new({
+                    let root = root.clone();
+                    let outside = outside.path().to_owned();
+                    move || {
+                        std::fs::rename(root.join("dir"), root.join("moved")).unwrap();
+                        std::os::unix::fs::symlink(&outside, root.join("dir")).unwrap();
+                    }
+                }),
+            ),
+        ] {
+            let mut adapter = ScriptedAdapter {
+                responses: VecDeque::from([
+                    calls(vec![ToolCall {
+                        id: "r".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": path}),
+                    }]),
+                    answer("done"),
+                ]),
+                requests: Vec::new(),
+            };
+            let mut observer = SwappingObserver {
+                events: Vec::new(),
+                swap: Some(swap),
+                cancellation: CancellationFlag::default(),
+            };
+            run_agent_turn(
+                &mut adapter,
+                &mut Vec::new(),
+                "read it".into(),
+                &root,
+                &TurnPolicy::new(ApprovalPolicy::Ask),
+                &mut observer,
+            )
+            .await
+            .unwrap();
+            assert!(observer.swap.is_none(), "the swap never ran");
+            assert_eq!(tool_results(&observer.events), [("r", expected)], "{path}");
+        }
     }
 
     #[tokio::test]

@@ -1,10 +1,11 @@
 use crate::SensitivePaths;
 use crate::engine::CancellationFlag;
+use crate::prepared::{self, ObjectKind, PreparedObject};
 use crate::process::{ProcessGroupGuard, configure_process_group};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -14,6 +15,8 @@ use xshell_core::{ToolCall, ToolDefinition};
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 500;
 const SHELL_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest wait for one preparation or read of a read-only tool.
+const FILESYSTEM_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Every tool the engine can dispatch. Closed on purpose: adding a tool is a
 /// new variant, and exhaustive matches find every place that must handle it.
@@ -220,35 +223,90 @@ impl std::fmt::Display for GateReason {
 
 /// Decide whether `call` must be approved before running in `root`.
 ///
-/// `run_shell` is always gated. Read-only tools are gated only when their
-/// resolved target matches `sensitive`. Resolution failures (missing file,
-/// escape from root) are not gated here: the tool itself will return an
-/// error, and prompting for a call that cannot run would be noise.
+/// `run_shell` is always gated. Read-only tools are gated only when the
+/// object they would read is sensitive; see [`prepare_call`]. Preparation
+/// failures (missing file, escape from root) are not gated: the tool reports
+/// the error itself, and prompting for a call that cannot run would be noise.
+///
+/// This prepares the call and discards the result. The engine keeps the
+/// preparation and reads from it, so the object it authorizes is the object
+/// it reads.
 pub fn requires_approval(
     call: &ToolCall,
     root: &Path,
     sensitive: &SensitivePaths,
 ) -> Option<GateReason> {
+    let preparation = match read_request(call) {
+        Some(Ok((path, kind))) => match prepared::prepare(root, &path, kind, sensitive) {
+            Ok(object) => Preparation::Read(object),
+            Err(error) => Preparation::Failed(format!("tool error: {error:#}")),
+        },
+        Some(Err(error)) => Preparation::Failed(format!("tool error: {error:#}")),
+        None => Preparation::Other,
+    };
+    gate(call, &preparation)
+}
+
+/// A tool call made ready to run: for the read-only tools, the object they
+/// will read, opened and classified; for every other tool, nothing.
+#[derive(Debug)]
+pub(crate) enum Preparation {
+    Read(PreparedObject),
+    /// The read could not be prepared; this is the tool's result.
+    Failed(String),
+    Other,
+}
+
+/// Prepare `call` for authorization and execution. Read-only tools are
+/// resolved beneath `root` and opened here, on a blocking worker with a
+/// deadline, so that [`gate`] and [`execute_prepared`] act on one object.
+pub(crate) async fn prepare_call(
+    call: &ToolCall,
+    root: &Path,
+    sensitive: &SensitivePaths,
+) -> Preparation {
+    let (path, kind) = match read_request(call) {
+        Some(Ok(request)) => request,
+        Some(Err(error)) => return Preparation::Failed(format!("tool error: {error:#}")),
+        None => return Preparation::Other,
+    };
+    let root = root.to_owned();
+    let sensitive = sensitive.clone();
+    match run_blocking(move || prepared::prepare(&root, &path, kind, &sensitive)).await {
+        Ok(object) => Preparation::Read(object),
+        Err(error) => Preparation::Failed(format!("tool error: {error:#}")),
+    }
+}
+
+/// Why `call` needs a human decision, judged from its preparation.
+pub(crate) fn gate(call: &ToolCall, preparation: &Preparation) -> Option<GateReason> {
     if requires_approval_by_name(&call.name) {
         return Some(GateReason::ShellExecution);
     }
-    if sensitive.patterns().is_empty() {
-        return None;
+    match preparation {
+        Preparation::Read(object) if object.sensitive() => Some(GateReason::SensitivePath),
+        _ => None,
     }
-    let requested = match call.name.as_str() {
-        "read_file" => call.arguments.get("path").and_then(Value::as_str)?,
-        "list_directory" => call
-            .arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("."),
-        _ => return None,
-    };
-    let (root, resolved) = resolve_existing_with_root(root, requested).ok()?;
-    let relative = resolved.strip_prefix(&root).unwrap_or(&resolved);
-    sensitive
-        .matches(relative)
-        .then_some(GateReason::SensitivePath)
+}
+
+/// The path and object kind a read-only tool asks for, or `None` for any
+/// other tool.
+fn read_request(call: &ToolCall) -> Option<Result<(String, ObjectKind)>> {
+    match Tool::from_name(&call.name)? {
+        Tool::ReadFile => Some(
+            required_string(&call.arguments, "path")
+                .map(|path| (path.to_owned(), ObjectKind::File)),
+        ),
+        Tool::ListDirectory => Some(Ok((
+            call.arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+                .to_owned(),
+            ObjectKind::Directory,
+        ))),
+        Tool::RunShell | Tool::DelegateTask => None,
+    }
 }
 
 /// Whether a tool is gated regardless of its arguments.
@@ -287,45 +345,82 @@ pub async fn execute_tool(call: &ToolCall, root: &Path) -> String {
     execute_tool_cancellable(call, root, CancellationFlag::default()).await
 }
 
+/// Prepare and run `call` with no sensitive-path policy: callers that gate on
+/// sensitivity prepare first and use [`execute_prepared`].
 pub(crate) async fn execute_tool_cancellable(
     call: &ToolCall,
     root: &Path,
     cancellation: CancellationFlag,
 ) -> String {
-    match execute_inner(call, root, cancellation).await {
+    let preparation = prepare_call(call, root, &SensitivePaths::none()).await;
+    execute_prepared(call, preparation, root, cancellation).await
+}
+
+/// Run a prepared call. A read-only tool reads from the object prepared for
+/// it, never from a fresh resolution of its path.
+pub(crate) async fn execute_prepared(
+    call: &ToolCall,
+    preparation: Preparation,
+    root: &Path,
+    cancellation: CancellationFlag,
+) -> String {
+    let output = match preparation {
+        Preparation::Failed(message) => return message,
+        Preparation::Read(object) => match Tool::from_name(&call.name) {
+            Some(Tool::ReadFile) => {
+                let max_bytes = call
+                    .arguments
+                    .get("max_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(MAX_TOOL_OUTPUT_BYTES as u64)
+                    .min(MAX_TOOL_OUTPUT_BYTES as u64) as usize;
+                run_blocking(move || read_file(object, max_bytes)).await
+            }
+            _ => run_blocking(move || list_directory(object)).await,
+        },
+        Preparation::Other => match Tool::from_name(&call.name) {
+            Some(Tool::RunShell) => run_shell(&call.arguments, root, cancellation).await,
+            Some(Tool::DelegateTask) => Err(anyhow::anyhow!(
+                "delegate_task is dispatched by the agent engine"
+            )),
+            Some(Tool::ReadFile | Tool::ListDirectory) => {
+                Err(anyhow::anyhow!("{} was not prepared", call.name))
+            }
+            None => Err(anyhow::anyhow!("unknown tool {}", call.name)),
+        },
+    };
+    match output {
         Ok(output) => truncate(output),
         Err(error) => format!("tool error: {error:#}"),
     }
 }
 
-async fn execute_inner(
-    call: &ToolCall,
-    root: &Path,
-    cancellation: CancellationFlag,
-) -> Result<String> {
-    match Tool::from_name(&call.name) {
-        Some(Tool::ReadFile) => read_file(&call.arguments, root),
-        Some(Tool::ListDirectory) => list_directory(&call.arguments, root),
-        Some(Tool::RunShell) => run_shell(&call.arguments, root, cancellation).await,
-        Some(Tool::DelegateTask) => bail!("delegate_task is dispatched by the agent engine"),
-        None => bail!("unknown tool {}", call.name),
+/// Run blocking filesystem work off the async runtime, bounded by
+/// [`FILESYSTEM_DEADLINE`]. A timed-out worker cannot be interrupted, but the
+/// turn and the runtime are no longer held by it.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    run_blocking_within(FILESYSTEM_DEADLINE, work).await
+}
+
+async fn run_blocking_within<T: Send + 'static>(
+    deadline: Duration,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    match tokio::time::timeout(deadline, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(anyhow::anyhow!("filesystem worker failed: {error}")),
+        Err(_) => bail!(
+            "the filesystem did not respond within {} ms",
+            deadline.as_millis()
+        ),
     }
 }
 
-fn read_file(arguments: &Value, root: &Path) -> Result<String> {
-    let path = required_string(arguments, "path")?;
-    let path = resolve_existing(root, path)?;
-    if !path.is_file() {
-        bail!("{} is not a file", path.display());
-    }
-    let max_bytes = arguments
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(MAX_TOOL_OUTPUT_BYTES as u64)
-        .min(MAX_TOOL_OUTPUT_BYTES as u64) as usize;
-    let bytes = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-    let truncated = bytes.len() > max_bytes;
-    let content = String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]);
+fn read_file(object: PreparedObject, max_bytes: usize) -> Result<String> {
+    let (bytes, truncated) = object.read(max_bytes)?;
+    let content = String::from_utf8_lossy(&bytes);
     Ok(if truncated {
         format!("{content}\n[output truncated at {max_bytes} bytes]")
     } else {
@@ -333,31 +428,21 @@ fn read_file(arguments: &Value, root: &Path) -> Result<String> {
     })
 }
 
-fn list_directory(arguments: &Value, root: &Path) -> Result<String> {
-    let relative = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-    let path = resolve_existing(root, relative)?;
-    if !path.is_dir() {
-        bail!("{} is not a directory", path.display());
-    }
-    let mut entries = std::fs::read_dir(&path)
-        .with_context(|| format!("cannot list {}", path.display()))?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    let truncated = entries.len() > MAX_DIRECTORY_ENTRIES;
+fn list_directory(object: PreparedObject) -> Result<String> {
+    let (mut entries, truncated) = object.list(MAX_DIRECTORY_ENTRIES)?;
+    entries.sort();
     let mut output = entries
         .into_iter()
-        .take(MAX_DIRECTORY_ENTRIES)
-        .map(|entry| {
-            let suffix = entry
-                .file_type()
-                .map(|kind| if kind.is_dir() { "/" } else { "" })
-                .unwrap_or("");
-            format!("{}{suffix}", entry.file_name().to_string_lossy())
+        .map(|(name, is_directory)| {
+            let suffix = if is_directory { "/" } else { "" };
+            format!("{}{suffix}", name.to_string_lossy())
         })
         .collect::<Vec<_>>()
         .join("\n");
     if truncated {
-        output.push_str("\n[listing truncated]");
+        output.push_str(&format!(
+            "\n[listing truncated after {MAX_DIRECTORY_ENTRIES} entries; the rest were not read]"
+        ));
     }
     Ok(output)
 }
@@ -473,31 +558,6 @@ fn required_string<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing string argument {key}"))
 }
 
-fn resolve_existing(root: &Path, requested: &str) -> Result<PathBuf> {
-    resolve_existing_with_root(root, requested).map(|(_, path)| path)
-}
-
-/// Like [`resolve_existing`] but also returns the canonical root, so callers
-/// can compute the path relative to it.
-fn resolve_existing_with_root(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf)> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("cannot resolve tool root {}", root.display()))?;
-    let requested = Path::new(requested);
-    let candidate = if requested.is_absolute() {
-        requested.to_owned()
-    } else {
-        root.join(requested)
-    };
-    let candidate = candidate
-        .canonicalize()
-        .with_context(|| format!("cannot resolve {}", candidate.display()))?;
-    if !candidate.starts_with(&root) {
-        bail!("path is outside the current xshell working directory");
-    }
-    Ok((root, candidate))
-}
-
 pub(crate) fn truncate(mut output: String) -> String {
     if output.len() <= MAX_TOOL_OUTPUT_BYTES {
         return output;
@@ -566,10 +626,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blocks_paths_outside_root() {
+    fn tool(name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_paths_outside_root() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(resolve_existing(root, "/etc/hosts").is_err());
+        let output = execute_tool(&tool("read_file", json!({"path": "/etc/hosts"})), root).await;
+        assert!(output.contains(prepared::OUTSIDE_ROOT), "{output}");
     }
 
     #[test]
@@ -587,15 +656,69 @@ mod tests {
         assert!(output.truncated);
     }
 
-    #[test]
-    fn blocks_symlink_escape_from_root() {
+    #[tokio::test]
+    async fn blocks_symlink_escape_from_root() {
         let temporary = tempfile::TempDir::new().unwrap();
         let root = temporary.path().join("root");
         std::fs::create_dir(&root).unwrap();
         std::os::unix::fs::symlink("/etc", root.join("escape")).unwrap();
-        assert!(resolve_existing(&root, "escape").is_err());
-        assert!(resolve_existing(&root, "escape/hosts").is_err());
-        assert!(resolve_existing(&root, "../").is_err());
+        for call in [
+            tool("list_directory", json!({"path": "escape"})),
+            tool("read_file", json!({"path": "escape/hosts"})),
+            tool("list_directory", json!({"path": "../"})),
+        ] {
+            let output = execute_tool(&call, &root).await;
+            assert!(output.contains(prepared::OUTSIDE_ROOT), "{output}");
+        }
+    }
+
+    #[test]
+    fn f4_sensitivity_is_the_same_from_every_cwd() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+        std::fs::write(root.join("sub/.git/config"), "[remote] token").unwrap();
+        std::fs::create_dir_all(root.join(".aws/project")).unwrap();
+        std::fs::write(root.join(".aws/credentials"), "key").unwrap();
+        std::fs::write(root.join(".aws/project/main.tf"), "resource").unwrap();
+        std::fs::write(root.join("README.md"), "hi").unwrap();
+        let sensitive = SensitivePaths::default();
+        let read = |path: &str| tool("read_file", json!({"path": path}));
+
+        // A nested repository's config, from the workspace, the repository,
+        // and inside its .git directory.
+        for (cwd, path) in [
+            (root.to_owned(), "sub/.git/config"),
+            (root.join("sub"), ".git/config"),
+            (root.join("sub/.git"), "config"),
+        ] {
+            assert_eq!(
+                requires_approval(&read(path), &cwd, &sensitive),
+                Some(GateReason::SensitivePath),
+                "{path} from {}",
+                cwd.display()
+            );
+        }
+        // A sensitive directory keeps its ancestry when it becomes the cwd,
+        // and a project kept inside one stays sensitive.
+        assert_eq!(
+            requires_approval(&read("credentials"), &root.join(".aws"), &sensitive),
+            Some(GateReason::SensitivePath)
+        );
+        assert_eq!(
+            requires_approval(&read("main.tf"), &root.join(".aws/project"), &sensitive),
+            Some(GateReason::SensitivePath)
+        );
+        // An alias is classified by what it resolves to.
+        std::os::unix::fs::symlink("sub/.git/config", root.join("alias")).unwrap();
+        assert_eq!(
+            requires_approval(&read("alias"), root, &sensitive),
+            Some(GateReason::SensitivePath)
+        );
+        assert_eq!(
+            requires_approval(&read("README.md"), root, &sensitive),
+            None
+        );
     }
 
     #[tokio::test]
@@ -720,10 +843,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lists_current_crate_directory() {
+    #[tokio::test]
+    async fn lists_current_crate_directory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let output = list_directory(&json!({}), root).unwrap();
+        let output = execute_tool(&tool("list_directory", json!({})), root).await;
         assert!(output.contains("Cargo.toml"));
+        assert!(output.contains("src/"));
+    }
+
+    #[tokio::test]
+    async fn f8_a_stuck_filesystem_call_does_not_hold_the_turn() {
+        // Stands in for a read blocked on a slow or hung filesystem.
+        let started = std::time::Instant::now();
+        let error = run_blocking_within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(800));
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        // The caller is released at the deadline, long before the worker.
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(error.to_string().contains("did not respond"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn f8_reads_and_listings_report_their_bounds() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        std::fs::File::create(root.join("large.bin"))
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        let output = execute_tool(
+            &tool("read_file", json!({"path": "large.bin", "max_bytes": 4})),
+            root,
+        )
+        .await;
+        assert!(
+            output.ends_with("[output truncated at 4 bytes]"),
+            "{output}"
+        );
+
+        std::fs::create_dir(root.join("big")).unwrap();
+        for index in 0..=MAX_DIRECTORY_ENTRIES {
+            std::fs::write(root.join(format!("big/f{index}")), "").unwrap();
+        }
+        let output = execute_tool(&tool("list_directory", json!({"path": "big"})), root).await;
+        assert_eq!(output.lines().count(), MAX_DIRECTORY_ENTRIES + 1);
+        assert!(output.ends_with("the rest were not read]"), "{output}");
     }
 }

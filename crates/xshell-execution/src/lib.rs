@@ -2,6 +2,7 @@ mod budget;
 mod call_id;
 mod compaction;
 mod engine;
+mod prepared;
 mod process;
 mod sensitive;
 mod tools;

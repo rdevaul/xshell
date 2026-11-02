@@ -6,9 +6,17 @@
 //! this project". Matching paths are *promoted to approval-gated*, not
 //! denied: `--approval auto` still reads them, `ask` prompts, `off` denies.
 //!
-//! Matching is done on the canonical path relative to the tool root, so a
-//! symlink or `..` cannot dodge a pattern, and on the file name alone, so a
-//! pattern like `*.pem` applies at any depth.
+//! Matching is done on the canonical absolute path of the object a tool is
+//! about to read (see `crate::prepared`), so a symlink or `..` cannot dodge a
+//! pattern and the answer does not depend on the session's cwd:
+//!
+//! - a pattern without `/` matches the final component, so `*.pem` applies to
+//!   a file of that name at any depth;
+//! - a pattern with `/` matches at any depth of the path, so `.git/config`
+//!   covers a nested repository's config and `.aws/**` covers everything
+//!   under any `.aws` directory, including a project kept inside one;
+//! - a pattern that starts with `/` is anchored to the filesystem root, for
+//!   administrators who mean one specific location.
 
 use std::path::Path;
 
@@ -79,17 +87,21 @@ impl SensitivePaths {
         &self.patterns
     }
 
-    /// Does `relative` (a canonical path relative to the tool root, using `/`
-    /// separators) match any pattern?
-    pub fn matches(&self, relative: &Path) -> bool {
-        let relative = relative
+    /// Does `path` match any pattern? Callers pass the canonical absolute
+    /// path of the object; a relative path is matched the same way, from its
+    /// first component.
+    pub fn matches(&self, path: &Path) -> bool {
+        let path = path
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let relative = relative.trim_start_matches("./");
-        let file_name = relative.rsplit('/').next().unwrap_or(relative);
+        let path = path.trim_start_matches("./").trim_start_matches('/');
+        let file_name = path.rsplit('/').next().unwrap_or(path);
         self.patterns.iter().any(|pattern| {
-            if pattern.contains('/') {
-                glob_match(pattern, relative)
+            if let Some(anchored) = pattern.strip_prefix('/') {
+                glob_match(anchored, path)
+            } else if pattern.contains('/') {
+                // Leading `**/` matches zero or more whole segments.
+                glob_match(&format!("**/{pattern}"), path)
             } else {
                 glob_match(pattern, file_name)
             }
@@ -218,6 +230,43 @@ mod tests {
                 "{miss} should not be sensitive"
             );
         }
+    }
+
+    #[test]
+    fn f4_slash_patterns_match_at_any_depth_of_the_absolute_path() {
+        let s = SensitivePaths::default();
+        // The same files from absolute paths, whatever the session cwd was.
+        for hit in [
+            "/home/user/work/.git/config",
+            "/home/user/work/sub/.git/config",
+            "/home/user/.aws/credentials",
+            "/home/user/.aws/project/main.tf",
+            "/home/user/.ssh",
+            "/srv/repo/.env",
+            "sub/.git/config",
+        ] {
+            assert!(s.matches(Path::new(hit)), "{hit} should be sensitive");
+        }
+        for miss in [
+            "/home/user/work/README.md",
+            "/home/user/work/.git/HEAD",
+            "/home/user/.awsome/notes.md",
+            "/home/user/git/config.rs",
+        ] {
+            assert!(
+                !s.matches(Path::new(miss)),
+                "{miss} should not be sensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_slash_anchors_a_pattern_to_the_filesystem_root() {
+        let anchored = SensitivePaths::new(vec!["/srv/vault/**".to_owned()]);
+        assert!(anchored.matches(Path::new("/srv/vault/keys/a")));
+        assert!(!anchored.matches(Path::new("/home/user/srv/vault/keys/a")));
+        let floating = SensitivePaths::new(vec!["srv/vault/**".to_owned()]);
+        assert!(floating.matches(Path::new("/home/user/srv/vault/keys/a")));
     }
 
     #[test]
