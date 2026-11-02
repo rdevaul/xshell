@@ -618,34 +618,46 @@ pub(crate) fn warn_if_truncated(finish_reason: Option<&str>) {
 }
 
 /// A prefix naming the subagent an event came from; empty for the root agent.
-fn agent_tag(agent: Option<&str>) -> String {
+pub(crate) fn agent_tag(agent: Option<&str>) -> String {
     agent.map_or_else(String::new, |agent| {
         format!("[{}] ", sanitize_terminal_text(agent))
     })
 }
 
 pub(crate) fn print_subagent_started(agent: &str, task: &str, tools: &[String]) {
+    println!("\n{}", format_subagent_started(agent, task, tools));
+}
+
+pub(crate) fn format_subagent_started(agent: &str, task: &str, tools: &[String]) -> String {
     let tools = if tools.is_empty() {
         "no tools".to_owned()
     } else {
         tools.join(", ")
     };
     // The task is model-written; escape it like a tool summary.
-    println!(
-        "\n{}subagent started ({tools}): {}",
+    format!(
+        "{}subagent started ({tools}): {}",
         agent_tag(Some(agent)),
         escape_for_prompt(task.lines().next().unwrap_or_default())
-    );
+    )
 }
 
 pub(crate) fn print_subagent_finished(agent: &str, outcome: &str, message: Option<&str>) {
+    println!("{}", format_subagent_finished(agent, outcome, message));
+}
+
+pub(crate) fn format_subagent_finished(
+    agent: &str,
+    outcome: &str,
+    message: Option<&str>,
+) -> String {
     match message {
-        Some(message) => println!(
+        Some(message) => format!(
             "{}subagent {outcome}: {}",
             agent_tag(Some(agent)),
             sanitize_terminal_text(message)
         ),
-        None => println!("{}subagent {outcome}", agent_tag(Some(agent))),
+        None => format!("{}subagent {outcome}", agent_tag(Some(agent))),
     }
 }
 
