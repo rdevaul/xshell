@@ -92,7 +92,9 @@ that are **not** implemented yet are automatic *installation* and upgrade of
 `xshelld` on remote hosts, resilient SSH supervision, a shared `/xshell`
 filesystem namespace, binary/media viewer plugins and CAD rendering, multi-user
 sessions and ACLs, and restoration of an in-flight process across an `xshelld`
-restart. FutureShell—the contractual workflow and bounded-rollback language
+restart. Durable per-directory handoff notes and persistent goals
+(`XSHELL.md`, `//goal`) are a [design proposal](docs/xshell-md-continuity.md),
+not yet implemented. FutureShell—the contractual workflow and bounded-rollback language
 planned on top of this fabric—is currently a design and roadmap, not an
 executable language.
 
@@ -410,7 +412,13 @@ visible and bounded:
 - Agent shell tools display an escaped, byte-faithful command before approval;
   `y` runs it, `n` denies it and continues the turn, and `q` aborts the turn.
 - Shell tools use a non-login shell, bounded captured output, a 60-second
-  timeout, and a separate process group that is killed as a unit.
+  timeout, and a separate process group that is killed as a unit; on
+  cancellation or timeout the group is killed again, a bounded number of
+  times, until it is empty, to catch a process forked during the first kill.
+- A `delegate_task` subagent runs inside its parent's turn with at most the
+  parent's tools (read-only by default, never `delegate_task`), the parent's
+  approval policy, and the same turn budget. Its shell requests are approved
+  by whoever is attached to the parent, tagged with the subagent's name.
 - A remote daemon's `max_approval` ceiling can make a controller's requested
   policy stricter, never more permissive.
 
@@ -457,6 +465,8 @@ rollback guarantees.
 - [Dual-mandate development roadmap](docs/xshell-development-roadmap.md)
 - [Security finding ledger](docs/xshell-security-findings.md)
 - [Execution mode conformance](docs/xshell-mode-conformance.md)
+- [Subagents: design and staged plan](docs/subagents-design.md)
+- [XSHELL.md durable handoff and goals (proposal)](docs/xshell-md-continuity.md)
 - [Home-lab service runner](docs/runall.md)
 - [Original implementation plan and detailed backlog](xshell-implementation-plan.md)
 - [Release artifacts and signing](docs/releasing.md)

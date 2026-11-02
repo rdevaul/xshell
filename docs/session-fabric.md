@@ -15,7 +15,7 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 11. The daemon
+with protocol version 14. The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Set `session_fabric.host_alias` to a short, distinct name for each machine; if
@@ -27,7 +27,13 @@ session listings, completion, selectors, and the interactive picker.
 Protocol versions are exact rather than negotiated across incompatible
 schemas. Any protocol bump therefore requires upgrading and restarting
 `xshelld` on the controller and every connected remote host before the new CLI
-can attach. Protocol v11 makes session activity self-describing: the session
+can attach. Protocol v14 adds the `delegate_task` subagent events
+(`subagent_started`, `subagent`, `subagent_finished`; see
+[subagents](#subagents)). Protocol v13 adds the `auto_continued` event and the
+`reasoning` and `finish_reason` fields on agent responses. Protocol v12 adds an
+explicit stopping phase, so a controller does not report a cancellation as
+complete while owned process cleanup is still in progress. Protocol v11 makes
+session activity self-describing: the session
 catalog distinguishes idle prompts, agent turns, and interactive processes,
 including the process command and stream attachment state. Protocol v10 added
 the `history_compacted` execution event. Protocol
@@ -118,6 +124,35 @@ event and recorded in the audit log, so a reader of the trail can see from
 which point the model no longer had the full transcript. A durable session
 restored with a smaller budget than it was saved under is brought within
 budget before its first provider request.
+
+## Turn budget
+
+Every agent turn draws from one budget for the whole turn, including any
+subagents it starts: 64 provider requests, 128 evaluated tool calls, 32 tool
+calls per response, and 60 minutes of elapsed time. Calls past the
+per-response limit are refused and the turn continues; exhausting any other
+limit fails the turn with a message naming it, and follows the usual failure
+rules: rolled back if no tool ran, otherwise kept with an execution record.
+The limits are fixed defaults today. Per-session and global budgets are not
+implemented yet (finding F10).
+
+## Subagents
+
+An agent can call `delegate_task` to run a subagent: a nested turn on the same
+model, with a fresh conversation, the task as its prompt, and at most the
+parent's tools (read-only by default, never `delegate_task` itself). The
+subagent runs inside the parent's turn, with the parent's approval policy,
+sensitive paths, cancellation, and budget. Its final message becomes the
+parent's tool result; its transcript is not added to the session's history.
+
+Over the protocol, every event the subagent emits arrives wrapped in a
+`subagent` execution event naming it (`delegate-1`, …), between
+`subagent_started` and `subagent_finished`. Its tool-call ids carry the same
+scope (`delegate-1/<id>`). An approval it needs is an ordinary pending
+approval for the session, answered with the existing `approve` request using
+that scoped id, so whichever controller is attached to the parent session
+decides it. Answering `q` to a subagent's prompt aborts the whole turn. See
+[the subagent design](subagents-design.md).
 
 ## Identity and attachment
 

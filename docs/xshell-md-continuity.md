@@ -305,6 +305,13 @@ re-injection step is needed. The engine takes it through `TurnPolicy`, as a
 context source consulted before each request, so the daemon, which owns the
 file for daemon sessions, supplies it.
 
+The engine already assembles each request this way. Since #94,
+`run_agent_turn_with_budget` folds execution and recovery records into the
+leading `system` message of the request copy, never the stored history, so
+records stay where they were written and are compacted away with their turns.
+The handoff belongs at the same step, after that merge, so the request still
+starts with exactly one `system` message.
+
 The injected content counts against the model's context: the session's
 compaction budget is reduced by its size. Above a configurable cap,
 `xshell_md.max_bytes`, activation is refused with a message suggesting the

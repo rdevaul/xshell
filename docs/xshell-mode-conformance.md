@@ -2,7 +2,7 @@
 
 **Status:** M0 baseline; unsupported and unverified cells are explicit
 
-**Updated:** 6 October 2026
+**Updated:** 2 November 2026
 
 This matrix identifies which shared lifecycle guarantees each current mode
 must satisfy. It is not a claim that all guarantees are implemented today.
@@ -14,6 +14,7 @@ must satisfy. It is not a claim that all guarantees are implemented today.
 | SSH daemon agent | Remote host daemon, ambient remote user | Remote daemon/durable session | Remote execution coordinator | Remote daemon boundary | Local-daemon guarantees plus bounded control transport |
 | Captured direct shell | CLI or daemon process | Cwd and bounded output according to session mode | Owning turn/coordinator | Start, output policy, and terminal outcome | F2/F3/F11 corrected |
 | Agent shell tool | Shared execution engine | Tool facts projected into conversation/session | Owning agent turn | Request, decision, result, and terminal turn outcome | F1/F2 corrected |
+| Delegated subagent (`delegate_task`) | Parent's turn: at most the parent's tools, the parent's approval policy | Final answer becomes the parent's tool result; transcript only in events and audit | Parent turn (shared cancellation flag and budget) | Bracketed by `subagent_started`/`subagent_finished`; scoped tool-call ids | Abort, budget exhaustion, tool narrowing, and remote approval covered by tests; daemon-crash recovery names only the parent operation |
 | Interactive PTY | Host daemon PTY coordinator | Process may outlive attachment; bounded replay is optional | PTY coordinator | Lifecycle always; stream capture by explicit bounded policy | F3 shutdown and forced-recovery markers implemented |
 
 ## Common lifecycle assertions
