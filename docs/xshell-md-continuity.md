@@ -4,6 +4,10 @@
 
 **Date:** 2026-10-26
 
+**Revised:** 2026-11-02, for the whole-turn budget (#84) and `delegate_task`
+subagents (#86), with TOML front matter, per-request injection, checked goal
+completion, and the daemon protocol.
+
 **Author:** Richard DeVaul
 
 ## Summary
@@ -16,8 +20,8 @@ work and serves as a durable handoff to a later session. A new `//goal`
 command records a goal in the same file, with completion criteria, a TTL, and
 a state, so the agent can keep working toward it across turns and sessions.
 
-Because the file's contents go into the model's system prompt, `XSHELL.md` is
-an instruction channel. The design therefore treats every file as untrusted
+Because the file's contents are sent to the model with every request,
+`XSHELL.md` is an instruction channel. The design therefore treats every file as untrusted
 until a person has reviewed it, and it tracks the exact content a person
 approved by hash, in the audit trail when one is available.
 
@@ -55,25 +59,34 @@ approved by hash, in the audit trail when one is available.
 
 ## File format
 
-The file is Markdown with a YAML front-matter block. xshell owns the front
-matter; the body is free-form handoff notes.
+The file is Markdown with a TOML front-matter block between `+++` lines, the
+same format as xshell's configuration, parsed with the `toml` crate the
+workspace already uses. xshell owns the front matter; the body is free-form
+handoff notes.
 
 ```markdown
----
-xshell: 1
-goal:
-  framing: >
-    Migrate the session store from JSON files to SQLite without losing
-    existing sessions.
-  criteria:
-    - Existing sessions load after upgrade (covered by an integration test).
-    - `cargo test --workspace` passes.
-  ttl:
-    turns: 30
-  turns_used: 7
-  state: in_progress
-  updated: 2026-10-26T18:04:11Z
----
++++
+xshell = 1
+
+[goal]
+framing = """
+Migrate the session store from JSON files to SQLite without losing
+existing sessions."""
+turns_used = 7
+state = "in_progress"
+updated = 2026-10-26T18:04:11Z
+
+[goal.ttl]
+turns = 30
+
+[[goal.criteria]]
+description = "Existing sessions load after upgrade."
+check = "cargo test -p xshell-session --test service upgrade"
+
+[[goal.criteria]]
+description = "The workspace tests pass."
+check = "cargo test --workspace"
++++
 
 ## Current state
 ...
@@ -86,8 +99,15 @@ goal:
 ```
 
 The front matter is optional: a file with no goal is still a handoff file.
-Unknown front-matter keys are rejected rather than ignored, so a future
-version's fields are never silently dropped by an older xshell.
+Unknown keys, and an `xshell` version newer than this build understands, are
+rejected rather than ignored, so a future version's fields are never silently
+dropped by an older xshell. Such a file is not activated: xshell names the key
+or version it does not understand and offers to set the file aside (see
+[Session start](#session-start)).
+
+TOML rather than YAML: the configuration is already TOML, `deny_unknown_fields`
+gives the rejection rule for free, and the common Rust YAML crate is archived
+and would be flagged by `cargo audit`.
 
 ## Session start
 
@@ -133,6 +153,32 @@ other on first use in each clone. For most projects, `XSHELL.md` belongs in
 `.gitignore`; xshell can offer to add it when it creates the file inside a git
 working tree.
 
+## Daemon and remote sessions
+
+The file lives on the host where the session runs, which for a daemon session
+may be another machine. The daemon owns the file's state; the client only
+presents prompts:
+
+- **Protocol.** New session-protocol requests report the file's status (path,
+  current hash, trusted hash, and the review content or diff, fetched from the
+  host through the daemon) and carry the user's decision: activate, approve
+  after review, set aside, or start fresh. Every decision names the hash it
+  was made about. If the file's hash has changed since, the daemon refuses
+  the decision and the client shows the new content for review. This bumps
+  `SESSION_PROTOCOL_VERSION`.
+- **Session state.** The session root, the active path, and its trusted hash
+  are part of the session descriptor, so every client sees the same state and
+  durable sessions save it.
+- **Restore.** When the daemon restores a durable session, or a client
+  reattaches, the file's hash is checked again before it is used. A mismatch
+  deactivates it and requires review.
+- **Detached starts.** A session created with nobody attached follows
+  `--xshell-md` as described above.
+
+The logic belongs on the daemon path. The standalone CLI should run the same
+code in-process rather than a second implementation, in line with the planned
+`SessionBackend` consolidation.
+
 ## Trust ledger
 
 The ledger is only as strong as the place it is stored: an attacker who can
@@ -159,11 +205,33 @@ hash-chained, signed logs, it can be re-derived and checked by
 rebuild from the logs at startup.
 
 This adds an audit protocol version and an on-disk format version, like
-earlier event additions.
+earlier event additions. It also changes the audit service's role: today
+`xshelld` only appends to it, and with this change `xshelld` also asks it
+questions. The query answers only with a hash for a path, derived from
+records `xshelld` wrote, but the audit service becomes something activation
+depends on, and its protocol and threat model documentation must say so.
 
-### Local store (fallback)
+### Which ledger is authoritative
 
-Without an audit service, `xshelld` keeps the ledger in a store it manages
+The ledger is chosen by configuration, not by availability. When auditing is
+enabled, the audit-backed ledger is the only one consulted, including with
+`required = false`. If the audit service cannot be reached:
+
+- no file is activated without review;
+- a review approval activates the file for the current session only, because
+  the trust decision cannot be recorded, so the next session reviews again;
+- a revocation that cannot be recorded still deactivates the file, which then
+  stays untrusted until the audit service records a new trust decision.
+
+xshell never falls back to the local store while auditing is enabled. A local
+store that is updated only while the audit service is down would disagree
+with it once the service returns: a revocation recorded only locally, such as
+an explicit revoke of an unchanged file, would be lost. Requiring review is
+the safe failure.
+
+### Local store (no auditing)
+
+Without auditing, `xshelld` keeps the ledger in a store it manages
 under its state directory, written atomically and updated with every trust
 event. This store is writable by the same account that runs agent shell
 commands, so it provides **no tamper resistance**: it prevents accidents and
@@ -176,10 +244,14 @@ say so plainly, as `docs/auditing.md` does for a same-account audit daemon.
 
 The agent gets a dedicated tool, `update_handoff`, that replaces the body of
 the active file. It cannot touch the front matter; goal state changes go
-through `report_goal` (see [Goals](#goals-1)). Each write:
+through `report_goal` (see [Persistent goals](#persistent-goals)). It is not
+gated by the approval policy: it can only replace the body of a file the user
+activated, and every write is recorded. Each write:
 
 1. takes the per-path writer lock (below);
-2. checks that the file on disk still has the trusted hash. If it does not,
+2. checks that the file on disk still has the trusted hash, reading it through
+   the descriptor-bound prepared file access from roadmap M1.3 rather than a
+   separate read path. If it does not,
    the write is refused, the file is revoked as `external_change`, and the
    user is told;
 3. writes a temporary file in the same directory and renames it into place;
@@ -219,12 +291,22 @@ user just wrote counts as reviewed.
 
 ## Context injection
 
-An active file's contents are placed in the system prompt when the session
-starts, and placed again after any compaction pass that removed turns, so a
-compacted session never loses its handoff. Both are delimited and labeled
-with the file's path and hash.
+An active file's contents are added to every provider request as a system
+message after the session's own system prompt, delimited and labeled with the
+file's path and hash. They are assembled at request time from the content
+that passed the hash check and are never stored in the session's history.
 
-The file counts against the history budget. Above a configurable cap,
+Storing the file in history does not work. The history's first message is the
+session's own system prompt, which durable sessions save and compaction keeps.
+Writing the file there would go stale after every `update_handoff` and would
+save file contents into session state. Adding it per request means the model
+always sees the current trusted content, compaction cannot remove it, and no
+re-injection step is needed. The engine takes it through `TurnPolicy`, as a
+context source consulted before each request, so the daemon, which owns the
+file for daemon sessions, supplies it.
+
+The injected content counts against the model's context: the session's
+compaction budget is reduced by its size. Above a configurable cap,
 `xshell_md.max_bytes`, activation is refused with a message suggesting the
 user trim it with `//vixshell`.
 
@@ -247,10 +329,12 @@ The session root and everything below it count as inside the session:
 
 Each agent `run_shell` call already runs as a separate `sh -c` process started
 in the session cwd, so an agent `cd` cannot change the session's directory
-today. Only the user's own `cd` moves the session. That property must be kept,
-and a test should pin it.
+today. Only the user moves the session: with `cd`, or with a client request
+that sets the working directory (the protocol's `Update` today). The root
+check applies to every path that changes the session's cwd. That the agent
+cannot move the session must be kept, and a test should pin it.
 
-## Goals
+## Persistent goals
 
 ### Commands
 
@@ -258,6 +342,8 @@ and a test should pin it.
   arguments, the completion criteria and a TTL.
 - `//goal status` shows the goal, its state, and the TTL used.
 - `//goal pause` and `//goal resume` suspend and continue it.
+- `//goal confirm` and `//goal reject [note]` settle a `reported_satisfied`
+  goal (see [Completion](#completion)).
 - `//goal clear` ends it; the final state is kept in the file's history
   section.
 
@@ -271,7 +357,8 @@ offers to create one. There is one goal per file.
 | `unclear` | The criteria are not specific enough for the agent to work toward on its own |
 | `in_progress` | The agent is working toward the goal |
 | `paused` | The user suspended the goal; it can be resumed |
-| `satisfied` | The criteria have been met |
+| `reported_satisfied` | The agent reports the criteria met, but at least one has no check; waiting for the user to confirm or reject |
+| `satisfied` | Every criterion's check passed, or the user confirmed a reported result |
 | `unsatisfied` | The goal is clear but has not been met, and work stopped (TTL used up, or the agent reports it cannot proceed) |
 
 When a goal is created, the model is asked once to assess the criteria. If it
@@ -284,22 +371,67 @@ and evidence, for example which criteria it checked and how. xshell applies
 only valid transitions, records each one in the front matter and the audit
 trail, and moves to `unsatisfied` itself when the TTL runs out.
 
+### Completion
+
+A model's report is a claim, not evidence. This follows the FS5 rule that
+prompt claims never satisfy execution predicates. Each criterion may name a
+`check` command. When the agent reports `satisfied`:
+
+- xshell runs each criterion's check in the parent turn, under the session's
+  approval policy exactly as a `run_shell` call would be, and records each
+  result in the audit trail;
+- if every criterion has a check and every check passed, the goal becomes
+  `satisfied`;
+- if a check fails, the goal stays `in_progress` and the agent is told which
+  check failed and its output;
+- if any criterion has no check, the goal becomes `reported_satisfied` and no
+  further turns start until the user runs `//goal confirm` (to `satisfied`) or
+  `//goal reject [note]` (back to `in_progress`, with the note given to the
+  agent).
+
 ### Working toward a goal
 
-While a goal is `in_progress`, a turn that ends without the goal being
-reported `satisfied` or `unsatisfied` continues automatically, building on the
-existing auto-continue mechanism. Every continued turn counts against the TTL.
-The approval policy is unchanged: under `ask`, each shell tool still needs a
-decision, so unattended progress needs `auto` within the daemon's
-`max_approval` ceiling.
+Continuing a goal means the daemon starting turns with no client input, which
+xshell does not do today. The existing auto-continue mechanism is not a basis
+for it: it only nudges a model within one turn, at most twice. While a goal is
+`in_progress`, when a turn ends without the goal reaching `satisfied`,
+`reported_satisfied`, or `unsatisfied`, the daemon submits a continuation turn
+itself:
+
+- **Admission.** A continuation is admitted like any submission: refused while
+  another turn is active or during shutdown. Under `ask`, continuations start
+  only while a client is attached, since a prompt nobody can answer would only
+  stall; otherwise the goal pauses with that reason. Unattended progress needs
+  `auto` within the daemon's `max_approval` ceiling.
+- **Audit.** A continuation is recorded at the execution boundary as an audit
+  `Input` event with route `goal` and the continuation prompt, as user input
+  is.
+- **Budget.** Each continuation is its own root turn with a fresh
+  `TurnBudget` (#84). The real bound on a goal is therefore its TTL in turns
+  times the per-turn limits (by default 64 provider requests, 128 tool calls,
+  and 60 minutes per turn).
+- **Failures.** A failed or budget-exhausted turn counts against the TTL.
+  Three consecutive failed turns move the goal to `unsatisfied` rather than
+  retrying the same failure until the TTL runs out.
 
 ### TTL
 
-The TTL's base unit is **turns**: the number of agent turns, including
-automatic continuations, the goal may consume. The format leaves room for
+The TTL's base unit is **turns**: the number of root agent turns the goal may
+consume, counting the turn that created it and every continuation turn the
+daemon starts. Auto-continue nudges within one turn are not separate turns. The format leaves room for
 wall-clock time (`ttl.wall_clock: 2h`) and estimated cost (`ttl.cost_usd`),
 with the goal stopping at whichever limit comes first. Cost requires per-model
-pricing in the model profile and is a later phase.
+pricing in the model profile and usage reporting from the adapters, which
+today stream only text, and is a later phase.
+
+## Subagents
+
+`update_handoff` and `report_goal` change the session's durable state, so a
+`delegate_task` subagent never receives them, even with `tools = "inherit"`.
+They are removed from every subagent toolset, as `delegate_task` itself is. A
+subagent does not see the handoff either: it starts from a fresh history by
+design, and the parent can put whatever the subagent needs into its task.
+Goal checks run in the parent's turn, never a subagent's.
 
 ## Audit events
 
@@ -312,7 +444,9 @@ Recorded by the process that performs the action:
 - `xshell_md_edit_started` and `xshell_md_edit_finished { outcome }` for
   `//vixshell`;
 - `goal_created`, `goal_state_changed { from, to, evidence }`, and
-  `goal_ttl_exhausted`.
+  `goal_ttl_exhausted`;
+- `goal_check { criterion, command, outcome }` for each completion check;
+- continuation turns as `Input` events with route `goal`.
 
 File contents are not duplicated into the log, only paths and hashes, as for
 view operations.
@@ -344,14 +478,16 @@ offer_gitignore = true
   `XSHELL.md.bak.*` should be added to the default sensitive-path patterns so
   `read_file` and `list_directory` access is at least gated.
 - **Time of check to time of use:** the hash is checked and the file read
-  under the writer lock, and the injected content is the content that was
-  hashed, not a second read.
+  once, under the writer lock, through M1.3's descriptor-bound prepared file
+  access, and the injected content is the content that was hashed, not a
+  second read.
 
 ## Open questions
 
-1. Should a `satisfied` report need the user's confirmation, or a configured
-   check command (for example `cargo test`) to pass, rather than the model's
-   word alone?
+1. ~~Should a `satisfied` report need the user's confirmation, or a configured
+   check command to pass, rather than the model's word alone?~~ Resolved: a
+   criterion's check must pass, or the user must confirm (see
+   [Completion](#completion)).
 2. When a second session starts in an active root, is a read-only view useful,
    or should it simply see no file?
 3. What should `xshell_md.max_bytes` default to, and should it scale with the
@@ -361,10 +497,12 @@ offer_gitignore = true
 
 ## Phases
 
-1. File format, startup flow, review, local ledger, injection at start and
-   after compaction, `update_handoff`, and directory-change handling.
+1. File format, startup flow and review (including the session-protocol
+   requests), local ledger, per-request injection, `update_handoff`, and
+   directory-change handling.
 2. Audit-backed ledger: new events, the `xshell-auditd` index and
    `trusted_hash` query, and verifier support.
 3. `//vixshell`, including reconnect recovery.
-4. `//goal` with turn TTLs, `report_goal`, and goal auto-continue.
+4. `//goal` with turn TTLs, `report_goal`, completion checks, and
+   daemon-started continuation turns.
 5. Wall-clock and cost TTLs.
