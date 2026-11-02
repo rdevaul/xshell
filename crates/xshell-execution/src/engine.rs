@@ -1195,6 +1195,7 @@ pub async fn run_direct_shell_streaming_cancellable(
         None => {
             let cancelled = cancellation.is_cancelled();
             group.kill();
+            group.sweep().await;
             let _ = wait_task.await;
             group.disarm();
             while let Some((stream, bytes)) = receiver.recv().await {
