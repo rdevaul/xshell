@@ -131,7 +131,10 @@ signatures, and the final-checkpoint marker.
 The initial implementation records session configuration (never API
 credentials), user input, cwd and model changes, model responses, model errors,
 tool calls, approval decisions, tool results, direct shell completion, and
-session closure. View operations record the requested or resolved path,
+session closure. A `delegate_task` subagent's activity is recorded between
+`subagent_started` (its name, task, and tools) and `subagent_finished` (its
+outcome); turns run sequentially, so every record in between belongs to the
+subagent, and its tool-call ids carry its scope (`delegate-1/...`). View operations record the requested or resolved path,
 content hash and size when acquisition succeeded, media type, selected viewer,
 and outcome; file contents are not duplicated into the audit log.
 
@@ -187,7 +190,8 @@ History-compaction events advanced the audit client/daemon protocol to version
 3 and the on-disk audit format to version 2; terminal-stream events advance
 them to protocol 4 and format 3; auto-continue events and the `reasoning` and
 `finish_reason` fields on agent responses advance them to protocol 5 and format
-4. Upgrade and restart `xshell-auditd` together
+4; `subagent_started` and `subagent_finished` events advance them to protocol 6
+and format 5. Upgrade and restart `xshell-auditd` together
 with `xshelld` and the CLI — a version mismatch is reported at handshake with
 the expected and received versions. The verifier remains able to read every
 format from version 1 onward.

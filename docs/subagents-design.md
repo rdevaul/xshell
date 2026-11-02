@@ -1,8 +1,9 @@
 # Subagents: design and staged plan
 
-Status: **proposed**. Step 1 (per-agent toolsets and scoped tool-call
-identities), step 2 (the shared whole-turn budget), and step 3 (the blocking
-`delegate_task` tool) are implemented; step 4 is design only.
+Status: steps 1–3 **implemented** — per-agent toolsets and scoped tool-call
+identities (#83), the shared whole-turn budget (#84), and the blocking
+`delegate_task` tool (#86). Step 4, child sessions, is design only and waits
+on protocol version negotiation and the M2 authorization contract.
 
 This document assesses what the xshell harness needs in order to create and
 manage subagents — agents started by another agent to do a bounded piece of
@@ -60,25 +61,33 @@ Non-goals for this plan:
 3. **The engine cannot build a child adapter.** It receives a constructed
    adapter; a child that uses another model profile needs a resolver from
    profile name to binding, resolved where credentials live (the daemon in
-   fabric mode).
+   fabric mode). *Open:* step 3 reuses the parent's adapter, so a subagent
+   always runs on the parent's model.
 4. **Events carry no agent identity.** `ExecutionEvent`, `SessionEventKind`,
    and `AuditEvent` need an agent path. The audit format must keep adding
    fields with `skip_serializing_if` so earlier records re-hash unchanged.
-5. **Budgets multiply.** Each `run_agent_turn` permits 64 steps; nesting
-   makes that 64 × 64. M1.4's whole-turn budget is a prerequisite.
+   *Addressed by step 3* with a wrapper event and bracketing audit records
+   rather than a per-event field; see
+   [Events, audit, and protocol](#events-audit-and-protocol).
+5. **Budgets multiply.** Each `run_agent_turn` permitted 64 steps; nesting
+   made that 64 × 64. *Addressed by step 2.*
 6. **Sequential tool execution.** Parallel children need concurrent dispatch
    of calls within one response and an approval queue in the CLI that names
-   the requesting agent.
+   the requesting agent. *Open.*
 7. **Recovery is per session.** If the daemon dies mid-turn, the in-flight
    marker names only the parent operation; recovery text must say a child
-   was running and what it was allowed to do.
+   was running and what it was allowed to do. *Open:* a subagent runs inside
+   its parent's operation, so recovery reports the parent's operation as
+   `outcome_unknown` without naming the subagent.
 8. **Two execution paths.** Standalone (`LocalObserver`) and daemon
    (`DaemonObserver` plus the CLI follower) each render, audit, and approve.
    Every subagent UI change is made twice until the standalone path is
    collapsed into the daemon path behind a `SessionBackend` trait (see the
-   2026-11-05 review).
+   2026-11-05 review). *Open:* step 3 was implemented in both paths.
 9. **Protocol lockstep.** `SESSION_PROTOCOL_VERSION` must match exactly, so
    new event variants force simultaneous upgrades on all connected hosts.
+   *Open:* step 3 moved the protocol to version 14; version-range
+   negotiation should land before step 4.
 
 ## Design
 
@@ -121,17 +130,21 @@ key and the audit correlation key. The provider id appears only in history.
 ### Toolsets (step 1)
 
 `ToolSet` is a small value type over a closed `Tool` enum (`read_file`,
-`list_directory`, `run_shell`). `TurnPolicy::tools` selects which tools are
-**advertised** to the model and which are **dispatchable**. A call to a tool
-outside the set — including a hallucinated tool name — is answered with a
-tool error without approval or execution, and does not count as observed
-tool activity, so a turn containing only such calls can still be rolled
-back. The default set is every tool, so existing behavior is unchanged.
+`list_directory`, `run_shell`, and since step 3 `delegate_task`).
+`TurnPolicy::tools` selects which tools are **advertised** to the model and
+which are **dispatchable**. A call to a tool outside the set — including a
+hallucinated tool name — is answered with a tool error without approval or
+execution, and does not count as observed tool activity, so a turn containing
+only such calls can still be rolled back. The default set is every tool, so
+since step 3 every agent is offered `delegate_task`; `ToolSet::read_only()`
+holds only `read_file` and `list_directory`.
 
-The enum stays closed on purpose: adding the delegate tool in step 3 is one
+The enum stays closed on purpose: adding the delegate tool in step 3 was one
 variant, and keeping dispatch exhaustive lets the compiler find every place
 that must handle it. A dynamic registry can replace it when FS5 connectors
-need runtime-registered tools.
+need runtime-registered tools. Further agent tools, such as `update_handoff`
+and `report_goal` from the [XSHELL.md proposal](xshell-md-continuity.md),
+must be removed from every subagent toolset the way `delegate_task` is.
 
 ### Delegation (step 3): blocking child turns
 
@@ -206,8 +219,8 @@ This is designed as FS5's `xshell-session` connector so its lifecycle
 A root turn owns one budget, shared by reference with every descendant:
 model rounds, tool dispatches, child starts, and wall time.
 
-The step 2 prototype implements this as `TurnLimits` (on `TurnPolicy`) and
-`TurnBudget` (clones share atomic counters) in `xshell-execution`:
+Step 2 implements this as `TurnLimits` (on `TurnPolicy`) and `TurnBudget`
+(clones share atomic counters) in `xshell-execution`:
 
 | Limit | Default | Counts | On exhaustion |
 |---|---|---|---|
@@ -221,30 +234,48 @@ usual failure rules: rolled back if no tool ran, otherwise kept with an
 execution record. `run_agent_turn` builds a fresh budget from the policy;
 `run_agent_turn_with_budget` lets a child draw from its root's budget and
 ignores the child policy's own limits. The 64-request default preserves the
-former 64-step limit. Per-session and global budgets from F10 remain open. Exhaustion stops
-new dispatch and is reported as the child's outcome, then as the root turn's
-failure if the root also cannot continue. Token and cost limits wait for
-usage reporting from adapters (`AgentEvent` carries only text deltas today);
-until then budgets are reported as `steps`-based, never as cost assurance.
+former 64-step limit.
+
+Exhaustion inside a subagent is reported as the subagent's
+`budget_exhausted` outcome, and the parent then fails on its own next charge
+because the budget is shared. Per-session and global budgets from F10 (#60)
+remain open. Token and cost limits wait for usage reporting from adapters
+(`AgentEvent` carries only text deltas today); until then budgets count
+requests, calls, and time, never cost.
 
 ### Events, audit, and protocol
 
-- `ExecutionEvent` gains an optional agent path; the CLI renders child output
-  indented or prefixed with the agent name and collapses it by default.
-- `AuditEvent` gains an optional `agent` field and an `AgentStarted` /
-  `AgentFinished` pair carrying scope, parent call id, toolset, approval,
-  model, and outcome.
-- Each change bumps `SESSION_PROTOCOL_VERSION`. Accepting a version range at
-  open, as the review recommends, should land before step 4.
+As implemented in step 3:
+
+- `ExecutionEvent` gained `SubagentStarted { agent, task, tools }`,
+  `Subagent { agent, event }` (a wrapper around every event the subagent
+  emits), and `SubagentFinished { agent, outcome, message }`, with
+  `innermost()` / `into_innermost()` to unwrap. A wrapper was chosen over an
+  optional agent field on every variant so existing variants and their
+  consumers stay unchanged.
+- The daemon registers a subagent's approval from the innermost
+  `ApprovalRequested`, under the subagent's scoped call id, so the existing
+  `approve` request works unchanged.
+- Both CLI paths, and the session redraw on switch (`backlog.rs`), tag
+  subagent output with `[delegate-<n>]` and leave the subagent's streamed text
+  to arrive as the tool result.
+- `AuditEvent` gained `SubagentStarted` and `SubagentFinished`. Turns run
+  sequentially, so every record between them belongs to the subagent, and
+  its tool-call ids also carry the scope.
+- Versions: session protocol 14, audit protocol 6, audit format 5.
+
+Step 4 should add protocol version-range negotiation first, as the review
+recommends, so a child-session protocol does not force every connected host
+to upgrade at once.
 
 ## Staged plan
 
-| Step | Deliverable | Depends on | Exit evidence |
-|---|---|---|---|
-| 1 | `ToolSet` on `TurnPolicy`; scoped tool-call ids in events/approvals/audit | — | Unoffered and unknown tools are refused without approval or execution; repeated provider ids get distinct scoped ids; scoped approvals round-trip; history keeps provider ids |
-| 2 | Whole-turn shared budget (part of M1.4) | — | Nested and sequential steps draw from one budget; exhaustion reported truthfully |
-| 3 | `delegate_task` blocking child turn, both execution paths | 1, 2; ideally the `SessionBackend` collapse | Child cannot exceed parent tools/approval/paths; cancel cascades; approvals reach the parent's human; child transcript audited; depth 1 enforced |
-| 4 | Child sessions as the FS5 `xshell-session` connector | 3, protocol version range, M2 operation contract | Detached children survive controller disconnect; closing a parent closes ephemeral children; recovery names interrupted children |
+| Step | Deliverable | Depends on | Exit evidence | Status |
+|---|---|---|---|---|
+| 1 | `ToolSet` on `TurnPolicy`; scoped tool-call ids in events/approvals/audit | — | Unoffered and unknown tools are refused without approval or execution; repeated provider ids get distinct scoped ids; scoped approvals round-trip; history keeps provider ids | Done (#83) |
+| 2 | Whole-turn shared budget (part of M1.4) | — | Nested and sequential steps draw from one budget; exhaustion reported truthfully | Done (#84) |
+| 3 | `delegate_task` blocking child turn, both execution paths | 1, 2; ideally the `SessionBackend` collapse | Child cannot exceed parent tools/approval/paths; cancel cascades; approvals reach the parent's human; child transcript audited; depth 1 enforced | Done (#86), without the `SessionBackend` collapse |
+| 4 | Child sessions as the FS5 `xshell-session` connector | 3, protocol version range, M2 operation contract | Detached children survive controller disconnect; closing a parent closes ephemeral children; recovery names interrupted children | Planned |
 
 ## Open questions
 
@@ -255,4 +286,5 @@ until then budgets are reported as `steps`-based, never as cost assurance.
   (Step 3 answers: delegation is not gated, and every child gate applies
   independently.)
 - What is the default per-root-turn budget for personal profiles, and is it
-  user-configurable per model profile?
+  user-configurable per model profile? (Step 2 set fixed defaults; they are
+  not configurable yet.)

@@ -1,6 +1,6 @@
 # xshell security finding ledger
 
-**Updated:** 6 October 2026
+**Updated:** 2 November 2026
 
 **Authority:** The evidence and acceptance conditions in the
 [design, security, and usability review](xshell-design-security-usability-review.md)
@@ -18,7 +18,7 @@ historical review.
 | F7 | [#57](https://github.com/rdevaul/xshell/issues/57) | P2 | M1.1 effects and recovery | Open | Injected write/sync/rename failures leave response, memory, and restarted state consistent |
 | F8 | [#58](https://github.com/rdevaul/xshell/issues/58) | P2 | M1.3 prepared file access | Open | File and directory acquisition remain bounded before allocation and control stays responsive |
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Open | Incomplete/error/refusal streams cannot produce executable tool calls |
-| F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
+| F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn budget landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
 
 ## Evidence rules
@@ -48,6 +48,18 @@ PTYs, including descendant-process cleanup and audit-close ordering. A durable
 pre-dispatch marker converts SIGKILL leftovers into an explicit
 `outcome_unknown` recovery record. Audit-peer responsiveness remains the
 separate F6 correction.
+
+F2 was hardened after its correction (#95). A single group-wide `SIGKILL`
+could miss a process whose fork overlapped the signal on macOS, which does not
+abort such a fork as Linux does; the F2 captured-shell test caught it on macOS
+CI. Cancellation now re-kills the group until it is empty, with a bounded
+number of rounds.
+
+F10 is partly corrected (#84): every agent turn, including its subagents,
+draws from one budget of provider requests, tool calls, tool calls per
+response, and elapsed time, and a maximal repeated batch stops at a
+deterministic limit. Byte, worker, retained-state, per-session, and global
+budgets remain, so F10 stays open.
 
 F4, F5, and F8 are the current P1/P2 work. They share one cause — authorization
 and acquisition resolve the path independently — so M1.3 corrects them as a
