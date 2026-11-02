@@ -478,10 +478,6 @@ pub async fn run_agent_turn_with_budget(
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
     let approval = policy.approval;
-    // Repair a transcript left malformed by an earlier failed turn before any
-    // of it is copied for rollback or replayed to the provider. See
-    // [`merge_system_messages`].
-    merge_system_messages(history);
     // Keep the exact prior history for failed/cancelled-turn rollback.
     let mut rollback_history = history.clone();
     history.push(ChatMessage::user(message));
@@ -508,10 +504,14 @@ pub async fn run_agent_turn_with_budget(
         // appended during this turn grow the prompt mid-flight, and that is
         // where context windows are actually exceeded.
         let staged = stage_compaction(policy.compactor.as_ref(), history);
-        let request_messages = match &staged {
+        let mut request_messages = match &staged {
             Some((compacted, _)) => compacted.clone(),
             None => history.clone(),
         };
+        // Fold execution records into the leading `system` message for the
+        // provider only. History keeps them where they were written; see
+        // [`merge_system_messages`].
+        merge_system_messages(&mut request_messages);
         let outcome = {
             let observer = &mut *observer;
             let mut emit = |event| match event {
@@ -1102,9 +1102,18 @@ fn stub_unfinished_tool_calls(history: &mut Vec<ChatMessage>, calls: &[ToolCall]
 /// the same malformed history and persists it again, so every later turn fails
 /// the same way and the session is unusable until it is discarded.
 ///
-/// Merging restores the single-`system`-prefix invariant the compactor already
-/// assumes (see [`crate::compaction`]) and keeps every record's text verbatim,
-/// so the model still sees why an earlier turn stopped.
+/// Merging keeps every record's text verbatim, so the model still sees why an
+/// earlier turn stopped. It is applied to each provider request, never to the
+/// stored history, for two reasons:
+///
+/// - Compaction never removes anything before the first user message.
+///   Records merged into the stored prefix would therefore stay there
+///   forever, growing with every failed or cancelled turn. Left in place,
+///   each record is removed with its turn when that turn is compacted.
+/// - The stored transcript keeps where each failure happened.
+///
+/// Because the merge happens on every request, sessions already saved with
+/// misplaced records recover on their next turn without a migration.
 fn merge_system_messages(history: &mut Vec<ChatMessage>) -> usize {
     let has_prefix = history
         .first()
@@ -2977,6 +2986,95 @@ mod tests {
         .await
         .unwrap();
         assert_well_formed(&resumed.requests[0].messages);
+    }
+
+    #[tokio::test]
+    async fn records_are_merged_for_the_provider_but_stay_in_place_in_history() {
+        let temporary = TempDir::new().unwrap();
+        let mut history = vec![
+            ChatMessage::system("prefix"),
+            ChatMessage::user("earlier"),
+            ChatMessage::system("xshell execution record: the previous turn stopped"),
+        ];
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: "ok".into(),
+                ..Default::default()
+            }]),
+            requests: Vec::new(),
+        };
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "continue".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut scripted_observer(),
+        )
+        .await
+        .unwrap();
+
+        // The provider sees one leading `system` message carrying the record...
+        let sent = &adapter.requests[0].messages;
+        assert_well_formed(sent);
+        assert!(sent[0].content.contains("previous turn stopped"));
+        // ...while the stored transcript is not rewritten: the prefix is
+        // unchanged and the record stays where it was written.
+        assert_eq!(history[0].content, "prefix");
+        assert_eq!(history[2].role, xshell_core::MessageRole::System);
+        assert!(history[2].content.contains("previous turn stopped"));
+    }
+
+    #[tokio::test]
+    async fn compaction_drops_an_old_record_with_its_turn() {
+        // Merging records into the stored prefix would keep them forever,
+        // since compaction never removes the prefix. Left in place, a record
+        // goes with the turn it belongs to.
+        let temporary = TempDir::new().unwrap();
+        let mut history = vec![
+            ChatMessage::system("prefix"),
+            ChatMessage::user("old question"),
+            ChatMessage::assistant("x".repeat(400)),
+            ChatMessage::system("xshell execution record: OLD-RECORD"),
+            ChatMessage::user("recent question"),
+            ChatMessage::assistant("recent answer"),
+        ];
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: "ok".into(),
+                ..Default::default()
+            }]),
+            requests: Vec::new(),
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_compaction(&CompactionConfig {
+            max_history_bytes: Some(300),
+            ..CompactionConfig::default()
+        });
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "new question".into(),
+            temporary.path(),
+            &policy,
+            &mut scripted_observer(),
+        )
+        .await
+        .unwrap();
+
+        let sent = &adapter.requests[0].messages;
+        assert_well_formed(sent);
+        assert!(
+            sent.iter()
+                .all(|message| !message.content.contains("OLD-RECORD")),
+            "a compacted turn's record still reached the provider"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("OLD-RECORD")),
+            "a compacted turn's record survived in the stored history"
+        );
+        assert_eq!(history[0].content, "prefix");
     }
 
     #[test]
