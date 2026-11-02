@@ -478,6 +478,10 @@ pub async fn run_agent_turn_with_budget(
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
     let approval = policy.approval;
+    // Repair a transcript left malformed by an earlier failed turn before any
+    // of it is copied for rollback or replayed to the provider. See
+    // [`merge_system_messages`].
+    merge_system_messages(history);
     // Keep the exact prior history for failed/cancelled-turn rollback.
     let mut rollback_history = history.clone();
     history.push(ChatMessage::user(message));
@@ -1085,6 +1089,57 @@ fn stub_unfinished_tool_calls(history: &mut Vec<ChatMessage>, calls: &[ToolCall]
     for call in calls {
         history.push(ChatMessage::tool_result(call, message));
     }
+}
+
+/// Collapse every misplaced `system` message into the leading `system`
+/// message, and report how many were merged.
+///
+/// Failure bookkeeping (`preserve_or_rollback_failed_turn`) and daemon
+/// recovery append `system` records wherever the turn happened to stop, which
+/// scatters `system` messages through the transcript. Strict OpenAI-compatible
+/// endpoints reject the next request outright — "System message must be at the
+/// beginning" — and the rejection is *sticky*: the failed turn rolls back to
+/// the same malformed history and persists it again, so every later turn fails
+/// the same way and the session is unusable until it is discarded.
+///
+/// Merging restores the single-`system`-prefix invariant the compactor already
+/// assumes (see [`crate::compaction`]) and keeps every record's text verbatim,
+/// so the model still sees why an earlier turn stopped.
+fn merge_system_messages(history: &mut Vec<ChatMessage>) -> usize {
+    let has_prefix = history
+        .first()
+        .is_some_and(|message| message.role == MessageRole::System);
+    // Index 0 is the prefix when it is a `system` message; every other
+    // `system` message is misplaced and must be folded into it.
+    let misplaced: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .skip(usize::from(has_prefix))
+        .filter(|(_, message)| message.role == MessageRole::System)
+        .map(|(index, _)| index)
+        .collect();
+    if misplaced.is_empty() {
+        return 0;
+    }
+    let mut sections: Vec<String> = Vec::with_capacity(misplaced.len() + 1);
+    if has_prefix {
+        sections.push(history[0].content.clone());
+    }
+    sections.extend(
+        misplaced
+            .iter()
+            .map(|&index| history[index].content.clone()),
+    );
+    for &index in misplaced.iter().rev() {
+        history.remove(index);
+    }
+    let merged = sections.join("\n\n");
+    if has_prefix {
+        history[0].content = merged;
+    } else {
+        history.insert(0, ChatMessage::system(merged));
+    }
+    misplaced.len()
 }
 
 fn preserve_or_rollback_failed_turn(
@@ -2797,6 +2852,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_budget_record_does_not_poison_the_next_turn() {
+        // Regression: exhausting the turn budget appended its record as a
+        // `system` message at the *end* of the history. The next turn pushed
+        // its user message after it, and strict OpenAI-compatible endpoints
+        // rejected the request with "System message must be at the
+        // beginning." - and kept rejecting every later one, because the
+        // failure rolled back to the same malformed history.
+        let temporary = TempDir::new().unwrap();
+        let provider_requests = 2;
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from_iter((0..provider_requests).map(|step| AssistantResponse {
+                content: String::new(),
+                tool_calls: vec![shell_call(&format!("c{step}"), "true")],
+                ..Default::default()
+            })),
+            requests: Vec::new(),
+        };
+        let mut observer = scripted_observer();
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_limits(TurnLimits {
+            provider_requests,
+            ..TurnLimits::default()
+        });
+        let mut history = vec![ChatMessage::system("test")];
+
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "go".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exhausted its budget"),
+            "unexpected error: {error}"
+        );
+        // The record is kept on record for the audit trail and the model...
+        assert!(
+            history
+                .last()
+                .unwrap()
+                .content
+                .contains("exhausted its budget"),
+            "the reason the turn stopped must survive in history"
+        );
+
+        // ...but it must not reach the provider in that position.
+        let mut resumed = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: "resumed".into(),
+                tool_calls: Vec::new(),
+                ..Default::default()
+            }]),
+            requests: Vec::new(),
+        };
+        run_agent_turn(
+            &mut resumed,
+            &mut history,
+            "please continue".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert_well_formed(&resumed.requests[0].messages);
+        assert!(
+            resumed.requests[0].messages[0]
+                .content
+                .contains("exhausted its budget"),
+            "the merged record must still be visible to the model"
+        );
+    }
+    #[tokio::test]
+    async fn failure_record_after_tool_activity_is_merged_before_the_next_request() {
+        // The provider-failure and cancellation paths reach the same
+        // bookkeeping as the step limit, so they are covered too.
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: String::new(),
+                tool_calls: vec![shell_call("effect", "true")],
+                ..Default::default()
+            }]),
+            requests: Vec::new(),
+        };
+        let mut observer = scripted_observer();
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto);
+        let mut history = vec![ChatMessage::system("test")];
+
+        assert!(
+            run_agent_turn(
+                &mut adapter,
+                &mut history,
+                "go".into(),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .is_err()
+        );
+        assert!(history.last().unwrap().content.contains("provider failed"));
+
+        let mut resumed = ScriptedAdapter {
+            responses: VecDeque::from([AssistantResponse {
+                content: "ok".into(),
+                tool_calls: Vec::new(),
+                ..Default::default()
+            }]),
+            requests: Vec::new(),
+        };
+        run_agent_turn(
+            &mut resumed,
+            &mut history,
+            "please continue".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert_well_formed(&resumed.requests[0].messages);
+    }
+
+    #[test]
+    fn merge_system_messages_folds_records_into_the_prefix() {
+        let mut history = vec![
+            ChatMessage::system("prefix"),
+            ChatMessage::user("q"),
+            ChatMessage::system("record one"),
+            ChatMessage::user("r"),
+            ChatMessage::system("record two"),
+        ];
+        assert_eq!(merge_system_messages(&mut history), 2);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content, "prefix\n\nrecord one\n\nrecord two");
+        assert_well_formed(&history);
+        // Idempotent, and a no-op report on clean history.
+        assert_eq!(merge_system_messages(&mut history), 0);
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn merge_system_messages_creates_a_prefix_when_there_is_none() {
+        // A resumed session can carry recovery records with no leading
+        // `system` message at all.
+        let mut history = vec![
+            ChatMessage::user("q"),
+            ChatMessage::system("record"),
+            ChatMessage::user("r"),
+        ];
+        assert_eq!(merge_system_messages(&mut history), 1);
+        assert_well_formed(&history);
+        assert_eq!(history[0].content, "record");
+        assert_eq!(history[0].role, xshell_core::MessageRole::System);
+    }
+
+    #[tokio::test]
     async fn history_is_compacted_before_every_provider_request() {
         // The pre-turn pass cannot see tool results appended later in the
         // same turn. Guarding each request individually is what stops a
@@ -3353,6 +3569,23 @@ mod tests {
         assert_eq!(
             Path::new(result.stdout.trim()),
             child.canonicalize().unwrap()
+        );
+    }
+
+    /// Every provider in this workspace accepts at most one `system` message,
+    /// and only at index 0; anything else is a `400 invalid_request_error`.
+    fn assert_well_formed(messages: &[ChatMessage]) {
+        let misplaced: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(index, message)| {
+                message.role == xshell_core::MessageRole::System && *index != 0
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            misplaced.is_empty(),
+            "`system` message at indices {misplaced:?}; only index 0 is accepted"
         );
     }
 
