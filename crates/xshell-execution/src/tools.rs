@@ -403,6 +403,7 @@ async fn run_shell(
         None => {
             let cancelled = cancellation.is_cancelled();
             group.kill();
+            group.sweep().await;
             let _ = child.wait().await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
