@@ -303,6 +303,68 @@ fn number_after(message: &str, phrases: &[&str]) -> Option<usize> {
     })
 }
 
+/// Longest provider error text quoted back in an [`AdapterError`].
+const MAX_QUOTED_ERROR_BYTES: usize = 2 * 1024;
+
+/// An error object or string the provider sent inside an otherwise successful
+/// stream. A context-overflow report keeps its own variant so the engine can
+/// still compact and retry.
+pub(crate) fn stream_error(error: &serde_json::Value) -> AdapterError {
+    let body = serde_json::json!({ "error": error }).to_string();
+    if let Some((prompt_tokens, available_tokens)) = context_overflow(&body) {
+        return AdapterError::ContextOverflow {
+            prompt_tokens,
+            available_tokens,
+        };
+    }
+    let mut quoted = error.to_string();
+    if quoted.len() > MAX_QUOTED_ERROR_BYTES {
+        let mut end = MAX_QUOTED_ERROR_BYTES;
+        while !quoted.is_char_boundary(end) {
+            end -= 1;
+        }
+        quoted.truncate(end);
+        quoted.push('…');
+    }
+    AdapterError::InvalidResponse(format!(
+        "the agent endpoint reported an error mid-stream: {quoted}"
+    ))
+}
+
+/// Refuse to hand tool calls to the engine unless the provider finished the
+/// response normally. A stream that ends without its completion marker, a
+/// response cut off by the output limit, and one stopped by a content filter
+/// can all carry tool calls whose arguments are truncated or were never meant
+/// to run, so none of them may dispatch anything.
+///
+/// `finish_reason` is the provider's stated reason: OpenAI's `finish_reason`
+/// or Ollama's `done_reason`. Text-only responses are not checked here; they
+/// cannot cause effects.
+pub(crate) fn require_dispatchable(
+    complete: bool,
+    finish_reason: Option<&str>,
+    tool_calls: usize,
+) -> Result<(), AdapterError> {
+    if tool_calls == 0 {
+        return Ok(());
+    }
+    let reason = if !complete {
+        "the response stream ended before the provider finished it".to_owned()
+    } else {
+        match finish_reason {
+            None | Some("stop" | "tool_calls" | "function_call") => return Ok(()),
+            Some("length") => "the response was cut off by the output token limit".to_owned(),
+            Some("content_filter") => {
+                "the response was stopped by the provider's content filter".to_owned()
+            }
+            Some(other) => format!("the response finished with reason {other:?}"),
+        }
+    };
+    Err(AdapterError::InvalidResponse(format!(
+        "{reason}; its {tool_calls} tool call(s) were not run"
+    )))
+}
+
 fn stream_duration_error() -> AdapterError {
     AdapterError::Transport(format!(
         "the agent endpoint response exceeded {} seconds",
