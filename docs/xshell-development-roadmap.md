@@ -193,7 +193,7 @@ Do not allow a connector to bypass shared authorization because it supplies its 
 1. Preserve the recorded D1–D9 ADR, finding ledger, and mode-conformance matrix as the M0 baseline.
 2. Preserve the landed F1–F3 lifecycle corrections and F11 cwd boundary while completing the remaining findings.
 3. Done: prepared bounded file reads and stable sensitivity semantics for F4/F5/F8 as one boundary in `xshell-execution` (`prepared.rs`): classification on the canonical absolute path, descriptor-bound prepared operations that authorization and acquisition share, and acquisition bounded before allocation.
-4. **Next:** Remove blocking global audit I/O and add deadline/failure tests (F6); then correct stream-completion handling (F9). The whole-turn budget part of F10 landed in #84; per-session, global, byte, and worker budgets remain.
+4. **Next:** Remove blocking global audit I/O and add deadline/failure tests (F6). Stream-completion handling (F9) is corrected, and the whole-turn budget part of F10 landed in #84; per-session, global, byte, and worker budgets remain.
 5. Draft the M2 operation/grant/provider contract and run one operation through personal and restrictive mock policies.
 6. Baseline the M3 home-lab journeys while the controlled deployment owner selects the M4 target environment.
 
