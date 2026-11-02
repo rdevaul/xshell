@@ -144,6 +144,7 @@ pub(crate) fn prepare(
     kind: ObjectKind,
     sensitive: &SensitivePaths,
 ) -> Result<PreparedObject> {
+    let spelled_root = root;
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot resolve tool root {}", root.display()))?;
@@ -151,7 +152,10 @@ pub(crate) fn prepare(
         .with_context(|| format!("cannot open tool root {}", root.display()))?;
 
     let mut pending = VecDeque::new();
-    push_front_components(&mut pending, &relative_to_root(&root, requested)?);
+    push_front_components(
+        &mut pending,
+        &relative_to_root(&root, spelled_root, Path::new(requested))?,
+    );
 
     // The directories opened so far, root first, with the name each was
     // reached by. The path the walk took is these names joined.
@@ -183,11 +187,9 @@ pub(crate) fn prepare(
             })?);
             if target.is_absolute() {
                 // Absolute targets restart from the root and must stay in it.
-                let inside = target
-                    .strip_prefix(&root)
-                    .map_err(|_| anyhow::anyhow!(OUTSIDE_ROOT))?;
+                let inside = relative_to_root(&root, spelled_root, &target)?;
                 opened.truncate(1);
-                push_front_components(&mut pending, inside);
+                push_front_components(&mut pending, &inside);
             } else {
                 push_front_components(&mut pending, &target);
             }
@@ -230,15 +232,18 @@ pub(crate) fn prepare(
     })
 }
 
-/// `requested` as a path relative to the canonical `root`. Absolute requests
-/// must name a location inside the root, spelled either way.
-fn relative_to_root(root: &Path, requested: &str) -> Result<PathBuf> {
-    let requested = Path::new(requested);
+/// `requested` as a path relative to the canonical `root`. Absolute paths,
+/// whether requested or the target of a link, must name a location inside the
+/// root, spelled canonically, as the caller spelled the root, or in any other
+/// way that canonicalizes into it.
+fn relative_to_root(root: &Path, spelled_root: &Path, requested: &Path) -> Result<PathBuf> {
     if !requested.is_absolute() {
         return Ok(requested.to_owned());
     }
-    if let Ok(inside) = requested.strip_prefix(root) {
-        return Ok(inside.to_owned());
+    for prefix in [root, spelled_root] {
+        if let Ok(inside) = requested.strip_prefix(prefix) {
+            return Ok(inside.to_owned());
+        }
     }
     // The root may be spelled differently (/tmp and /private/tmp on macOS).
     // Canonicalizing only chooses where the walk starts; the walk itself
@@ -439,6 +444,31 @@ mod tests {
             read_all(prepare_file(&root, absolute.to_str().unwrap()).unwrap()),
             "nested notes"
         );
+    }
+
+    /// macOS spells temporary directories through a link (`/var` is
+    /// `/private/var`), so a link created with the root's own spelling has an
+    /// absolute target that does not start with the canonical root.
+    #[test]
+    fn absolute_links_may_use_any_spelling_of_the_root() {
+        let (temporary, root) = workspace();
+        let spelled = temporary.path().join("spelled");
+        symlink(&root, &spelled).unwrap();
+        symlink(spelled.join(".env"), root.join("via-spelling")).unwrap();
+        symlink(
+            temporary.path().join("spelled/../outside/notes.txt"),
+            root.join("via-spelling-up"),
+        )
+        .unwrap();
+
+        for given_root in [&root, &spelled] {
+            let prepared = prepare_file(given_root, "via-spelling").unwrap();
+            assert!(prepared.sensitive());
+            assert_eq!(prepared.path(), root.join(".env"));
+            assert_eq!(read_all(prepared), "SECRET=1");
+            let error = prepare_file(given_root, "via-spelling-up").unwrap_err();
+            assert!(error.to_string().contains(OUTSIDE_ROOT), "{error:#}");
+        }
     }
 
     #[test]
