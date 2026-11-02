@@ -109,7 +109,7 @@ and its [review record](docs/futureshell-fs0-review.md).
 
 ## Build and run
 
-xshell targets macOS and Linux and requires Rust 1.88 or newer. With Ollama
+xshell targets macOS and Linux and requires Rust 1.95 or newer. With Ollama
 serving `qwen3:8b` on its default local endpoint:
 
 ```sh
