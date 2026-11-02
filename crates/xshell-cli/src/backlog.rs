@@ -8,7 +8,8 @@
 use crate::session::SessionRuntime;
 use crate::sessions_ui::session_label;
 use crate::turn::{
-    TRUNCATED_RESPONSE_NOTICE, format_auto_continue, format_compaction, format_tool_result,
+    TRUNCATED_RESPONSE_NOTICE, agent_tag, format_auto_continue, format_compaction,
+    format_subagent_finished, format_subagent_started, format_tool_result,
 };
 use anyhow::Result;
 use std::collections::HashSet;
@@ -90,6 +91,21 @@ fn backlog_end(
         .map_or(cursor, |first| cursor.max(first.sequence.saturating_sub(1)))
 }
 
+/// The event with its subagent wrappers removed, and the innermost subagent
+/// that emitted it (`None` for the root agent).
+fn innermost(mut event: &ExecutionEvent) -> (Option<&str>, &ExecutionEvent) {
+    let mut agent = None;
+    while let ExecutionEvent::Subagent {
+        agent: inner_agent,
+        event: inner,
+    } = event
+    {
+        agent = Some(inner_agent.as_str());
+        event = inner;
+    }
+    (agent, event)
+}
+
 /// Render journal events the way `follow_daemon_turn` draws them live, but
 /// into a buffer and without prompting, auditing, or acknowledging anything.
 fn render_events<'a>(
@@ -112,71 +128,101 @@ fn render_events<'a>(
                 };
                 writeln!(output, "› {}", text.trim_end())?;
             }
-            SessionEventKind::Execution { event } => match event {
-                ExecutionEvent::TextDelta { text } => renderer.push(text, &mut output)?,
-                ExecutionEvent::AgentResponse {
-                    content,
-                    finish_reason,
-                    ..
-                } => {
-                    if !renderer.received_delta() && !content.is_empty() {
-                        renderer.push(content, &mut output)?;
+            SessionEventKind::Execution { event } => {
+                // As drawn live: a subagent's events are tagged with its
+                // name, and its text is left to arrive as the tool result.
+                let (agent, event) = innermost(event);
+                let tag = agent_tag(agent);
+                match event {
+                    ExecutionEvent::TextDelta { text } => {
+                        if agent.is_none() {
+                            renderer.push(text, &mut output)?;
+                        }
                     }
-                    renderer.finish(&mut output)?;
-                    renderer = AgentRenderer::new(render_options);
-                    if finish_reason.as_deref() == Some("length") {
-                        writeln!(output, "{TRUNCATED_RESPONSE_NOTICE}")?;
+                    ExecutionEvent::AgentResponse {
+                        content,
+                        finish_reason,
+                        ..
+                    } => {
+                        if agent.is_none() {
+                            if !renderer.received_delta() && !content.is_empty() {
+                                renderer.push(content, &mut output)?;
+                            }
+                            renderer.finish(&mut output)?;
+                            renderer = AgentRenderer::new(render_options);
+                        }
+                        if finish_reason.as_deref() == Some("length") {
+                            writeln!(output, "{TRUNCATED_RESPONSE_NOTICE}")?;
+                        }
                     }
-                }
-                ExecutionEvent::AutoContinued { reason, .. } => {
-                    writeln!(output, "{}", format_auto_continue(reason))?;
-                }
-                ExecutionEvent::ToolRequested { call } => {
-                    writeln!(
-                        output,
-                        "agent requests: {}",
-                        escape_for_prompt(&tool_summary(call))
-                    )?;
-                }
-                ExecutionEvent::ApprovalRequested { call, reason } => {
-                    let why = match reason {
-                        Some(GateReason::SensitivePath) => " (matches sensitive-path policy)",
-                        _ => "",
-                    };
-                    write!(
-                        output,
-                        "Approve `{}`{why}? ",
-                        escape_for_prompt(&tool_summary(call))
-                    )?;
-                    prompted_calls.insert(call.id.as_str());
-                }
-                ExecutionEvent::ToolDecision { call_id, decision } => {
-                    if prompted_calls.remove(call_id.as_str()) {
+                    ExecutionEvent::AutoContinued { reason, .. } => {
+                        writeln!(output, "{}", format_auto_continue(reason))?;
+                    }
+                    ExecutionEvent::ToolRequested { call } => {
+                        writeln!(
+                            output,
+                            "{tag}agent requests: {}",
+                            escape_for_prompt(&tool_summary(call))
+                        )?;
+                    }
+                    ExecutionEvent::ApprovalRequested { call, reason } => {
+                        let why = match reason {
+                            Some(GateReason::SensitivePath) => " (matches sensitive-path policy)",
+                            _ => "",
+                        };
+                        write!(
+                            output,
+                            "{tag}Approve `{}`{why}? ",
+                            escape_for_prompt(&tool_summary(call))
+                        )?;
+                        prompted_calls.insert(call.id.as_str());
+                    }
+                    ExecutionEvent::ToolDecision { call_id, decision } => {
+                        if prompted_calls.remove(call_id.as_str()) {
+                            writeln!(
+                                output,
+                                "{}",
+                                match decision {
+                                    ApprovalDecision::Approve => "y",
+                                    ApprovalDecision::Deny => "n",
+                                    ApprovalDecision::AbortTurn => "q",
+                                }
+                            )?;
+                        }
+                    }
+                    ExecutionEvent::ToolSkipped { .. } => {}
+                    ExecutionEvent::ToolResult { result, .. } => {
+                        output.extend_from_slice(tag.as_bytes());
+                        output.extend_from_slice(format_tool_result(result).as_bytes());
+                    }
+                    ExecutionEvent::TurnAborted => {
+                        writeln!(
+                            output,
+                            "{tag}agent turn aborted; no remaining tools were executed"
+                        )?;
+                    }
+                    ExecutionEvent::HistoryCompacted { report } => {
+                        writeln!(output, "{}", format_compaction(report))?;
+                    }
+                    ExecutionEvent::SubagentStarted { agent, task, tools } => {
+                        renderer.finish(&mut output)?;
+                        writeln!(output, "{}", format_subagent_started(agent, task, tools))?;
+                    }
+                    ExecutionEvent::SubagentFinished {
+                        agent,
+                        outcome,
+                        message,
+                    } => {
                         writeln!(
                             output,
                             "{}",
-                            match decision {
-                                ApprovalDecision::Approve => "y",
-                                ApprovalDecision::Deny => "n",
-                                ApprovalDecision::AbortTurn => "q",
-                            }
+                            format_subagent_finished(agent, outcome, message.as_deref())
                         )?;
                     }
+                    // Removed by `innermost` above.
+                    ExecutionEvent::Subagent { .. } => {}
                 }
-                ExecutionEvent::ToolSkipped { .. } => {}
-                ExecutionEvent::ToolResult { result, .. } => {
-                    output.extend_from_slice(format_tool_result(result).as_bytes());
-                }
-                ExecutionEvent::TurnAborted => {
-                    writeln!(
-                        output,
-                        "agent turn aborted; no remaining tools were executed"
-                    )?;
-                }
-                ExecutionEvent::HistoryCompacted { report } => {
-                    writeln!(output, "{}", format_compaction(report))?;
-                }
-            },
+            }
             SessionEventKind::ShellOutput { text, .. } => output.extend_from_slice(text.as_bytes()),
             SessionEventKind::WorkingDirectoryChanged { .. } => {}
             SessionEventKind::ShellFinished { status, .. } => {
@@ -293,6 +339,79 @@ mod tests {
             Some(xshell_view::OutputMode::Never),
         )
         .unwrap()
+    }
+
+    fn execution(sequence: u64, event: ExecutionEvent) -> SessionEvent {
+        record(sequence, "t1", SessionEventKind::Execution { event })
+    }
+
+    fn from_subagent(sequence: u64, event: ExecutionEvent) -> SessionEvent {
+        execution(
+            sequence,
+            ExecutionEvent::Subagent {
+                agent: "delegate-1".into(),
+                event: Box::new(event),
+            },
+        )
+    }
+
+    #[test]
+    fn subagent_events_are_tagged_and_their_text_is_left_to_the_result() {
+        let call = xshell_core::ToolCall {
+            id: "delegate-1/c1".into(),
+            name: "run_shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        };
+        let events = [
+            started(1, "t1", "look around"),
+            execution(
+                2,
+                ExecutionEvent::SubagentStarted {
+                    agent: "delegate-1".into(),
+                    task: "List the files.".into(),
+                    tools: vec!["run_shell".into()],
+                },
+            ),
+            from_subagent(
+                3,
+                ExecutionEvent::TextDelta {
+                    text: "subagent thinking".into(),
+                },
+            ),
+            from_subagent(4, ExecutionEvent::ToolRequested { call: call.clone() }),
+            from_subagent(
+                5,
+                ExecutionEvent::ApprovalRequested {
+                    call,
+                    reason: Some(GateReason::ShellExecution),
+                },
+            ),
+            from_subagent(
+                6,
+                ExecutionEvent::ToolDecision {
+                    call_id: "delegate-1/c1".into(),
+                    decision: ApprovalDecision::Approve,
+                },
+            ),
+            execution(
+                7,
+                ExecutionEvent::SubagentFinished {
+                    agent: "delegate-1".into(),
+                    outcome: "completed".into(),
+                    message: None,
+                },
+            ),
+            record(8, "t1", SessionEventKind::TurnCompleted),
+        ];
+        let rendered = String::from_utf8(render_events(&events, plain()).unwrap()).unwrap();
+        assert_eq!(
+            rendered,
+            "› look around\n\
+             [delegate-1] subagent started (run_shell): List the files.\n\
+             [delegate-1] agent requests: $ ls\n\
+             [delegate-1] Approve `$ ls`? y\n\
+             [delegate-1] subagent completed\n"
+        );
     }
 
     #[test]
