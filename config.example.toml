@@ -106,8 +106,11 @@ default_session = "default"
 max_approval = "ask"
 # Read-only agent tools (read_file, list_directory) normally run without a
 # prompt. Paths matching these globs are promoted to approval-gated so a model
-# cannot silently read credentials. Patterns without "/" match a file name at
-# any depth; patterns with "/" are anchored at the session cwd; "**" spans
+# cannot silently read credentials. Patterns are matched against the canonical
+# absolute path of the file or directory being read, so the result does not
+# depend on the session cwd. Patterns without "/" match a file name; patterns
+# with "/" match at any depth (".git/config" also covers nested repositories);
+# a leading "/" anchors a pattern to the filesystem root; "**" spans
 # directories. Omit to use the built-in defaults (.env, *.pem, *.key, id_*,
 # .ssh/**, .aws/**, .git/config, *.tfstate, ...); set to [] to disable.
 # sensitive_paths = [".env", ".env.*", "*.pem", "*.key", ".ssh/**", "secrets.*"]

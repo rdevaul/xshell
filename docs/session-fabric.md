@@ -56,9 +56,15 @@ whether shell tools may run without a prompt there.
 
 `session_fabric.sensitive_paths` lists glob patterns for files an agent must
 not read or list without a human decision, even though `read_file` and
-`list_directory` are otherwise automatic. The daemon evaluates the policy
-against the canonical path relative to the session cwd, so symlinks and `..`
-cannot dodge it. A match is reported through `approval_requested` with
+`list_directory` are otherwise automatic. The daemon prepares each read before
+deciding: the path is walked beneath the session cwd without following
+symlinks implicitly, and the policy is evaluated against the canonical
+absolute path of the object that walk opened. The read then uses that same
+open object, so the file cannot be swapped between the decision and the read,
+and the answer does not depend on the cwd. Patterns without `/` match a file
+name; patterns with `/` match at any depth, so `.git/config` covers nested
+repositories and `.aws/**` covers a project kept inside `.aws`; a leading `/`
+anchors a pattern to the filesystem root. A match is reported through `approval_requested` with
 `reason = "sensitive_path"` (shell tools report `"shell_execution"`) and then
 follows the turn's approval policy exactly like a shell tool. Omitting the key
 selects the built-in defaults; an empty list disables the check.

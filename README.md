@@ -405,10 +405,14 @@ attachments are next-stage work. See the
 xshell is agentic infrastructure, not a sandbox. Its controls make authority
 visible and bounded:
 
-- `read_file` and `list_directory` are confined to the session cwd after
-  canonical and symlink resolution.
+- `read_file` and `list_directory` are confined to the session cwd: the path
+  is walked one component at a time without following symlinks implicitly,
+  and the read uses the object that walk opened, so it cannot be swapped
+  between the approval decision and the read. Reads and listings are bounded
+  before memory is allocated.
 - Credential-like paths such as `.env`, `.ssh/**`, private keys,
-  `.git/config`, and Terraform state are approval-gated by default.
+  `.git/config`, and Terraform state are approval-gated by default, judged
+  from the file's full path so the answer is the same from any cwd.
 - Agent shell tools display an escaped, byte-faithful command before approval;
   `y` runs it, `n` denies it and continues the turn, and `q` aborts the turn.
 - Shell tools use a non-login shell, bounded captured output, a 60-second
