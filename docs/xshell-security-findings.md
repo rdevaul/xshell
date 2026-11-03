@@ -17,7 +17,7 @@ historical review.
 | F6 | [#56](https://github.com/rdevaul/xshell/issues/56) | P1 | M1.4 service bounds | Open | A non-acknowledging audit peer cannot freeze unrelated sessions, control, or shutdown |
 | F7 | [#57](https://github.com/rdevaul/xshell/issues/57) | P2 | M1.1 effects and recovery | Open | Injected write/sync/rename failures leave response, memory, and restarted state consistent |
 | F8 | [#58](https://github.com/rdevaul/xshell/issues/58) | P2 | M1.3 prepared file access | Open | File and directory acquisition remain bounded before allocation and control stays responsive |
-| F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Open | Incomplete/error/refusal streams cannot produce executable tool calls |
+| F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Corrected | Incomplete/error/refusal streams cannot produce executable tool calls |
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn budget landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
 
@@ -54,6 +54,17 @@ could miss a process whose fork overlapped the signal on macOS, which does not
 abort such a fork as Linux does; the F2 captured-shell test caught it on macOS
 CI. Cancellation now re-kills the group until it is empty, with a bounded
 number of rounds.
+
+F9 is corrected. Both adapters hand tool calls to the engine only from a
+response the provider finished normally: the OpenAI-compatible adapter needs
+`[DONE]` or a `finish_reason`, and the Ollama adapter needs the final
+`done: true` chunk. A response cut off by the output limit, stopped by a
+content filter, or finished for an unknown reason dispatches nothing, and so
+does one carrying an error mid-stream, a second choice, an unnamed call, or
+unparseable arguments. Adapter tests cover each case, and a daemon test shows
+a complete-looking `run_shell` call from a stream that ends early never runs.
+Text-only responses are not held to this rule because they cannot cause
+effects.
 
 F10 is partly corrected (#84): every agent turn, including its subagents,
 draws from one budget of provider requests, tool calls, tool calls per

@@ -1673,6 +1673,99 @@ fn sse_text(content: &str) -> String {
 }
 
 #[test]
+fn f9_tool_call_from_an_unfinished_stream_never_runs() {
+    let temporary = TempDir::new().unwrap();
+    let marker = temporary.path().join("marker");
+    // A complete-looking tool call, but the stream ends without `[DONE]` or a
+    // finish reason: the connection dropped mid-response.
+    let unfinished = sse_tool_call(
+        "call_1",
+        "run_shell",
+        serde_json::json!({"command": format!("touch {}", marker.display())}),
+    )
+    .replace("data: [DONE]\n\n", "");
+    let (base_url, model_server) = serve_sse(vec![unfinished]);
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "unfinished".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+                max_history_bytes: None,
+                context_tokens: None,
+                reserve_output_tokens: None,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    client
+        .submit(
+            session.descriptor.id.clone(),
+            TurnInput::Agent {
+                message: "run it".into(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+
+    let mut after = 0;
+    let mut failure = None;
+    let mut tool_events = 0;
+    for _ in 0..100 {
+        let batch = client
+            .events(session.descriptor.id.clone(), after, 500)
+            .unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::Execution {
+                    event:
+                        ExecutionEvent::ToolRequested { .. }
+                        | ExecutionEvent::ApprovalRequested { .. }
+                        | ExecutionEvent::ToolDecision { .. }
+                        | ExecutionEvent::ToolResult { .. },
+                } => tool_events += 1,
+                SessionEventKind::TurnFailed { message } => failure = Some(message),
+                SessionEventKind::TurnCompleted => panic!("an unfinished stream completed"),
+                _ => {}
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+    let failure = failure.expect("the turn did not fail");
+    assert!(
+        failure.contains("ended before the provider finished it"),
+        "unexpected failure: {failure}"
+    );
+    assert_eq!(
+        tool_events, 0,
+        "the unfinished tool call reached the engine"
+    );
+    assert!(!marker.exists(), "the unfinished tool call ran");
+    model_server.join().unwrap();
+}
+
+#[test]
 fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
     // Parent delegates; the subagent asks to run a command; the subagent
     // answers; the parent answers. One fake provider serves all four requests.

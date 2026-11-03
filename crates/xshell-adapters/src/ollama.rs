@@ -85,10 +85,19 @@ struct OllamaToolDefinition<'a> {
 
 #[derive(Deserialize)]
 struct OllamaChunk {
+    #[serde(default)]
     message: OllamaChunkMessage,
+    /// An error Ollama reports in place of a message.
+    #[serde(default)]
+    error: Option<Value>,
+    /// Set on the final chunk of a completed response.
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    done_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct OllamaChunkMessage {
     #[serde(default)]
     content: String,
@@ -147,12 +156,21 @@ impl AgentAdapter for OllamaAdapter {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
         let mut tool_argument_bytes = 0_usize;
+        let mut done = false;
+        let mut done_reason = None;
         stream_lines(response, |line| {
             if line.trim().is_empty() {
                 return Ok(());
             }
             let chunk: OllamaChunk = serde_json::from_str(line)
                 .map_err(|error| AdapterError::InvalidResponse(error.to_string()))?;
+            if let Some(error) = &chunk.error {
+                return Err(crate::stream_error(error));
+            }
+            if chunk.done {
+                done = true;
+                done_reason = chunk.done_reason;
+            }
             if !chunk.message.content.is_empty() {
                 content.push_str(&chunk.message.content);
                 events(AgentEvent::TextDelta(chunk.message.content));
@@ -174,6 +192,12 @@ impl AgentAdapter for OllamaAdapter {
                             crate::MAX_TOOL_ARGUMENT_BYTES
                         ))
                     })?;
+                if call.function.name.is_empty() {
+                    return Err(AdapterError::InvalidResponse(format!(
+                        "tool call {} has no function name",
+                        tool_calls.len()
+                    )));
+                }
                 tool_calls.push(ToolCall {
                     id: format!("ollama-call-{}", tool_calls.len()),
                     name: call.function.name,
@@ -184,9 +208,11 @@ impl AgentAdapter for OllamaAdapter {
         })
         .await?;
 
+        crate::require_dispatchable(done, done_reason.as_deref(), tool_calls.len())?;
         Ok(AssistantResponse {
             content,
             tool_calls,
+            finish_reason: done_reason,
             ..Default::default()
         })
     }
@@ -198,6 +224,71 @@ mod tests {
     use crate::test_support::serve_once;
     use serde_json::json;
     use xshell_core::{ChatMessage, ChatRequest, ToolCall};
+
+    const OLLAMA_CALL: &str = concat!(
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"\",",
+        "\"tool_calls\":[{\"function\":{\"name\":\"read_file\",",
+        "\"arguments\":{\"path\":\"README.md\"}}}]},\"done\":false}\n"
+    );
+
+    async fn stream(body: String) -> Result<AssistantResponse, AdapterError> {
+        let (base_url, server) = serve_once("application/x-ndjson", body);
+        let mut adapter = OllamaAdapter::new(base_url, "test-model");
+        let result = adapter
+            .chat_stream(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    tools: Vec::new(),
+                },
+                &mut |_| {},
+            )
+            .await;
+        server.join().unwrap();
+        result
+    }
+
+    fn assert_refused(result: Result<AssistantResponse, AdapterError>, reason: &str) {
+        match result {
+            Err(AdapterError::InvalidResponse(message)) => assert!(
+                message.contains(reason),
+                "expected {reason:?} in {message:?}"
+            ),
+            other => panic!("expected a refused response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn f9_tool_calls_need_the_final_done_chunk() {
+        assert_refused(
+            stream(OLLAMA_CALL.to_owned()).await,
+            "ended before the provider finished it",
+        );
+        let response = stream(format!(
+            "{OLLAMA_CALL}{{\"message\":{{\"role\":\"assistant\",\"content\":\"\"}},\"done\":true,\"done_reason\":\"stop\"}}\n"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn f9_truncated_responses_and_errors_dispatch_nothing() {
+        assert_refused(
+            stream(format!(
+                "{OLLAMA_CALL}{{\"message\":{{\"role\":\"assistant\",\"content\":\"\"}},\"done\":true,\"done_reason\":\"length\"}}\n"
+            ))
+            .await,
+            "output token limit",
+        );
+        assert_refused(
+            stream(format!(
+                "{OLLAMA_CALL}{{\"error\":\"model runner crashed\"}}\n"
+            ))
+            .await,
+            "model runner crashed",
+        );
+    }
 
     #[tokio::test]
     async fn streams_text_and_collects_tool_calls() {

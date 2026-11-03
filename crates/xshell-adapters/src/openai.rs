@@ -109,10 +109,16 @@ struct OpenAiToolDefinition<'a> {
 struct OpenAiChunk {
     #[serde(default)]
     choices: Vec<OpenAiChoice>,
+    /// An error the provider reports inside a successful stream.
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiChoice {
+    /// xshell requests a single choice, so only index 0 is valid.
+    #[serde(default)]
+    index: usize,
     #[serde(default)]
     delta: OpenAiDelta,
     #[serde(default)]
@@ -191,6 +197,7 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut finish_reason = None;
+        let mut saw_done = false;
         let mut partial_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
         let mut tool_argument_bytes = 0_usize;
         stream_lines(response, |line| {
@@ -198,12 +205,25 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
                 return Ok(());
             };
             let data = data.trim();
-            if data.is_empty() || data == "[DONE]" {
+            if data == "[DONE]" {
+                saw_done = true;
+                return Ok(());
+            }
+            if data.is_empty() {
                 return Ok(());
             }
             let chunk: OpenAiChunk = serde_json::from_str(data)
                 .map_err(|error| AdapterError::InvalidResponse(error.to_string()))?;
+            if let Some(error) = &chunk.error {
+                return Err(crate::stream_error(error));
+            }
             for choice in chunk.choices {
+                if choice.index != 0 {
+                    return Err(AdapterError::InvalidResponse(format!(
+                        "the agent endpoint streamed choice {} although one was requested",
+                        choice.index
+                    )));
+                }
                 if choice.finish_reason.is_some() {
                     finish_reason = choice.finish_reason;
                 }
@@ -250,9 +270,19 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         })
         .await?;
 
+        crate::require_dispatchable(
+            saw_done || finish_reason.is_some(),
+            finish_reason.as_deref(),
+            partial_calls.len(),
+        )?;
         let tool_calls = partial_calls
             .into_iter()
             .map(|(index, call)| {
+                if call.name.is_empty() {
+                    return Err(AdapterError::InvalidResponse(format!(
+                        "tool call {index} has no function name"
+                    )));
+                }
                 let arguments = if call.arguments.trim().is_empty() {
                     Value::Object(Default::default())
                 } else {
@@ -335,6 +365,140 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.tool_calls[0].arguments["path"], "README.md");
         assert!(request.contains("\"stream\":true"));
+    }
+
+    const READ_CALL: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+        "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n\n"
+    );
+
+    /// Stream `body` and return the adapter's result.
+    async fn stream(body: String) -> Result<AssistantResponse, AdapterError> {
+        let (base_url, server) = serve_once("text/event-stream", body);
+        let mut adapter = OpenAiCompatibleAdapter::new(base_url, "test-model", None);
+        let result = adapter
+            .chat_stream(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    tools: Vec::new(),
+                },
+                &mut |_| {},
+            )
+            .await;
+        server.join().unwrap();
+        result
+    }
+
+    fn assert_refused(result: Result<AssistantResponse, AdapterError>, reason: &str) {
+        match result {
+            Err(AdapterError::InvalidResponse(message)) => assert!(
+                message.contains(reason),
+                "expected {reason:?} in {message:?}"
+            ),
+            other => panic!("expected a refused response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn f9_tool_calls_need_a_completed_stream() {
+        // EOF after tool deltas, with neither `[DONE]` nor a finish reason.
+        assert_refused(
+            stream(READ_CALL.to_owned()).await,
+            "ended before the provider finished it",
+        );
+        // Either completion signal alone is enough.
+        let done = stream(format!("{READ_CALL}data: [DONE]\n\n"))
+            .await
+            .unwrap();
+        assert_eq!(done.tool_calls[0].name, "read_file");
+        let finished = stream(format!(
+            "{READ_CALL}data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(finished.tool_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn f9_truncated_and_filtered_responses_dispatch_nothing() {
+        for (reason, expected) in [
+            ("length", "output token limit"),
+            ("content_filter", "content filter"),
+            ("unexpected", "reason \"unexpected\""),
+        ] {
+            assert_refused(
+                stream(format!(
+                    "{READ_CALL}data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n"
+                ))
+                .await,
+                expected,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn f9_text_only_responses_are_not_held_to_the_tool_rule() {
+        // No tool call, no effect: a stream without a completion marker still
+        // yields its text.
+        let response =
+            stream("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_owned())
+                .await
+                .unwrap();
+        assert_eq!(response.content, "partial");
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn f9_mid_stream_errors_fail_the_response() {
+        assert_refused(
+            stream(format!(
+                "{READ_CALL}data: {{\"error\":{{\"message\":\"upstream exploded\",\"code\":502}}}}\n\ndata: [DONE]\n\n"
+            ))
+            .await,
+            "upstream exploded",
+        );
+        // A context overflow reported mid-stream keeps its own variant, so the
+        // engine can still compact and retry.
+        let overflow = stream(
+            "data: {\"error\":{\"message\":\"This model's maximum context length is 32768 tokens. However, you requested 40000 tokens\",\"code\":\"context_length_exceeded\"}}\n\n".to_owned(),
+        )
+        .await;
+        assert!(
+            matches!(overflow, Err(AdapterError::ContextOverflow { .. })),
+            "got {overflow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f9_extra_choices_and_unnamed_calls_are_rejected() {
+        assert_refused(
+            stream(
+                "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"other\"}}]}\n\ndata: [DONE]\n\n"
+                    .to_owned(),
+            )
+            .await,
+            "streamed choice 1",
+        );
+        assert_refused(
+            stream(
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",",
+                    "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n"
+                )
+                .to_owned(),
+            )
+            .await,
+            "has no function name",
+        );
+        // Partial arguments that do not parse were already refused.
+        assert_refused(
+            stream(concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",",
+                "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\ndata: [DONE]\n\n"
+            ).to_owned())
+            .await,
+            "invalid arguments",
+        );
     }
 
     #[tokio::test]
