@@ -202,19 +202,33 @@ impl DeadlineStream {
 
 impl Read for DeadlineStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(self.remaining()?)?;
+        let timeout = self.remaining()?;
+        tolerate_closed_peer(self.stream.set_read_timeout(timeout))?;
         self.stream.read(buffer)
     }
 }
 
 impl Write for DeadlineStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.stream.set_write_timeout(self.remaining()?)?;
+        let timeout = self.remaining()?;
+        tolerate_closed_peer(self.stream.set_write_timeout(timeout))?;
         self.stream.write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
+    }
+}
+
+/// macOS refuses to set a socket timeout with `EINVAL` once the peer has
+/// closed the connection, which the audit service does right after its final
+/// reply. A socket in that state cannot block: the read returns the buffered
+/// reply or end of file, and a write fails. So the timeout is not needed, and
+/// the I/O itself reports the socket's real state.
+fn tolerate_closed_peer(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        result => result,
     }
 }
 
@@ -229,4 +243,50 @@ fn set_close_on_exec(stream: &UnixStream) -> Result<()> {
             .context("cannot protect audit socket from child processes");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+
+    /// The audit service closes its end right after the final reply. Reading
+    /// that reply must not fail, though macOS will not set a timeout on a
+    /// socket whose peer has closed.
+    #[test]
+    fn a_reply_followed_by_close_is_still_read_within_the_deadline() {
+        let (client, mut service) = UnixStream::pair().unwrap();
+        service.write_all(b"{\"response\":\"ack\"}\n").unwrap();
+        service.shutdown(Shutdown::Both).unwrap();
+        drop(service);
+
+        let mut reader = BufReader::new(DeadlineStream::new(client));
+        reader.get_mut().deadline = Some(Instant::now() + Duration::from_secs(5));
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "{\"response\":\"ack\"}\n");
+        line.clear();
+        assert_eq!(
+            reader.read_line(&mut line).unwrap(),
+            0,
+            "end of file after the reply"
+        );
+    }
+
+    #[test]
+    fn a_missed_deadline_is_a_timeout() {
+        let (client, _service) = UnixStream::pair().unwrap();
+        let mut stream = DeadlineStream::new(client);
+        stream.deadline = Some(Instant::now() + Duration::from_millis(50));
+        let started = Instant::now();
+        let error = stream.read(&mut [0; 8]).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }
