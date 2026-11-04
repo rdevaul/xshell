@@ -134,7 +134,7 @@ budget before its first provider request.
 ## Turn budget
 
 Every agent turn draws from one budget for the whole turn, including any
-subagents it starts: 64 provider requests, 128 evaluated tool calls, 32 tool
+subagents it starts: 128 provider requests, 256 evaluated tool calls, 64 tool
 calls per response, and 60 minutes of elapsed time. Calls past the
 per-response limit are refused and the turn continues; exhausting any other
 limit fails the turn with a message naming it, and follows the usual failure

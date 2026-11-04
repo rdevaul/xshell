@@ -28,9 +28,9 @@ pub struct TurnLimits {
 impl Default for TurnLimits {
     fn default() -> Self {
         Self {
-            provider_requests: 64,
-            tool_calls: 128,
-            tool_calls_per_response: 32,
+            provider_requests: 128,
+            tool_calls: 256,
+            tool_calls_per_response: 64,
             wall_time: Duration::from_secs(60 * 60),
         }
     }

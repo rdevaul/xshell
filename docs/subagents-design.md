@@ -224,9 +224,9 @@ Step 2 implements this as `TurnLimits` (on `TurnPolicy`) and `TurnBudget`
 
 | Limit | Default | Counts | On exhaustion |
 |---|---|---|---|
-| `provider_requests` | 64 | Every provider request, including auto-continues and the overflow retry | Turn fails before the request |
-| `tool_calls` | 128 | Every evaluated call: approved, denied, or refused by toolset | This and the remaining calls in the response are answered with a refusal; turn fails |
-| `tool_calls_per_response` | 32 | Calls in one response | Calls past the limit are refused; the turn continues so the model can resend |
+| `provider_requests` | 128 | Every provider request, including auto-continues and the overflow retry | Turn fails before the request |
+| `tool_calls` | 256 | Every evaluated call: approved, denied, or refused by toolset | This and the remaining calls in the response are answered with a refusal; turn fails |
+| `tool_calls_per_response` | 64 | Calls in one response | Calls past the limit are refused; the turn continues so the model can resend |
 | `wall_time` | 60 min | Elapsed time since the root turn started | Checked before every request and call, and enforced during provider requests; a running tool is bounded by its own timeout |
 
 Exhaustion fails the turn with a typed `BudgetExhausted` error and follows the
