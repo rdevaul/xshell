@@ -188,6 +188,26 @@ async fn main() -> Result<()> {
 
     let mut sticky_shell = false;
     let exit_reason = loop {
+        // A turn detached with the escape prefix keeps running on the daemon.
+        // Once it finishes, take the conversation it produced.
+        match sessions.take_finished_turn() {
+            Ok(Some(snapshot)) => {
+                println!("xshell: the session's agent turn finished; //resume shows its output");
+                apply_runtime_snapshot(
+                    snapshot,
+                    &mut active_model,
+                    &mut agent,
+                    &mut cwd,
+                    &mut history,
+                    &args.system_prompt,
+                    &mut editor,
+                    true,
+                )?;
+                refresh_shell_completions(&sessions, &mut editor);
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("xshell: cannot refresh the session: {error:#}"),
+        }
         let activity = sessions
             .active()
             .map_or("", |session| match &session.activity {
@@ -694,7 +714,9 @@ async fn main() -> Result<()> {
                 unreachable!("sticky shell routes are normalized before dispatch")
             }
         }
-        sessions.sync(&active_model, &cwd, &history)?;
+        if let Err(error) = sessions.sync(&active_model, &cwd, &history) {
+            eprintln!("xshell: {error:#}");
+        }
     };
 
     sessions.sync(&active_model, &cwd, &history)?;
