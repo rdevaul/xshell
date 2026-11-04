@@ -33,3 +33,6 @@ xshell-pty = { path = "../xshell-pty" }
 base64.workspace = true
 tempfile = "3.21"
 xshell-audit = { path = "../xshell-audit", features = [] }
+
+[lints]
+workspace = true

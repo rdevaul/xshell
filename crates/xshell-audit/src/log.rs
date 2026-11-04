@@ -425,6 +425,7 @@ fn validate_key_file(path: &Path, private: bool) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("audit key {} must be a regular file", path.display());
     }
+    // SAFETY: geteuid(2) takes no arguments and cannot fail.
     if metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
             "audit key {} is not owned by the daemon user",
@@ -444,6 +445,8 @@ fn append_checkpoint_index(file: &mut File, checkpoint: &AuditCheckpoint) -> Res
     let mut encoded = serde_json::to_vec(checkpoint)?;
     encoded.push(b'\n');
     let descriptor = file.as_raw_fd();
+    // SAFETY: flock(2) takes only integers; `descriptor` belongs to `file`, which is open until
+    // the unlock below.
     if unsafe { libc::flock(descriptor, libc::LOCK_EX) } != 0 {
         return Err(std::io::Error::last_os_error()).context("cannot lock checkpoint index");
     }
@@ -452,6 +455,7 @@ fn append_checkpoint_index(file: &mut File, checkpoint: &AuditCheckpoint) -> Res
         file.sync_data()?;
         Ok(())
     })();
+    // SAFETY: flock(2) takes only integers; `file` is still open.
     let unlock_result = unsafe { libc::flock(descriptor, libc::LOCK_UN) };
     if unlock_result != 0 && result.is_ok() {
         return Err(std::io::Error::last_os_error()).context("cannot unlock checkpoint index");

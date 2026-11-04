@@ -220,10 +220,14 @@ impl Write for DeadlineStream {
 
 fn set_close_on_exec(stream: &UnixStream) -> Result<()> {
     let descriptor = stream.as_raw_fd();
+    // SAFETY: fcntl(2) with these commands takes only integers and has no memory-safety
+    // preconditions.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error()).context("cannot inspect audit socket flags");
     }
+    // SAFETY: fcntl(2) with these commands takes only integers and has no memory-safety
+    // preconditions.
     if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
         return Err(std::io::Error::last_os_error())
             .context("cannot protect audit socket from child processes");

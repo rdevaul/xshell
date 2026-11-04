@@ -30,3 +30,6 @@ xshell-platform = { path = "../xshell-platform" }
 
 [dev-dependencies]
 tempfile = "3.21"
+
+[lints]
+workspace = true
