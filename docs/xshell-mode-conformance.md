@@ -10,7 +10,7 @@ must satisfy. It is not a claim that all guarantees are implemented today.
 | Mode | Authority location | Persistence | Cancellation owner | Required audit behavior | Current conformance |
 |---|---|---|---|---|---|
 | Standalone agent | CLI process, ambient user | Process-local conversation | CLI turn observer | Optional local audit only | F1/F2 lifecycle corrections implemented; broader profile conformance pending |
-| Local daemon agent | Host daemon, ambient user | Ephemeral, daemon, or durable session | Execution coordinator | Daemon execution boundary | F1/F2/F3 corrected; F6/F7 remain |
+| Local daemon agent | Host daemon, ambient user | Ephemeral, daemon, or durable session | Execution coordinator | Daemon execution boundary | F1/F2/F3/F6 corrected; F7 remains |
 | SSH daemon agent | Remote host daemon, ambient remote user | Remote daemon/durable session | Remote execution coordinator | Remote daemon boundary | Local-daemon guarantees plus bounded control transport |
 | Captured direct shell | CLI or daemon process | Cwd and bounded output according to session mode | Owning turn/coordinator | Start, output policy, and terminal outcome | F2/F3/F11 corrected |
 | Agent shell tool | Shared execution engine | Tool facts projected into conversation/session | Owning agent turn | Request, decision, result, and terminal turn outcome | F1/F2 corrected |
@@ -58,8 +58,8 @@ or not a directory; it does not silently substitute another directory.
 | Agent effect recovery | Engine and durable-session restart regressions tagged F1 | Add storage-failure coverage under F7 |
 | Agent/captured-shell cancellation | Pipeline and grandchild delayed-marker regressions tagged F2 | Repeat on supported macOS/Linux targets |
 | Daemon shutdown | SIGTERM all-mode, audit-ordering, and SIGKILL recovery tests tagged F3 | Repeat on supported macOS/Linux targets |
-| PTY termination | PTY coordinator and daemon SIGTERM integration tests | Bound audit-stall behavior under F6 |
-| Required audit failure | Existing reservation/audit failure test; `AuditClient::probe` deadline test | Add the equivalent non-acknowledging peer deadline to the session append path for F6 |
+| PTY termination | PTY coordinator and daemon SIGTERM integration tests | PTY audit records use the same deadline-bound session handle as F6 |
+| Required audit failure | Reservation/audit failure test; F6 non-acknowledging-peer daemon and unit tests | Repeat on supported macOS/Linux targets |
 | Cwd validation | Shared engine/CLI/registry tests tagged F11 | Repeat mode matrix on supported targets |
 
 The controlled deployment adds authorization, data-domain, provider, and

@@ -1,10 +1,11 @@
 # xshell development roadmap: daily driver and controlled deployment
 
-**Updated:** 2 November 2026
+**Updated:** 4 November 2026
 
-**Status:** M0 baseline recorded; F1–F5, F8, and F11 corrected (M1.3 prepared
-file access landed); F10 partly corrected by a whole-turn budget; F6 audit and
-control I/O bounds are the next work; later milestones remain planned.
+**Status:** M0 baseline recorded; F1–F6, F8, F9, and F11 corrected (M1.3
+prepared file access and the F6 audit bounds landed); F10 partly corrected by a
+whole-turn budget; the remaining F10 budgets and F7 persistence are the next
+work; later milestones remain planned.
 
 **Companion:** [Design, security, and usability review](xshell-design-security-usability-review.md).
 
@@ -193,9 +194,10 @@ Do not allow a connector to bypass shared authorization because it supplies its 
 1. Preserve the recorded D1–D9 ADR, finding ledger, and mode-conformance matrix as the M0 baseline.
 2. Preserve the landed F1–F3 lifecycle corrections and F11 cwd boundary while completing the remaining findings.
 3. Done: prepared bounded file reads and stable sensitivity semantics for F4/F5/F8 as one boundary in `xshell-execution` (`prepared.rs`): classification on the canonical absolute path, descriptor-bound prepared operations that authorization and acquisition share, and acquisition bounded before allocation.
-4. **Next:** Remove blocking global audit I/O and add deadline/failure tests (F6). Stream-completion handling (F9) is corrected, and the whole-turn budget part of F10 landed in #84; per-session, global, byte, and worker budgets remain.
-5. Draft the M2 operation/grant/provider contract and run one operation through personal and restrictive mock policies.
-6. Baseline the M3 home-lab journeys while the controlled deployment owner selects the M4 target environment.
+4. Done: per-session audit connections with acknowledgement deadlines and no global lock across audit I/O (F6), and stream-completion handling (F9). Deadlines on the CLI's own session-service connection (local socket and SSH) remain a separate hardening item.
+5. **Next:** the remaining F10 budgets (per-session, global, byte, and worker; the whole-turn budget landed in #84), then F7 transactional persistence.
+6. Draft the M2 operation/grant/provider contract and run one operation through personal and restrictive mock policies.
+7. Baseline the M3 home-lab journeys while the controlled deployment owner selects the M4 target environment.
 
 Two design proposals depend on this sequence. [Subagents](subagents-design.md)
 steps 1–3 have landed; step 4 (child sessions) waits on protocol version

@@ -25,7 +25,11 @@ impl AuditRuntime {
             .socket
             .as_deref()
             .context("audit.socket is required when auditing is enabled")?;
-        match AuditClient::connect(socket, env!("CARGO_PKG_VERSION")) {
+        match AuditClient::connect_with_timeout(
+            socket,
+            env!("CARGO_PKG_VERSION"),
+            config.ack_timeout(),
+        ) {
             Ok(client) => Ok(Self {
                 client: Some(client),
                 required: config.required,

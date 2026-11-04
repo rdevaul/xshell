@@ -46,6 +46,10 @@ checkpoint_interval = 16
 terminal_stream = false
 # Per-job cap on captured stream bytes; 0 = unbounded.
 terminal_stream_max_bytes = 16777216
+# How long xshelld waits for the audit service to acknowledge one record (or to
+# open or close an audit session) before failing it. With required = true the
+# audited action is refused; one stalled exchange delays only its own session.
+ack_timeout_ms = 5000
 
 # Remote bootstrap stays disabled unless a signed release source is configured.
 # The public key is an Ed25519 verifying key encoded as 64 lowercase hex

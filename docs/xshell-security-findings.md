@@ -14,7 +14,7 @@ historical review.
 | F3 | [#53](https://github.com/rdevaul/xshell/issues/53) | P1 | M1.2 cancellation and shutdown | Corrected | SIGTERM drains agent, shell, and PTY work before audit closure; forced interruption is recovered as uncertain |
 | F4 | [#54](https://github.com/rdevaul/xshell/issues/54) | P1 | M1.3 prepared file access | Corrected | Sensitivity is stable across cwd changes, nesting, aliases, and sensitive ancestors |
 | F5 | [#55](https://github.com/rdevaul/xshell/issues/55) | P1 | M1.3 prepared file access | Corrected | Replacement hooks cannot substitute sensitive or outside-root bytes after authorization |
-| F6 | [#56](https://github.com/rdevaul/xshell/issues/56) | P1 | M1.4 service bounds | Open | A non-acknowledging audit peer cannot freeze unrelated sessions, control, or shutdown |
+| F6 | [#56](https://github.com/rdevaul/xshell/issues/56) | P1 | M1.4 service bounds | Corrected | A non-acknowledging audit peer cannot freeze unrelated sessions, control, or shutdown |
 | F7 | [#57](https://github.com/rdevaul/xshell/issues/57) | P2 | M1.1 effects and recovery | Open | Injected write/sync/rename failures leave response, memory, and restarted state consistent |
 | F8 | [#58](https://github.com/rdevaul/xshell/issues/58) | P2 | M1.3 prepared file access | Corrected | File and directory acquisition remain bounded before allocation and control stays responsive |
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Corrected | Incomplete/error/refusal streams cannot produce executable tool calls |
@@ -40,14 +40,15 @@ historical review.
 1. Complete M0 contracts and the mode matrix.
 2. Correct F1, F2, F3, and the independent F11 defect.
 3. Implement prepared file operations for F4, F5, and F8. (Done.)
-4. Correct audit/provider/resource bounds for F6, F9, and F10.
+4. Correct audit/provider/resource bounds for F6, F9, and F10. (F6 and F9
+   done; F10 partly done.)
 5. Complete F7 transactional persistence and crash-durability injection.
 
 F3 has graceful SIGTERM coverage for agent tools, captured shell commands, and
 PTYs, including descendant-process cleanup and audit-close ordering. A durable
 pre-dispatch marker converts SIGKILL leftovers into an explicit
-`outcome_unknown` recovery record. Audit-peer responsiveness remains the
-separate F6 correction.
+`outcome_unknown` recovery record. Audit-peer responsiveness is the F6
+correction below.
 
 F2 was hardened after its correction (#95). A single group-wide `SIGKILL`
 could miss a process whose fork overlapped the signal on macOS, which does not
@@ -96,12 +97,41 @@ authorization and acquisition resolved the path independently.
   limit, and preparation and reads run on a blocking worker with a deadline so
   a stalled filesystem returns an error instead of holding the turn.
 
-`AuditClient::probe` adds bounded socket read/write waits and has a
-non-acknowledging-peer regression test, but it is a readiness check for the
-[home-lab runner](runall.md), not an F6 correction. `AuditClient::connect` still
-sets no deadlines, and `SessionAuditHandle::append`
-(`crates/xshell-session/src/audit.rs:234`) still holds the global session map
-lock across socket I/O. F6 remains Open.
+F6 is corrected. A hung audit service now delays only the session whose
+record it is withholding, and only until a deadline:
+
+- **Deadlines.** Every exchange with the audit service (open, each append and
+  its acknowledgement, close) must finish within `audit.ack_timeout_ms`
+  (default 5 seconds). The deadline covers the whole exchange, so a peer that
+  trickles bytes cannot stretch it. It applies to `xshelld`, its startup
+  probe, and the CLI's own audit connection.
+- **No global lock across I/O.** Each xshell session has its own audit
+  connection behind its own lock. The shared map is locked only to find or
+  insert an entry.
+- **Fail closed, then recover.** A missed deadline marks the connection
+  unusable, because the record may or may not have been written. With
+  `required = true` the audited action is refused, and later records fail at
+  once rather than waiting again. After one deadline interval the next record
+  opens a new connection, recorded as `LogicalSessionAttached` with action
+  `xshelld_execution_resumed`. Records between the failure and the resumption
+  were not acknowledged; with `required = true` their actions did not run.
+- **Bounded shutdown.** Sessions close in parallel, each within its
+  deadlines, so a hung service delays shutdown by about one session's close
+  rather than hanging it.
+
+Evidence: `f6_a_hung_audit_peer_cannot_freeze_other_sessions_control_or_shutdown`
+runs a real `xshelld` against a fake audit service that withholds one
+session's acknowledgement. Another session runs a command and the controller
+lists sessions while the first waits. The stalled command is refused at its
+deadline and never runs, and with the service hung entirely SIGTERM still
+exits cleanly. Without the correction, the other session freezes behind the
+stalled one. Unit tests in `xshell-session/src/audit.rs` cover the latch and
+resumption, optional audit, closing one session, and shutdown with eight
+sessions taking one deadline rather than eight.
+
+The review also asks for deadlines on the CLI's own connection to the session
+service (local socket and SSH). That is client-side hardening outside F6's
+acceptance condition and is not part of this correction.
 
 The [development roadmap](xshell-development-roadmap.md) remains the
 cross-product sequencing authority.

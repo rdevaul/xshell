@@ -1,51 +1,64 @@
 use crate::{AUDIT_PROTOCOL_VERSION, AuditCheckpoint, AuditEvent, ClientRequest, ServerResponse};
 use anyhow::{Context, Result, bail};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// The deadline [`AuditClient::connect`] applies to each exchange.
+pub const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A connection to `xshell-auditd`.
+///
+/// Every exchange (open, append with its acknowledgement, close) must finish
+/// within the client's deadline. The deadline covers the whole exchange, so a
+/// peer that trickles bytes cannot stretch it. After any failed exchange,
+/// including a missed deadline, the connection's state is unknown: the
+/// record may or may not have been written. The client then refuses further
+/// use, and the caller must treat the record as not acknowledged.
 pub struct AuditClient {
     session_id: String,
     signing_key_id: String,
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<DeadlineStream>,
+    writer: DeadlineStream,
+    timeout: Duration,
+    failed: bool,
 }
 
 impl AuditClient {
     pub fn connect(socket: &Path, client_version: &str) -> Result<Self> {
-        Self::connect_with_timeout(socket, client_version, None)
+        Self::connect_with_timeout(socket, client_version, DEFAULT_EXCHANGE_TIMEOUT)
     }
 
     pub fn probe(socket: &Path, client_version: &str) -> Result<()> {
-        Self::connect_with_timeout(socket, client_version, Some(Duration::from_secs(2)))?
-            .close()?;
+        Self::connect_with_timeout(socket, client_version, Duration::from_secs(2))?.close()?;
         Ok(())
     }
 
-    fn connect_with_timeout(
+    /// Connect with `timeout` as the deadline for each exchange, the opening
+    /// handshake included.
+    pub fn connect_with_timeout(
         socket: &Path,
         client_version: &str,
-        timeout: Option<Duration>,
+        timeout: Duration,
     ) -> Result<Self> {
         let stream = UnixStream::connect(socket)
             .with_context(|| format!("cannot connect to audit service at {}", socket.display()))?;
-        stream.set_read_timeout(timeout)?;
-        stream.set_write_timeout(timeout)?;
         set_close_on_exec(&stream)?;
         let writer = stream.try_clone().context("cannot clone audit socket")?;
         set_close_on_exec(&writer)?;
         let mut client = Self {
             session_id: String::new(),
             signing_key_id: String::new(),
-            reader: BufReader::new(stream),
-            writer,
+            reader: BufReader::new(DeadlineStream::new(stream)),
+            writer: DeadlineStream::new(writer),
+            timeout,
+            failed: false,
         };
-        client.send(&ClientRequest::open(client_version))?;
-        match client.receive()? {
+        match client.exchange(&ClientRequest::open(client_version))? {
             ServerResponse::Opened {
                 protocol_version,
                 session_id,
@@ -75,8 +88,7 @@ impl AuditClient {
     }
 
     pub fn append(&mut self, event: AuditEvent) -> Result<(u64, String)> {
-        self.send(&ClientRequest::Append { event })?;
-        match self.receive()? {
+        match self.exchange(&ClientRequest::Append { event })? {
             ServerResponse::Ack {
                 sequence,
                 record_hash,
@@ -87,12 +99,38 @@ impl AuditClient {
     }
 
     pub fn close(mut self) -> Result<AuditCheckpoint> {
-        self.send(&ClientRequest::Close)?;
-        match self.receive()? {
+        match self.exchange(&ClientRequest::Close)? {
             ServerResponse::Closed { checkpoint } => Ok(checkpoint),
             ServerResponse::Error { message } => bail!("audit close failed: {message}"),
             response => bail!("unexpected audit close response: {response:?}"),
         }
+    }
+
+    /// Send `request` and receive its response within the deadline. Any
+    /// failure leaves the connection unusable.
+    fn exchange(&mut self, request: &ClientRequest) -> Result<ServerResponse> {
+        if self.failed {
+            bail!("the audit connection failed earlier and cannot be reused");
+        }
+        let deadline = Instant::now() + self.timeout;
+        self.writer.deadline = Some(deadline);
+        self.reader.get_mut().deadline = Some(deadline);
+        let result = self.send(request).and_then(|()| self.receive());
+        self.writer.deadline = None;
+        self.reader.get_mut().deadline = None;
+        if result.is_err() {
+            self.failed = true;
+        }
+        result.map_err(|error| {
+            if timed_out(&error) {
+                error.context(format!(
+                    "the audit service did not respond within {} ms",
+                    self.timeout.as_millis()
+                ))
+            } else {
+                error
+            }
+        })
     }
 
     fn send(&mut self, request: &ClientRequest) -> Result<()> {
@@ -115,6 +153,68 @@ impl AuditClient {
             bail!("audit service response exceeds {MAX_RESPONSE_BYTES} bytes");
         }
         serde_json::from_slice(&bytes).context("audit service returned an invalid response")
+    }
+}
+
+fn timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+        }) || cause
+            .downcast_ref::<serde_json::Error>()
+            .and_then(|error| error.io_error_kind())
+            .is_some_and(|kind| matches!(kind, io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+    })
+}
+
+/// A socket whose reads and writes fail once `deadline` has passed. Each call
+/// gets only the time remaining, so the deadline bounds a whole exchange
+/// however the peer splits its bytes.
+struct DeadlineStream {
+    stream: UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineStream {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            deadline: None,
+        }
+    }
+
+    fn remaining(&self) -> io::Result<Option<Duration>> {
+        let Some(deadline) = self.deadline else {
+            return Ok(None);
+        };
+        match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) if !remaining.is_zero() => Ok(Some(remaining)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "audit exchange deadline elapsed",
+            )),
+        }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(self.remaining()?)?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(self.remaining()?)?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 

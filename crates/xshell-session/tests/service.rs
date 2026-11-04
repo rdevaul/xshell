@@ -2838,3 +2838,175 @@ fn terminating_an_active_process_finalizes_stream_before_completion() {
     assert!(saw_stream, "active process produced no captured output");
     assert!(saw_finished, "terminated process has no completion record");
 }
+
+/// F6: an audit service that accepts records for most sessions but never
+/// acknowledges a record containing `STALL` (or, once `stall_all` is set,
+/// anything). A withheld reply keeps the connection open, as a hung peer
+/// would.
+fn start_withholding_audit_service(
+    socket: &Path,
+    stall_all: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let listener = UnixListener::bind(socket).unwrap();
+    thread::spawn(move || {
+        for (index, stream) in listener.incoming().flatten().enumerate() {
+            let stall_all = std::sync::Arc::clone(&stall_all);
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                let mut sequence = 0;
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { return };
+                    if stall_all.load(Ordering::SeqCst) || line.contains("STALL") {
+                        continue;
+                    }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    sequence += 1;
+                    let reply = match request["request"].as_str().unwrap() {
+                        "open" => serde_json::json!({
+                            "response": "opened",
+                            "protocol_version": xshell_audit::AUDIT_PROTOCOL_VERSION,
+                            "session_id": format!("fake-{index}"),
+                            "signing_key_id": "fake",
+                        }),
+                        "append" => serde_json::json!({
+                            "response": "ack", "sequence": sequence, "record_hash": "h",
+                        }),
+                        _ => serde_json::json!({
+                            "response": "closed",
+                            "checkpoint": {
+                                "body": {
+                                    "format_version": 1, "session_id": format!("fake-{index}"),
+                                    "checkpoint_sequence": 0, "previous_checkpoint_hash": "",
+                                    "sequence": sequence, "daemon_timestamp_unix_ms": 0,
+                                    "chain_head": "", "signing_key_id": "fake",
+                                    "final_checkpoint": true,
+                                },
+                                "blinding_nonce": "", "witness": {"scheme": "", "commitment": ""},
+                                "signature": "", "checkpoint_hash": "",
+                            },
+                        }),
+                    };
+                    if writeln!(writer, "{reply}").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn f6_a_hung_audit_peer_cannot_freeze_other_sessions_control_or_shutdown() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let temporary = TempDir::new().unwrap();
+    let audit_socket = temporary.path().join("audit.sock");
+    let stall_all = std::sync::Arc::new(AtomicBool::new(false));
+    start_withholding_audit_service(&audit_socket, std::sync::Arc::clone(&stall_all));
+
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[audit]\nenabled = true\nrequired = true\nsocket = {:?}\nack_timeout_ms = 2000\n",
+            audit_socket.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .args(["--config", config_path.to_str().unwrap()])
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let create = |client: &mut SessionClient, name: &str| {
+        client
+            .create(SessionCreation {
+                name: name.into(),
+                model: model("local"),
+                cwd: temporary.path().into(),
+                persistence: PersistenceMode::Daemon,
+                visibility: Visibility::Fabric,
+                history: Vec::new(),
+            })
+            .unwrap()
+            .descriptor
+            .id
+    };
+    let mut stalled_client = connect_when_ready(&socket);
+    let stalled = create(&mut stalled_client, "stalled");
+    let mut other_client = connect_when_ready(&socket);
+    let other = create(&mut other_client, "other");
+
+    // The stalled session's input record is never acknowledged.
+    let marker = temporary.path().join("must-not-exist");
+    let command = format!("echo STALL > {}", marker.display());
+    let started = Instant::now();
+    let (stalled_done, stalled_result) = mpsc::channel();
+    thread::spawn(move || {
+        let result =
+            stalled_client.submit(stalled, TurnInput::Shell { command }, ApprovalPolicy::Ask);
+        stalled_done
+            .send(result.map_err(|error| format!("{error:#}")))
+            .unwrap();
+    });
+    thread::sleep(Duration::from_millis(100));
+
+    // Meanwhile another session runs a command and the controller answers.
+    let (other_done, other_result) = mpsc::channel();
+    let other_id = other.clone();
+    thread::spawn(move || {
+        let submitted = other_client.submit(
+            other_id.clone(),
+            TurnInput::Shell {
+                command: "true".into(),
+            },
+            ApprovalPolicy::Ask,
+        );
+        let listed = other_client.list();
+        other_done
+            .send((
+                submitted.is_ok(),
+                listed.map(|sessions| sessions.len()).ok(),
+            ))
+            .unwrap();
+    });
+    let (submitted, listed) = other_result
+        .recv_timeout(Duration::from_millis(1500))
+        .expect("another session froze behind the stalled audit exchange");
+    assert!(submitted);
+    assert_eq!(listed, Some(2));
+
+    // The stalled action is refused at its deadline and never runs.
+    let error = stalled_result
+        .recv_timeout(Duration::from_secs(8))
+        .expect("the stalled session did not fail at its deadline")
+        .unwrap_err();
+    assert!(error.contains("required audit"), "{error}");
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert!(!marker.exists());
+
+    // With the service hung entirely, shutdown still completes.
+    stall_all.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    let (exited, exit) = mpsc::channel();
+    let pid = daemon.0.id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let mut child = std::mem::replace(&mut daemon.0, Command::new("true").spawn().unwrap());
+    thread::spawn(move || exited.send(child.wait().unwrap()).unwrap());
+    let status = exit
+        .recv_timeout(Duration::from_secs(15))
+        .expect("xshelld shutdown froze on the hung audit service");
+    assert!(status.success(), "{status:?}");
+    // One deadline for the open session's final record, plus slack.
+    assert!(started.elapsed() < Duration::from_secs(8));
+}
