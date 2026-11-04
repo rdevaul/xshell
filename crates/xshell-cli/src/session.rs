@@ -265,15 +265,43 @@ impl SessionRuntime {
     }
 
     pub fn sync(&mut self, model: &ActiveModel, cwd: &Path, history: &[ChatMessage]) -> Result<()> {
-        let Some((session_id, interactive_process)) = self.active.as_ref().map(|session| {
-            (
-                session.id.clone(),
-                session.activity.is_interactive_process(),
-            )
-        }) else {
+        let Some((session_id, interactive_process, agent_turn)) =
+            self.active.as_ref().map(|session| {
+                (
+                    session.id.clone(),
+                    session.activity.is_interactive_process(),
+                    matches!(session.activity, SessionActivity::AgentTurn { .. }),
+                )
+            })
+        else {
             return Ok(());
         };
         let model = model.to_session_binding();
+        if agent_turn {
+            // A turn this client detached from (or never followed) owns the
+            // session's state on the daemon. The local conversation predates
+            // the turn, so it is never pushed: doing so would be refused while
+            // the turn runs and would overwrite the turn's messages once it
+            // has finished.
+            let snapshot = self.client_mut()?.snapshot(session_id)?;
+            if !matches!(
+                snapshot.descriptor.activity,
+                SessionActivity::AgentTurn { .. }
+            ) {
+                // Finished meanwhile. Keep the cached activity so the caller
+                // adopts the daemon's state (see `take_finished_turn`).
+                return Ok(());
+            }
+            let unchanged = snapshot.descriptor.model == model && snapshot.descriptor.cwd == cwd;
+            self.active = Some(snapshot.descriptor);
+            if !unchanged {
+                bail!(
+                    "cannot change the model or working directory while the session's agent \
+turn is running; wait for it, //resume it, or //stop it"
+                );
+            }
+            return Ok(());
+        }
         if interactive_process {
             let snapshot = self.client_mut()?.snapshot(session_id.clone())?;
             if snapshot.descriptor.activity.is_interactive_process() {
@@ -554,6 +582,24 @@ session's interactive process is running; stop it first"
         let snapshot = self.client_mut()?.snapshot(session_id)?;
         self.active = Some(snapshot.descriptor.clone());
         Ok(snapshot)
+    }
+
+    /// When the cached state says an agent turn is running, ask the daemon.
+    /// Returns the session's snapshot once that turn has finished, so the
+    /// caller can adopt the conversation the turn produced; `None` while it
+    /// is still running or when no turn was cached.
+    pub fn take_finished_turn(&mut self) -> Result<Option<SessionSnapshot>> {
+        if self.active_turn_id().is_none() {
+            return Ok(None);
+        }
+        let session_id = self.active_session_id()?;
+        let snapshot = self.client_mut()?.snapshot(session_id)?;
+        let finished = !matches!(
+            snapshot.descriptor.activity,
+            SessionActivity::AgentTurn { .. }
+        );
+        self.active = Some(snapshot.descriptor.clone());
+        Ok(finished.then_some(snapshot))
     }
 
     pub fn active_turn_id(&self) -> Option<&str> {
@@ -934,6 +980,204 @@ fn resolve_socket(config: &SessionConfig) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod detached_turns {
+        use super::*;
+        use crate::config::Provider;
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex};
+        use xshell_session::{AccessMode, ClientRequest, SESSION_PROTOCOL_VERSION, ServerResponse};
+
+        /// A session service holding one session whose state the test sets.
+        /// It answers snapshots, and refuses updates while a turn is active as
+        /// `xshelld` does, counting every update it receives.
+        struct FakeService {
+            _directory: tempfile::TempDir,
+            socket: PathBuf,
+            session: Arc<Mutex<SessionSnapshot>>,
+            updates: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        fn model() -> ActiveModel {
+            ActiveModel {
+                profile_name: Some("local".into()),
+                provider: Provider::Ollama,
+                model: "m".into(),
+                base_url: "http://127.0.0.1:1".into(),
+                api_key_env: None,
+                max_history_bytes: None,
+                context_tokens: None,
+                reserve_output_tokens: None,
+            }
+        }
+
+        fn running() -> SessionActivity {
+            SessionActivity::AgentTurn {
+                turn_id: "turn-1".into(),
+                phase: AgentTurnPhase::Running,
+            }
+        }
+
+        fn snapshot(activity: SessionActivity, history: Vec<ChatMessage>) -> SessionSnapshot {
+            SessionSnapshot {
+                descriptor: SessionDescriptor {
+                    id: "s1".into(),
+                    name: "testsession".into(),
+                    host_id: "host".into(),
+                    host_alias: "host".into(),
+                    user: "user".into(),
+                    model: model().to_session_binding(),
+                    cwd: PathBuf::from("/"),
+                    persistence: PersistenceMode::Daemon,
+                    visibility: Visibility::Fabric,
+                    access_mode: AccessMode::SingleUser,
+                    status: SessionStatus::Attached,
+                    activity,
+                    attached_clients: 1,
+                    created_at_unix_ms: 0,
+                    last_active_at_unix_ms: 0,
+                },
+                history,
+            }
+        }
+
+        impl FakeService {
+            fn start(initial: SessionSnapshot) -> Self {
+                let directory = tempfile::TempDir::new().unwrap();
+                let socket = directory.path().join("xshelld.sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                let session = Arc::new(Mutex::new(initial));
+                let updates = Arc::new(Mutex::new(Vec::new()));
+                let (state, received) = (Arc::clone(&session), Arc::clone(&updates));
+                std::thread::spawn(move || {
+                    let stream = listener.incoming().next().unwrap().unwrap();
+                    let mut writer = stream.try_clone().unwrap();
+                    for line in BufReader::new(stream).lines() {
+                        let Ok(line) = line else { return };
+                        let current = state.lock().unwrap().clone();
+                        let reply = match serde_json::from_str(&line).unwrap() {
+                            ClientRequest::Open { .. } => ServerResponse::Opened {
+                                protocol_version: SESSION_PROTOCOL_VERSION,
+                                client_id: "client".into(),
+                                host_id: "host".into(),
+                                host_alias: "host".into(),
+                                user: "user".into(),
+                            },
+                            ClientRequest::Snapshot { .. } => {
+                                ServerResponse::Snapshot { session: current }
+                            }
+                            ClientRequest::Update { history, .. } => {
+                                received.lock().unwrap().push(history);
+                                if matches!(current.descriptor.activity, SessionActivity::Idle) {
+                                    ServerResponse::Updated {
+                                        session: current.descriptor,
+                                    }
+                                } else {
+                                    ServerResponse::Error {
+                                        code: "request_failed".into(),
+                                        message:
+                                            "cannot replace session state while a turn is active"
+                                                .into(),
+                                    }
+                                }
+                            }
+                            request => panic!("unexpected request {request:?}"),
+                        };
+                        serde_json::to_writer(&mut writer, &reply).unwrap();
+                        writer.write_all(b"\n").unwrap();
+                    }
+                });
+                Self {
+                    _directory: directory,
+                    socket,
+                    session,
+                    updates,
+                }
+            }
+
+            /// A runtime attached to the session, believing a turn runs, as
+            /// after the escape-prefix detach from a turn.
+            fn detached_runtime(&self) -> SessionRuntime {
+                let client = SessionClient::connect(&self.socket, "test").unwrap();
+                let mut cached = self.session.lock().unwrap().descriptor.clone();
+                cached.activity = running();
+                SessionRuntime {
+                    connection: Some(HostConnection {
+                        client,
+                        endpoint: ConnectionEndpoint::Local(self.socket.clone()),
+                    }),
+                    parked_connections: HashMap::new(),
+                    display_host_aliases: HashMap::new(),
+                    active: Some(cached),
+                    navigation_history: Vec::new(),
+                    event_cursors: HashMap::new(),
+                    pty_cursors: HashMap::new(),
+                    redraw_pending: false,
+                }
+            }
+        }
+
+        fn before_turn() -> Vec<ChatMessage> {
+            vec![ChatMessage::user("start the job")]
+        }
+
+        fn after_turn() -> Vec<ChatMessage> {
+            vec![
+                ChatMessage::user("start the job"),
+                ChatMessage::assistant("job finished"),
+            ]
+        }
+
+        #[test]
+        fn syncing_during_a_detached_turn_neither_fails_nor_pushes() {
+            let service = FakeService::start(snapshot(running(), before_turn()));
+            let mut runtime = service.detached_runtime();
+            runtime
+                .sync(&model(), Path::new("/"), &before_turn())
+                .unwrap();
+            assert!(service.updates.lock().unwrap().is_empty());
+            assert_eq!(runtime.take_finished_turn().unwrap(), None);
+            assert!(runtime.active_turn_id().is_some());
+        }
+
+        #[test]
+        fn a_turn_that_finished_while_detached_is_adopted_not_overwritten() {
+            let service = FakeService::start(snapshot(SessionActivity::Idle, after_turn()));
+            let mut runtime = service.detached_runtime();
+            // The local conversation predates the turn; pushing it would
+            // discard the turn's messages.
+            runtime
+                .sync(&model(), Path::new("/"), &before_turn())
+                .unwrap();
+            assert!(service.updates.lock().unwrap().is_empty());
+
+            let finished = runtime.take_finished_turn().unwrap().unwrap();
+            assert_eq!(finished.history, after_turn());
+            assert_eq!(runtime.active_turn_id(), None);
+            // Once adopted, ordinary syncing resumes.
+            runtime
+                .sync(&model(), Path::new("/"), &after_turn())
+                .unwrap();
+            assert_eq!(*service.updates.lock().unwrap(), [after_turn()]);
+        }
+
+        #[test]
+        fn local_model_or_cwd_changes_during_a_turn_are_reported_not_pushed() {
+            let service = FakeService::start(snapshot(running(), before_turn()));
+            let mut runtime = service.detached_runtime();
+            let error = runtime
+                .sync(&model(), Path::new("/tmp"), &before_turn())
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("while the session's agent turn is running"),
+                "{error:#}"
+            );
+            assert!(service.updates.lock().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn close_fallback_prefers_reverse_navigation_history() {
