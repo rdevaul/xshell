@@ -1,6 +1,6 @@
 # Agentic CAD readiness: plan and level of effort
 
-**Status:** Proposed
+**Status:** Accepted, with the decisions recorded in §8
 **Updated:** 4 November 2026
 
 ## 1. Summary
@@ -21,10 +21,10 @@ Three capabilities are missing:
 
 | Workstream | Core LoE | With optional items |
 |---|---|---|
-| A. Images and multimodal models | 15–22 engineer-days | 23–35 |
-| B. Configurable and relaxed limits | 7–10 | 13–19 |
+| A. Images and multimodal models | 15–22 engineer-days | 24–36 |
+| B. Configurable and relaxed limits | 7–10 | 7–10 |
 | C. Headless mode | 15–22 | 18–27 |
-| **Total** | **37–54 days (about 8–11 weeks)** | **54–81 days (about 11–16 weeks)** |
+| **Total** | **37–54 days (about 8–11 weeks)** | **49–73 days (about 10–15 weeks)** |
 
 The figures are for one engineer who knows the codebase, and include tests,
 documentation, and review fixes. Add 2–3 days for a security review of
@@ -78,16 +78,42 @@ duplicate renders free.
 Re-encoding also removes metadata and limits the decoder's exposure to a
 crafted file.
 
-**Sources:**
+**Sources.** The first release supports attaching images and letting the
+agent view image files. A configurable render toolset (A7) follows.
 
 - **`//attach PATH`:** the user attaches an image to their next message.
 - **`view_image` agent tool:** read-only, and gated like `read_file` for
   sensitive paths. The agent asks to see a file. This covers renders and plots
   that its own shell commands produced.
-- **Render tool (optional, A7):** converts STL, STEP, OBJ, or GLB to PNG
-  through F3D when it is installed. It reports clearly when F3D is missing,
-  and produces the render manifest the original implementation plan
-  describes.
+- **Render toolset (A7):** a `render` agent tool that turns CAD files and
+  packages into images. The configuration chooses the renderer from the
+  file or package type, so F3D, yapCAD, or any other command can be added
+  without code changes:
+
+  ```toml
+  [[render.renderers]]
+  name = "f3d"
+  match = ["*.stl", "*.step", "*.stp", "*.obj", "*.glb", "*.gltf"]
+  command = ["f3d", "--output={output}", "--resolution=1600,1200", "{input}"]
+  timeout = "120s"
+
+  [[render.renderers]]
+  name = "yapcad-package"
+  match = ["*.ycpkg"]
+  command = ["yapcad", "render", "{input}", "--out", "{output_dir}"]
+  ```
+
+  - **Selection:** the first renderer whose patterns match is used, unless
+    the call names one.
+  - **Execution:** commands are argument vectors with placeholders, never
+    shell strings. They run in a fresh output directory, under the
+    renderer's time limit and in their own process group. Every image they
+    produce goes through the ingestion path above, and a render manifest
+    (renderer, command, input hash, outputs) is recorded.
+  - **Approval:** the tool is governed by the approval policy like any other.
+    A renderer listed in the policy can be always-allowed, so routine renders
+    don't prompt.
+  - **Missing renderers:** the tool says which program is missing.
 
 **Adapters:**
 
@@ -97,6 +123,8 @@ crafted file.
   is therefore sent as a short text tool result, followed by a `user`
   message that carries the image and names the tool call it came from.
 - **Ollama:** images go in the message's `images` array as base64.
+- **Both providers in the first release:** OpenAI-compatible endpoints and
+  Ollama vision models are both required.
 - **Capability flag:** model profiles gain `vision = true|false`. Without it,
   an attach is refused with a clear message, and the `view_image` tool is not
   offered. Behaviour of the specific servers in use (vLLM, TabbyAPI, Ollama)
@@ -110,7 +138,7 @@ dropped from context]`) so the model knows something was there.
 **Remote sessions.** An attach from a controller to a remote session uploads
 the bytes through a new bounded protocol operation, and the daemon stores and
 hashes them on its own side. This is the first session-protocol change in the
-plan. Batch it with the headless protocol changes (§5) into a single protocol
+plan. Batch it with the headless protocol changes (§5.1) into a single protocol
 version bump.
 
 **Audit.** Audit records the hash, media type, dimensions, source, and
@@ -130,7 +158,7 @@ an external viewer or prints the path and dimensions.
 | A4 | Ingestion: prepared-access read, decode, bound, downscale, re-encode; `//attach`; `view_image` tool | 4–6 |
 | A5 | Token estimates and image-aware compaction | 2–3 |
 | A6 | *Optional:* terminal inline display and `//view` for images | 3–5 |
-| A7 | *Optional:* F3D render tool with manifest, and CAD fixture tests | 5–8 |
+| A7 | *Follow-on:* configurable render toolset, selected by file or package type; manifests; CAD fixture tests | 6–9 |
 | | **Core (A1–A5)** | **15–22** |
 
 **Risks:**
@@ -189,12 +217,14 @@ auto_continues = 50
   - The event journal keeps its bounds; clients that fall behind read the
     final state from the snapshot rather than the journal (§5).
 
-**Task runs (optional, B4).** Many engineering tasks need many turns, not
-one huge turn. The persistent-goals proposal (`xshell-md-continuity.md`)
-defines continuation turns toward a goal, with a turn TTL. B4 implements its
-minimum, a task that continues until the model declares it complete or a
-task-level budget runs out. The budget spans turns: total wall time and
-total tool calls for the task, not only per turn.
+**Multi-turn tasks are out of scope.** A task that continues across many
+turns under one budget is a special case of persistent goals
+(`xshell-md-continuity.md`). Goals will be implemented properly first, and
+cross-turn task budgets built on them; neither is estimated here.
+
+**Starting values.** The relaxed profile above is the starting point. It
+will be adjusted once real CAD jobs run under it, which today's limits
+prevent.
 
 **Interaction with F10.** Relaxed limits make the remaining F10 work, the
 per-session and global budgets, more important: one relaxed headless job
@@ -208,7 +238,6 @@ turn limit before enabling relaxed limits by default anywhere.
 | B1 | Config schema, named profiles, `--limits`, `//limits`, daemon `max_limits` ceiling with clamping | 3–4 |
 | B2 | Relaxed semantics, configurable shell timeout, configurable auto-continues, compaction default under relaxed | 2–3 |
 | B3 | Progress events, docs, tests | 2–3 |
-| B4 | *Optional:* task runs with cross-turn budgets (minimal persistent goals) | 6–9 |
 | | **Core (B1–B3)** | **7–10** |
 
 **Risk:** an 8-hour unattended run with auto-approval is the most dangerous
@@ -231,9 +260,9 @@ echo $?
   `--attach image.png` adds images (workstream A). `--session NAME` reuses
   a named session (created if missing), and `--ephemeral` uses a throwaway
   one.
-- **Execution:** runs go through `xshelld` by default, so they get durability,
-  audit, the daemon's ceilings, and survival of the client. `--standalone`
-  runs in-process for environments without a daemon.
+- **Execution:** runs always go through `xshelld`, so they get durability,
+  audit, the daemon's ceilings, and survival of the client. A missing daemon
+  is exit code 6.
 - **Output:** `--output text` prints the answer only. `--output jsonl` streams
   one JSON object per event:
   - **Schema:** versioned and documented: `turn_started`, `assistant_text`,
@@ -255,18 +284,13 @@ echo $?
   | 5 | An approval was denied and the task could not continue |
   | 6 | The daemon or audit service is unavailable |
 
-- **Approvals without a terminal:** a headless run must decide every approval
-  without a person. There is no silent default to auto. The options are:
-  - `--approval deny`: read-only and gated tools are refused.
-  - An **approval policy file**: rules that allow or deny by tool name,
-    command pattern, and working directory. For example, allow `yapcad
-    export *` and `f3d *` under the project, and deny everything else. Rules
-    are checked before the daemon's `max_approval` ceiling, which still wins.
-  - `--approval-channel FD`: each `approval_needed` event waits for a JSON
-    decision written to that descriptor, so a supervising script or a person
-    on another channel can decide.
-  - `--approval auto`: allowed only when the daemon's ceiling permits it, and
-    recorded in audit.
+- **Approvals:** a call's outcome is the combination of the approval
+  mode (`off`, `ask`, `auto`) and an approval policy (§5.2). In a headless
+  run, a call that would prompt goes to the approval channel
+  (`--approval-channel FD`): each `approval_needed` event waits for a JSON
+  decision written to that descriptor. With no channel the call is denied.
+  `--approval auto` takes effect only when the daemon's ceiling permits it,
+  and is recorded in audit.
 - **Lifecycle:**
   - SIGINT and SIGTERM cancel the turn (or detach, with `--detach-on-signal`).
   - `--detach` prints the turn ID and exits at once.
@@ -278,13 +302,55 @@ echo $?
 - **Other languages:** the JSONL output and the subcommands are the supported
   interface. Scripts do not need to speak the daemon's protocol.
 
-### 5.2 Tasks and estimates
+### 5.2 Approval policy
+
+An approval policy has three optional lists. An entry names a tool
+(`read_file`, `render`), or `run_shell` with a command pattern matched
+against the parsed argument vector (`run_shell: yapcad export *`).
+
+```toml
+always_allowed = ["read_file", "list_directory", "render", "run_shell: yapcad export *"]
+allowed        = ["run_shell: yapcad *", "run_shell: f3d *", "run_shell: git status"]
+denied         = ["run_shell: rm *", "run_shell: git push *"]
+```
+
+The policy applies to every turn, interactive and headless; only the
+channel a prompt goes to differs. Each call is decided by the first rule
+that matches:
+
+| # | The call | `off` | `ask` | `auto` |
+|---|---|---|---|---|
+| 1 | matches `denied` | deny | deny | deny |
+| 2 | matches neither `always_allowed` nor `allowed`, and an `allowed` list exists | deny | deny | deny |
+| 3 | matches `always_allowed` | deny | run | run |
+| 4 | matches `allowed` | deny | prompt | run |
+| 5 | is unlisted, and there is no `allowed` list | today's rules | today's rules | today's rules |
+
+- **"Today's rules":** read-only tools on non-sensitive paths run in every
+  mode. Gated calls (shell commands, sensitive reads) are denied in `off`,
+  prompt in `ask`, and run in `auto`.
+- **Denied wins:** a `denied` entry overrides any `always_allowed` or
+  `allowed` entry it overlaps. Each override is reported when the policy is
+  loaded: as a warning in the CLI and `xshelld` logs, an audit record, and a
+  `warning` event in headless output.
+- **Unmatched calls:** with an `allowed` list, a call matching no list is
+  denied, so the list is exhaustive.
+- **Shell patterns:** patterns match the parsed argument vector, not the raw
+  command string, so quoting cannot smuggle a second command past a
+  pattern. A command that does not parse as one simple command (pipelines,
+  `;`, `&&`, substitutions) matches only a bare `run_shell` entry.
+- **Subagents:** they inherit the policy, as they already inherit the
+  toolset and approval mode.
+
+Four details are still to settle (§8).
+
+### 5.3 Tasks and estimates
 
 | ID | Task | Days |
 |---|---|---|
-| C1 | `xshell run`: prompt sources, sessions, daemon and standalone execution, exit codes | 3–4 |
+| C1 | `xshell run`: prompt sources, sessions, daemon execution, exit codes | 2–3 |
 | C2 | Versioned JSONL event schema, final `result` object, text mode | 3–4 |
-| C3 | Headless approvals: deny, policy-file rules, approval channel, ceiling interaction | 4–6 |
+| C3 | Approval policy (§5.2) in the daemon for all turns; shell-pattern matching on parsed arguments; override warnings; approval channel; ceiling interaction | 5–7 |
 | C4 | `--detach`, `wait`, `status`, `result`, `cancel`; signal handling; recovery from the snapshot | 3–5 |
 | C5 | Tests with piped stdio (no terminal needed) and schema documentation | 2–3 |
 | C6 | *Optional:* attachments (`--attach`) and an artifact manifest in the result (needs A) | 2–3 |
@@ -292,8 +358,9 @@ echo $?
 | | **Core (C1–C5)** | **15–22** |
 
 **Risk:** the approval policy matcher is security-relevant: command
-patterns are easy to get wrong. Rules should match parsed argument vectors,
-not raw strings, and anything unmatched is denied.
+patterns are easy to get wrong. Matching on parsed argument vectors,
+treating compound commands as unmatched, and denying unmatched calls when
+an `allowed` list exists keep its failure mode closed.
 
 ## 6. Cross-cutting work
 
@@ -322,7 +389,7 @@ These are included in the estimates above, except the security review: allow
 | 1 | B1–B3 | 1.5–2 weeks | Configurable limits and the relaxed profile in interactive use |
 | 2 | C1–C5 | 3–4.5 weeks | Scripted engineering runs with structured output and safe approvals |
 | 3 | A1–A5 (+ C6) | 3–4.5 weeks | Agents see attached images and their own renders; headless runs accept images |
-| 4 | Optional: A6, A7, B4, C7 | 3–5 weeks | Inline display, F3D renders, multi-turn task runs |
+| 4 | A7, then optional A6 and C7 | 2.5–4 weeks | Configurable CAD render toolset; inline display; Python wrapper |
 
 - **Phase 1 before C:** limits are the smallest workstream and the most
   immediately useful. Headless runs also need them: a script must be able to
@@ -335,21 +402,48 @@ These are included in the estimates above, except the security review: allow
 - **F10:** the global and per-session budgets should land during Phase 2, so
   relaxed headless runs are bounded across sessions before they are common.
 
-## 8. Open questions
+## 8. Decisions and open questions
 
-1. **Vision models:** which models and servers matter first, for example the
-   OpenAI-compatible endpoint in daily use or a local Ollama vision model?
-   This decides which content-part dialects A3 must support at launch.
-2. **Image sources:** is attaching images and letting the agent view its own
-   renders enough to start, or is the F3D render tool (A7) needed in the first
-   release?
-3. **Headless approvals:** policy file, approval channel, or both at first?
-   And should a policy file be allowed to permit arbitrary shell commands at
-   all, or only named tools and command prefixes?
-4. **Relaxed defaults:** what relaxed limits suit real CAD tasks? Two or three
-   representative yapCAD jobs, run with generous limits and their usage
-   recorded, would set them better than guesses.
-5. **Task runs (B4):** are multi-turn task runs needed in the first release,
-   or is one long relaxed turn enough at first?
-6. **Standalone headless:** is running without a daemon worth supporting, or
-   should headless always require `xshelld`?
+### Decided (4 November 2026)
+
+1. **Vision models:** the first release supports both OpenAI-compatible
+   endpoints and Ollama vision models.
+2. **Image sources:** start with attaching images and viewing image files.
+   A configurable render toolset that selects renderers by CAD file or
+   package type (A7) follows.
+3. **Headless approvals:** both a policy file and an approval channel. A
+   call's outcome combines the policy with the approval mode, as specified
+   in §5.2.
+4. **Relaxed defaults:** start with the values in §4.1, and adjust after
+   running real CAD jobs.
+5. **Multi-turn task runs:** dropped from this plan. Persistent goals come
+   first, and task budgets build on them.
+6. **Standalone headless:** not supported. Headless runs always require
+   `xshelld`.
+
+### Still open
+
+These came out of writing down the policy rules. Each has a proposed answer.
+
+1. **`off` mode and read-only tools.** Rules 3 and 4 deny a listed tool in
+   `off` mode, even a read-only one like `read_file`, which runs in `off`
+   mode when unlisted. *Proposal:* keep that literal rule. `off` with a
+   policy means "only what the policy calls safe without approval, and
+   nothing it lists", which is predictable. The alternative would be to let
+   read-only tools on non-sensitive paths keep running in `off` unless they
+   are denied.
+2. **Client policies and the daemon's ceiling.** `always_allowed` acts like
+   `auto` mode for the tools it lists. If a client could supply its own
+   policy, it could get past a daemon capped at `ask`. *Proposal:* the
+   daemon's configured policy is the base. A run's own policy may add
+   `denied` entries and narrow `allowed`. Its `always_allowed` entries take
+   effect only when the daemon's ceiling is `auto`; otherwise they are
+   treated as `allowed`, with a warning.
+3. **Sensitive paths.** Should `always_allowed: read_file` also skip the
+   sensitive-path prompt (for `.env`, keys, and the like)? *Proposal:* no.
+   The sensitive-path gate still prompts unless the entry names the path
+   explicitly (`read_file: config/.env`).
+4. **Compound shell commands.** Is matching only a bare `run_shell` entry
+   for pipelines and `&&` chains acceptable, or should each part be matched
+   separately? *Proposal:* only a bare entry at first. Matching each part
+   can come later, once its parsing is reviewed.
