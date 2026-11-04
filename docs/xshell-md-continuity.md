@@ -415,7 +415,7 @@ itself:
   is.
 - **Budget.** Each continuation is its own root turn with a fresh
   `TurnBudget` (#84). The real bound on a goal is therefore its TTL in turns
-  times the per-turn limits (by default 64 provider requests, 128 tool calls,
+  times the per-turn limits (by default 128 provider requests, 256 tool calls,
   and 60 minutes per turn).
 - **Failures.** A failed or budget-exhausted turn counts against the TTL.
   Three consecutive failed turns move the goal to `unsatisfied` rather than
