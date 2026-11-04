@@ -489,16 +489,14 @@ These are included in the estimates above, except the security review: allow
    step subjects every `run_shell` call to the policy, and compound commands
    match only a bare `run_shell` entry.
 
+10. **Listed tools in `off` mode:** rules 3 and 4 apply literally. A listed
+    tool is denied in `off` mode even if it is read-only, like `read_file`.
+    The policy can then express such a restriction whenever one is needed,
+    rather than the implementation ruling it out in advance.
+
 ### Still open
 
-1. **`off` mode and read-only tools.** Rules 3 and 4 deny a listed tool in
-   `off` mode, even a read-only one like `read_file`, which runs in `off`
-   mode when unlisted. *Proposal:* keep that literal rule. `off` with a
-   policy means "only what the policy calls safe without approval, and
-   nothing it lists", which is predictable. The alternative would be to let
-   read-only tools on non-sensitive paths keep running in `off` unless they
-   are denied.
-2. **Shell safety beyond pattern matching** (a design topic, not a blocker).
+1. **Shell safety beyond pattern matching** (a design topic, not a blocker).
    Patterns cannot see what a script or interpreter does once it runs.
    Options to explore:
    - static analysis of compound commands, matching each part against the
