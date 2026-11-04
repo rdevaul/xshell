@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use xshell_audit::{AuditClient, AuditConfig, AuditEvent};
 use xshell_platform::LockExt;
 
@@ -20,6 +21,12 @@ pub struct TerminalStreamPolicy {
 }
 
 /// Per-daemon audit policy plus one audit-service session per xshell session.
+///
+/// Each xshell session has its own connection behind its own lock, and every
+/// exchange with the audit service has a deadline (`audit.ack_timeout_ms`).
+/// The shared map is locked only to find or insert a session's entry, never
+/// across I/O, so a stalled exchange delays only the session it belongs to,
+/// and only until its deadline.
 #[derive(Clone, Default)]
 pub struct DaemonAudit {
     inner: Option<Arc<AuditInner>>,
@@ -27,13 +34,36 @@ pub struct DaemonAudit {
 
 struct AuditInner {
     config: AuditConfig,
-    sessions: Mutex<HashMap<String, SessionAudit>>,
+    sessions: Mutex<HashMap<String, Arc<Mutex<SessionAudit>>>>,
 }
 
+/// One xshell session's audit connection.
 struct SessionAudit {
-    client: Option<AuditClient>,
-    audit_session_id: String,
+    session_id: String,
+    descriptor: SessionAuditDescriptor,
+    state: Connection,
 }
+
+enum Connection {
+    /// Not opened yet.
+    Unopened,
+    Open(AuditClient),
+    /// The last open or exchange failed at this time. Nothing is recorded
+    /// (and with `required = true`, nothing audited runs) until a reconnect
+    /// succeeds; one is attempted on the first record after
+    /// `ack_timeout_ms`, so a dead service costs each session at most one
+    /// deadline per interval.
+    Failed(Instant),
+    /// The xshell session was closed; later records are dropped.
+    Closed,
+}
+
+/// `LogicalSessionAttached` actions: a session's first audit connection, and
+/// a later one replacing a connection that failed. Records made between the
+/// two were not acknowledged; with `required = true` their actions did not
+/// run.
+const ATTACH_ACTION: &str = "xshelld_execution";
+const RESUME_ACTION: &str = "xshelld_execution_resumed";
 
 impl DaemonAudit {
     /// Build from configuration. When auditing is disabled this is a no-op
@@ -50,8 +80,12 @@ impl DaemonAudit {
         if config.required {
             // Probe once so misconfiguration is reported at startup rather
             // than on the first turn. The probe session is closed cleanly.
-            let mut probe = AuditClient::connect(socket, env!("CARGO_PKG_VERSION"))
-                .context("required auditing is unavailable; xshelld will not start")?;
+            let mut probe = AuditClient::connect_with_timeout(
+                socket,
+                env!("CARGO_PKG_VERSION"),
+                config.ack_timeout(),
+            )
+            .context("required auditing is unavailable; xshelld will not start")?;
             probe.append(AuditEvent::SessionEnded {
                 reason: "xshelld audit probe".into(),
             })?;
@@ -101,64 +135,40 @@ impl DaemonAudit {
         let Some(inner) = &self.inner else {
             return SessionAuditHandle::disabled();
         };
-        let mut sessions = inner.sessions.lock_recover();
-        if !sessions.contains_key(session_id) {
-            let opened = inner
-                .config
-                .socket
-                .as_deref()
-                .context("audit.socket is required when auditing is enabled")
-                .and_then(|socket| AuditClient::connect(socket, env!("CARGO_PKG_VERSION")));
-            let entry = match opened {
-                Ok(mut client) => {
-                    let audit_session_id = client.session_id().to_owned();
-                    let started = client.append(AuditEvent::LogicalSessionAttached {
-                        action: "xshelld_execution".into(),
+        let entry = Arc::clone(
+            inner
+                .sessions
+                .lock_recover()
+                .entry(session_id.to_owned())
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(SessionAudit {
                         session_id: session_id.to_owned(),
-                        name: descriptor.name,
-                        host_id: descriptor.host_id,
-                        host_alias: descriptor.host_alias,
-                        user: descriptor.user,
-                        terminal_stream: Some(inner.config.terminal_stream),
-                    });
-                    match started {
-                        Ok(_) => SessionAudit {
-                            client: Some(client),
-                            audit_session_id,
-                        },
-                        Err(error) => {
-                            eprintln!("xshelld audit warning: {error:#}");
-                            SessionAudit {
-                                client: None,
-                                audit_session_id: String::new(),
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    eprintln!("xshelld audit warning: {error:#}");
-                    SessionAudit {
-                        client: None,
-                        audit_session_id: String::new(),
-                    }
-                }
-            };
-            sessions.insert(session_id.to_owned(), entry);
+                        descriptor,
+                        state: Connection::Unopened,
+                    }))
+                }),
+        );
+        {
+            let mut audit = entry.lock_recover();
+            if matches!(audit.state, Connection::Unopened) {
+                audit.open(&inner.config, ATTACH_ACTION);
+            }
         }
         SessionAuditHandle {
             inner: Some(Arc::clone(inner)),
-            session_id: session_id.to_owned(),
+            entry: Some(entry),
         }
     }
 
     /// The audit-service session ID for an xshell session, if one is open.
     pub fn audit_session_id(&self, session_id: &str) -> Option<String> {
         let inner = self.inner.as_ref()?;
-        let sessions = inner.sessions.lock_recover();
-        sessions
-            .get(session_id)
-            .filter(|entry| entry.client.is_some())
-            .map(|entry| entry.audit_session_id.clone())
+        let entry = inner.sessions.lock_recover().get(session_id).cloned()?;
+        let audit = entry.lock_recover();
+        match &audit.state {
+            Connection::Open(client) => Some(client.session_id().to_owned()),
+            _ => None,
+        }
     }
 
     /// Close the audit-service session for a deleted xshell session.
@@ -167,44 +177,116 @@ impl DaemonAudit {
             return;
         };
         let removed = inner.sessions.lock_recover().remove(session_id);
-        if let Some(SessionAudit {
-            client: Some(mut client),
-            ..
-        }) = removed
+        if let Some(entry) = removed {
+            entry.lock_recover().close(reason);
+        }
+    }
+
+    /// Finalize every open audit session with a signed checkpoint. Called on
+    /// daemon shutdown so a clean stop does not leave verifiable-but-open
+    /// chains behind. Sessions close in parallel, each within its deadlines,
+    /// so a stalled service delays shutdown by about one session's worth.
+    pub fn close_all(&self, reason: &str) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let drained: Vec<_> = inner.sessions.lock_recover().drain().collect();
+        std::thread::scope(|scope| {
+            for (_, entry) in &drained {
+                scope.spawn(|| entry.lock_recover().close(reason));
+            }
+        });
+    }
+}
+
+impl SessionAudit {
+    /// Open a connection and record the attachment. On failure the session
+    /// is marked failed and the reason reported.
+    fn open(&mut self, config: &AuditConfig, action: &str) {
+        let opened = config
+            .socket
+            .as_deref()
+            .context("audit.socket is required when auditing is enabled")
+            .and_then(|socket| {
+                AuditClient::connect_with_timeout(
+                    socket,
+                    env!("CARGO_PKG_VERSION"),
+                    config.ack_timeout(),
+                )
+            })
+            .and_then(|mut client| {
+                client.append(AuditEvent::LogicalSessionAttached {
+                    action: action.into(),
+                    session_id: self.session_id.clone(),
+                    name: self.descriptor.name.clone(),
+                    host_id: self.descriptor.host_id.clone(),
+                    host_alias: self.descriptor.host_alias.clone(),
+                    user: self.descriptor.user.clone(),
+                    terminal_stream: Some(config.terminal_stream),
+                })?;
+                Ok(client)
+            });
+        self.state = match opened {
+            Ok(client) => Connection::Open(client),
+            Err(error) => {
+                eprintln!(
+                    "xshelld audit warning: session {}: {error:#}",
+                    self.session_id
+                );
+                Connection::Failed(Instant::now())
+            }
+        };
+    }
+
+    fn append(&mut self, config: &AuditConfig, event: AuditEvent) -> Result<()> {
+        match self.state {
+            Connection::Closed => return Ok(()),
+            Connection::Unopened => self.open(config, ATTACH_ACTION),
+            Connection::Failed(at) if at.elapsed() >= config.ack_timeout() => {
+                self.open(config, RESUME_ACTION)
+            }
+            Connection::Open(_) | Connection::Failed(_) => {}
+        }
+        let Connection::Open(client) = &mut self.state else {
+            if config.required {
+                anyhow::bail!("required auditing is unavailable for this session");
+            }
+            return Ok(());
+        };
+        match client.append(event) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.state = Connection::Failed(Instant::now());
+                if config.required {
+                    Err(error).context(
+                        "required audit append failed; refusing to continue the audited action",
+                    )
+                } else {
+                    eprintln!(
+                        "xshelld audit warning: session {}: {error:#}; records are dropped until the audit service responds again",
+                        self.session_id
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn close(&mut self, reason: &str) {
+        if let Connection::Open(mut client) = std::mem::replace(&mut self.state, Connection::Closed)
         {
-            let _ = client.append(AuditEvent::SessionEnded {
+            let ended = client.append(AuditEvent::SessionEnded {
                 reason: reason.into(),
             });
-            if let Err(error) = client.close() {
+            if let Err(error) = ended.and_then(|_| client.close()) {
                 eprintln!("xshelld audit warning: could not finalize audit: {error:#}");
             }
         }
     }
 }
 
-impl DaemonAudit {
-    /// Finalize every open audit session with a signed checkpoint. Called on
-    /// daemon shutdown so a clean stop does not leave verifiable-but-open
-    /// chains behind.
-    pub fn close_all(&self, reason: &str) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        let drained: Vec<_> = inner.sessions.lock_recover().drain().collect();
-        for (_, entry) in drained {
-            if let Some(mut client) = entry.client {
-                let _ = client.append(AuditEvent::SessionEnded {
-                    reason: reason.into(),
-                });
-                if let Err(error) = client.close() {
-                    eprintln!("xshelld audit warning: could not finalize audit: {error:#}");
-                }
-            }
-        }
-    }
-}
-
 /// Identity fields recorded when the daemon first audits a session.
+#[derive(Clone)]
 pub struct SessionAuditDescriptor {
     pub name: String,
     pub host_id: String,
@@ -217,49 +299,277 @@ pub struct SessionAuditDescriptor {
 #[derive(Clone)]
 pub struct SessionAuditHandle {
     inner: Option<Arc<AuditInner>>,
-    session_id: String,
+    entry: Option<Arc<Mutex<SessionAudit>>>,
 }
 
 impl SessionAuditHandle {
     fn disabled() -> Self {
         Self {
             inner: None,
-            session_id: String::new(),
+            entry: None,
         }
     }
 
-    /// Append one event. With `required = true` an append failure is returned
-    /// so the caller can refuse to continue the action; otherwise the failure
-    /// is reported once and auditing for this session is switched off.
+    /// Append one event, waiting at most the acknowledgement deadline. With
+    /// `required = true` a failure is returned so the caller can refuse to
+    /// continue the action, and later appends fail at once until the audit
+    /// service responds again; otherwise the failure is reported and the
+    /// record dropped.
     pub fn append(&self, event: AuditEvent) -> Result<()> {
-        let Some(inner) = &self.inner else {
+        let (Some(inner), Some(entry)) = (&self.inner, &self.entry) else {
             return Ok(());
         };
-        let mut sessions = inner.sessions.lock_recover();
-        let Some(entry) = sessions.get_mut(&self.session_id) else {
-            return Ok(());
-        };
-        let Some(client) = entry.client.as_mut() else {
-            if inner.config.required {
-                anyhow::bail!("required auditing is unavailable for this session");
-            }
-            return Ok(());
-        };
-        match client.append(event) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                entry.client = None;
-                if inner.config.required {
-                    Err(error).context(
-                        "required audit append failed; refusing to continue the audited action",
-                    )
-                } else {
-                    eprintln!(
-                        "xshelld audit warning: {error:#}; auditing is disabled for this session"
+        entry.lock_recover().append(&inner.config, event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread;
+    use std::time::Duration;
+    use xshell_audit::{AUDIT_PROTOCOL_VERSION, ClientRequest};
+
+    const DEADLINE: Duration = Duration::from_secs(1);
+
+    /// An audit service that answers like `xshell-auditd` but never
+    /// acknowledges a record whose text contains `STALL`, nor anything at all
+    /// while `stall_all` is set. A withheld reply leaves the connection open,
+    /// as a hung peer would.
+    struct FakeAuditService {
+        _directory: tempfile::TempDir,
+        socket: PathBuf,
+        stall_all: Arc<AtomicBool>,
+        attachments: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeAuditService {
+        fn start() -> Self {
+            let directory = tempfile::TempDir::new().unwrap();
+            let socket = directory.path().join("audit.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let stall_all = Arc::new(AtomicBool::new(false));
+            let attachments = Arc::new(Mutex::new(Vec::new()));
+            let (stall, attached) = (Arc::clone(&stall_all), Arc::clone(&attachments));
+            thread::spawn(move || {
+                let sessions = Arc::new(AtomicU64::new(0));
+                for stream in listener.incoming().flatten() {
+                    let (stall, attached, sessions) = (
+                        Arc::clone(&stall),
+                        Arc::clone(&attached),
+                        Arc::clone(&sessions),
                     );
-                    Ok(())
+                    thread::spawn(move || serve(stream, &stall, &attached, &sessions));
                 }
+            });
+            Self {
+                _directory: directory,
+                socket,
+                stall_all,
+                attachments,
             }
         }
+
+        fn config(&self) -> AuditConfig {
+            AuditConfig {
+                enabled: true,
+                required: true,
+                socket: Some(self.socket.clone()),
+                ack_timeout_ms: DEADLINE.as_millis() as u64,
+                ..AuditConfig::default()
+            }
+        }
+    }
+
+    fn serve(
+        stream: UnixStream,
+        stall_all: &AtomicBool,
+        attached: &Mutex<Vec<String>>,
+        sessions: &AtomicU64,
+    ) {
+        let mut writer = stream.try_clone().unwrap();
+        let mut sequence = 0;
+        let session = format!("fake-{}", sessions.fetch_add(1, Ordering::SeqCst));
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { return };
+            if stall_all.load(Ordering::SeqCst) || line.contains("STALL") {
+                continue;
+            }
+            let reply = match serde_json::from_str::<ClientRequest>(&line).unwrap() {
+                ClientRequest::Open { .. } => serde_json::json!({
+                    "response": "opened",
+                    "protocol_version": AUDIT_PROTOCOL_VERSION,
+                    "session_id": session,
+                    "signing_key_id": "fake",
+                }),
+                ClientRequest::Append { event } => {
+                    if let AuditEvent::LogicalSessionAttached { action, .. } = event {
+                        attached.lock().unwrap().push(action);
+                    }
+                    sequence += 1;
+                    serde_json::json!({"response": "ack", "sequence": sequence, "record_hash": "h"})
+                }
+                ClientRequest::Close => serde_json::json!({
+                    "response": "closed",
+                    "checkpoint": {
+                        "body": {
+                            "format_version": 1, "session_id": session,
+                            "checkpoint_sequence": 0, "previous_checkpoint_hash": "",
+                            "sequence": sequence, "daemon_timestamp_unix_ms": 0,
+                            "chain_head": "", "signing_key_id": "fake", "final_checkpoint": true,
+                        },
+                        "blinding_nonce": "", "witness": {"scheme": "", "commitment": ""},
+                        "signature": "", "checkpoint_hash": "",
+                    },
+                }),
+            };
+            if writeln!(writer, "{reply}").is_err() {
+                return;
+            }
+        }
+    }
+
+    fn descriptor(name: &str) -> SessionAuditDescriptor {
+        SessionAuditDescriptor {
+            name: name.into(),
+            host_id: "host".into(),
+            host_alias: "host".into(),
+            user: "user".into(),
+        }
+    }
+
+    fn stalling_event() -> AuditEvent {
+        AuditEvent::SessionEnded {
+            reason: "STALL".into(),
+        }
+    }
+
+    fn ordinary_event() -> AuditEvent {
+        AuditEvent::SessionEnded {
+            reason: "ordinary".into(),
+        }
+    }
+
+    #[test]
+    fn f6_a_stalled_session_does_not_hold_up_another() {
+        let service = FakeAuditService::start();
+        let audit = DaemonAudit::from_config(&service.config()).unwrap();
+        let stalled = audit.session("a", descriptor("a"));
+        let other = audit.session("b", descriptor("b"));
+
+        let started = Instant::now();
+        let waiting = thread::spawn(move || stalled.append(stalling_event()));
+        thread::sleep(Duration::from_millis(50));
+        // While session a waits on its acknowledgement, session b records.
+        other.append(ordinary_event()).unwrap();
+        assert!(
+            !waiting.is_finished(),
+            "the stalled append should still be waiting"
+        );
+        assert!(
+            started.elapsed() < DEADLINE,
+            "session b waited on session a"
+        );
+
+        // Session a fails at its deadline, closed rather than frozen.
+        let error = waiting.join().unwrap().unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= DEADLINE && elapsed < DEADLINE * 4, "{elapsed:?}");
+        assert!(format!("{error:#}").contains("required audit append failed"));
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "did not respond within {} ms",
+                DEADLINE.as_millis()
+            )),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn f6_a_failed_session_refuses_at_once_then_resumes_on_a_new_connection() {
+        let service = FakeAuditService::start();
+        let audit = DaemonAudit::from_config(&service.config()).unwrap();
+        let handle = audit.session("a", descriptor("a"));
+        let first_audit_session = audit.audit_session_id("a").unwrap();
+        handle.append(stalling_event()).unwrap_err();
+
+        // Latched: the next record fails without waiting for the service.
+        let started = Instant::now();
+        let error = handle.append(ordinary_event()).unwrap_err();
+        assert!(started.elapsed() < DEADLINE / 2);
+        assert!(
+            error
+                .to_string()
+                .contains("required auditing is unavailable")
+        );
+        assert_eq!(audit.audit_session_id("a"), None);
+
+        // After the retry interval a new connection takes over, recorded as
+        // a resumption.
+        thread::sleep(DEADLINE);
+        handle.append(ordinary_event()).unwrap();
+        let resumed = audit.audit_session_id("a").unwrap();
+        assert_ne!(resumed, first_audit_session);
+        assert_eq!(
+            *service.attachments.lock().unwrap(),
+            [ATTACH_ACTION, RESUME_ACTION]
+        );
+    }
+
+    #[test]
+    fn f6_optional_audit_drops_records_without_stopping_the_action() {
+        let service = FakeAuditService::start();
+        let config = AuditConfig {
+            required: false,
+            ..service.config()
+        };
+        let audit = DaemonAudit::from_config(&config).unwrap();
+        let handle = audit.session("a", descriptor("a"));
+        handle.append(stalling_event()).unwrap();
+        // Dropped at once while failed.
+        let started = Instant::now();
+        handle.append(ordinary_event()).unwrap();
+        assert!(started.elapsed() < DEADLINE / 2);
+    }
+
+    #[test]
+    fn f6_shutdown_with_a_hung_service_takes_one_deadline_not_one_per_session() {
+        let service = FakeAuditService::start();
+        let audit = DaemonAudit::from_config(&service.config()).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|index| audit.session(&index.to_string(), descriptor("s")))
+            .collect();
+        for handle in &handles {
+            handle.append(ordinary_event()).unwrap();
+        }
+        service.stall_all.store(true, Ordering::SeqCst);
+
+        let started = Instant::now();
+        audit.close_all("shutdown");
+        let elapsed = started.elapsed();
+        // Each close waits one deadline for its unacknowledged final record;
+        // sequentially that would be eight.
+        assert!(elapsed < DEADLINE * 3, "{elapsed:?}");
+        // Closed sessions drop later records instead of reconnecting.
+        handles[0].append(ordinary_event()).unwrap();
+    }
+
+    #[test]
+    fn f6_closing_one_session_waits_only_for_that_session() {
+        let service = FakeAuditService::start();
+        let audit = DaemonAudit::from_config(&service.config()).unwrap();
+        let stalled = audit.session("a", descriptor("a"));
+        let other = audit.session("b", descriptor("b"));
+        let waiting = thread::spawn(move || stalled.append(stalling_event()));
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        audit.close_session("b", "closed");
+        other.append(ordinary_event()).unwrap();
+        assert!(started.elapsed() < DEADLINE, "closing b waited on a");
+        waiting.join().unwrap().unwrap_err();
     }
 }

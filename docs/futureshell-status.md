@@ -71,8 +71,8 @@ xshell components.
 
 ## Immediate sequence
 
-1. Complete the shared M1 lifecycle and access corrections. M1.3 prepared file
-   access (F4, F5, F8) is the active work; F6, F7, F9, and F10 follow.
+1. Complete the shared M1 lifecycle and access corrections. F1–F6, F8, F9,
+   and F11 are corrected; the remaining F10 budgets and F7 follow.
 2. Establish the M2 authorization/provider boundary. Its grants bind to the
    prepared operations produced by M1.3.
 3. Prove one bounded structured-plan workflow under the personal and

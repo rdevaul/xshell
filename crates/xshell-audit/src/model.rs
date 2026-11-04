@@ -40,11 +40,23 @@ pub struct AuditConfig {
     /// for the job reports how many bytes were not recorded. `0` means no
     /// bound.
     pub terminal_stream_max_bytes: u64,
+    /// How long one exchange with the audit service may take, in
+    /// milliseconds: sending a record and receiving its acknowledgement, or
+    /// opening and closing an audit session. An exchange that misses it fails
+    /// the record, and with `required = true` the action it covers.
+    pub ack_timeout_ms: u64,
 }
 
 impl AuditConfig {
     /// Default per-job capture budget: 16 MiB.
     pub const DEFAULT_TERMINAL_STREAM_MAX_BYTES: u64 = 16 * 1024 * 1024;
+    /// Default acknowledgement deadline: 5 seconds.
+    pub const DEFAULT_ACK_TIMEOUT_MS: u64 = 5_000;
+
+    /// The acknowledgement deadline, never zero.
+    pub fn ack_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.ack_timeout_ms.max(1))
+    }
 }
 
 impl Default for AuditConfig {
@@ -57,6 +69,7 @@ impl Default for AuditConfig {
             checkpoint_interval: 16,
             terminal_stream: false,
             terminal_stream_max_bytes: Self::DEFAULT_TERMINAL_STREAM_MAX_BYTES,
+            ack_timeout_ms: Self::DEFAULT_ACK_TIMEOUT_MS,
         }
     }
 }

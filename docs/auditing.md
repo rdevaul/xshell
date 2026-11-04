@@ -42,16 +42,35 @@ directory = "/var/lib/xshell-audit"
 checkpoint_interval = 16
 terminal_stream = false        # opt-in byte-for-byte PTY capture (xshelld)
 terminal_stream_max_bytes = 16777216
+ack_timeout_ms = 5000          # deadline for each exchange with the service
 ```
 
-`xshell` uses `enabled`, `required`, and `socket`. `xshelld` uses those plus
-`terminal_stream` and `terminal_stream_max_bytes`. The audit daemon uses
+`xshell` uses `enabled`, `required`, `socket`, and `ack_timeout_ms`. `xshelld`
+uses those plus `terminal_stream` and `terminal_stream_max_bytes`. The audit daemon uses
 `socket`, `directory`, and `checkpoint_interval`. Command-line flags override
 the daemon paths.
 
 When `required = true`, xshell refuses to start if the daemon is unavailable.
 It also refuses to execute an input that the daemon has not acknowledged.
 Events are flushed and synchronized before the daemon acknowledges them.
+
+Every exchange with the audit service, from sending a record to receiving its
+acknowledgement, must finish within `ack_timeout_ms`. An audit service that
+stops responding therefore cannot freeze xshell:
+
+- `xshelld` keeps one audit connection per xshell session, so a withheld
+  acknowledgement delays only that session, and only until the deadline.
+  Other sessions, session control, and shutdown carry on.
+- A missed deadline counts as a failed record: the record may or may not have
+  reached the log. With `required = true` the action it covers is refused and
+  later records for that session fail at once. After one deadline interval the
+  next record tries a new connection; when it succeeds the log shows a
+  `logical_session_attached` record with action `xshelld_execution_resumed`
+  that starts a new audit session for the same xshell session.
+- With `required = false` records are dropped while the service is
+  unresponsive, with a warning, and recording resumes the same way.
+- Shutdown closes every audit session in parallel, so a hung service delays it
+  by about one deadline per close rather than hanging it.
 
 ## Who records what
 
