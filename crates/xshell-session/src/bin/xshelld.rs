@@ -872,6 +872,7 @@ fn serve_claimed_pty(
             events: libc::POLLIN | libc::POLLHUP,
             revents: 0,
         };
+        // SAFETY: `descriptor` is one initialized `pollfd`, matching the count of 1.
         let polled = unsafe { libc::poll(&mut descriptor, 1, 0) };
         if polled < 0 {
             let error = std::io::Error::last_os_error();
@@ -1327,7 +1328,11 @@ fn system_hostname() -> String {
     // `c_char` is `i8` on x86_64 but `u8` on aarch64 Linux; spell the element
     // type through libc so this compiles on every supported target.
     let mut buffer = [0 as libc::c_char; 256];
+    // SAFETY: `buffer` is writable for the length passed, one byte short of its size, so the
+    // zeroed last byte always terminates the name.
     if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } == 0 {
+        // SAFETY: gethostname succeeded, and the buffer's last byte is still NUL, so `buffer`
+        // holds a NUL-terminated string that lives for this borrow.
         let hostname = unsafe { CStr::from_ptr(buffer.as_ptr()) };
         if let Ok(hostname) = hostname.to_str() {
             return hostname.to_owned();
@@ -1351,6 +1356,7 @@ fn validate_host_alias(alias: String) -> Result<String> {
 }
 
 fn system_user() -> String {
+    // SAFETY: geteuid(2) takes no arguments and cannot fail.
     std::env::var("USER").unwrap_or_else(|_| unsafe { libc::geteuid() }.to_string())
 }
 

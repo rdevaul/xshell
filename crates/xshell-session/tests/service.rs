@@ -49,6 +49,7 @@ fn connect_when_ready(socket: &Path) -> SessionClient {
 }
 
 fn terminate_daemon(daemon: &mut Daemon) {
+    // SAFETY: kill(2) has no memory-safety preconditions; the daemon child has not been reaped.
     let result = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
     assert_eq!(result, 0, "could not send SIGTERM to xshelld");
     assert!(
@@ -1481,6 +1482,7 @@ fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
         .trim()
         .parse::<i32>()
         .unwrap();
+    // SAFETY: kill(2) has no memory-safety preconditions.
     unsafe {
         libc::kill(-process_group, libc::SIGKILL);
     }
@@ -3000,6 +3002,7 @@ fn f6_a_hung_audit_peer_cannot_freeze_other_sessions_control_or_shutdown() {
     let started = Instant::now();
     let (exited, exit) = mpsc::channel();
     let pid = daemon.0.id() as libc::pid_t;
+    // SAFETY: kill(2) has no memory-safety preconditions; the daemon child has not been reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     let mut child = std::mem::replace(&mut daemon.0, Command::new("true").spawn().unwrap());
     thread::spawn(move || exited.send(child.wait().unwrap()).unwrap());

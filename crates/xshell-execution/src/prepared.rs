@@ -92,6 +92,8 @@ impl PreparedObject {
     /// Each entry is a name and whether it is a directory.
     pub(crate) fn list(self, max_entries: usize) -> Result<(Vec<(OsString, bool)>, bool)> {
         // fdopendir takes ownership of the descriptor it is given.
+        // SAFETY: dup(2) takes only an integer; `self.descriptor` is an open descriptor `self`
+        // owns.
         let duplicate = unsafe { libc::dup(self.descriptor.as_raw_fd()) };
         if duplicate < 0 {
             return Err(io::Error::last_os_error())
@@ -101,6 +103,8 @@ impl PreparedObject {
         let stream = unsafe { libc::fdopendir(duplicate) };
         if stream.is_null() {
             let error = io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so `duplicate` is still ours to close, and nothing else
+            // uses it.
             unsafe { libc::close(duplicate) };
             return Err(error).with_context(|| format!("cannot list {}", self.path.display()));
         }
@@ -113,6 +117,8 @@ impl PreparedObject {
             if entry.is_null() {
                 break;
             }
+            // SAFETY: `entry` is non-null and stays valid until the next readdir call; `d_name`
+            // is NUL-terminated, and `name` is used only before that call.
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
             let bytes = name.to_bytes();
             if bytes == b"." || bytes == b".." {
@@ -122,8 +128,10 @@ impl PreparedObject {
                 truncated = true;
                 break;
             }
+            // SAFETY: `entry` is non-null and valid until the next readdir call.
             let is_directory = match unsafe { (*entry).d_type } {
                 libc::DT_DIR => true,
+                // SAFETY: `stream` is a valid, open DIR*.
                 libc::DT_UNKNOWN => stat_at(unsafe { libc::dirfd(stream) }, name)
                     .is_ok_and(|status| file_type(&status) == libc::S_IFDIR),
                 _ => false,
@@ -298,6 +306,7 @@ fn open_at(parent: RawFd, name: &OsStr, flags: libc::c_int) -> io::Result<OwnedF
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: openat succeeded, so `descriptor` is a new descriptor nothing else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
@@ -315,6 +324,7 @@ fn stat_at(parent: RawFd, name: &CStr) -> io::Result<libc::stat> {
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fstatat succeeded, so it initialized `status`.
     Ok(unsafe { status.assume_init() })
 }
 
@@ -324,6 +334,7 @@ fn stat_descriptor(descriptor: RawFd) -> io::Result<libc::stat> {
     if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fstat succeeded, so it initialized `status`.
     Ok(unsafe { status.assume_init() })
 }
 
@@ -498,6 +509,7 @@ mod tests {
         );
         // Opening a FIFO with no writer would block without O_NONBLOCK.
         let fifo = CString::new(root.join("pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let error = prepare_file(&root, "pipe").unwrap_err();
         assert!(

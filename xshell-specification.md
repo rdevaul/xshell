@@ -1,6 +1,10 @@
 # xshell: Product and Technical Specification
 
-**Status:** Draft for review
+**Status:** Draft for review. This specification describes the target product.
+Several features it specifies, including `//share`, `//chroot`, and CAD
+rendering, are not implemented yet. The [development
+roadmap](docs/xshell-development-roadmap.md) records what is built and in what
+order the rest is planned; the [README](README.md) describes current behaviour.
 
 **Target platforms:** macOS and Linux
 **Primary users:** engineers and designers working with local and remote AI agents, source trees, data, and CAD assets.

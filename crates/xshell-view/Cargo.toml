@@ -13,3 +13,6 @@ pulldown-cmark = "0.13"
 serde.workspace = true
 terminal_size = "0.4"
 unicode-width = "0.2"
+
+[lints]
+workspace = true

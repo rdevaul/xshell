@@ -44,3 +44,7 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 [profile.release]
 lto = "thin"
 strip = true
+
+[workspace.lints.clippy]
+# Every `unsafe` block states why it is sound in a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"

@@ -28,6 +28,8 @@ pub fn peer_uid(stream: &UnixStream) -> Result<u32> {
     // `length` bytes into it.
     let mut credentials: libc::ucred = unsafe { zeroed() };
     let mut length = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `credentials` is a writable `ucred` and `length` holds its size, so getsockopt
+    // writes within it.
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),

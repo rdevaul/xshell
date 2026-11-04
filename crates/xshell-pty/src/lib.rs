@@ -189,6 +189,7 @@ impl ControllerInput {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: `descriptor` is one initialized `pollfd`, matching the count of 1.
         let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
         if result < 0 {
             let error = io::Error::last_os_error();
@@ -201,6 +202,8 @@ impl ControllerInput {
             return Ok((Vec::new(), None));
         }
         let mut input = [0_u8; REMOTE_INPUT_BYTES];
+        // SAFETY: `input` is writable for the `input.len()` bytes passed; read(2) writes at
+        // most that many. A stale descriptor fails rather than touching memory.
         let count =
             unsafe { libc::read(self.descriptor, input.as_mut_ptr().cast(), input.len() as _) };
         if count < 0 {
@@ -304,6 +307,8 @@ impl RemotePtyProcess {
     /// to repaint itself. Reapplying an unchanged window size is not required
     /// to generate `SIGWINCH`, so attachments request it explicitly.
     pub fn request_redraw(&self) -> Result<()> {
+        // SAFETY: tcgetpgrp(3) only reads a property of `self.master`, an open descriptor
+        // `self` owns.
         let process_group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
         if process_group < 0 {
             return Err(io::Error::last_os_error())
@@ -312,6 +317,8 @@ impl RemotePtyProcess {
         if process_group <= 1 {
             bail!("invalid foreground PTY process group {process_group}");
         }
+        // SAFETY: kill(2) has no memory-safety preconditions; `process_group > 1` was checked
+        // above, so this cannot signal init or every process.
         if unsafe { libc::kill(-process_group, libc::SIGWINCH) } < 0 {
             return Err(io::Error::last_os_error()).context("cannot request a PTY redraw");
         }
@@ -414,6 +421,7 @@ fn relay_duplex_inner(
         } else {
             0
         };
+        // SAFETY: `descriptors` is an initialized array whose length is the count passed.
         let polled = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
         if polled < 0 {
             let error = io::Error::last_os_error();
@@ -447,6 +455,8 @@ fn relay_duplex_inner(
         }
 
         if descriptors[0].revents & libc::POLLIN != 0 {
+            // SAFETY: `input` is writable for the `input.len()` bytes passed; read(2) writes at
+            // most that many. A stale descriptor fails rather than touching memory.
             let count =
                 unsafe { libc::read(terminal_fd, input.as_mut_ptr().cast(), input.len() as _) };
             if count > 0 {
@@ -664,6 +674,8 @@ fn spawn_child(
     // terminal, so its line discipline delivers terminal-generated signals
     // and SIGWINCH to
     // the foreground command rather than xshell.
+    // SAFETY: The hook runs in the forked child before exec. It calls only setsid(2) and
+    // ioctl(2), which are async-signal-safe, and neither allocates nor takes a lock.
     unsafe {
         process.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -727,6 +739,7 @@ fn relay_bytes(
             },
         ];
         let timeout = i32::try_from(POLL_INTERVAL.as_millis()).unwrap_or(100);
+        // SAFETY: `descriptors` is an initialized array whose length is the count passed.
         let polled =
             unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
         if polled < 0 {
@@ -737,6 +750,8 @@ fn relay_bytes(
         }
 
         if descriptors[0].revents & libc::POLLIN != 0 {
+            // SAFETY: `buffer` is writable for the `buffer.len()` bytes passed; read(2) writes
+            // at most that many. A stale descriptor fails rather than touching memory.
             let count =
                 unsafe { libc::read(terminal_fd, buffer.as_mut_ptr().cast(), buffer.len() as _) };
             if count > 0 {
@@ -754,6 +769,8 @@ fn relay_bytes(
         }
 
         if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            // SAFETY: `buffer` is writable for the `buffer.len()` bytes passed; read(2) writes
+            // at most that many. A stale descriptor fails rather than touching memory.
             let count =
                 unsafe { libc::read(master_fd, buffer.as_mut_ptr().cast(), buffer.len() as _) };
             if count > 0 {
@@ -784,11 +801,15 @@ fn terminal_size(descriptor: RawFd) -> Option<Winsize> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    // SAFETY: TIOCGWINSZ writes one `winsize` through the pointer, and `size` is a valid,
+    // writable `winsize`.
     let result = unsafe { libc::ioctl(descriptor, libc::TIOCGWINSZ as _, &mut size) };
     (result == 0 && size.ws_row > 0 && size.ws_col > 0).then_some(size)
 }
 
 fn set_pty_size(descriptor: RawFd, size: Winsize) -> Result<()> {
+    // SAFETY: TIOCSWINSZ reads one `winsize` through the pointer, and `size` is a valid
+    // `winsize`.
     if unsafe { libc::ioctl(descriptor, libc::TIOCSWINSZ as _, &size) } < 0 {
         return Err(io::Error::last_os_error()).context("cannot resize pseudoterminal");
     }
@@ -797,6 +818,7 @@ fn set_pty_size(descriptor: RawFd, size: Winsize) -> Result<()> {
 
 fn write_all_fd(descriptor: RawFd, mut bytes: &[u8]) -> Result<()> {
     while !bytes.is_empty() {
+        // SAFETY: `bytes` is readable for the `bytes.len()` bytes passed.
         let count = unsafe { libc::write(descriptor, bytes.as_ptr().cast(), bytes.len()) };
         if count > 0 {
             bytes = &bytes[count as usize..];
@@ -811,10 +833,14 @@ fn write_all_fd(descriptor: RawFd, mut bytes: &[u8]) -> Result<()> {
 }
 
 fn set_nonblocking(descriptor: RawFd) -> Result<()> {
+    // SAFETY: fcntl(2) with these commands takes only integers and has no memory-safety
+    // preconditions.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error()).context("cannot inspect PTY flags");
     }
+    // SAFETY: fcntl(2) with these commands takes only integers and has no memory-safety
+    // preconditions.
     if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error()).context("cannot set PTY nonblocking mode");
     }
@@ -825,6 +851,7 @@ fn write_available(descriptor: RawFd, bytes: &[u8]) -> Result<usize> {
     if bytes.is_empty() {
         return Ok(0);
     }
+    // SAFETY: `bytes` is readable for the `bytes.len()` bytes passed.
     let count = unsafe { libc::write(descriptor, bytes.as_ptr().cast(), bytes.len()) };
     if count >= 0 {
         return Ok(count as usize);
@@ -851,6 +878,7 @@ fn read_available(
         events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
+    // SAFETY: `poll` is one initialized `pollfd`, matching the count of 1.
     let result = unsafe { libc::poll(&mut poll, 1, timeout) };
     if result < 0 {
         let error = io::Error::last_os_error();
@@ -865,6 +893,8 @@ fn read_available(
     if result == 0 || poll.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
         return Ok(0);
     }
+    // SAFETY: `output` is writable for the `output.len()` bytes passed; read(2) writes at most
+    // that many. A stale descriptor fails rather than touching memory.
     let count = unsafe { libc::read(descriptor, output.as_mut_ptr().cast(), output.len()) };
     if count > 0 {
         return Ok(count as usize);
@@ -890,6 +920,7 @@ fn read_terminal_available(descriptor: RawFd, output: &mut [u8]) -> Result<usize
         events: libc::POLLIN,
         revents: 0,
     };
+    // SAFETY: `poll` is one initialized `pollfd`, matching the count of 1.
     let result = unsafe { libc::poll(&mut poll, 1, 0) };
     if result <= 0 || poll.revents & libc::POLLIN == 0 {
         if result < 0 {
@@ -900,6 +931,8 @@ fn read_terminal_available(descriptor: RawFd, output: &mut [u8]) -> Result<usize
         }
         return Ok(0);
     }
+    // SAFETY: `output` is writable for the `output.len()` bytes passed; read(2) writes at most
+    // that many. A stale descriptor fails rather than touching memory.
     let count = unsafe { libc::read(descriptor, output.as_mut_ptr().cast(), output.len()) };
     if count >= 0 {
         return Ok(count as usize);
@@ -916,6 +949,8 @@ fn terminate(child: &mut Child) {
         // `spawn_child` calls setsid(), so the shell leader is also the PTY
         // process-group leader. Kill the group so a pager or pipeline cannot
         // survive after its controller disconnects.
+        // SAFETY: kill(2) has no memory-safety preconditions. The child has not been reaped, so
+        // neither its pid nor the process group it leads can have been reused.
         (unsafe { libc::kill(-pid, libc::SIGKILL) }) == 0
     });
     if !killed_group {
@@ -945,6 +980,8 @@ impl TerminalGuard {
     }
 
     fn enter_attributes(descriptor: RawFd, original: Termios, active: Termios) -> Result<Self> {
+        // SAFETY: A `TerminalGuard` is only created for a descriptor that outlives it (the
+        // process's stdin, or a PTY slave a test holds), and this borrow ends with the call.
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(descriptor) };
         tcsetattr(borrowed, SetArg::TCSANOW, &active).context("cannot set terminal attributes")?;
         Ok(Self {
@@ -957,6 +994,8 @@ impl TerminalGuard {
         let Some(original) = self.original.take() else {
             return Ok(());
         };
+        // SAFETY: A `TerminalGuard` is only created for a descriptor that outlives it (the
+        // process's stdin, or a PTY slave a test holds), and this borrow ends with the call.
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.descriptor) };
         tcsetattr(borrowed, SetArg::TCSANOW, &original)
             .context("cannot restore terminal attributes")
