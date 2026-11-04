@@ -23,8 +23,8 @@ Three capabilities are missing:
 |---|---|---|
 | A. Images and multimodal models | 15–22 engineer-days | 24–36 |
 | B. Configurable and relaxed limits | 7–10 | 7–10 |
-| C. Headless mode | 15–22 | 18–27 |
-| **Total** | **37–54 days (about 8–11 weeks)** | **49–73 days (about 10–15 weeks)** |
+| C. Headless mode | 16–24 | 19–29 |
+| **Total** | **38–56 days (about 8–11 weeks)** | **50–75 days (about 10–15 weeks)** |
 
 The figures are for one engineer who knows the codebase, and include tests,
 documentation, and review fixes. Add 2–3 days for a security review of
@@ -342,7 +342,65 @@ that matches:
 - **Subagents:** they inherit the policy, as they already inherit the
   toolset and approval mode.
 
-Four details are still to settle (§8).
+**Daemon policy and client overlays.** The daemon's operator writes a policy
+with the same structure in the `xshelld` configuration, as fine-grained as
+needed. A client or headless run may supply its own policy as an overlay,
+but it can never loosen the daemon's:
+
+- **Mode:** the requested mode is first clamped to the daemon's `max_approval`.
+- **Per-call decision:** each policy decides the call by the table above,
+  using `deny`, `prompt` or `run`.
+- **Combination:** the stricter of the two decisions wins (`deny` is
+  stricter than `prompt`, which is stricter than `run`). With no client
+  overlay, the daemon's decision stands.
+
+So a client's `always_allowed` entry runs a call without a prompt only if
+the daemon's policy would also run it. A client's `denied` entry always takes
+effect. Whenever the overlay asks for more than the daemon allows, the
+stricter result applies and a warning is reported.
+
+**Sensitive and blocked paths.** The daemon's configuration describes
+sensitivity in classes, each with an action:
+
+```toml
+[[session_fabric.sensitivity]]
+action = "prompt"     # read-only tools need approval for these paths
+patterns = [".env", ".env.*", ".git/config", ".aws/**", ".ssh/**"]
+
+[[session_fabric.sensitivity]]
+action = "block"      # agent tools can never read these paths
+patterns = ["*.pem", "*.key", "*.p12", "*.pfx", "id_rsa", "id_ed25519"]
+```
+
+- **`prompt`:** the call is gated: it needs approval in `ask`, is denied in
+  `off`, and runs in `auto`. A policy's `always_allowed` entry does not skip
+  that prompt. Only the daemon's own policy can always-allow a sensitive
+  path, and only by naming it (`read_file: config/.env`); a client overlay
+  never can.
+- **`block`:** every read through agent tools is denied in every mode,
+  whatever either policy says. That covers `read_file`, `list_directory`,
+  `view_image`, and render inputs.
+- **Matching:** patterns are matched against the canonical path of the
+  opened object, as for sensitive paths today (F4). The existing
+  `sensitive_paths` list becomes the `prompt` class, so current
+  configurations keep working.
+- **Shell commands:** sensitivity classes govern the agent's read tools. A
+  shell command such as `cat id_rsa` is governed by the policy's `run_shell`
+  rules and the approval mode, not by the classes. Truly blocking such
+  access needs operating-system permissions or the sandboxing follow-up
+  below.
+
+**Compound commands and scripts.** Pipelines, `;`, `&&`, command
+substitution, and scripts run through an interpreter must not become a way
+around the policy. The first step treats every `run_shell` call as subject
+to the policy:
+
+- A compound command matches only a bare `run_shell` entry.
+- A pattern that allows an interpreter or a script (`python *`,
+  `bash -c *`, `./build.sh`) is documented as allowing whatever that
+  interpreter or script does.
+
+Making shell access safe beyond that is a separate design topic (§8).
 
 ### 5.3 Tasks and estimates
 
@@ -350,12 +408,12 @@ Four details are still to settle (§8).
 |---|---|---|
 | C1 | `xshell run`: prompt sources, sessions, daemon execution, exit codes | 2–3 |
 | C2 | Versioned JSONL event schema, final `result` object, text mode | 3–4 |
-| C3 | Approval policy (§5.2) in the daemon for all turns; shell-pattern matching on parsed arguments; override warnings; approval channel; ceiling interaction | 5–7 |
+| C3 | Approval policy (§5.2) in the daemon for all turns: daemon policy with client overlays, sensitivity classes with `prompt` and `block`, shell-pattern matching on parsed arguments, override warnings, approval channel | 6–9 |
 | C4 | `--detach`, `wait`, `status`, `result`, `cancel`; signal handling; recovery from the snapshot | 3–5 |
 | C5 | Tests with piped stdio (no terminal needed) and schema documentation | 2–3 |
 | C6 | *Optional:* attachments (`--attach`) and an artifact manifest in the result (needs A) | 2–3 |
 | C7 | *Optional:* a small Python client wrapper with examples | 1–2 |
-| | **Core (C1–C5)** | **15–22** |
+| | **Core (C1–C5)** | **16–24** |
 
 **Risk:** the approval policy matcher is security-relevant: command
 patterns are easy to get wrong. Matching on parsed argument vectors,
@@ -421,9 +479,17 @@ These are included in the estimates above, except the security review: allow
 6. **Standalone headless:** not supported. Headless runs always require
    `xshelld`.
 
-### Still open
+7. **Daemon and client policies:** the daemon's policy is authoritative and
+   can be as fine-grained as needed. A client's policy is an overlay, and
+   the stricter decision wins for every call (§5.2).
+8. **Sensitivity:** the daemon's configuration describes sensitive paths in
+   classes. `prompt` requires approval; `block` denies agent reads
+   altogether, for example of private keys and certificates (§5.2).
+9. **Compound commands and scripts:** must not be an escape hatch. The first
+   step subjects every `run_shell` call to the policy, and compound commands
+   match only a bare `run_shell` entry.
 
-These came out of writing down the policy rules. Each has a proposed answer.
+### Still open
 
 1. **`off` mode and read-only tools.** Rules 3 and 4 deny a listed tool in
    `off` mode, even a read-only one like `read_file`, which runs in `off`
@@ -432,18 +498,15 @@ These came out of writing down the policy rules. Each has a proposed answer.
    nothing it lists", which is predictable. The alternative would be to let
    read-only tools on non-sensitive paths keep running in `off` unless they
    are denied.
-2. **Client policies and the daemon's ceiling.** `always_allowed` acts like
-   `auto` mode for the tools it lists. If a client could supply its own
-   policy, it could get past a daemon capped at `ask`. *Proposal:* the
-   daemon's configured policy is the base. A run's own policy may add
-   `denied` entries and narrow `allowed`. Its `always_allowed` entries take
-   effect only when the daemon's ceiling is `auto`; otherwise they are
-   treated as `allowed`, with a warning.
-3. **Sensitive paths.** Should `always_allowed: read_file` also skip the
-   sensitive-path prompt (for `.env`, keys, and the like)? *Proposal:* no.
-   The sensitive-path gate still prompts unless the entry names the path
-   explicitly (`read_file: config/.env`).
-4. **Compound shell commands.** Is matching only a bare `run_shell` entry
-   for pipelines and `&&` chains acceptable, or should each part be matched
-   separately? *Proposal:* only a bare entry at first. Matching each part
-   can come later, once its parsing is reviewed.
+2. **Shell safety beyond pattern matching** (a design topic, not a blocker).
+   Patterns cannot see what a script or interpreter does once it runs.
+   Options to explore:
+   - static analysis of compound commands, matching each part against the
+     policy;
+   - an operating-system sandbox for `run_shell`: Landlock or bubblewrap on
+     Linux, a sandbox profile on macOS, restricting files and network to
+     what the policy allows;
+   - running shell tools as a separate, less-privileged user.
+
+   This deserves its own design document before headless runs with broad
+   `run_shell` allowances become common.
