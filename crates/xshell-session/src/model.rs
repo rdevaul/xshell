@@ -360,8 +360,23 @@ pub enum SessionEventKind {
     TurnCompleted,
     TurnFailed {
         message: String,
+        /// Why the turn failed, when that is one of the causes clients act
+        /// on. Absent for other failures and in journals written before the
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<TurnFailureReason>,
     },
     TurnCancelled,
+}
+
+/// A failure cause a client can act on without parsing the message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureReason {
+    /// A turn limit ran out.
+    BudgetExhausted,
+    /// Required auditing failed, so the turn was stopped.
+    AuditUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

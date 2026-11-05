@@ -1585,7 +1585,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
                 SessionEventKind::Execution {
                     event: ExecutionEvent::ApprovalRequested { call, .. },
                 } => requested = Some(call.id),
-                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
                 _ => {}
             }
         }
@@ -1638,7 +1638,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
                     event: ExecutionEvent::ToolResult { result, .. },
                 } => tool_result = result,
                 SessionEventKind::TurnCompleted => completed = true,
-                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
                 _ => {}
             }
         }
@@ -1745,7 +1745,7 @@ fn f9_tool_call_from_an_unfinished_stream_never_runs() {
                         | ExecutionEvent::ToolDecision { .. }
                         | ExecutionEvent::ToolResult { .. },
                 } => tool_events += 1,
-                SessionEventKind::TurnFailed { message } => failure = Some(message),
+                SessionEventKind::TurnFailed { message, .. } => failure = Some(message),
                 SessionEventKind::TurnCompleted => panic!("an unfinished stream completed"),
                 _ => {}
             }
@@ -1845,7 +1845,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
                         requested = Some(call.id.clone());
                     }
                 }
-                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
                 _ => {}
             }
         }
@@ -1886,7 +1886,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
                     _ => {}
                 },
                 SessionEventKind::TurnCompleted => completed = true,
-                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
                 _ => {}
             }
         }
@@ -2407,7 +2407,7 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
                     event: ExecutionEvent::ToolResult { result: r, .. },
                 } => result = Some(r),
                 SessionEventKind::TurnCompleted => completed = true,
-                SessionEventKind::TurnFailed { message } => panic!("turn failed: {message}"),
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
                 _ => {}
             }
         }
@@ -3080,6 +3080,7 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
     let mut after = 0;
     let mut started = None;
     let mut failure = None;
+    let mut reason = None;
     for _ in 0..100 {
         let batch = client
             .events(session.descriptor.id.clone(), after, 500)
@@ -3092,7 +3093,13 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
                     requested_limits,
                     ..
                 } => started = Some((limits, requested_limits)),
-                SessionEventKind::TurnFailed { message } => failure = Some(message),
+                SessionEventKind::TurnFailed {
+                    message,
+                    reason: failure_reason,
+                } => {
+                    failure = Some(message);
+                    reason = failure_reason;
+                }
                 SessionEventKind::TurnCompleted => panic!("the turn outran its limits"),
                 _ => {}
             }
@@ -3115,5 +3122,9 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
     assert!(
         failure.contains("exhausted its budget of 1 provider requests"),
         "{failure}"
+    );
+    assert_eq!(
+        reason,
+        Some(xshell_session::TurnFailureReason::BudgetExhausted)
     );
 }
