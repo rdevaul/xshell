@@ -70,6 +70,8 @@ control commands:
   //model           show the active model profile
   //model list      list configured model profiles
   //model NAME      switch profiles and start a fresh conversation
+  //limits          show the turn limits that apply and the known profiles
+  //limits NAME     use the named limit profile for following turns
   //agent            show active agent capabilities
   //tools            show tools exposed to the active agent
   //view [OPTIONS] PATH
@@ -101,6 +103,7 @@ control commands:
             eprintln!("xshell: unknown control command //{name}; try //help")
         }
         ControlCommand::Model(_) => unreachable!("model is handled by the REPL"),
+        ControlCommand::Limits(_) => unreachable!("limits is handled by the REPL"),
         ControlCommand::View(_) => unreachable!("view is handled by the REPL"),
         ControlCommand::Connect(_)
         | ControlCommand::Sessions

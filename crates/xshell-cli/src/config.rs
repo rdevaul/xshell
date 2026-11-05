@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use xshell_audit::AuditConfig;
+use xshell_execution::{LimitSettings, TurnLimits};
 use xshell_release::ReleaseSource;
 use xshell_session::{ModelBinding, SessionConfig};
 pub use xshell_view::{OutputMode, RenderingConfig};
@@ -38,6 +39,22 @@ pub struct ModelProfile {
     /// set. Defaults to `DEFAULT_RESERVE_OUTPUT_TOKENS`.
     #[serde(default)]
     pub reserve_output_tokens: Option<usize>,
+    /// Limit profile for turns with this model, unless the command line or
+    /// `//limits` chose one.
+    #[serde(default)]
+    pub limits: Option<String>,
+}
+
+/// Turn limits: which profile applies when nothing else chooses one, and
+/// the profiles themselves. `default` and `relaxed` are built in; a table
+/// with either name overrides individual limits of the built-in, and a
+/// table with another name defines a profile that starts from `default`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    pub limits: Option<String>,
+    #[serde(default)]
+    pub limit_profiles: BTreeMap<String, LimitSettings>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -53,6 +70,8 @@ pub struct XshellConfig {
     pub remote_bootstrap: Option<ReleaseSource>,
     #[serde(default)]
     pub session_fabric: SessionConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     #[serde(default)]
     pub models: BTreeMap<String, ModelProfile>,
 }
@@ -143,6 +162,9 @@ impl XshellConfig {
                 .validate()
                 .with_context(|| format!("invalid configuration file {}", path.display()))?;
         }
+        config
+            .validate_limits()
+            .with_context(|| format!("invalid configuration file {}", path.display()))?;
         Ok((config, path))
     }
 
@@ -211,6 +233,75 @@ impl XshellConfig {
             context_tokens: profile.context_tokens,
             reserve_output_tokens: profile.reserve_output_tokens,
         })
+    }
+
+    /// The limits of the named profile.
+    pub fn limit_profile(&self, name: &str) -> Result<TurnLimits> {
+        let profiles = &self.agent.limit_profiles;
+        let default = match profiles.get("default") {
+            Some(settings) => settings
+                .apply_to(TurnLimits::default())
+                .context("in limit profile \"default\"")?,
+            None => TurnLimits::default(),
+        };
+        if name == "default" {
+            return Ok(default);
+        }
+        let builtin = TurnLimits::builtin(name);
+        match (profiles.get(name), builtin) {
+            (Some(settings), base) => settings
+                .apply_to(base.unwrap_or(default))
+                .with_context(|| format!("in limit profile {name:?}")),
+            (None, Some(limits)) => Ok(limits),
+            (None, None) => bail!(
+                "unknown limit profile {name:?}; known profiles: {}",
+                self.limit_profile_names().join(", ")
+            ),
+        }
+    }
+
+    /// Every profile name: the built-in ones, then the configured ones.
+    pub fn limit_profile_names(&self) -> Vec<String> {
+        let mut names = vec!["default".to_owned(), "relaxed".to_owned()];
+        for name in self.agent.limit_profiles.keys() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    /// The limit profile for a turn: an explicit choice (the command line or
+    /// `//limits`), else the active model profile's, else `agent.limits`,
+    /// else `default`.
+    pub fn limits_name_for(&self, explicit: Option<&str>, active: &ActiveModel) -> String {
+        explicit
+            .map(str::to_owned)
+            .or_else(|| {
+                active
+                    .profile_name
+                    .as_deref()
+                    .and_then(|name| self.models.get(name))
+                    .and_then(|profile| profile.limits.clone())
+            })
+            .or_else(|| self.agent.limits.clone())
+            .unwrap_or_else(|| "default".into())
+    }
+
+    fn validate_limits(&self) -> Result<()> {
+        for name in self.limit_profile_names() {
+            self.limit_profile(&name)?;
+        }
+        if let Some(name) = &self.agent.limits {
+            self.limit_profile(name).context("in agent.limits")?;
+        }
+        for (model, profile) in &self.models {
+            if let Some(name) = &profile.limits {
+                self.limit_profile(name)
+                    .with_context(|| format!("in model profile {model:?}"))?;
+            }
+        }
+        Ok(())
     }
 
     fn profile(&self, name: &str) -> Result<&ModelProfile> {
@@ -468,5 +559,143 @@ api_key_env = "OPENROUTER_API_KEY"
             .to_string();
         assert!(error.contains("environment variable name"));
         assert!(!error.contains(secret));
+    }
+
+    fn limits_config(source: &str) -> XshellConfig {
+        toml::from_str(source).unwrap()
+    }
+
+    #[test]
+    fn builtin_limit_profiles_need_no_configuration() {
+        let config = XshellConfig::default();
+        assert_eq!(
+            config.limit_profile("default").unwrap(),
+            TurnLimits::default()
+        );
+        assert_eq!(
+            config.limit_profile("relaxed").unwrap(),
+            TurnLimits::relaxed()
+        );
+        let error = config.limit_profile("huge").unwrap_err().to_string();
+        assert!(
+            error.contains("known profiles: default, relaxed"),
+            "{error}"
+        );
+        config.validate_limits().unwrap();
+    }
+
+    #[test]
+    fn configured_profiles_override_builtins_and_start_new_ones_from_default() {
+        let config = limits_config(
+            r#"
+[agent.limit_profiles.default]
+tool_calls = 300
+
+[agent.limit_profiles.relaxed]
+wall_time = "12h"
+
+[agent.limit_profiles.render]
+shell_timeout = "45m"
+"#,
+        );
+        config.validate_limits().unwrap();
+        assert_eq!(config.limit_profile("default").unwrap().tool_calls, 300);
+        let relaxed = config.limit_profile("relaxed").unwrap();
+        assert_eq!(relaxed.wall_time, std::time::Duration::from_secs(12 * 3600));
+        assert_eq!(relaxed.tool_calls, TurnLimits::relaxed().tool_calls);
+        // A new profile starts from the configured default.
+        let render = config.limit_profile("render").unwrap();
+        assert_eq!(render.tool_calls, 300);
+        assert_eq!(
+            render.shell_timeout,
+            std::time::Duration::from_secs(45 * 60)
+        );
+        assert_eq!(
+            config.limit_profile_names(),
+            ["default", "relaxed", "render"]
+        );
+    }
+
+    #[test]
+    fn limit_profile_selection_prefers_explicit_then_model_then_agent_default() {
+        let config = limits_config(
+            r#"
+[agent]
+limits = "relaxed"
+
+[agent.limit_profiles.render]
+shell_timeout = "45m"
+
+[models.cad]
+provider = "ollama"
+model = "m"
+limits = "render"
+
+[models.chat]
+provider = "ollama"
+model = "m"
+"#,
+        );
+        config.validate_limits().unwrap();
+        let cad = config.resolve_profile("cad").unwrap();
+        let chat = config.resolve_profile("chat").unwrap();
+        assert_eq!(config.limits_name_for(Some("default"), &cad), "default");
+        assert_eq!(config.limits_name_for(None, &cad), "render");
+        assert_eq!(config.limits_name_for(None, &chat), "relaxed");
+        assert_eq!(
+            XshellConfig::default().limits_name_for(None, &chat),
+            "default"
+        );
+    }
+
+    #[test]
+    fn invalid_limit_configuration_is_rejected_at_load() {
+        for source in [
+            "[agent]\nlimits = \"missing\"\n",
+            "[agent.limit_profiles.default]\ntool_calls = 0\n",
+            "[agent.limit_profiles.relaxed]\nwall_time = \"forever\"\n",
+            "[models.m]\nprovider = \"ollama\"\nmodel = \"m\"\nlimits = \"missing\"\n",
+        ] {
+            let rejected = toml::from_str::<XshellConfig>(source)
+                .map_err(anyhow::Error::from)
+                .and_then(|config| config.validate_limits());
+            assert!(rejected.is_err(), "accepted: {source}");
+        }
+    }
+
+    #[test]
+    fn the_example_configuration_loads_with_its_limit_examples_enabled() {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml"),
+        )
+        .unwrap();
+        let shipped: XshellConfig = toml::from_str(&source).unwrap();
+        shipped.validate_limits().unwrap();
+
+        // Uncomment the limit examples, as a user following them would.
+        let enabled: String = source
+            .lines()
+            .map(|line| {
+                let uncommented = line.strip_prefix("# ").unwrap_or(line);
+                let is_limits_example = uncommented.starts_with("[agent")
+                    || uncommented.starts_with("[session_fabric.max_limits]")
+                    || uncommented.starts_with("limits = ")
+                    || uncommented.starts_with("wall_time = ")
+                    || uncommented.starts_with("shell_timeout = ")
+                    || uncommented.starts_with("tool_calls = ");
+                if is_limits_example { uncommented } else { line }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: XshellConfig = toml::from_str(&enabled).unwrap();
+        config.validate_limits().unwrap();
+        assert_eq!(config.agent.limits.as_deref(), Some("default"));
+        assert_eq!(
+            config.limit_profile("cad-render").unwrap().shell_timeout,
+            std::time::Duration::from_secs(45 * 60)
+        );
+        let ceiling = config.session_fabric.limit_ceiling().unwrap();
+        assert_eq!(ceiling.wall_time, std::time::Duration::from_secs(4 * 3600));
+        assert_eq!(ceiling.tool_calls, 2000);
     }
 }

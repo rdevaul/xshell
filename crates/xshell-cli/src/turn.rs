@@ -66,12 +66,20 @@ pub(crate) fn follow_daemon_turn(
                 SessionEventKind::TurnStarted {
                     approval,
                     requested_approval,
+                    limits,
+                    requested_limits,
                     ..
                 } => {
                     if let Some(requested) = requested_approval {
                         eprintln!(
                             "xshell: session host limits approval to \"{approval}\"; \
 requested \"{requested}\" was not applied"
+                        );
+                    }
+                    if let (Some(applied), Some(_)) = (limits, requested_limits) {
+                        eprintln!(
+                            "xshell: session host lowered this turn's limits to its ceiling: {}",
+                            applied.summary()
                         );
                     }
                 }
@@ -598,8 +606,10 @@ pub(crate) fn turn_policy_for(
     base: &TurnPolicy,
     session_default: &xshell_execution::CompactionConfig,
     active: &ActiveModel,
+    limits: xshell_execution::TurnLimits,
 ) -> TurnPolicy {
     base.clone()
+        .with_limits(limits)
         .with_compaction(&session_default.for_model(xshell_execution::ModelBudget {
             max_history_bytes: active.max_history_bytes,
             context_tokens: active.context_tokens,

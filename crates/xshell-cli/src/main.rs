@@ -68,6 +68,13 @@ struct Args {
 
     #[arg(
         long,
+        env = "XSHELL_LIMITS",
+        help = "Turn limit profile: default, relaxed, or one defined under [agent.limit_profiles]"
+    )]
+    limits: Option<String>,
+
+    #[arg(
+        long,
         env = "XSHELL_APPROVAL",
         value_enum,
         default_value = "ask",
@@ -117,6 +124,12 @@ async fn main() -> Result<()> {
             api_key_env: args.api_key_env.clone(),
         },
     )?;
+    // An explicit profile choice outlives `//model` switches; without one, the
+    // active model profile's choice (or `agent.limits`) applies.
+    let mut explicit_limits = args.limits.clone();
+    if let Some(name) = &explicit_limits {
+        model_config.limit_profile(name)?;
+    }
     let mut cwd = xshell_execution::validate_working_directory(&args.cwd)
         .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
     let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
@@ -376,11 +389,14 @@ async fn main() -> Result<()> {
                         }
                         continue;
                     }
+                    // `$` commands are bounded by their own timeout, not
+                    // the agent turn limits.
                     let result = sessions.submit(
                         TurnInput::Shell {
                             command: command.clone(),
                         },
                         args.approval,
+                        xshell_execution::TurnLimits::default(),
                     );
                     if let Err(error) = result.and_then(|_| {
                         resume_active_session(
@@ -637,6 +653,38 @@ async fn main() -> Result<()> {
                     eprintln!("xshell: {error:#}");
                 }
             }
+            InputRoute::Control(ControlCommand::Limits(limits_args)) => {
+                match limits_args.as_slice() {
+                    [] => {}
+                    [name] => match model_config.limit_profile(name) {
+                        Ok(_) => explicit_limits = Some(name.clone()),
+                        Err(error) => {
+                            eprintln!("xshell: {error:#}");
+                            continue;
+                        }
+                    },
+                    _ => {
+                        eprintln!("xshell: usage: //limits [PROFILE]");
+                        continue;
+                    }
+                }
+                match current_limits(&model_config, explicit_limits.as_deref(), &active_model) {
+                    Ok((name, limits)) => {
+                        println!("limits: {name} — {}", limits.summary());
+                        println!(
+                            "profiles: {}",
+                            model_config.limit_profile_names().join(", ")
+                        );
+                        if sessions.enabled() {
+                            println!(
+                                "the session host may lower these to its own ceiling \
+(session_fabric.max_limits)"
+                            );
+                        }
+                    }
+                    Err(error) => eprintln!("xshell: {error:#}"),
+                }
+            }
             InputRoute::Control(ControlCommand::View(view_args)) => {
                 if let Err(error) = handle_view(
                     &view_args,
@@ -660,12 +708,24 @@ async fn main() -> Result<()> {
                 args.approval,
             ),
             InputRoute::Agent(message) => {
+                let limits = match current_limits(
+                    &model_config,
+                    explicit_limits.as_deref(),
+                    &active_model,
+                ) {
+                    Ok((_, limits)) => limits,
+                    Err(error) => {
+                        eprintln!("xshell: {error:#}");
+                        continue;
+                    }
+                };
                 if sessions.enabled() {
                     let result = sessions.submit(
                         TurnInput::Agent {
                             message: message.clone(),
                         },
                         args.approval,
+                        limits,
                     );
                     if let Err(error) = result.and_then(|_| {
                         resume_active_session(
@@ -692,6 +752,7 @@ async fn main() -> Result<()> {
                     &base_policy,
                     &model_config.session_fabric.compaction,
                     &active_model,
+                    limits,
                 );
                 if let Err(error) = run_agent_turn(
                     agent.as_mut(),
@@ -721,6 +782,17 @@ async fn main() -> Result<()> {
 
     sessions.sync(&active_model, &cwd, &history)?;
     audit.close(exit_reason)
+}
+
+/// The limit profile that applies to the next turn, and its limits.
+fn current_limits(
+    config: &XshellConfig,
+    explicit: Option<&str>,
+    active: &config::ActiveModel,
+) -> Result<(String, xshell_execution::TurnLimits)> {
+    let name = config.limits_name_for(explicit, active);
+    let limits = config.limit_profile(&name)?;
+    Ok((name, limits))
 }
 
 /// Warn when the configured PTY escape prefix takes over a terminal function.

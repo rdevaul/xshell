@@ -14,7 +14,7 @@ use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
     AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, CompactionConfig,
-    ExecutionEvent, GateReason, ModelBudget, SensitivePaths, TurnObserver, TurnPolicy,
+    ExecutionEvent, GateReason, ModelBudget, SensitivePaths, TurnLimits, TurnObserver, TurnPolicy,
     build_adapter, run_agent_turn, run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
@@ -35,6 +35,7 @@ struct CoordinatorInner {
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
     audit: DaemonAudit,
     max_approval: ApprovalPolicy,
+    max_limits: TurnLimits,
     sensitive_paths: SensitivePaths,
     compaction: CompactionConfig,
 }
@@ -70,6 +71,7 @@ impl ExecutionCoordinator {
             registry,
             DaemonAudit::default(),
             ApprovalPolicy::Ask,
+            TurnLimits::relaxed(),
             SensitivePaths::default(),
             CompactionConfig::default(),
         )
@@ -79,6 +81,7 @@ impl ExecutionCoordinator {
         registry: Arc<Mutex<SessionRegistry>>,
         audit: DaemonAudit,
         max_approval: ApprovalPolicy,
+        max_limits: TurnLimits,
         sensitive_paths: SensitivePaths,
         compaction: CompactionConfig,
     ) -> Self {
@@ -90,6 +93,7 @@ impl ExecutionCoordinator {
                 workers: Mutex::new(Vec::new()),
                 audit,
                 max_approval,
+                max_limits,
                 sensitive_paths,
                 compaction,
             }),
@@ -98,6 +102,10 @@ impl ExecutionCoordinator {
 
     pub fn max_approval(&self) -> ApprovalPolicy {
         self.inner.max_approval
+    }
+
+    pub fn max_limits(&self) -> TurnLimits {
+        self.inner.max_limits
     }
 
     pub fn audit(&self) -> &DaemonAudit {
@@ -130,6 +138,7 @@ impl ExecutionCoordinator {
         session_id: &str,
         input: TurnInput,
         requested_approval: ApprovalPolicy,
+        requested_limits: Option<TurnLimits>,
     ) -> Result<String> {
         if !*self.inner.admission.lock_recover() {
             bail!("session execution is shutting down");
@@ -139,6 +148,10 @@ impl ExecutionCoordinator {
         // execution it permits. A client may ask for less, never more.
         let approval = requested_approval.clamp_to(self.inner.max_approval);
         let requested_approval = (approval != requested_approval).then_some(requested_approval);
+        // Limits work the same way: each one is lowered to the daemon's.
+        let requested_limits = requested_limits.unwrap_or_default();
+        let (limits, lowered) = requested_limits.clamp_to(self.inner.max_limits);
+        let requested_limits = lowered.then_some(requested_limits);
         let snapshot = self.inner.registry.lock_recover().snapshot(session_id)?;
         let execution = self.session(session_id);
         let turn_id = Uuid::new_v4().to_string();
@@ -185,6 +198,9 @@ impl ExecutionCoordinator {
                 input: input.clone(),
                 approval,
                 requested_approval,
+                limits: matches!(input, TurnInput::Agent { .. }).then_some(limits),
+                requested_limits: requested_limits
+                    .filter(|_| matches!(input, TurnInput::Agent { .. })),
             },
         );
 
@@ -209,6 +225,7 @@ impl ExecutionCoordinator {
                     spawned_turn_id,
                     input,
                     approval,
+                    limits,
                     snapshot,
                     cancellation,
                     audit,
@@ -387,6 +404,7 @@ impl ExecutionCoordinator {
         turn_id: String,
         input: TurnInput,
         approval: ApprovalPolicy,
+        limits: TurnLimits,
         mut snapshot: crate::SessionSnapshot,
         cancellation: CancellationFlag,
         audit: SessionAuditHandle,
@@ -425,6 +443,7 @@ impl ExecutionCoordinator {
                         api_key_env: model.api_key_env.clone(),
                     })?;
                     let policy = TurnPolicy::new(approval)
+                        .with_limits(limits)
                         .with_sensitive_paths(self.inner.sensitive_paths.clone())
                         .with_compaction(&self.inner.compaction.for_model(ModelBudget {
                             max_history_bytes: model.max_history_bytes,

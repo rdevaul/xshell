@@ -228,6 +228,12 @@ Step 2 implements this as `TurnLimits` (on `TurnPolicy`) and `TurnBudget`
 | `tool_calls` | 256 | Every evaluated call: approved, denied, or refused by toolset | This and the remaining calls in the response are answered with a refusal; turn fails |
 | `tool_calls_per_response` | 64 | Calls in one response | Calls past the limit are refused; the turn continues so the model can resend |
 | `wall_time` | 60 min | Elapsed time since the root turn started | Checked before every request and call, and enforced during provider requests; a running tool is bounded by its own timeout |
+| `shell_timeout` | 60 s | One `run_shell` call | The command's process group is killed and the call reports the timeout |
+| `auto_continues` | 2 | Automatic continuations per agent | The turn ends with the response it has |
+
+The defaults are the built-in `default` profile; limit profiles are
+configurable, and the daemon clamps them to its `max_limits`
+([session fabric](session-fabric.md#turn-budget)).
 
 Exhaustion fails the turn with a typed `BudgetExhausted` error and follows the
 usual failure rules: rolled back if no tool ran, otherwise kept with an

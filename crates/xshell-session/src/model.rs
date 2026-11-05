@@ -10,7 +10,7 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `reasoning` and `finish_reason` fields on `ExecutionEvent::AgentResponse`.
 // Version 14 adds the `delegate_task` subagent events (`SubagentStarted`,
 // `Subagent`, `SubagentFinished`).
-pub const SESSION_PROTOCOL_VERSION: u32 = 14;
+pub const SESSION_PROTOCOL_VERSION: u32 = 15;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +70,10 @@ pub struct SessionConfig {
     /// before provider requests and after completed turns. A model profile's
     /// own `max_history_bytes` takes precedence. Omit to keep full history.
     pub compaction: xshell_execution::CompactionConfig,
+    /// The most generous turn limits this daemon applies, whatever a client
+    /// requests. Unset fields take the built-in `relaxed` profile's values,
+    /// so clients can choose `relaxed` unless the operator lowers this.
+    pub max_limits: xshell_execution::LimitSettings,
 }
 
 impl SessionConfig {
@@ -78,6 +82,14 @@ impl SessionConfig {
             None => xshell_execution::SensitivePaths::default(),
             Some(patterns) => xshell_execution::SensitivePaths::new(patterns.iter().cloned()),
         }
+    }
+
+    /// The ceiling `max_limits` describes: the built-in `relaxed` profile
+    /// with the configured fields replaced.
+    pub fn limit_ceiling(&self) -> anyhow::Result<xshell_execution::TurnLimits> {
+        self.max_limits
+            .apply_to(xshell_execution::TurnLimits::relaxed())
+            .map_err(|error| error.context("in session_fabric.max_limits"))
     }
 }
 
@@ -94,6 +106,7 @@ impl Default for SessionConfig {
             max_approval: ApprovalPolicy::Ask,
             sensitive_paths: None,
             compaction: xshell_execution::CompactionConfig::default(),
+            max_limits: xshell_execution::LimitSettings::default(),
         }
     }
 }
@@ -322,6 +335,13 @@ pub enum SessionEventKind {
         /// The policy the client asked for, when it differed from `approval`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_approval: Option<ApprovalPolicy>,
+        /// The limits an agent turn runs under, after clamping to the
+        /// daemon's `max_limits`. Absent for `$` commands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limits: Option<xshell_execution::TurnLimits>,
+        /// The limits the client asked for, when clamping lowered them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_limits: Option<xshell_execution::TurnLimits>,
     },
     Execution {
         event: ExecutionEvent,

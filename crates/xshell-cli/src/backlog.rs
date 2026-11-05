@@ -316,6 +316,8 @@ mod tests {
                 },
                 approval: ApprovalPolicy::default(),
                 requested_approval: None,
+                limits: None,
+                requested_limits: None,
             },
         )
     }
