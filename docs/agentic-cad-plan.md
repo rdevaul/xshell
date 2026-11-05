@@ -403,9 +403,11 @@ Making shell access safe beyond that is a separate design topic (§8).
 
 ### 5.3 Tasks and estimates
 
-**Status:** C1, C2, C4, and C5 are implemented (`xshell run`, `--detach`,
-`wait`, `status`, `result`, `cancel`; see [headless runs](headless.md)).
-Progress events, deferred from B, remain for the schema. C3 is next.
+**Status:** C1–C5 are implemented: `xshell run`, `--detach`, `wait`,
+`status`, `result`, `cancel`, the approval policy with client overlays and
+sensitivity classes, and the approval channel (see [headless runs](headless.md)
+and [approval policy](session-fabric.md#approval-policy)). Progress events,
+deferred from B, remain for the schema.
 
 | ID | Task | Days |
 |---|---|---|

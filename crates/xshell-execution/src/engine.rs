@@ -3,8 +3,9 @@ use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
 use crate::tools::{execute_prepared, gate, prepare_call, truncate};
 use crate::{
-    CompactionConfig, CompactionReport, Compactor, GateReason, SensitivePaths, Tool, ToolSet,
-    drop_tool_payloads, estimate_history_tokens, history_bytes,
+    ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, GateReason,
+    PolicyDecision, SensitivePaths, Tool, ToolSet, default_decision, drop_tool_payloads,
+    estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -280,6 +281,10 @@ fn resolve_api_key(config: &AdapterConfig) -> Result<Option<String>> {
 pub struct TurnPolicy {
     pub approval: ApprovalPolicy,
     pub sensitive_paths: SensitivePaths,
+    /// Paths agent tools may never read, whatever the policy says.
+    pub blocked_paths: SensitivePaths,
+    /// The approval policy combined with `approval` for every call.
+    pub rules: ApprovalRules,
     /// Applied before every provider request (staged on a copy and committed
     /// once the provider accepts) and after a turn completes. Failed and
     /// cancelled turns restore the pre-turn history.
@@ -301,6 +306,8 @@ impl std::fmt::Debug for TurnPolicy {
         f.debug_struct("TurnPolicy")
             .field("approval", &self.approval)
             .field("sensitive_paths", &self.sensitive_paths)
+            .field("blocked_paths", &self.blocked_paths)
+            .field("rules", &self.rules)
             .field("compactor", &self.compactor.name())
             .field("tools", &self.tools)
             .field("agent_scope", &self.agent_scope)
@@ -314,6 +321,8 @@ impl Clone for TurnPolicy {
         Self {
             approval: self.approval,
             sensitive_paths: self.sensitive_paths.clone(),
+            blocked_paths: self.blocked_paths.clone(),
+            rules: self.rules.clone(),
             compactor: Arc::clone(&self.compactor),
             tools: self.tools,
             agent_scope: self.agent_scope.clone(),
@@ -327,6 +336,8 @@ impl TurnPolicy {
         Self {
             approval,
             sensitive_paths: SensitivePaths::default(),
+            blocked_paths: SensitivePaths::none(),
+            rules: ApprovalRules::default(),
             compactor: Arc::from(CompactionConfig::default().build()),
             tools: ToolSet::all(),
             agent_scope: None,
@@ -346,6 +357,16 @@ impl TurnPolicy {
 
     pub fn with_limits(mut self, limits: TurnLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    pub fn with_rules(mut self, rules: ApprovalRules) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    pub fn with_blocked_paths(mut self, blocked_paths: SensitivePaths) -> Self {
+        self.blocked_paths = blocked_paths;
         self
     }
 
@@ -759,20 +780,37 @@ Start a new session with //new or lower max_history_bytes to continue.",
             // Read-only tools are prepared here: the object they will read is
             // opened and classified once, the decision below is about that
             // object, and execution reads from it (F5).
-            let preparation = prepare_call(call, cwd, &policy.sensitive_paths).await;
-            let decision = match gate(call, &preparation) {
-                None => ApprovalDecision::Approve,
-                Some(reason) => match approval {
-                    ApprovalPolicy::Auto => ApprovalDecision::Approve,
-                    ApprovalPolicy::Off => ApprovalDecision::Deny,
-                    ApprovalPolicy::Ask => {
-                        observer.emit(ExecutionEvent::ApprovalRequested {
-                            call: scoped.clone(),
-                            reason: Some(reason),
-                        });
-                        observer.approve(scoped, reason).await
-                    }
-                },
+            let preparation =
+                prepare_call(call, cwd, &policy.sensitive_paths, &policy.blocked_paths).await;
+            let gate_reason = gate(call, &preparation);
+            let facts = CallFacts {
+                tool: &call.name,
+                command: (tool == Tool::RunShell)
+                    .then(|| {
+                        call.arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .flatten(),
+                path: preparation.path(),
+                gated: gate_reason.is_some(),
+                sensitive: gate_reason == Some(GateReason::SensitivePath),
+            };
+            let policy_decision = policy.rules.decide(&facts, approval);
+            // A denial the approval mode alone would not have made.
+            let denied_by_policy = policy_decision == PolicyDecision::Deny
+                && default_decision(&facts, approval) != PolicyDecision::Deny;
+            let decision = match policy_decision {
+                PolicyDecision::Run => ApprovalDecision::Approve,
+                PolicyDecision::Deny => ApprovalDecision::Deny,
+                PolicyDecision::Prompt => {
+                    let reason = gate_reason.unwrap_or(GateReason::Policy);
+                    observer.emit(ExecutionEvent::ApprovalRequested {
+                        call: scoped.clone(),
+                        reason: Some(reason),
+                    });
+                    observer.approve(scoped, reason).await
+                }
             };
             observer.emit(ExecutionEvent::ToolDecision {
                 call_id: scoped.id.clone(),
@@ -815,7 +853,9 @@ Start a new session with //new or lower max_history_bytes to continue.",
             }
 
             let mut subagent_aborted = false;
-            let result = if decision != ApprovalDecision::Approve {
+            let result = if denied_by_policy {
+                "tool denied by the approval policy".into()
+            } else if decision != ApprovalDecision::Approve {
                 "tool denied by user".into()
             } else if tool == Tool::DelegateTask {
                 // A delegation counts as tool activity even if the subagent

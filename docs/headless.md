@@ -78,16 +78,51 @@ xshell cancel --session "$session"     # cancel and report (exit 4)
 
 ## Approvals
 
-A headless run has nobody at a terminal to answer an approval prompt.
+Each call's outcome combines the approval mode with the daemon's approval
+policy and, if given, the run's own (`--approval-policy FILE`); see
+[approval policy](session-fabric.md#approval-policy). A run's policy can only
+restrict the daemon's.
 
-| `--approval` | Gated calls (shell commands, sensitive reads) |
+| `--approval` | Calls the policy leaves to the mode (shell commands, sensitive reads) |
 |---|---|
 | `off` | Denied by the daemon |
-| `ask` (default) | Denied by the run, with an `approval_decided` event whose `source` is `no_approval_channel`; the model is told and the turn continues |
+| `ask` (default) | Prompted: answered by the approval channel if there is one, otherwise denied |
 | `auto` | Run, if the daemon's `max_approval` allows `auto`; otherwise lowered, with a warning |
 
-An approval policy file and an approval channel, for finer control, are
-planned ([agentic CAD plan](agentic-cad-plan.md), §5.2).
+**Approval channel.** `--approval-channel FD` (on `run` and `wait`) names a
+file descriptor, 3 or above, that the run reads decisions from. For each
+`approval_needed` event, write one line:
+
+```json
+{"call_id": "call_1", "decision": "approve"}
+```
+
+`decision` is `approve`, `deny`, or `abort` (deny and stop the turn). A reply
+for another call, an invalid line, or a closed channel denies the prompt;
+after the channel closes, later prompts are denied too. Every decision is
+reported in an `approval_decided` event whose `source` is `approval_channel`,
+`no_approval_channel`, `approval_channel_closed`, `approval_channel_invalid`,
+`approval_channel_mismatch`, or `interrupted`.
+
+```python
+import json, os, subprocess
+
+read_fd, write_fd = os.pipe()
+run = subprocess.Popen(
+    ["xshell", "run", "--output", "jsonl", "--approval-channel", str(read_fd),
+     "Export the bracket"],
+    stdout=subprocess.PIPE, text=True, pass_fds=(read_fd,),
+)
+os.close(read_fd)
+with os.fdopen(write_fd, "w") as channel:
+    for line in run.stdout:
+        event = json.loads(line)
+        if event["event"] == "approval_needed":
+            ok = event["name"] == "run_shell" and event["arguments"]["command"].startswith("yapcad ")
+            channel.write(json.dumps({"call_id": event["call_id"],
+                                      "decision": "approve" if ok else "deny"}) + "\n")
+            channel.flush()
+```
 
 ## Exit codes
 

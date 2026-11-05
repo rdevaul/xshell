@@ -81,10 +81,10 @@ daily-driver milestones, and the separate controlled-deployment acceptance gates
 | Sessions | Multiple named sessions per user and host; ephemeral, daemon-lifetime, and durable lifecycle modes; common switching for idle prompts, active agent turns, and interactive processes |
 | Network fabric | SSH-connected macOS and Linux hosts in the same session catalog; remote creation, switching, execution, completion, viewing, detach, and manual reconnect |
 | Detachment | Daemon-owned agent turns and interactive processes continue after controller disconnect; bounded event and terminal-output replay on return |
-| Headless runs | `xshell run` runs one agent turn for a script: text or versioned JSON Lines output, documented exit codes, cancellation on SIGINT/SIGTERM, and approval prompts denied when nobody can answer them ([headless runs](docs/headless.md)) |
+| Headless runs | `xshell run` runs one agent turn for a script: text or versioned JSON Lines output, documented exit codes, cancellation on SIGINT/SIGTERM, detached jobs with `wait`/`status`/`result`/`cancel`, and approvals decided by a policy file or an approval channel ([headless runs](docs/headless.md)) |
 | Models | Named profiles, live `//model` switching, per-session bindings, per-model history budgets, and environment-based credentials that are never printed or sent over the session protocol |
 | Viewing | Streamed terminal Markdown, tables, a safe reStructuredText subset, policy-driven pagination, and local rendering of text acquired from either local or remote sessions with `//view` |
-| Safety | Exact-command approval, remote-host approval ceilings, cwd-confined file tools, sensitive-path gating, execution time/output limits, and process-group cleanup |
+| Safety | Exact-command approval, a per-call approval policy (always allowed, allowed, denied) that clients can only tighten, blocked paths agent tools can never read, remote-host approval ceilings, cwd-confined file tools, sensitive-path gating, execution time/output limits, and process-group cleanup |
 | Audit | Separate append-only service, hash-chained JSONL, Ed25519-signed checkpoints, daemon-side execution events, and opt-in bounded byte-for-byte PTY stream capture |
 
 `//connect` can start or restart an already-installed remote daemon for you,

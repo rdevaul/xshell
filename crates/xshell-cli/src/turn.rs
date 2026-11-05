@@ -302,6 +302,7 @@ fn confirm_daemon_tool(
     let why = match reason {
         GateReason::ShellExecution => String::new(),
         GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
+        GateReason::Policy => " (the approval policy requires approval)".to_owned(),
     };
     print!(
         "Approve `{}`{why}? [y/N/q] ",
@@ -728,6 +729,7 @@ pub(crate) fn confirm_tool(call: &ToolCall, reason: GateReason) -> Result<Approv
         let why = match reason {
             GateReason::ShellExecution => String::new(),
             GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
+            GateReason::Policy => " (the approval policy requires approval)".to_owned(),
         };
         print!(
             "Approve `{}`{why}? [y/N/q] ",

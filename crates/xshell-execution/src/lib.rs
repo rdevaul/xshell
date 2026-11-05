@@ -2,6 +2,7 @@ mod budget;
 mod call_id;
 mod compaction;
 mod engine;
+mod policy;
 mod prepared;
 mod process;
 mod sensitive;
@@ -20,6 +21,9 @@ pub use engine::{
     ExecutionEvent, TurnObserver, TurnPolicy, build_adapter, captured_cd_destination,
     run_agent_turn, run_agent_turn_with_budget, run_direct_shell, run_direct_shell_streaming,
     run_direct_shell_streaming_cancellable, validate_working_directory,
+};
+pub use policy::{
+    ApprovalRules, CallFacts, Policy, PolicyConfig, PolicyDecision, default_decision,
 };
 pub use sensitive::{DEFAULT_SENSITIVE_PATTERNS, SensitivePaths};
 pub use tools::{

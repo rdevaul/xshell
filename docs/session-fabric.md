@@ -52,6 +52,55 @@ matters once a controller on one host submits turns to `xshelld` on another:
 the remote operator's configuration, not the controller's flag, decides
 whether shell tools may run without a prompt there.
 
+## Approval policy
+
+`[session_fabric.approval_policy]` decides, call by call, which agent tool
+calls run, which need a human decision, and which are refused. It has three
+optional lists:
+
+```toml
+[session_fabric.approval_policy]
+always_allowed = ["read_file", "list_directory", "run_shell: yapcad export *"]
+allowed        = ["run_shell: yapcad *", "run_shell: f3d *", "run_shell: git status"]
+denied         = ["run_shell: rm *", "run_shell: git push *"]
+```
+
+An entry names a tool, `run_shell` with a pattern matched word for word
+against the command's parsed arguments (`*` matches within a word, and a final
+`*` matches any remaining words), or `read_file` or `list_directory` with a
+path pattern (matched as sensitive paths are). Each call is decided by the
+first rule that matches:
+
+| The call | `off` | `ask` | `auto` |
+|---|---|---|---|
+| matches `denied` | deny | deny | deny |
+| matches no list while an `allowed` list exists | deny | deny | deny |
+| matches `always_allowed` | deny | run | run |
+| matches `allowed` | deny | prompt | run |
+| is unlisted, with no `allowed` list | default | default | default |
+
+- **Default:** the behaviour without a policy. Read-only calls on
+  non-sensitive paths run; shell commands and sensitive reads are denied,
+  prompted, or run by mode.
+- **Denied wins:** a `denied` entry overrides an `always_allowed` or `allowed`
+  entry it covers, and xshelld reports each override when it starts.
+- **Compound commands:** allow patterns never match a command with a
+  pipeline, `;`, `&&`, a substitution, or a redirection; only a bare
+  `run_shell` entry does. Deny patterns are also checked against each part of
+  such a command, so chaining cannot get around a denial. A pattern that
+  allows an interpreter or a script (`python *`, `./build.sh`) allows
+  whatever that program does.
+- **Literal words:** patterns match the command as written, so
+  `run_shell: rm *` does not match `/bin/rm` or `command rm`. Prefer an
+  `allowed` list, which denies everything unlisted, over a `denied` list
+  when the goal is to keep a command from running.
+- **Client policies:** a client may send its own policy with a turn
+  (`xshell --approval-policy FILE`). Each policy decides the call and the
+  stricter decision wins, so a client can only restrict: its
+  `always_allowed` runs a call without a prompt only where the daemon's
+  policy would too. A client policy is silent about calls it does not list.
+- **Subagents** are decided by the same policy.
+
 ## Sensitive-path policy
 
 `session_fabric.sensitive_paths` lists glob patterns for files an agent must
@@ -68,6 +117,26 @@ anchors a pattern to the filesystem root. A match is reported through `approval_
 `reason = "sensitive_path"` (shell tools report `"shell_execution"`) and then
 follows the turn's approval policy exactly like a shell tool. Omitting the key
 selects the built-in defaults; an empty list disables the check.
+
+Sensitivity classes extend this. Each `[[session_fabric.sensitivity]]` table
+has an `action` and `patterns`:
+
+```toml
+[[session_fabric.sensitivity]]
+action = "prompt"    # added to sensitive_paths
+patterns = ["secrets/**"]
+
+[[session_fabric.sensitivity]]
+action = "block"     # agent read tools can never read these
+patterns = ["*.pem", "*.key", "*.p12", "id_rsa", "id_ed25519"]
+```
+
+A `prompt` path stays gated even when the approval policy always allows its
+tool, unless the daemon's own policy names the path (`read_file:
+config/.env`); a client policy never can. A `block` path is refused to
+`read_file` and `list_directory` in every mode, whatever either policy says.
+Sensitivity governs the agent's read tools; a shell command that reads such a
+file is governed by the policy's `run_shell` rules.
 
 ## History compaction
 

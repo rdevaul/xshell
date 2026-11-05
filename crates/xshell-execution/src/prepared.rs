@@ -65,7 +65,6 @@ pub(crate) struct PreparedObject {
 
 impl PreparedObject {
     /// The canonical absolute path the walk resolved.
-    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

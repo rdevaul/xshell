@@ -460,23 +460,26 @@ impl SessionClient {
         input: TurnInput,
         approval: ApprovalPolicy,
     ) -> Result<String> {
-        self.submit_with_limits(session_id, input, approval, None)
+        self.submit_with_limits(session_id, input, approval, None, None)
     }
 
     /// Submit a turn asking for `limits`, which the daemon clamps to its
-    /// `max_limits`. `None` asks for the built-in default profile.
+    /// `max_limits` (`None` asks for the built-in default profile), with an
+    /// optional approval policy that can only restrict the daemon's.
     pub fn submit_with_limits(
         &mut self,
         session_id: String,
         input: TurnInput,
         approval: ApprovalPolicy,
         limits: Option<xshell_execution::TurnLimits>,
+        policy: Option<xshell_execution::PolicyConfig>,
     ) -> Result<String> {
         self.send(&ClientRequest::Submit {
             session_id,
             input,
             approval,
             limits,
+            policy,
         })?;
         match self.receive()? {
             ServerResponse::Accepted { turn_id } => Ok(turn_id),

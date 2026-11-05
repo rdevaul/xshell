@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use xshell_audit::AuditConfig;
-use xshell_execution::{LimitSettings, TurnLimits};
+use xshell_execution::{LimitSettings, Policy, PolicyConfig, TurnLimits};
 use xshell_release::ReleaseSource;
 use xshell_session::{ModelBinding, SessionConfig};
 pub use xshell_view::{OutputMode, RenderingConfig};
@@ -329,6 +329,19 @@ fn validate_api_key_env(value: String, profile_name: Option<&str>) -> Result<Str
         "invalid api_key_env{location}; expected an environment variable name such as \
 OPENROUTER_API_KEY, not an API key"
     )
+}
+
+/// Load an approval policy file: TOML with optional `always_allowed`,
+/// `allowed`, and `denied` lists. Returns the policy as written (to send to
+/// a session host), parsed, and warnings about overridden entries.
+pub fn load_policy_file(path: &Path) -> Result<(PolicyConfig, Policy, Vec<String>)> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read approval policy {}", path.display()))?;
+    let config: PolicyConfig = toml::from_str(&source)
+        .with_context(|| format!("invalid approval policy {}", path.display()))?;
+    let (policy, warnings) = Policy::parse(&config)
+        .with_context(|| format!("invalid approval policy {}", path.display()))?;
+    Ok((config, policy, warnings))
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
@@ -679,6 +692,13 @@ model = "m"
                 let uncommented = line.strip_prefix("# ").unwrap_or(line);
                 let is_limits_example = uncommented.starts_with("[agent")
                     || uncommented.starts_with("[session_fabric.max_limits]")
+                    || uncommented.starts_with("[session_fabric.approval_policy]")
+                    || uncommented.starts_with("[[session_fabric.sensitivity]]")
+                    || uncommented.starts_with("always_allowed = ")
+                    || uncommented.starts_with("allowed = ")
+                    || uncommented.starts_with("denied = ")
+                    || uncommented.starts_with("action = ")
+                    || uncommented.starts_with("patterns = ")
                     || uncommented.starts_with("limits = ")
                     || uncommented.starts_with("wall_time = ")
                     || uncommented.starts_with("shell_timeout = ")
@@ -697,5 +717,13 @@ model = "m"
         let ceiling = config.session_fabric.limit_ceiling().unwrap();
         assert_eq!(ceiling.wall_time, std::time::Duration::from_secs(4 * 3600));
         assert_eq!(ceiling.tool_calls, 2000);
+        let (_, warnings) = config.session_fabric.approval_policy().unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            config
+                .session_fabric
+                .blocked_paths()
+                .matches(Path::new("/home/user/keys/server.pem"))
+        );
     }
 }

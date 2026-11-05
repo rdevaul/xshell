@@ -3074,6 +3074,7 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
             },
             ApprovalPolicy::Ask,
             Some(requested),
+            None,
         )
         .unwrap();
 

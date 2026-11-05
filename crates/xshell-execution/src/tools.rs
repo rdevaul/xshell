@@ -209,6 +209,8 @@ pub enum GateReason {
     ShellExecution,
     /// The tool would read or list a path matching the sensitive-path policy.
     SensitivePath,
+    /// The approval policy lists the call as needing approval.
+    Policy,
 }
 
 impl std::fmt::Display for GateReason {
@@ -216,6 +218,7 @@ impl std::fmt::Display for GateReason {
         f.write_str(match self {
             Self::ShellExecution => "shell execution",
             Self::SensitivePath => "sensitive path",
+            Self::Policy => "approval policy",
         })
     }
 }
@@ -263,6 +266,7 @@ pub(crate) async fn prepare_call(
     call: &ToolCall,
     root: &Path,
     sensitive: &SensitivePaths,
+    blocked: &SensitivePaths,
 ) -> Preparation {
     let (path, kind) = match read_request(call) {
         Some(Ok(request)) => request,
@@ -272,8 +276,23 @@ pub(crate) async fn prepare_call(
     let root = root.to_owned();
     let sensitive = sensitive.clone();
     match run_blocking(move || prepared::prepare(&root, &path, kind, &sensitive)).await {
+        // A blocked path is never read, whatever the approval policy says.
+        Ok(object) if blocked.matches(object.path()) => Preparation::Failed(format!(
+            "tool error: {} is blocked by the session host's policy",
+            object.path().display()
+        )),
         Ok(object) => Preparation::Read(object),
         Err(error) => Preparation::Failed(format!("tool error: {error:#}")),
+    }
+}
+
+impl Preparation {
+    /// The canonical path a read-only tool opened.
+    pub(crate) fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Read(object) => Some(object.path()),
+            _ => None,
+        }
     }
 }
 
@@ -351,7 +370,8 @@ pub(crate) async fn execute_tool_cancellable(
     root: &Path,
     cancellation: CancellationFlag,
 ) -> String {
-    let preparation = prepare_call(call, root, &SensitivePaths::none()).await;
+    let preparation =
+        prepare_call(call, root, &SensitivePaths::none(), &SensitivePaths::none()).await;
     execute_prepared(
         call,
         preparation,
