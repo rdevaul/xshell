@@ -3013,3 +3013,107 @@ fn f6_a_hung_audit_peer_cannot_freeze_other_sessions_control_or_shutdown() {
     // One deadline for the open session's final record, plus slack.
     assert!(started.elapsed() < Duration::from_secs(8));
 }
+
+#[test]
+fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
+    let temporary = TempDir::new().unwrap();
+    // One response that asks for a read-only tool; a second provider request
+    // would be needed to finish, and the requested limits allow only one.
+    let (base_url, _model_server) = serve_sse(vec![sse_tool_call(
+        "call_1",
+        "list_directory",
+        serde_json::json!({"path": "."}),
+    )]);
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[session_fabric.max_limits]\ntool_calls = 3\nwall_time = \"10m\"\n",
+    )
+    .unwrap();
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .args(["--config", config_path.to_str().unwrap()])
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "limited".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+                max_history_bytes: None,
+                context_tokens: None,
+                reserve_output_tokens: None,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    let requested = xshell_execution::TurnLimits {
+        provider_requests: 1,
+        ..xshell_execution::TurnLimits::relaxed()
+    };
+    client
+        .submit_with_limits(
+            session.descriptor.id.clone(),
+            TurnInput::Agent {
+                message: "look around".into(),
+            },
+            ApprovalPolicy::Ask,
+            Some(requested),
+        )
+        .unwrap();
+
+    let mut after = 0;
+    let mut started = None;
+    let mut failure = None;
+    for _ in 0..100 {
+        let batch = client
+            .events(session.descriptor.id.clone(), after, 500)
+            .unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::TurnStarted {
+                    limits,
+                    requested_limits,
+                    ..
+                } => started = Some((limits, requested_limits)),
+                SessionEventKind::TurnFailed { message } => failure = Some(message),
+                SessionEventKind::TurnCompleted => panic!("the turn outran its limits"),
+                _ => {}
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+
+    let (applied, reported_request) = started.expect("no TurnStarted event");
+    let applied = applied.expect("an agent turn reports its limits");
+    // Each limit is lowered to the ceiling independently.
+    assert_eq!(applied.provider_requests, 1);
+    assert_eq!(applied.tool_calls, 3);
+    assert_eq!(applied.wall_time, std::time::Duration::from_secs(600));
+    assert_eq!(applied.shell_timeout, requested.shell_timeout);
+    assert_eq!(reported_request, Some(requested));
+    // The turn ran under the requested provider-request limit.
+    let failure = failure.expect("the turn should exhaust its budget");
+    assert!(
+        failure.contains("exhausted its budget of 1 provider requests"),
+        "{failure}"
+    );
+}

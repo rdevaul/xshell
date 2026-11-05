@@ -40,6 +40,10 @@ pub enum ClientRequest {
         session_id: String,
         input: TurnInput,
         approval: ApprovalPolicy,
+        /// The limits the client asks for. The daemon clamps them to its
+        /// `max_limits`; absent means the built-in default profile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limits: Option<xshell_execution::TurnLimits>,
     },
     Events {
         session_id: String,
@@ -166,6 +170,7 @@ mod tests {
                 message: "hello".into(),
             },
             approval: ApprovalPolicy::Ask,
+            limits: None,
         };
         let encoded = serde_json::to_string(&request).unwrap();
         assert!(encoded.contains("\"request\":\"submit\""));

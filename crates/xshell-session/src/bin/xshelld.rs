@@ -147,10 +147,12 @@ fn main() -> Result<()> {
         user,
     )?));
     let audit = DaemonAudit::from_config(&audit_config)?;
+    let max_limits = config.limit_ceiling()?;
     let execution = ExecutionCoordinator::with_policy(
         Arc::clone(&registry),
         audit,
         config.max_approval,
+        max_limits,
         config.sensitive_paths(),
         config.compaction.clone(),
     );
@@ -170,6 +172,7 @@ fn main() -> Result<()> {
     );
     drop(identity);
     println!("max approval: {}", execution.max_approval());
+    println!("max limits: {}", execution.max_limits().summary());
     println!(
         "audit: {}",
         match (execution.audit().enabled(), execution.audit().required()) {
@@ -1022,12 +1025,13 @@ fn process_request(
             session_id,
             input,
             approval,
+            limits,
         } => {
             require_current(attached_session, &session_id)?;
             if ptys.has_session(&session_id) {
                 bail!("cannot start a turn while a PTY is active");
             }
-            let turn_id = execution.submit(&session_id, input, approval)?;
+            let turn_id = execution.submit(&session_id, input, approval, limits)?;
             Ok(ServerResponse::Accepted { turn_id })
         }
         ClientRequest::Events {

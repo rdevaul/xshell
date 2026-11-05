@@ -60,10 +60,32 @@ ack_timeout_ms = 5000
 # manifest_url = "https://github.com/rdevaul/xshell/releases/download/v{version}/xshell-release.json"
 # public_key = "RELEASE_ED25519_PUBLIC_KEY_HEX"
 
+# Turn limits. Every agent turn, with the subagents it starts, draws from one
+# budget. Two profiles are built in:
+#   default: 128 provider requests, 256 tool calls (64 per response), 1h wall
+#            time, 60s shell timeout, 2 automatic continuations
+#   relaxed: 2000 provider requests, 5000 tool calls (128 per response), 8h
+#            wall time, 30m shell timeout, 50 automatic continuations
+# Choose one with --limits NAME, //limits NAME, `limits = "NAME"` on a model
+# profile, or `limits` below (checked in that order). A table named after a
+# built-in profile overrides only the fields it sets; any other name defines a
+# new profile that starts from `default`. Durations take s, m, h, or d.
+# [agent]
+# limits = "default"
+#
+# [agent.limit_profiles.relaxed]
+# wall_time = "12h"
+#
+# [agent.limit_profiles.cad-render]
+# shell_timeout = "45m"
+# tool_calls = 1000
+
 [models.local-qwen]
 provider = "ollama"
 model = "qwen3:8b"
 base_url = "http://127.0.0.1:11434"
+# Limit profile for turns with this model, unless --limits or //limits chose one.
+# limits = "relaxed"
 # Per-model history budget (bytes of content + tool arguments). Size to the
 # model's context window; a small local model needs a much tighter budget than
 # a 200K-context cloud model. Overrides session_fabric.compaction. 0 = never
@@ -132,8 +154,7 @@ max_approval = "ask"
 # max_history_bytes is BYTES, not tokens. Roughly 3 bytes per token for code
 # and JSON; do not size it to the window itself - leave room for the reply and
 # for tool definitions. For a 262144-token model, 200000 is a safe default.
-# [session_fabric.compaction]
-# max_history_bytes = 200000
+# (the [session_fabric.compaction] table is at the end of this section)
 # Prefix for interactive-process commands: d detach, s switch, l last, n/p cycle,
 # q terminate, ? help, or repeat the prefix to send it literally.
 #
@@ -149,3 +170,15 @@ max_approval = "ask"
 # keys is a legitimate setup — but xshell warns at startup when you pick one.
 # Pressing the prefix twice always sends the literal byte through.
 pty_escape = "ctrl-]"
+
+# Sub-tables of [session_fabric] go after its plain keys.
+# [session_fabric.compaction]
+# max_history_bytes = 200000
+
+# The most generous turn limits this daemon applies, whatever a client asks for.
+# Unset fields take the built-in relaxed profile's values, so clients can use
+# `relaxed` unless you lower them here. A client asking for more is clamped
+# field by field and told so.
+# [session_fabric.max_limits]
+# wall_time = "4h"
+# tool_calls = 2000

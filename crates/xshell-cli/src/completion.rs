@@ -15,6 +15,7 @@ const CONTROL_COMMANDS: &[&str] = &[
     "//detach",
     "//help",
     "//history",
+    "//limits",
     "//model",
     "//new",
     "//quit",

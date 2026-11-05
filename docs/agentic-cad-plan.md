@@ -174,30 +174,27 @@ an external viewer or prints the path and dimensions.
 
 ### 4.1 Design
 
-**Limit profiles in configuration:**
+**Status:** B1 and B2 are implemented. Progress events and compaction by
+default under relaxed limits are not; see "Deferred" below.
+
+**Limit profiles in configuration.** `default` and `relaxed` are built in
+with the values below. A table named after one overrides the fields it
+sets, and any other name defines a profile that starts from `default`:
 
 ```toml
-[agent.limits]                    # applies when no profile is named
-provider_requests = 128
-tool_calls = 256
-tool_calls_per_response = 64
-wall_time = "60m"
-shell_timeout = "60s"
-auto_continues = 2
+[agent]
+limits = "default"                # profile used when nothing else chooses one
 
-[agent.limits.profiles.relaxed]
-provider_requests = 2000
-tool_calls = 5000
-tool_calls_per_response = 128
-wall_time = "8h"
-shell_timeout = "30m"
-auto_continues = 50
+[agent.limit_profiles.relaxed]    # built in as: 2000 requests, 5000 tool calls,
+wall_time = "12h"                 # 128 per response, 8h, 30m shell, 50 continues
+
+[agent.limit_profiles.cad-render]
+shell_timeout = "45m"
 ```
 
 - **Selecting a profile:** `--limits relaxed` on the command line, `//limits
   relaxed` during a session, or `limits = "relaxed"` on a model profile.
-  `//limits` with no argument shows the active limits and how much of each
-  the current turn has used.
+  `//limits` with no argument shows the profile in effect and its values.
 - **Relaxed mode:** wall-clock time becomes the governing limit, and the count
   limits are high but finite. Each count still stops a runaway loop
   deterministically (finding F10's concern) rather than letting it run
@@ -209,13 +206,15 @@ auto_continues = 50
 - **Per-tool time limits:** `shell_timeout` replaces the fixed 60 s, with
   a hard upper bound. A tool still runs in its own process group and is
   killed when cancelled or when it overruns.
-- **Long-run hygiene:**
-  - Compaction is on by default under relaxed limits, because an 8-hour run
-    otherwise overflows the context.
-  - A periodic progress event (turn number, budget used, elapsed time) lets
-    headless clients and attached users see that the run is alive.
-  - The event journal keeps its bounds; clients that fall behind read the
-    final state from the snapshot rather than the journal (§5).
+- **Long-run hygiene:** the event journal keeps its bounds; clients that
+  fall behind read the final state from the snapshot rather than the journal
+  (§5).
+- **Deferred:**
+  - *Progress events* (budget used, elapsed time) move to C2, where the
+    headless event schema that consumes them is defined.
+  - *Compaction by default under relaxed limits* needs the model's context
+    size, which only a model profile knows. Until then, long runs should set
+    `context_tokens` or `max_history_bytes` on their model profile.
 
 **Multi-turn tasks are out of scope.** A task that continues across many
 turns under one budget is a special case of persistent goals

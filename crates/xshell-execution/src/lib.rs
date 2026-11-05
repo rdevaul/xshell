@@ -7,7 +7,9 @@ mod process;
 mod sensitive;
 mod tools;
 
-pub use budget::{BudgetExhausted, TurnBudget, TurnLimits};
+pub use budget::{
+    BudgetExhausted, LimitSettings, MAX_LIMIT_DURATION, TurnBudget, TurnLimits, parse_duration,
+};
 pub use compaction::{
     BYTES_PER_TOKEN, CompactionConfig, CompactionReport, Compactor, DEFAULT_RESERVE_OUTPUT_TOKENS,
     MINIMUM_HISTORY_TOKENS, MaxBytesCompactor, ModelBudget, NoCompaction, REQUEST_OVERHEAD_TOKENS,

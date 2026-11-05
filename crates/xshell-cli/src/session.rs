@@ -422,11 +422,19 @@ session's interactive process is running; stop it first"
         Ok(detached)
     }
 
-    pub fn submit(&mut self, input: TurnInput, approval: ApprovalPolicy) -> Result<String> {
+    pub fn submit(
+        &mut self,
+        input: TurnInput,
+        approval: ApprovalPolicy,
+        limits: xshell_execution::TurnLimits,
+    ) -> Result<String> {
         let session_id = self.active_session_id()?;
-        let turn_id = self
-            .client_mut()?
-            .submit(session_id.clone(), input, approval)?;
+        let turn_id = self.client_mut()?.submit_with_limits(
+            session_id.clone(),
+            input,
+            approval,
+            Some(limits),
+        )?;
         if let Some(active) = &mut self.active {
             active.activity = SessionActivity::AgentTurn {
                 turn_id: turn_id.clone(),

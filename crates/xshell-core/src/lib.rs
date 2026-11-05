@@ -23,6 +23,7 @@ pub enum ControlCommand {
     Audit(Vec<String>),
     Tools,
     Model(Vec<String>),
+    Limits(Vec<String>),
     Agent(Vec<String>),
     View(String),
     Connect(Vec<String>),
@@ -76,6 +77,7 @@ fn parse_control(input: &str) -> ControlCommand {
         "audit" => ControlCommand::Audit(args),
         "tools" => ControlCommand::Tools,
         "model" => ControlCommand::Model(args),
+        "limits" => ControlCommand::Limits(args),
         "agent" => ControlCommand::Agent(args),
         "connect" => ControlCommand::Connect(args),
         "sessions" => ControlCommand::Sessions,
@@ -324,6 +326,18 @@ mod tests {
         assert_eq!(
             classify_input("//model openrouter-free"),
             InputRoute::Control(ControlCommand::Model(vec!["openrouter-free".into()]))
+        );
+    }
+
+    #[test]
+    fn parses_limits_control_command() {
+        assert_eq!(
+            classify_input("//limits"),
+            InputRoute::Control(ControlCommand::Limits(Vec::new()))
+        );
+        assert_eq!(
+            classify_input("//limits relaxed"),
+            InputRoute::Control(ControlCommand::Limits(vec!["relaxed".into()]))
         );
     }
 

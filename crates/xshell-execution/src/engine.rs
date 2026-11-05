@@ -29,7 +29,6 @@ use xshell_core::{
 
 /// How many times one turn may be nudged to keep going after the model ends a
 /// response without a tool call while apparently mid-task.
-const MAX_AUTO_CONTINUES: usize = 2;
 const ANNOUNCED_STEP_PROMPT: &str = "[xshell] Your last message announced another step but \
 contained no tool call, so the turn would have ended there. If you meant to use a tool, call it \
 now. If you are finished, give your final answer.";
@@ -677,7 +676,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
         );
         if response.tool_calls.is_empty() {
             if let Some((reason, prompt)) = continue_reason
-                && auto_continues < MAX_AUTO_CONTINUES
+                && auto_continues < budget.limits().auto_continues
             {
                 auto_continues += 1;
                 observer.emit(ExecutionEvent::AutoContinued {
@@ -838,7 +837,14 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 delegation.result
             } else {
                 observed_tool_activity = true;
-                execute_prepared(call, preparation, cwd, observer.cancellation()).await
+                execute_prepared(
+                    call,
+                    preparation,
+                    cwd,
+                    observer.cancellation(),
+                    budget.limits().shell_timeout,
+                )
+                .await
             };
             observer.emit(ExecutionEvent::ToolResult {
                 call_id: scoped.id.clone(),
@@ -3927,13 +3933,98 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(adapter.requests.len(), 1 + MAX_AUTO_CONTINUES);
+        assert_eq!(
+            adapter.requests.len(),
+            1 + TurnLimits::default().auto_continues
+        );
         let continued = observer
             .events
             .iter()
             .filter(|event| matches!(event, ExecutionEvent::AutoContinued { reason, .. } if reason == "empty_response"))
             .count();
-        assert_eq!(continued, MAX_AUTO_CONTINUES);
+        assert_eq!(continued, TurnLimits::default().auto_continues);
+    }
+
+    #[tokio::test]
+    async fn the_automatic_continuation_limit_is_configurable() {
+        for allowed in [0, 4] {
+            let temporary = TempDir::new().unwrap();
+            let stalled = || AssistantResponse {
+                reasoning: Some("thinking only".into()),
+                ..Default::default()
+            };
+            let mut adapter = ScriptedAdapter {
+                responses: (0..10).map(|_| stalled()).collect(),
+                requests: Vec::new(),
+            };
+            let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_limits(TurnLimits {
+                auto_continues: allowed,
+                ..TurnLimits::default()
+            });
+            run_agent_turn(
+                &mut adapter,
+                &mut Vec::new(),
+                "go".into(),
+                temporary.path(),
+                &policy,
+                &mut scripted_observer(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(adapter.requests.len(), 1 + allowed);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shell_timeout_comes_from_the_turn_limits() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "slow".into(),
+                        name: "run_shell".into(),
+                        arguments: json!({"command": "sleep 30"}),
+                    }],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let policy = TurnPolicy::new(ApprovalPolicy::Auto).with_limits(TurnLimits {
+            shell_timeout: Duration::from_secs(1),
+            ..TurnLimits::default()
+        });
+        let mut observer = scripted_observer();
+        let started = std::time::Instant::now();
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "go".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let result = observer
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::ToolResult { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(result.contains("timed out after 1 seconds"), "{result}");
     }
 
     #[tokio::test]

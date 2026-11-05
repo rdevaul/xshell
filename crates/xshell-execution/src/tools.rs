@@ -14,7 +14,6 @@ use xshell_core::{ToolCall, ToolDefinition};
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 500;
-const SHELL_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest wait for one preparation or read of a read-only tool.
 const FILESYSTEM_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -353,7 +352,14 @@ pub(crate) async fn execute_tool_cancellable(
     cancellation: CancellationFlag,
 ) -> String {
     let preparation = prepare_call(call, root, &SensitivePaths::none()).await;
-    execute_prepared(call, preparation, root, cancellation).await
+    execute_prepared(
+        call,
+        preparation,
+        root,
+        cancellation,
+        crate::TurnLimits::default().shell_timeout,
+    )
+    .await
 }
 
 /// Run a prepared call. A read-only tool reads from the object prepared for
@@ -363,6 +369,7 @@ pub(crate) async fn execute_prepared(
     preparation: Preparation,
     root: &Path,
     cancellation: CancellationFlag,
+    shell_timeout: Duration,
 ) -> String {
     let output = match preparation {
         Preparation::Failed(message) => return message,
@@ -379,7 +386,9 @@ pub(crate) async fn execute_prepared(
             _ => run_blocking(move || list_directory(object)).await,
         },
         Preparation::Other => match Tool::from_name(&call.name) {
-            Some(Tool::RunShell) => run_shell(&call.arguments, root, cancellation).await,
+            Some(Tool::RunShell) => {
+                run_shell(&call.arguments, root, cancellation, shell_timeout).await
+            }
             Some(Tool::DelegateTask) => Err(anyhow::anyhow!(
                 "delegate_task is dispatched by the agent engine"
             )),
@@ -451,6 +460,7 @@ async fn run_shell(
     arguments: &Value,
     root: &Path,
     cancellation: CancellationFlag,
+    timeout: Duration,
 ) -> Result<String> {
     let command = required_string(arguments, "command")?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -481,7 +491,7 @@ async fn run_shell(
     let wait = tokio::select! {
         status = child.wait() => Some(status.context("could not wait for shell tool")),
         () = cancellation.wait() => None,
-        () = tokio::time::sleep(SHELL_TOOL_TIMEOUT) => None,
+        () = tokio::time::sleep(timeout) => None,
     };
     let status = match wait {
         Some(status) => status?,
@@ -498,7 +508,7 @@ async fn run_shell(
             }
             bail!(
                 "shell tool timed out after {} seconds; the process group was killed and reaped",
-                SHELL_TOOL_TIMEOUT.as_secs()
+                timeout.as_secs()
             );
         }
     };
@@ -728,6 +738,7 @@ mod tests {
             &json!({"command": "printf out; printf err >&2; exit 3"}),
             root,
             CancellationFlag::default(),
+            Duration::from_secs(60),
         )
         .await
         .unwrap();

@@ -134,13 +134,35 @@ budget before its first provider request.
 ## Turn budget
 
 Every agent turn draws from one budget for the whole turn, including any
-subagents it starts: 128 provider requests, 256 evaluated tool calls, 64 tool
-calls per response, and 60 minutes of elapsed time. Calls past the
-per-response limit are refused and the turn continues; exhausting any other
-limit fails the turn with a message naming it, and follows the usual failure
-rules: rolled back if no tool ran, otherwise kept with an execution record.
-The limits are fixed defaults today. Per-session and global budgets are not
-implemented yet (finding F10).
+subagents it starts. The limits come from a named profile:
+
+| Limit | `default` | `relaxed` |
+|---|---|---|
+| Provider requests | 128 | 2,000 |
+| Evaluated tool calls | 256 | 5,000 |
+| Tool calls per response | 64 | 128 |
+| Wall time | 1 hour | 8 hours |
+| `run_shell` timeout | 60 seconds | 30 minutes |
+| Automatic continuations | 2 | 50 |
+
+- **Choosing a profile:** `--limits NAME` (or `XSHELL_LIMITS`), `//limits
+  NAME` during a session, `limits = "NAME"` on a model profile, or
+  `[agent] limits`, checked in that order. `//limits` alone shows the
+  profile in effect and its values.
+- **Defining profiles:** a table under `[agent.limit_profiles]` named
+  `default` or `relaxed` overrides the fields it sets; any other name
+  defines a new profile that starts from `default`. Durations are written
+  like `"45s"`, `"30m"`, or `"8h"`.
+- **The daemon's ceiling:** `xshelld` applies at most
+  `[session_fabric.max_limits]`, whose unset fields take the `relaxed`
+  values. A client asking for more is lowered field by field, and the CLI
+  reports the limits that applied.
+
+Calls past the per-response limit are refused and the turn continues;
+exhausting any other limit fails the turn with a message naming it, and
+follows the usual failure rules: rolled back if no tool ran, otherwise kept
+with an execution record. Per-session and global budgets are not implemented
+yet (finding F10).
 
 ## Subagents
 
