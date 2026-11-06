@@ -395,6 +395,10 @@ around the policy. The first step treats every `run_shell` call as subject
 to the policy:
 
 - A compound command matches only a bare `run_shell` entry.
+- With `run_shell` deny patterns, a command that cannot be split into parts
+  read as written (substitutions, separators inside quotes, expanding
+  command words) is prompted in `ask` mode and denied otherwise, so it can
+  never slip past a denial unattended.
 - A pattern that allows an interpreter or a script (`python *`,
   `bash -c *`, `./build.sh`) is documented as allowing whatever that
   interpreter or script does.

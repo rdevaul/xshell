@@ -27,9 +27,15 @@
 //! only restrict. An overlay is silent about calls it does not list.
 //!
 //! Allow patterns never match a compound shell command (pipelines, `;`, `&&`,
-//! substitutions, redirections); only a bare `run_shell` entry does. Deny
-//! patterns are also checked against each part of a compound command, so
-//! chaining commands cannot get around a denial.
+//! substitutions, redirections, brace expansion) or one whose command word is
+//! not plain (`FOO=1 make`, `=make`); only a bare `run_shell` entry does.
+//! Deny patterns are also checked against each part of a compound command.
+//! When a policy has shell deny patterns and a command cannot be split into
+//! parts that are read as written (a substitution, a separator inside quotes,
+//! an expanding command word), the command is never run unattended: it is
+//! prompted in `ask` mode and denied otherwise. Chaining and quoting therefore
+//! cannot get around a denial. Patterns still match literal words, so wrappers
+//! such as `xargs rm` or `env rm` are not recognised as `rm`.
 
 use crate::{ApprovalPolicy, SensitivePaths};
 use anyhow::{Result, bail};
@@ -223,6 +229,40 @@ impl Policy {
     /// policy, which alone may let a named path skip the sensitive-path
     /// prompt, and whose silence means the default behaviour.
     fn decide(&self, call: &CallFacts, mode: ApprovalPolicy, base: bool) -> PolicyDecision {
+        let decision = self.decide_by_rules(call, mode, base);
+        if self.denial_is_uncheckable(call) {
+            // A shell denial exists but this command cannot be read reliably
+            // enough to know it does not match. Fail closed: a person may
+            // still approve it, but it never runs unattended.
+            let ceiling = if mode == ApprovalPolicy::Ask {
+                PolicyDecision::Prompt
+            } else {
+                PolicyDecision::Deny
+            };
+            return decision.min(ceiling);
+        }
+        decision
+    }
+
+    /// Whether this policy denies some shell commands by pattern and `call`
+    /// is a shell command those patterns cannot be checked against reliably.
+    fn denial_is_uncheckable(&self, call: &CallFacts) -> bool {
+        call.tool == "run_shell"
+            && self
+                .denied
+                .iter()
+                .any(|rule| matches!(rule, Rule::Shell(_)))
+            && call
+                .command
+                .is_none_or(|command| checked_parts(command).is_none())
+    }
+
+    fn decide_by_rules(
+        &self,
+        call: &CallFacts,
+        mode: ApprovalPolicy,
+        base: bool,
+    ) -> PolicyDecision {
         if self.denied.iter().any(|rule| rule.denies(call)) {
             return PolicyDecision::Deny;
         }
@@ -290,29 +330,67 @@ impl ApprovalRules {
     }
 }
 
-/// Shell metacharacters that make a command compound: more than one command,
-/// a redirection, or a substitution. Checked on the raw text, quoted or not,
-/// so the test errs towards "compound".
-const COMPOUND: &[char] = &['|', ';', '&', '<', '>', '`', '$', '(', ')', '\n', '\r'];
+/// Shell metacharacters that separate commands or redirect them. Checked on
+/// the raw text, quoted or not, so the test errs towards "compound".
+const SEPARATORS: &[char] = &['|', ';', '&', '<', '>', '\n', '\r'];
 
-/// The words of `command` if it is one simple command.
+/// Shell metacharacters that substitute or expand text, so the words the
+/// shell runs cannot be read from the command as written: command and
+/// parameter substitution, subshells, and brace expansion.
+const EXPANSIONS: &[char] = &['`', '$', '(', ')', '{', '}'];
+
+/// Whether `word` is a plain command name or path, which the shell runs as
+/// written. Rejects variable assignments (`FOO=1 rm`), globs (`r?`), tilde
+/// and zsh `=` expansion (`=rm`), and anything else that could make the
+/// shell run a command other than the one the word spells.
+fn plain_command_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | ':' | '@' | ',')
+        })
+}
+
+/// The words of `command` if it is one simple command whose command word is
+/// plain.
 fn simple_command(command: &str) -> Option<Vec<String>> {
-    if command.contains(COMPOUND) {
+    if command.contains(SEPARATORS) || command.contains(EXPANSIONS) {
         return None;
     }
     shell_words::split(command)
         .ok()
-        .filter(|words| !words.is_empty())
+        .filter(|words| words.first().is_some_and(|word| plain_command_word(word)))
 }
 
 /// The words of each part of `command`, split at the metacharacters that
-/// separate commands. Parts that do not parse are skipped.
+/// separate commands. Parts that do not parse are skipped, so this is a
+/// best-effort reading: [`checked_parts`] says whether it can be trusted.
 fn command_parts(command: &str) -> Vec<Vec<String>> {
     command
-        .split(COMPOUND)
+        .split(|c| SEPARATORS.contains(&c) || EXPANSIONS.contains(&c))
         .filter_map(|part| shell_words::split(part).ok())
         .filter(|words| !words.is_empty())
         .collect()
+}
+
+/// The words of each part of `command` if every part is a simple command
+/// that can be read as written: no substitution or expansion anywhere, every
+/// part parses (a separator inside quotes leaves an unbalanced part), and
+/// every command word is plain. `None` means a denial cannot be checked
+/// reliably against this command.
+fn checked_parts(command: &str) -> Option<Vec<Vec<String>>> {
+    if command.contains(EXPANSIONS) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in command.split(SEPARATORS) {
+        let words = shell_words::split(part).ok()?;
+        match words.first() {
+            None => {}
+            Some(word) if plain_command_word(word) => parts.push(words),
+            Some(_) => return None,
+        }
+    }
+    Some(parts)
 }
 
 /// Whether `words` match `pattern` word for word. A pattern word may contain
@@ -489,7 +567,8 @@ mod tests {
         assert_eq!(base(&rules, &shell("ls -la")), [Deny, Run, Run]);
         // Chained onto an allowed command: falls back to the default.
         assert_eq!(base(&rules, &shell("ls; touch x")), [Deny, Prompt, Run]);
-        assert_eq!(base(&rules, &shell("ls $(whoami)")), [Deny, Prompt, Run]);
+        // A substitution cannot be checked against the denial: never unattended.
+        assert_eq!(base(&rules, &shell("ls $(whoami)")), [Deny, Prompt, Deny]);
         assert_eq!(base(&rules, &shell("ls > out")), [Deny, Prompt, Run]);
         // A denied command anywhere in the chain is denied.
         assert_eq!(base(&rules, &shell("ls && rm -rf x")), [Deny, Deny, Deny]);
@@ -500,6 +579,61 @@ mod tests {
         // A bare run_shell entry matches compound commands too.
         let bare = policy(&["run_shell"], None, &[]);
         assert_eq!(base(&bare, &shell("ls | wc -l")), [Deny, Run, Run]);
+    }
+
+    #[test]
+    fn commands_a_denial_cannot_be_checked_against_never_run_unattended() {
+        // Everything but `rm` runs: the configuration a denial must protect.
+        let rules = policy(&["run_shell"], None, &["run_shell: rm *"]);
+        assert_eq!(base(&rules, &shell("make all")), [Deny, Run, Run]);
+        assert_eq!(base(&rules, &shell("ls | wc -l")), [Deny, Run, Run]);
+        assert_eq!(base(&rules, &shell("rm -rf build")), [Deny, Deny, Deny]);
+        for command in [
+            // A separator inside quotes leaves parts that do not parse.
+            "rm -rf \"build;\"",
+            "rm -rf 'a|b' build",
+            // Substitutions hide the command word.
+            "$(echo rm) -rf build",
+            "`echo rm` -rf build",
+            "${RM:-rm} -rf build",
+            // Expansions and assignments change what the shell runs.
+            "{rm,-rf,build}",
+            "r{m,} -rf build",
+            "FOO=1 rm -rf build",
+            "=rm -rf build",
+            "r? -rf build",
+            "~/bin/rm -rf build",
+        ] {
+            assert_eq!(
+                base(&rules, &shell(command)),
+                [Deny, Prompt, Deny],
+                "{command}"
+            );
+        }
+        // The same commands without a shell denial follow the other rules.
+        let open = policy(&["run_shell"], None, &[]);
+        assert_eq!(
+            base(&open, &shell("$(echo rm) -rf build")),
+            [Deny, Run, Run]
+        );
+        // An overlay's denial fails closed in the same way.
+        let rules = ApprovalRules {
+            base: policy(&["run_shell"], None, &[]),
+            overlay: Some(policy(&[], None, &["run_shell: rm *"])),
+        };
+        assert_eq!(rules.decide(&shell("`echo rm` -rf build"), Auto), Deny);
+        assert_eq!(rules.decide(&shell("`echo rm` -rf build"), Ask), Prompt);
+    }
+
+    #[test]
+    fn allow_patterns_need_a_plain_command_word() {
+        let rules = policy(&["run_shell: make *"], None, &[]);
+        assert_eq!(base(&rules, &shell("make all")), [Deny, Run, Run]);
+        assert_eq!(
+            base(&rules, &shell("CC=evil make all")),
+            [Deny, Prompt, Run]
+        );
+        assert_eq!(base(&rules, &shell("make{,} all")), [Deny, Prompt, Run]);
     }
 
     #[test]

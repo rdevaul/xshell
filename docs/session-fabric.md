@@ -85,11 +85,16 @@ first rule that matches:
 - **Denied wins:** a `denied` entry overrides an `always_allowed` or `allowed`
   entry it covers, and xshelld reports each override when it starts.
 - **Compound commands:** allow patterns never match a command with a
-  pipeline, `;`, `&&`, a substitution, or a redirection; only a bare
-  `run_shell` entry does. Deny patterns are also checked against each part of
-  such a command, so chaining cannot get around a denial. A pattern that
-  allows an interpreter or a script (`python *`, `./build.sh`) allows
-  whatever that program does.
+  pipeline, `;`, `&&`, a substitution, a redirection, or brace expansion, or
+  one whose command word is not a plain name or path (`FOO=1 make`, `=make`,
+  `ma?e`); only a bare `run_shell` entry does. Deny patterns are also checked
+  against each part of such a command. When a policy has `run_shell` deny
+  patterns and a command cannot be split into parts that are read as written
+  (a substitution, a separator inside quotes, an expanding command word), it
+  never runs unattended: it is prompted in `ask` mode and denied otherwise.
+  So neither chaining nor quoting gets around a denial. A pattern that allows
+  an interpreter or a script (`python *`, `./build.sh`) allows whatever that
+  program does.
 - **Literal words:** patterns match the command as written, so
   `run_shell: rm *` does not match `/bin/rm` or `command rm`. Prefer an
   `allowed` list, which denies everything unlisted, over a `denied` list
