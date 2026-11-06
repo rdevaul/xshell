@@ -243,7 +243,7 @@ requested \"{requested}\" was not applied"
                     }
                     return Ok(DaemonTurnOutcome::Completed(Box::new(snapshot)));
                 }
-                SessionEventKind::TurnFailed { message } => {
+                SessionEventKind::TurnFailed { message, .. } => {
                     sessions.mark_turn_finished();
                     renderer.finish(&mut stdout)?;
                     sessions.acknowledge_event(sequence)?;

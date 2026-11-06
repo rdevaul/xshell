@@ -403,6 +403,10 @@ Making shell access safe beyond that is a separate design topic (§8).
 
 ### 5.3 Tasks and estimates
 
+**Status:** C1, C2, and C5 are implemented (`xshell run`,
+[headless runs](headless.md)). Progress events, deferred from B, remain for C2's
+schema. C4 and C3 are next.
+
 | ID | Task | Days |
 |---|---|---|
 | C1 | `xshell run`: prompt sources, sessions, daemon execution, exit codes | 2–3 |

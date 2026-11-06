@@ -3,6 +3,7 @@ mod backlog;
 mod completion;
 mod config;
 mod control;
+mod headless;
 mod model;
 mod pty_ui;
 mod session;
@@ -39,35 +40,36 @@ use xshell_view::{RenderOptions, ViewerRegistry};
 #[derive(Debug, Parser)]
 #[command(version, about = "An agent-first, network-aware interactive shell")]
 struct Args {
-    #[arg(long, env = "XSHELL_CONFIG")]
+    #[arg(long, global = true, env = "XSHELL_CONFIG")]
     config: Option<PathBuf>,
 
-    #[arg(long, env = "XSHELL_PROFILE")]
+    #[arg(long, global = true, env = "XSHELL_PROFILE")]
     profile: Option<String>,
 
-    #[arg(long, env = "XSHELL_PROVIDER", value_enum)]
+    #[arg(long, global = true, env = "XSHELL_PROVIDER", value_enum)]
     provider: Option<Provider>,
 
-    #[arg(long, env = "XSHELL_MODEL")]
+    #[arg(long, global = true, env = "XSHELL_MODEL")]
     model: Option<String>,
 
-    #[arg(long, env = "XSHELL_BASE_URL")]
+    #[arg(long, global = true, env = "XSHELL_BASE_URL")]
     base_url: Option<String>,
 
-    #[arg(long, env = "XSHELL_API_KEY_ENV")]
+    #[arg(long, global = true, env = "XSHELL_API_KEY_ENV")]
     api_key_env: Option<String>,
 
-    #[arg(long, env = "XSHELL_SYSTEM_PROMPT", default_value = DEFAULT_SYSTEM_PROMPT)]
+    #[arg(long, global = true, env = "XSHELL_SYSTEM_PROMPT", default_value = DEFAULT_SYSTEM_PROMPT)]
     system_prompt: String,
 
-    #[arg(long, env = "XSHELL_SESSION")]
+    #[arg(long, global = true, env = "XSHELL_SESSION")]
     session: Option<String>,
 
-    #[arg(long, default_value = ".")]
+    #[arg(long, global = true, default_value = ".")]
     cwd: PathBuf,
 
     #[arg(
         long,
+        global = true,
         env = "XSHELL_LIMITS",
         help = "Turn limit profile: default, relaxed, or one defined under [agent.limit_profiles]"
     )]
@@ -75,6 +77,7 @@ struct Args {
 
     #[arg(
         long,
+        global = true,
         env = "XSHELL_APPROVAL",
         value_enum,
         default_value = "ask",
@@ -97,11 +100,43 @@ struct Args {
         help = "Rendered ANSI styling: auto, always, or never (NO_COLOR wins)"
     )]
     color: Option<OutputMode>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Run one agent turn without a terminal and report its outcome
+    /// (see docs/headless.md).
+    Run(headless::RunArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if let Some(Command::Run(run)) = args.command.take() {
+        let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        headless::watch_signals(std::sync::Arc::clone(&interrupted));
+        let shared = headless::SharedOptions {
+            config: args.config,
+            profile: args.profile,
+            provider: args.provider,
+            model: args.model,
+            base_url: args.base_url,
+            api_key_env: args.api_key_env,
+            system_prompt: args.system_prompt,
+            session: args.session,
+            cwd: args.cwd,
+            approval: args.approval,
+            limits: args.limits,
+        };
+        // The turn's events are polled synchronously; keep that off the
+        // runtime's worker so the signal watcher keeps running.
+        let code =
+            tokio::task::spawn_blocking(move || headless::run(shared, run, interrupted)).await?;
+        std::process::exit(code);
+    }
     let (model_config, config_path) = XshellConfig::load(args.config.as_deref())?;
     let render_options =
         RenderOptions::resolve(&model_config.rendering, args.markdown, args.color)?;

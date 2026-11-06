@@ -1,3 +1,4 @@
+use crate::TurnFailureReason;
 use crate::audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
 use crate::{
     AgentTurnPhase, ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind,
@@ -13,9 +14,10 @@ use uuid::Uuid;
 use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, CompactionConfig,
-    ExecutionEvent, GateReason, ModelBudget, SensitivePaths, TurnLimits, TurnObserver, TurnPolicy,
-    build_adapter, run_agent_turn, run_direct_shell_streaming_cancellable,
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, BudgetExhausted, CancellationFlag,
+    CompactionConfig, ExecutionEvent, GateReason, ModelBudget, SensitivePaths, TurnLimits,
+    TurnObserver, TurnPolicy, build_adapter, run_agent_turn,
+    run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
 
@@ -243,6 +245,7 @@ impl ExecutionCoordinator {
                     &turn_id,
                     SessionEventKind::TurnFailed {
                         message: error.to_string(),
+                        reason: None,
                     },
                 );
                 persistence.context("cannot clear unstarted session operation")?;
@@ -420,6 +423,7 @@ impl ExecutionCoordinator {
                     &turn_id,
                     SessionEventKind::TurnFailed {
                         message: error.to_string(),
+                        reason: None,
                     },
                 );
                 return;
@@ -532,16 +536,22 @@ impl ExecutionCoordinator {
         let terminal = if let Err(error) = persistence {
             SessionEventKind::TurnFailed {
                 message: format!("cannot persist terminal turn state: {error:#}"),
+                reason: None,
             }
         } else if let Some(error) = audit_failure {
             SessionEventKind::TurnFailed {
                 message: format!("{error:#}"),
+                reason: Some(TurnFailureReason::AuditUnavailable),
             }
         } else if cancellation.is_cancelled() {
             SessionEventKind::TurnCancelled
         } else if let Err(error) = result {
+            let budget = error
+                .chain()
+                .any(|cause| cause.downcast_ref::<BudgetExhausted>().is_some());
             SessionEventKind::TurnFailed {
                 message: format!("{error:#}"),
+                reason: budget.then_some(TurnFailureReason::BudgetExhausted),
             }
         } else {
             SessionEventKind::TurnCompleted

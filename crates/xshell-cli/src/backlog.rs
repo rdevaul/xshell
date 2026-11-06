@@ -231,7 +231,7 @@ fn render_events<'a>(
                 }
             }
             SessionEventKind::TurnCompleted => renderer.finish(&mut output)?,
-            SessionEventKind::TurnFailed { message } => {
+            SessionEventKind::TurnFailed { message, .. } => {
                 renderer.finish(&mut output)?;
                 writeln!(
                     output,

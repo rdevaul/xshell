@@ -30,6 +30,7 @@ xshell-session = { path = "../xshell-session" }
 xshell-view = { path = "../xshell-view" }
 
 [dev-dependencies]
+libc.workspace = true
 tempfile = "3.21"
 
 [lints]
