@@ -182,3 +182,19 @@ pty_escape = "ctrl-]"
 # [session_fabric.max_limits]
 # wall_time = "4h"
 # tool_calls = 2000
+
+# The approval policy every agent tool call on this daemon is decided by,
+# combined with the approval mode (see docs/session-fabric.md#approval-policy).
+# Entries name a tool, `run_shell: PATTERN` (matched against the parsed
+# command), or `read_file: PATH` / `list_directory: PATH`. A client's own policy
+# (xshell --approval-policy FILE) can only restrict this one.
+# [session_fabric.approval_policy]
+# always_allowed = ["run_shell: git status"]
+# allowed = ["run_shell: yapcad *", "run_shell: make *"]
+# denied = ["run_shell: rm *", "run_shell: git push *"]
+
+# Sensitivity classes: "prompt" paths need approval for agent reads (as
+# sensitive_paths); "block" paths can never be read by agent read tools.
+# [[session_fabric.sensitivity]]
+# action = "block"
+# patterns = ["*.pem", "*.key", "*.p12", "id_rsa", "id_ed25519"]

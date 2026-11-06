@@ -44,6 +44,9 @@ pub enum ClientRequest {
         /// `max_limits`; absent means the built-in default profile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limits: Option<xshell_execution::TurnLimits>,
+        /// An approval policy that can only restrict the daemon's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<xshell_execution::PolicyConfig>,
     },
     Events {
         session_id: String,
@@ -171,6 +174,7 @@ mod tests {
             },
             approval: ApprovalPolicy::Ask,
             limits: None,
+            policy: None,
         };
         let encoded = serde_json::to_string(&request).unwrap();
         assert!(encoded.contains("\"request\":\"submit\""));

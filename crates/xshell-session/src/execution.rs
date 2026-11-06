@@ -14,9 +14,9 @@ use uuid::Uuid;
 use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, BudgetExhausted, CancellationFlag,
-    CompactionConfig, ExecutionEvent, GateReason, ModelBudget, SensitivePaths, TurnLimits,
-    TurnObserver, TurnPolicy, build_adapter, run_agent_turn,
+    AdapterConfig, ApprovalDecision, ApprovalPolicy, ApprovalRules, BudgetExhausted,
+    CancellationFlag, CompactionConfig, ExecutionEvent, GateReason, ModelBudget, Policy,
+    SensitivePaths, TurnLimits, TurnObserver, TurnPolicy, build_adapter, run_agent_turn,
     run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
@@ -36,10 +36,31 @@ struct CoordinatorInner {
     admission: Mutex<bool>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
     audit: DaemonAudit,
-    max_approval: ApprovalPolicy,
-    max_limits: TurnLimits,
-    sensitive_paths: SensitivePaths,
-    compaction: CompactionConfig,
+    policy: DaemonPolicy,
+}
+
+/// What the daemon's operator decides for every turn, whatever a client asks.
+#[derive(Debug, Clone)]
+pub struct DaemonPolicy {
+    pub max_approval: ApprovalPolicy,
+    pub max_limits: TurnLimits,
+    pub sensitive_paths: SensitivePaths,
+    pub blocked_paths: SensitivePaths,
+    pub rules: Policy,
+    pub compaction: CompactionConfig,
+}
+
+impl Default for DaemonPolicy {
+    fn default() -> Self {
+        Self {
+            max_approval: ApprovalPolicy::Ask,
+            max_limits: TurnLimits::relaxed(),
+            sensitive_paths: SensitivePaths::default(),
+            blocked_paths: SensitivePaths::none(),
+            rules: Policy::default(),
+            compaction: CompactionConfig::default(),
+        }
+    }
 }
 
 struct SessionExecution {
@@ -69,23 +90,13 @@ struct ActiveTurn {
 
 impl ExecutionCoordinator {
     pub fn new(registry: Arc<Mutex<SessionRegistry>>) -> Self {
-        Self::with_policy(
-            registry,
-            DaemonAudit::default(),
-            ApprovalPolicy::Ask,
-            TurnLimits::relaxed(),
-            SensitivePaths::default(),
-            CompactionConfig::default(),
-        )
+        Self::with_policy(registry, DaemonAudit::default(), DaemonPolicy::default())
     }
 
     pub fn with_policy(
         registry: Arc<Mutex<SessionRegistry>>,
         audit: DaemonAudit,
-        max_approval: ApprovalPolicy,
-        max_limits: TurnLimits,
-        sensitive_paths: SensitivePaths,
-        compaction: CompactionConfig,
+        policy: DaemonPolicy,
     ) -> Self {
         Self {
             inner: Arc::new(CoordinatorInner {
@@ -94,20 +105,17 @@ impl ExecutionCoordinator {
                 admission: Mutex::new(true),
                 workers: Mutex::new(Vec::new()),
                 audit,
-                max_approval,
-                max_limits,
-                sensitive_paths,
-                compaction,
+                policy,
             }),
         }
     }
 
     pub fn max_approval(&self) -> ApprovalPolicy {
-        self.inner.max_approval
+        self.inner.policy.max_approval
     }
 
     pub fn max_limits(&self) -> TurnLimits {
-        self.inner.max_limits
+        self.inner.policy.max_limits
     }
 
     pub fn audit(&self) -> &DaemonAudit {
@@ -141,6 +149,7 @@ impl ExecutionCoordinator {
         input: TurnInput,
         requested_approval: ApprovalPolicy,
         requested_limits: Option<TurnLimits>,
+        overlay: Option<Policy>,
     ) -> Result<String> {
         if !*self.inner.admission.lock_recover() {
             bail!("session execution is shutting down");
@@ -148,11 +157,11 @@ impl ExecutionCoordinator {
         self.reap_finished_workers();
         // The daemon executes; the daemon decides how much unattended
         // execution it permits. A client may ask for less, never more.
-        let approval = requested_approval.clamp_to(self.inner.max_approval);
+        let approval = requested_approval.clamp_to(self.inner.policy.max_approval);
         let requested_approval = (approval != requested_approval).then_some(requested_approval);
         // Limits work the same way: each one is lowered to the daemon's.
         let requested_limits = requested_limits.unwrap_or_default();
-        let (limits, lowered) = requested_limits.clamp_to(self.inner.max_limits);
+        let (limits, lowered) = requested_limits.clamp_to(self.inner.policy.max_limits);
         let requested_limits = lowered.then_some(requested_limits);
         let snapshot = self.inner.registry.lock_recover().snapshot(session_id)?;
         let execution = self.session(session_id);
@@ -228,6 +237,7 @@ impl ExecutionCoordinator {
                     input,
                     approval,
                     limits,
+                    overlay,
                     snapshot,
                     cancellation,
                     audit,
@@ -408,6 +418,7 @@ impl ExecutionCoordinator {
         input: TurnInput,
         approval: ApprovalPolicy,
         limits: TurnLimits,
+        overlay: Option<Policy>,
         mut snapshot: crate::SessionSnapshot,
         cancellation: CancellationFlag,
         audit: SessionAuditHandle,
@@ -448,8 +459,13 @@ impl ExecutionCoordinator {
                     })?;
                     let policy = TurnPolicy::new(approval)
                         .with_limits(limits)
-                        .with_sensitive_paths(self.inner.sensitive_paths.clone())
-                        .with_compaction(&self.inner.compaction.for_model(ModelBudget {
+                        .with_rules(ApprovalRules {
+                            base: self.inner.policy.rules.clone(),
+                            overlay,
+                        })
+                        .with_sensitive_paths(self.inner.policy.sensitive_paths.clone())
+                        .with_blocked_paths(self.inner.policy.blocked_paths.clone())
+                        .with_compaction(&self.inner.policy.compaction.for_model(ModelBudget {
                             max_history_bytes: model.max_history_bytes,
                             context_tokens: model.context_tokens,
                             reserve_output_tokens: model.reserve_output_tokens,

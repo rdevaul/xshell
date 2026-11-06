@@ -10,7 +10,7 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `reasoning` and `finish_reason` fields on `ExecutionEvent::AgentResponse`.
 // Version 14 adds the `delegate_task` subagent events (`SubagentStarted`,
 // `Subagent`, `SubagentFinished`).
-pub const SESSION_PROTOCOL_VERSION: u32 = 15;
+pub const SESSION_PROTOCOL_VERSION: u32 = 16;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,14 +74,62 @@ pub struct SessionConfig {
     /// requests. Unset fields take the built-in `relaxed` profile's values,
     /// so clients can choose `relaxed` unless the operator lowers this.
     pub max_limits: xshell_execution::LimitSettings,
+    /// The approval policy every turn on this daemon is decided by. A
+    /// client's policy can only restrict it.
+    pub approval_policy: xshell_execution::PolicyConfig,
+    /// Sensitivity classes: paths agent read tools need approval for
+    /// (`prompt`, added to `sensitive_paths`) or may never read (`block`).
+    pub sensitivity: Vec<SensitivityClass>,
+}
+
+/// A set of path patterns and what agent read tools must do with them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SensitivityClass {
+    pub action: SensitivityAction,
+    pub patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitivityAction {
+    /// Reads need approval, as for `sensitive_paths`.
+    Prompt,
+    /// Reads are refused in every mode, whatever the policy says.
+    Block,
 }
 
 impl SessionConfig {
     pub fn sensitive_paths(&self) -> xshell_execution::SensitivePaths {
-        match &self.sensitive_paths {
-            None => xshell_execution::SensitivePaths::default(),
-            Some(patterns) => xshell_execution::SensitivePaths::new(patterns.iter().cloned()),
-        }
+        let base: Vec<String> = match &self.sensitive_paths {
+            None => xshell_execution::DEFAULT_SENSITIVE_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+            Some(patterns) => patterns.clone(),
+        };
+        xshell_execution::SensitivePaths::new(
+            base.into_iter()
+                .chain(self.class_patterns(SensitivityAction::Prompt)),
+        )
+    }
+
+    /// Paths agent read tools may never read.
+    pub fn blocked_paths(&self) -> xshell_execution::SensitivePaths {
+        xshell_execution::SensitivePaths::new(self.class_patterns(SensitivityAction::Block))
+    }
+
+    fn class_patterns(&self, action: SensitivityAction) -> impl Iterator<Item = String> + '_ {
+        self.sensitivity
+            .iter()
+            .filter(move |class| class.action == action)
+            .flat_map(|class| class.patterns.iter().cloned())
+    }
+
+    /// The parsed approval policy and warnings about entries it overrides.
+    pub fn approval_policy(&self) -> anyhow::Result<(xshell_execution::Policy, Vec<String>)> {
+        xshell_execution::Policy::parse(&self.approval_policy)
+            .map_err(|error| error.context("in session_fabric.approval_policy"))
     }
 
     /// The ceiling `max_limits` describes: the built-in `relaxed` profile
@@ -107,6 +155,8 @@ impl Default for SessionConfig {
             sensitive_paths: None,
             compaction: xshell_execution::CompactionConfig::default(),
             max_limits: xshell_execution::LimitSettings::default(),
+            approval_policy: xshell_execution::PolicyConfig::default(),
+            sensitivity: Vec::new(),
         }
     }
 }

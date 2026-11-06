@@ -117,6 +117,17 @@ impl Fabric {
     /// A config whose default model is the scripted provider, with the
     /// session fabric enabled. `start_daemon` controls whether xshelld runs.
     fn new(provider_url: &str, start_daemon: bool, enabled: bool) -> Self {
+        Self::with_config(provider_url, start_daemon, enabled, "", "")
+    }
+
+    /// As `new`, with extra keys for `[session_fabric]` and extra tables.
+    fn with_config(
+        provider_url: &str,
+        start_daemon: bool,
+        enabled: bool,
+        fabric_keys: &str,
+        tables: &str,
+    ) -> Self {
         let directory = TempDir::new().unwrap();
         let state = directory.path().join("state");
         let socket = state.join("xshelld.sock");
@@ -126,8 +137,8 @@ impl Fabric {
             format!(
                 "default_model = \"fake\"\n\n[models.fake]\nprovider = \"openai\"\n\
 model = \"fake-model\"\nbase_url = \"{provider_url}\"\n\n[session_fabric]\n\
-enabled = {enabled}\nsocket = {socket:?}\nstate_directory = {state:?}\n\n\
-[agent.limit_profiles.tiny]\nprovider_requests = 1\n",
+enabled = {enabled}\nsocket = {socket:?}\nstate_directory = {state:?}\n{fabric_keys}\n\n\
+[agent.limit_profiles.tiny]\nprovider_requests = 1\n\n{tables}\n",
                 socket = socket.to_str().unwrap(),
                 state = state.to_str().unwrap(),
             ),
@@ -560,4 +571,234 @@ fn interrupting_wait_leaves_the_turn_running() {
             .next(),
         Some("long: agent running")
     );
+}
+
+fn touch(marker: &Path) -> String {
+    sse_tool_call(
+        "call_1",
+        "run_shell",
+        serde_json::json!({"command": format!("touch {}", marker.display())}),
+    )
+}
+
+fn tool_result(events: &[Value]) -> String {
+    events
+        .iter()
+        .find(|event| event["event"] == "tool_result")
+        .and_then(|event| event["result"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn the_daemon_policy_always_allows_a_listed_command_without_a_prompt() {
+    let fabric_dir = TempDir::new().unwrap();
+    let marker = fabric_dir.path().join("made-by-policy");
+    let fabric = Fabric::with_config(
+        &serve(vec![touch(&marker), sse_text("made it")]),
+        true,
+        true,
+        "",
+        "[session_fabric.approval_policy]\nalways_allowed = [\"run_shell: touch *\"]\n",
+    );
+    let output = fabric.run(&["--output", "jsonl", "--ephemeral", "make a file"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let events = events(&output);
+    assert!(!names(&events).contains(&"approval_needed"), "{events:?}");
+    assert!(marker.exists());
+}
+
+#[test]
+fn the_daemon_policy_denies_a_listed_command_even_in_auto_mode() {
+    let fabric_dir = TempDir::new().unwrap();
+    let marker = fabric_dir.path().join("must-not-exist");
+    let fabric = Fabric::with_config(
+        &serve(vec![touch(&marker), sse_text("refused")]),
+        true,
+        true,
+        "max_approval = \"auto\"",
+        "[session_fabric.approval_policy]\ndenied = [\"run_shell: touch *\"]\n",
+    );
+    let output = fabric.run(&[
+        "--output",
+        "jsonl",
+        "--ephemeral",
+        "--approval",
+        "auto",
+        "go",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        tool_result(&events(&output)),
+        "tool denied by the approval policy"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn a_client_policy_can_restrict_but_never_loosen_the_daemon_policy() {
+    let fabric_dir = TempDir::new().unwrap();
+    // The daemon always allows `touch`; the client denies it.
+    let marker = fabric_dir.path().join("restricted");
+    let fabric = Fabric::with_config(
+        &serve(vec![touch(&marker), sse_text("refused")]),
+        true,
+        true,
+        "",
+        "[session_fabric.approval_policy]\nalways_allowed = [\"run_shell: touch *\"]\n",
+    );
+    let policy = fabric_dir.path().join("client.toml");
+    std::fs::write(&policy, "denied = [\"run_shell: touch *\"]\n").unwrap();
+    let mut command = fabric.command(&["--output", "jsonl", "--ephemeral", "go"]);
+    command.args(["--approval-policy", policy.to_str().unwrap()]);
+    let output = wait_with_timeout(command.spawn().unwrap(), Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        tool_result(&events(&output)),
+        "tool denied by the approval policy"
+    );
+    assert!(!marker.exists());
+
+    // The daemon has no policy; the client always allows every command. In
+    // ask mode the prompt remains, and with no channel it is denied.
+    let marker = fabric_dir.path().join("not-loosened");
+    let fabric = Fabric::new(
+        &serve(vec![touch(&marker), sse_text("refused")]),
+        true,
+        true,
+    );
+    let policy = fabric_dir.path().join("loose.toml");
+    std::fs::write(&policy, "always_allowed = [\"run_shell\"]\n").unwrap();
+    let mut command = fabric.command(&["--output", "jsonl", "--ephemeral", "go"]);
+    command.args(["--approval-policy", policy.to_str().unwrap()]);
+    let output = wait_with_timeout(command.spawn().unwrap(), Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(names(&events(&output)).contains(&"approval_needed"));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn an_invalid_client_policy_is_a_usage_error() {
+    let fabric = Fabric::new(&serve(Vec::new()), true, true);
+    let policy = fabric.directory.path().join("bad.toml");
+    std::fs::write(&policy, "denied = [\"delegate_task: x\"]\n").unwrap();
+    let mut command = fabric.command(&["--ephemeral", "go"]);
+    command.args(["--approval-policy", policy.to_str().unwrap()]);
+    let output = wait_with_timeout(command.spawn().unwrap(), Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+#[test]
+fn a_blocked_path_is_never_read_whatever_the_mode() {
+    let fabric = Fabric::with_config(
+        &serve(vec![
+            sse_tool_call(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "server.pem"}),
+            ),
+            sse_text("could not read it"),
+        ]),
+        true,
+        true,
+        "max_approval = \"auto\"",
+        "[[session_fabric.sensitivity]]\naction = \"block\"\npatterns = [\"*.pem\"]\n",
+    );
+    std::fs::write(fabric.directory.path().join("server.pem"), "PRIVATE KEY").unwrap();
+    let output = fabric.run(&[
+        "--output",
+        "jsonl",
+        "--ephemeral",
+        "--approval",
+        "auto",
+        "read it",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let result = tool_result(&events(&output));
+    assert!(
+        result.contains("blocked by the session host's policy"),
+        "{result}"
+    );
+    assert!(!result.contains("PRIVATE KEY"));
+}
+
+/// Spawn `xshell run` with a pipe on descriptor 3 for approval decisions.
+fn spawn_with_channel(fabric: &Fabric, args: &[&str]) -> (Child, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a writable array of two descriptors, as pipe(2) needs.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read_end, write_end) = (fds[0], fds[1]);
+    let mut command = fabric.command(args);
+    command.args(["--approval-channel", "3"]);
+    // SAFETY: the hook runs in the forked child before exec and calls only
+    // dup2(2) and close(2), which are async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(read_end, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(write_end);
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    // SAFETY: the parent no longer needs the read end, and owns the write end.
+    unsafe { libc::close(read_end) };
+    // SAFETY: `write_end` is an open descriptor this process owns.
+    (child, unsafe { std::fs::File::from_raw_fd(write_end) })
+}
+
+#[test]
+fn the_approval_channel_answers_prompts() {
+    use std::io::BufRead;
+    let fabric_dir = TempDir::new().unwrap();
+    let marker = fabric_dir.path().join("approved");
+    let fabric = Fabric::new(&serve(vec![touch(&marker), sse_text("done")]), true, true);
+    let (mut child, mut channel) =
+        spawn_with_channel(&fabric, &["--output", "jsonl", "--ephemeral", "go"]);
+    let stdout = child.stdout.take().unwrap();
+    let mut lines = Vec::new();
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        let event: Value = serde_json::from_str(&line).unwrap();
+        if event["event"] == "approval_needed" {
+            let reply = serde_json::json!({"call_id": event["call_id"], "decision": "approve"});
+            writeln!(channel, "{reply}").unwrap();
+        }
+        lines.push(event);
+    }
+    let output = wait_with_timeout(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(0), "{output:?} {lines:?}");
+    let decided = lines
+        .iter()
+        .find(|event| event["event"] == "approval_decided")
+        .unwrap();
+    assert_eq!(decided["decision"], "approve");
+    assert_eq!(decided["source"], "approval_channel");
+    assert!(marker.exists());
+}
+
+#[test]
+fn a_closed_approval_channel_denies() {
+    let fabric_dir = TempDir::new().unwrap();
+    let marker = fabric_dir.path().join("not-approved");
+    let fabric = Fabric::new(
+        &serve(vec![touch(&marker), sse_text("refused")]),
+        true,
+        true,
+    );
+    let (child, channel) = spawn_with_channel(&fabric, &["--output", "jsonl", "--ephemeral", "go"]);
+    drop(channel);
+    let output = wait_with_timeout(child, Duration::from_secs(30));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let events = events(&output);
+    let decided = events
+        .iter()
+        .find(|event| event["event"] == "approval_decided")
+        .unwrap();
+    assert_eq!(decided["decision"], "deny");
+    assert_eq!(decided["source"], "approval_channel_closed");
+    assert!(!marker.exists());
 }

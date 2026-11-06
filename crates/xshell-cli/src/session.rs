@@ -427,6 +427,7 @@ session's interactive process is running; stop it first"
         input: TurnInput,
         approval: ApprovalPolicy,
         limits: xshell_execution::TurnLimits,
+        policy: Option<xshell_execution::PolicyConfig>,
     ) -> Result<String> {
         let session_id = self.active_session_id()?;
         let turn_id = self.client_mut()?.submit_with_limits(
@@ -434,6 +435,7 @@ session's interactive process is running; stop it first"
             input,
             approval,
             Some(limits),
+            policy,
         )?;
         if let Some(active) = &mut self.active {
             active.activity = SessionActivity::AgentTurn {

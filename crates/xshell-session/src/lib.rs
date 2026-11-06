@@ -15,14 +15,14 @@ pub use client::{
     SessionHandshake,
 };
 pub use completion::complete_shell;
-pub use execution::ExecutionCoordinator;
+pub use execution::{DaemonPolicy, ExecutionCoordinator};
 pub use model::{
     AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, DAEMON_PROBE_SCHEMA_VERSION,
     DaemonProbeReport, DaemonProbeStatus, EventBatch, ModelBinding, PersistenceMode, PtySize,
-    PtyTicket, SESSION_PROTOCOL_VERSION, SessionActivity, SessionConfig, SessionCreation,
-    SessionDescriptor, SessionEvent, SessionEventKind, SessionSnapshot, SessionStatus,
-    ShellCompletionCandidate, ShellCompletionResult, TurnFailureReason, TurnInput, ViewResource,
-    Visibility,
+    PtyTicket, SESSION_PROTOCOL_VERSION, SensitivityAction, SensitivityClass, SessionActivity,
+    SessionConfig, SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind,
+    SessionSnapshot, SessionStatus, ShellCompletionCandidate, ShellCompletionResult,
+    TurnFailureReason, TurnInput, ViewResource, Visibility,
 };
 pub use protocol::{ClientRequest, ServerResponse};
 pub use pty::{PtyAudit, PtyClaim, PtyCoordinator, PtyReadResult};

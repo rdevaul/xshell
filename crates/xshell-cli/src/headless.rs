@@ -11,7 +11,8 @@ use crate::config::{ModelOverrides, Provider, XshellConfig};
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +57,11 @@ pub struct RunArgs {
     #[arg(long, conflicts_with = "ephemeral")]
     pub detach: bool,
 
+    /// Read approval decisions from this file descriptor, one JSON object
+    /// per line: {"call_id": ..., "decision": "approve" | "deny" | "abort"}.
+    #[arg(long, value_name = "FD", conflicts_with = "detach")]
+    pub approval_channel: Option<i32>,
+
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     pub output: OutputFormat,
@@ -68,6 +74,11 @@ pub struct JobArgs {
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     pub output: OutputFormat,
+
+    /// For `wait`: read approval decisions from this file descriptor, as for
+    /// `run --approval-channel`.
+    #[arg(long, value_name = "FD")]
+    pub approval_channel: Option<i32>,
 }
 
 /// What to do with a session's turn.
@@ -96,6 +107,7 @@ pub struct SharedOptions {
     pub cwd: PathBuf,
     pub approval: ApprovalPolicy,
     pub limits: Option<String>,
+    pub approval_policy: Option<PathBuf>,
 }
 
 /// How a run ended. Each outcome has one exit code.
@@ -219,6 +231,18 @@ fn execute(
         .with_context(|| format!("cannot use working directory {}", shared.cwd.display()))
         .or_outcome(Outcome::Usage)?;
     let prompt = read_prompt(args).or_outcome(Outcome::Usage)?;
+    let overlay = match &shared.approval_policy {
+        Some(path) => {
+            let (config, _, warnings) =
+                crate::config::load_policy_file(path).or_outcome(Outcome::Usage)?;
+            for warning in warnings {
+                output.warning(&format!("approval policy: {warning}"));
+            }
+            Some(config)
+        }
+        None => None,
+    };
+    let mut responder = Responder::open(args.approval_channel).or_outcome(Outcome::Usage)?;
 
     let mut client = connect(&config)?;
 
@@ -263,6 +287,7 @@ fn execute(
             TurnInput::Agent { message: prompt },
             shared.approval,
             Some(limits),
+            overlay,
         )
         .map_err(|error| {
             // The daemon refuses the turn outright when required auditing
@@ -311,6 +336,7 @@ client answers them; use --approval auto or off to avoid that",
         output,
         interrupted,
         Following::Owner,
+        &mut responder,
     )?;
     summary.outcome = Some(outcome);
     output.result(&summary);
@@ -346,7 +372,13 @@ pub fn job(
     interrupted: Arc<AtomicBool>,
 ) -> i32 {
     let mut output = Output::new(args.output);
-    let outcome = match execute_job(command, &shared, &interrupted, &mut output) {
+    let outcome = match execute_job(
+        command,
+        &shared,
+        args.approval_channel,
+        &interrupted,
+        &mut output,
+    ) {
         Ok(outcome) => outcome,
         Err(RunError { outcome, error }) => {
             output.result(&Summary {
@@ -365,6 +397,7 @@ pub fn job(
 fn execute_job(
     command: JobCommand,
     shared: &SharedOptions,
+    approval_channel: Option<i32>,
     interrupted: &AtomicBool,
     output: &mut Output,
 ) -> std::result::Result<Outcome, RunError> {
@@ -374,6 +407,9 @@ fn execute_job(
         .context("name the session with --session (`xshell run --detach` prints it)")
         .or_outcome(Outcome::Usage)?;
     let config = load_config(shared)?;
+    // Take the channel's descriptor before opening any of our own, so it
+    // cannot name a socket this process created.
+    let mut responder = Responder::open(approval_channel).or_outcome(Outcome::Usage)?;
     let mut client = connect(&config)?;
     let descriptor = client
         .list()
@@ -446,6 +482,7 @@ fn execute_job(
         output,
         interrupted,
         following,
+        &mut responder,
     )?;
     summary.outcome = Some(outcome);
     output.result(&summary);
@@ -494,6 +531,7 @@ fn follow_turn(
     output: &mut Output,
     interrupted: &AtomicBool,
     following: Following,
+    responder: &mut Responder,
 ) -> std::result::Result<Outcome, RunError> {
     let mut cancel_requested = false;
     let mut last_progress = Instant::now();
@@ -522,7 +560,6 @@ fn follow_turn(
                 "the session's event journal dropped events before sequence {sequence}"
             ));
         }
-        let answer = following != Following::Observer;
         let mut terminal = None;
         for record in batch.events {
             after = record.sequence;
@@ -530,6 +567,7 @@ fn follow_turn(
                 continue;
             }
             last_progress = Instant::now();
+            let answering = (following != Following::Observer).then_some(&mut *responder);
             if let Some(outcome) = handle_event(
                 record.event,
                 client,
@@ -537,7 +575,7 @@ fn follow_turn(
                 turn_id,
                 summary,
                 output,
-                answer,
+                answering.map(|responder| (responder, interrupted)),
             ) {
                 terminal = Some(outcome);
             }
@@ -565,7 +603,7 @@ fn handle_event(
     turn_id: &str,
     summary: &mut Summary,
     output: &mut Output,
-    answer_approvals: bool,
+    answering: Option<(&mut Responder, &AtomicBool)>,
 ) -> Option<Outcome> {
     match event {
         SessionEventKind::TurnStarted {
@@ -590,14 +628,7 @@ fn handle_event(
         SessionEventKind::Execution { event } => {
             let (agent, event) = event.into_innermost();
             handle_execution(
-                event,
-                agent,
-                client,
-                session_id,
-                turn_id,
-                summary,
-                output,
-                answer_approvals,
+                event, agent, client, session_id, turn_id, summary, output, answering,
             );
             None
         }
@@ -639,7 +670,7 @@ fn handle_execution(
     turn_id: &str,
     summary: &mut Summary,
     output: &mut Output,
-    answer_approvals: bool,
+    answering: Option<(&mut Responder, &AtomicBool)>,
 ) {
     let tagged = |mut value: Value| {
         if let Some(agent) = &agent {
@@ -688,32 +719,44 @@ fn handle_execution(
                 "arguments": call.arguments,
                 "reason": reason,
             })));
-            // Nobody is at a terminal to answer, so a prompt is denied. The
-            // model is told and the turn continues. A prompt replayed from
-            // the journal may already be answered; the daemon then refuses
-            // the reply, and the replay reports only what happened.
-            if !answer_approvals {
+            // Without a channel nobody can answer, so a prompt is denied and
+            // the model is told. A prompt replayed from the journal may
+            // already be answered; the daemon then refuses the reply, and
+            // the replay reports only what happened.
+            let Some((responder, interrupted)) = answering else {
                 return;
-            }
+            };
+            let (decision, source) = responder.decide(&call.id, interrupted, output);
             let sent = client.approve(
                 session_id.to_owned(),
                 turn_id.to_owned(),
                 call.id.clone(),
-                ApprovalDecision::Deny,
+                decision,
             );
             if sent.is_err() {
                 return;
             }
-            summary.approvals_denied += 1;
-            output.progress(&format!(
-                "denied {} (no approval channel; use --approval auto to run without prompts)",
-                call.name
-            ));
+            if decision != ApprovalDecision::Approve {
+                summary.approvals_denied += 1;
+            }
+            let decision_name = match decision {
+                ApprovalDecision::Approve => "approve",
+                ApprovalDecision::Deny => "deny",
+                ApprovalDecision::AbortTurn => "abort",
+            };
+            if source == "no_approval_channel" {
+                output.progress(&format!(
+                    "denied {} (no approval channel; use --approval auto or --approval-channel)",
+                    call.name
+                ));
+            } else {
+                output.progress(&format!("{decision_name} {} ({source})", call.name));
+            }
             output.event(tagged(json!({
                 "event": "approval_decided",
                 "call_id": call.id,
-                "decision": "deny",
-                "source": "no_approval_channel",
+                "decision": decision_name,
+                "source": source,
             })));
         }
         ExecutionEvent::ToolDecision { call_id, decision } => {
@@ -777,6 +820,103 @@ fn handle_execution(
         }
         // `into_innermost` removes these wrappers.
         ExecutionEvent::Subagent { .. } => {}
+    }
+}
+
+/// Answers approval prompts: from an approval channel when there is one,
+/// otherwise by denying them.
+pub struct Responder {
+    channel: Option<BufReader<std::fs::File>>,
+    closed: bool,
+}
+
+impl Responder {
+    /// Take ownership of the descriptor `fd`, if given.
+    fn open(fd: Option<i32>) -> Result<Self> {
+        let channel = match fd {
+            None => None,
+            Some(fd) => {
+                if fd < 3 {
+                    bail!("--approval-channel needs a descriptor of 3 or above, not {fd}");
+                }
+                // SAFETY: fcntl(F_GETFD) only queries the descriptor.
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                    bail!("--approval-channel {fd} is not an open file descriptor");
+                }
+                // SAFETY: the caller opened `fd` for this process to read
+                // decisions from, and nothing else in xshell uses it, so
+                // taking ownership cannot close a descriptor in use.
+                Some(BufReader::new(unsafe { std::fs::File::from_raw_fd(fd) }))
+            }
+        };
+        Ok(Self {
+            channel,
+            closed: false,
+        })
+    }
+
+    /// The decision for the prompt on `call_id`, and where it came from.
+    fn decide(
+        &mut self,
+        call_id: &str,
+        interrupted: &AtomicBool,
+        output: &mut Output,
+    ) -> (ApprovalDecision, &'static str) {
+        let Some(channel) = &mut self.channel else {
+            return (ApprovalDecision::Deny, "no_approval_channel");
+        };
+        if self.closed {
+            return (ApprovalDecision::Deny, "approval_channel_closed");
+        }
+        // Wait for a line without blocking signals out: poll the descriptor
+        // in short steps unless a line is already buffered.
+        while !channel.buffer().contains(&b'\n') {
+            if interrupted.load(Ordering::SeqCst) {
+                return (ApprovalDecision::Deny, "interrupted");
+            }
+            let mut poll = libc::pollfd {
+                fd: channel.get_ref().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll` is one initialized `pollfd`, matching the count of 1.
+            let ready = unsafe { libc::poll(&mut poll, 1, POLL_WAIT_MS as i32) };
+            if ready > 0 {
+                break;
+            }
+        }
+        let mut line = String::new();
+        match channel.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                self.closed = true;
+                output.warning("the approval channel closed; later prompts are denied");
+                return (ApprovalDecision::Deny, "approval_channel_closed");
+            }
+            Ok(_) => {}
+        }
+        let reply: Value = match serde_json::from_str(line.trim()) {
+            Ok(reply) => reply,
+            Err(error) => {
+                output.warning(&format!("invalid approval decision {line:?}: {error}"));
+                return (ApprovalDecision::Deny, "approval_channel_invalid");
+            }
+        };
+        if reply["call_id"].as_str() != Some(call_id) {
+            output.warning(&format!(
+                "the approval channel answered {:?}, not the waiting call {call_id:?}; denied",
+                reply["call_id"]
+            ));
+            return (ApprovalDecision::Deny, "approval_channel_mismatch");
+        }
+        match reply["decision"].as_str() {
+            Some("approve") => (ApprovalDecision::Approve, "approval_channel"),
+            Some("deny") => (ApprovalDecision::Deny, "approval_channel"),
+            Some("abort") => (ApprovalDecision::AbortTurn, "approval_channel"),
+            other => {
+                output.warning(&format!("unknown approval decision {other:?}; denied"));
+                (ApprovalDecision::Deny, "approval_channel_invalid")
+            }
+        }
     }
 }
 

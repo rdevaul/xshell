@@ -15,11 +15,11 @@ use uuid::Uuid;
 use xshell_platform::LockExt;
 use xshell_platform::service::{ServiceDefinition, ServiceManager, ServiceState, ServiceVerb};
 use xshell_session::{
-    ClientPtyFrame, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonAudit, DaemonProbeReport,
-    DaemonProbeStatus, ExecutionCoordinator, PersistenceMode, PtyAudit, PtyClaim, PtyCoordinator,
-    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionConfig,
-    SessionHandshake, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
-    write_server_frame,
+    ClientPtyFrame, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonAudit, DaemonPolicy,
+    DaemonProbeReport, DaemonProbeStatus, ExecutionCoordinator, PersistenceMode, PtyAudit,
+    PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
+    SessionActivity, SessionConfig, SessionHandshake, SessionRegistry, complete_shell,
+    load_view_resource, read_client_frame, write_server_frame,
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -147,14 +147,21 @@ fn main() -> Result<()> {
         user,
     )?));
     let audit = DaemonAudit::from_config(&audit_config)?;
-    let max_limits = config.limit_ceiling()?;
+    let (rules, warnings) = config.approval_policy()?;
+    for warning in warnings {
+        eprintln!("xshelld: approval policy: {warning}");
+    }
     let execution = ExecutionCoordinator::with_policy(
         Arc::clone(&registry),
         audit,
-        config.max_approval,
-        max_limits,
-        config.sensitive_paths(),
-        config.compaction.clone(),
+        DaemonPolicy {
+            max_approval: config.max_approval,
+            max_limits: config.limit_ceiling()?,
+            sensitive_paths: config.sensitive_paths(),
+            blocked_paths: config.blocked_paths(),
+            rules,
+            compaction: config.compaction.clone(),
+        },
     );
     let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
 
@@ -1026,12 +1033,18 @@ fn process_request(
             input,
             approval,
             limits,
+            policy,
         } => {
             require_current(attached_session, &session_id)?;
             if ptys.has_session(&session_id) {
                 bail!("cannot start a turn while a PTY is active");
             }
-            let turn_id = execution.submit(&session_id, input, approval, limits)?;
+            let overlay = policy
+                .map(|config| xshell_execution::Policy::parse(&config))
+                .transpose()
+                .context("invalid client approval policy")?
+                .map(|(overlay, _warnings)| overlay);
+            let turn_id = execution.submit(&session_id, input, approval, limits, overlay)?;
             Ok(ServerResponse::Accepted { turn_id })
         }
         ClientRequest::Events {

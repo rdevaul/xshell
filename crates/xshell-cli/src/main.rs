@@ -78,6 +78,14 @@ struct Args {
     #[arg(
         long,
         global = true,
+        env = "XSHELL_APPROVAL_POLICY",
+        help = "Approval policy file (always_allowed, allowed, denied); it can only restrict the session host's policy"
+    )]
+    approval_policy: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
         env = "XSHELL_APPROVAL",
         value_enum,
         default_value = "ask",
@@ -138,6 +146,7 @@ async fn main() -> Result<()> {
             cwd: args.cwd,
             approval: args.approval,
             limits: args.limits,
+            approval_policy: args.approval_policy,
         };
         // Turn events are polled synchronously; keep that off the runtime's
         // worker so the signal watcher keeps running.
@@ -169,8 +178,33 @@ async fn main() -> Result<()> {
     // Approval and sensitive paths are fixed for the process; the history
     // budget is resolved per turn from the active model so `//model` switches
     // are honoured (see `turn_policy_for`).
+    // A policy file is an overlay on the session host's policy. Without a
+    // session host, this process executes: the configured
+    // `session_fabric.approval_policy` is the base, and the file the overlay.
+    let approval_overlay = match &args.approval_policy {
+        Some(path) => {
+            let (config, policy, warnings) = config::load_policy_file(path)?;
+            for warning in warnings {
+                eprintln!("xshell: approval policy: {warning}");
+            }
+            Some((config, policy))
+        }
+        None => None,
+    };
     let base_policy = TurnPolicy::new(args.approval)
-        .with_sensitive_paths(model_config.session_fabric.sensitive_paths());
+        .with_sensitive_paths(model_config.session_fabric.sensitive_paths())
+        .with_blocked_paths(model_config.session_fabric.blocked_paths())
+        .with_rules(xshell_execution::ApprovalRules {
+            base: {
+                let (policy, warnings) = model_config.session_fabric.approval_policy()?;
+                for warning in warnings {
+                    eprintln!("xshell: approval policy: {warning}");
+                }
+                policy
+            },
+            overlay: approval_overlay.as_ref().map(|(_, policy)| policy.clone()),
+        });
+    let overlay_config = approval_overlay.map(|(config, _)| config);
     let viewers = ViewerRegistry::with_builtins();
     let mut active_model = model_config.resolve_startup(
         args.profile.as_deref(),
@@ -454,6 +488,7 @@ async fn main() -> Result<()> {
                         },
                         args.approval,
                         xshell_execution::TurnLimits::default(),
+                        overlay_config.clone(),
                     );
                     if let Err(error) = result.and_then(|_| {
                         resume_active_session(
@@ -783,6 +818,7 @@ async fn main() -> Result<()> {
                         },
                         args.approval,
                         limits,
+                        overlay_config.clone(),
                     );
                     if let Err(error) = result.and_then(|_| {
                         resume_active_session(
