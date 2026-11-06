@@ -15,6 +15,10 @@ use tempfile::TempDir;
 /// provider that is still thinking would.
 const HOLD: &str = "HOLD";
 
+/// Prefix for a response sent only after a delay, so the turn is observably
+/// running for a while.
+const SLOW: &str = "SLOW:";
+
 fn xshelld_binary() -> PathBuf {
     let candidate = PathBuf::from(env!("CARGO_BIN_EXE_xshell")).with_file_name("xshelld");
     if !candidate.exists() {
@@ -83,6 +87,13 @@ fn serve(responses: Vec<String>) -> String {
                 held.push(socket);
                 continue;
             }
+            let body = match body.strip_prefix(SLOW) {
+                Some(rest) => {
+                    thread::sleep(Duration::from_secs(5));
+                    rest.to_owned()
+                }
+                None => body,
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -153,6 +164,22 @@ enabled = {enabled}\nsocket = {socket:?}\nstate_directory = {state:?}\n\n\
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
+    }
+
+    /// `xshell SUBCOMMAND ARGS` with this fabric's configuration.
+    fn job(&self, subcommand: &str, args: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_xshell"));
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.directory.path())
+            .args(["--config", self.config.to_str().unwrap()])
+            .arg(subcommand)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        wait_with_timeout(command.spawn().unwrap(), Duration::from_secs(30))
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -381,4 +408,156 @@ fn sigterm_cancels_the_turn_and_exits_four() {
     assert!(names.contains(&"cancel_requested"), "{names:?}");
     assert_eq!(&names[names.len() - 2..], ["turn_cancelled", "result"]);
     assert_eq!(events.last().unwrap()["outcome"], "cancelled");
+}
+
+#[test]
+fn a_detached_turn_can_be_inspected_and_waited_for() {
+    let fabric = Fabric::new(
+        &serve(vec![format!("{SLOW}{}", sse_text("finished later"))]),
+        true,
+        true,
+    );
+    let started = fabric.run(&["--detach", "--approval", "auto", "--session", "job", "work"]);
+    assert_eq!(started.status.code(), Some(0), "{started:?}");
+    // Text output is the session name, for `wait --session`.
+    assert_eq!(String::from_utf8_lossy(&started.stdout), "job\n");
+
+    let status = fabric.job("status", &["--session", "job", "--output", "jsonl"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let status = events(&status).pop().unwrap();
+    assert_eq!(status["event"], "status");
+    assert_eq!(status["activity"], "agent_running");
+
+    let early = fabric.job("result", &["--session", "job", "--output", "jsonl"]);
+    assert_eq!(early.status.code(), Some(7), "{early:?}");
+    assert_eq!(events(&early).pop().unwrap()["outcome"], "running");
+
+    let waited = fabric.job("wait", &["--session", "job", "--output", "jsonl"]);
+    assert_eq!(waited.status.code(), Some(0), "{waited:?}");
+    let waited = events(&waited);
+    // The wait replays the turn from its start.
+    assert_eq!(waited.first().unwrap()["event"], "turn_started");
+    let result = waited.last().unwrap();
+    assert_eq!(result["outcome"], "completed");
+    assert_eq!(result["answer"], "finished later");
+
+    // Once finished, `result` reports the same outcome without waiting.
+    let late = fabric.job("result", &["--session", "job"]);
+    assert_eq!(late.status.code(), Some(0), "{late:?}");
+    assert_eq!(String::from_utf8_lossy(&late.stdout), "finished later\n");
+    let idle = fabric.job("status", &["--session", "job"]);
+    assert_eq!(String::from_utf8_lossy(&idle.stdout), "job: idle\n");
+}
+
+#[test]
+fn cancel_stops_a_detached_turn_and_reports_it() {
+    let fabric = Fabric::new(&serve(vec![HOLD.into()]), true, true);
+    let started = fabric.run(&[
+        "--detach",
+        "--approval",
+        "auto",
+        "--session",
+        "stuck",
+        "think",
+    ]);
+    assert_eq!(started.status.code(), Some(0), "{started:?}");
+    let cancelled = fabric.job("cancel", &["--session", "stuck", "--output", "jsonl"]);
+    assert_eq!(cancelled.status.code(), Some(4), "{cancelled:?}");
+    let events = events(&cancelled);
+    assert_eq!(events.first().unwrap()["event"], "cancel_requested");
+    assert_eq!(events.last().unwrap()["outcome"], "cancelled");
+    // Nothing is left to cancel.
+    let again = fabric.job("cancel", &["--session", "stuck"]);
+    assert_eq!(again.status.code(), Some(1), "{again:?}");
+}
+
+#[test]
+fn job_commands_need_an_existing_session() {
+    let fabric = Fabric::new(&serve(Vec::new()), true, true);
+    let unnamed = fabric.job("wait", &[]);
+    assert_eq!(unnamed.status.code(), Some(2), "{unnamed:?}");
+    assert!(String::from_utf8_lossy(&unnamed.stderr).contains("--session"));
+    let unknown = fabric.job("status", &["--session", "nope"]);
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+}
+
+#[test]
+fn detaching_in_ask_mode_warns_that_prompts_will_wait() {
+    let fabric = Fabric::new(&serve(vec![sse_text("ok")]), true, true);
+    let started = fabric.run(&["--detach", "--output", "jsonl", "--session", "asky", "hi"]);
+    assert_eq!(started.status.code(), Some(0), "{started:?}");
+    let events = events(&started);
+    assert!(events.iter().any(|event| {
+        event["event"] == "warning"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("approval prompts wait")
+    }));
+    assert_eq!(
+        &names(&events)[names(&events).len() - 2..],
+        ["detached", "result"]
+    );
+    assert_eq!(events.last().unwrap()["outcome"], "detached");
+}
+
+#[test]
+fn interrupting_wait_leaves_the_turn_running() {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+
+    let fabric = Fabric::new(&serve(vec![HOLD.into()]), true, true);
+    let started = fabric.run(&[
+        "--detach",
+        "--approval",
+        "auto",
+        "--session",
+        "long",
+        "work",
+    ]);
+    assert_eq!(started.status.code(), Some(0), "{started:?}");
+    let mut waiter = Command::new(env!("CARGO_BIN_EXE_xshell"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", fabric.directory.path())
+        .args(["--config", fabric.config.to_str().unwrap()])
+        .args(["wait", "--session", "long", "--output", "jsonl"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = waiter.id() as libc::pid_t;
+    let stdout = waiter.stdout.take().unwrap();
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in std::io::BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if line.contains("\"event\":\"turn_started\"") {
+                let _ = seen_tx.send(());
+            }
+            lines.push(line);
+        }
+        lines
+    });
+    seen_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("wait never replayed the turn's start");
+    // SAFETY: kill(2) has no memory-safety preconditions; the child has not
+    // been reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let output = wait_with_timeout(waiter, Duration::from_secs(30));
+    let lines = reader.join().unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?} {lines:?}");
+    assert!(lines.last().unwrap().contains("\"outcome\":\"running\""));
+    // The turn was not cancelled.
+    let status = fabric.job("status", &["--session", "long"]);
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout)
+            .trim_end()
+            .split(" (")
+            .next(),
+        Some("long: agent running")
+    );
 }

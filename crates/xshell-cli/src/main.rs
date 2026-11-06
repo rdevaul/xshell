@@ -110,12 +110,20 @@ enum Command {
     /// Run one agent turn without a terminal and report its outcome
     /// (see docs/headless.md).
     Run(headless::RunArgs),
+    /// Follow a session's active turn to its end, or report its last turn.
+    Wait(headless::JobArgs),
+    /// Report a session's activity.
+    Status(headless::JobArgs),
+    /// Report a session's last finished turn (exit 7 while one is running).
+    Result(headless::JobArgs),
+    /// Cancel a session's active turn and report how it ended.
+    Cancel(headless::JobArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
-    if let Some(Command::Run(run)) = args.command.take() {
+    if let Some(command) = args.command.take() {
         let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         headless::watch_signals(std::sync::Arc::clone(&interrupted));
         let shared = headless::SharedOptions {
@@ -131,10 +139,24 @@ async fn main() -> Result<()> {
             approval: args.approval,
             limits: args.limits,
         };
-        // The turn's events are polled synchronously; keep that off the
-        // runtime's worker so the signal watcher keeps running.
-        let code =
-            tokio::task::spawn_blocking(move || headless::run(shared, run, interrupted)).await?;
+        // Turn events are polled synchronously; keep that off the runtime's
+        // worker so the signal watcher keeps running.
+        let code = tokio::task::spawn_blocking(move || match command {
+            Command::Run(run) => headless::run(shared, run, interrupted),
+            Command::Wait(job) => {
+                headless::job(headless::JobCommand::Wait, shared, job, interrupted)
+            }
+            Command::Status(job) => {
+                headless::job(headless::JobCommand::Status, shared, job, interrupted)
+            }
+            Command::Result(job) => {
+                headless::job(headless::JobCommand::Result, shared, job, interrupted)
+            }
+            Command::Cancel(job) => {
+                headless::job(headless::JobCommand::Cancel, shared, job, interrupted)
+            }
+        })
+        .await?;
         std::process::exit(code);
     }
     let (model_config, config_path) = XshellConfig::load(args.config.as_deref())?;

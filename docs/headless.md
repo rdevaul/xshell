@@ -40,6 +40,41 @@ xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral] [--prompt-file F
   stdout, as described below.
 - **Signals:** SIGINT or SIGTERM cancels the turn. The run still reports the
   outcome and exits with code 4.
+- **Detaching:** `--detach` starts the turn and exits at once with code 0.
+  With text output it prints the session name; follow the turn with the job
+  commands below.
+
+## Long-running jobs
+
+A turn runs in the daemon whether or not a client follows it. These commands
+act on the session named by `--session`, so a job can outlive the script
+that started it, and a restarted script can pick it up:
+
+```sh
+session=$(xshell run --detach --approval auto --limits relaxed "Render every part")
+xshell status --session "$session"     # idle, agent running, ...
+xshell wait --session "$session"       # follow to the end; exit code as for run
+xshell result --session "$session"     # the last outcome now, or exit 7 if still running
+xshell cancel --session "$session"     # cancel and report (exit 4)
+```
+
+- **`wait`** follows the session's active turn to its end, replaying it from
+  its first event in the session's journal. With no turn active, it replays
+  the last finished turn. SIGINT or SIGTERM stops waiting, leaves the turn
+  running, and exits 7.
+- **`result`** reports the last finished turn without waiting, or exits 7 if a
+  turn is running.
+- **`status`** reports the session's activity and exits 0.
+- **`cancel`** cancels the active turn, follows it until it ends, and exits 4;
+  it exits 1 if no turn is active.
+- **Approvals:** `wait` denies approval prompts the same way `run` does. A
+  detached turn's prompt waits until `wait` or an interactive client answers
+  it, so `run --detach` in `ask` mode warns about this. Use `--approval auto`
+  or `off` for unattended jobs.
+- **Retention:** turns are replayed from the daemon's in-memory event
+  journal, which keeps recent turns until its size bound evicts them and does
+  not survive a daemon restart. The session and its conversation persist as
+  its persistence mode allows.
 
 ## Approvals
 
@@ -65,6 +100,9 @@ planned ([agentic CAD plan](agentic-cad-plan.md), §5.2).
 | 4 | `cancelled` | The turn was cancelled, by a signal or another client |
 | 5 | `approval_denied` | The turn failed after the run denied an approval |
 | 6 | `unavailable` | The daemon could not be reached, or required auditing failed |
+| 7 | `running` | The turn is still running (`result`, or an interrupted `wait`) |
+
+`run --detach` and `status` exit 0.
 
 ## JSON Lines schema (version 1)
 
@@ -94,7 +132,9 @@ incompatible change increments `schema`.
 | `subagent_started` | `subagent`, `task`, `tools` | A `delegate_task` call started a subagent |
 | `subagent_finished` | `subagent`, `outcome`, `message`? | That subagent ended |
 | `turn_aborted` | | The turn was aborted at an approval |
-| `cancel_requested` | | The run received a signal and asked the daemon to cancel |
+| `cancel_requested` | | The client asked the daemon to cancel the turn |
+| `detached` | | `run --detach` left the turn running |
+| `status` | `schema`, `session`, `session_id`, `activity`, `turn_id`? | The output of `status`; `activity` is `idle`, `agent_running`, `agent_waiting_approval`, `agent_stopping`, or `interactive_process` |
 | `warning` | `message` | Something worth knowing that did not end the run |
 | `turn_completed` | | The turn finished |
 | `turn_failed` | `message`, `reason`? | The turn failed; `reason` is `budget_exhausted` or `audit_unavailable` when known |
@@ -102,7 +142,8 @@ incompatible change increments `schema`.
 | `result` | `schema`, `outcome`, `exit_code`, `answer`, `message`?, `session`?, `session_id`?, `turn_id`?, `tool_calls`, `approvals_denied` | How the run ended; `answer` is the final text of the main agent |
 
 A run that fails before its turn starts (bad configuration, no daemon) prints
-only a `result` line.
+only a `result` line. `wait` and `result` print the replayed turn's events,
+starting at `turn_started`, followed by a `result` line.
 
 ## Examples
 

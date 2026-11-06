@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 use xshell_session::{
-    PersistenceMode, SessionClient, SessionCreation, SessionEventKind, TurnFailureReason,
-    TurnInput, Visibility,
+    AgentTurnPhase, PersistenceMode, SessionActivity, SessionClient, SessionCreation,
+    SessionEventKind, TurnFailureReason, TurnInput, Visibility,
 };
 
 /// The version of the JSON Lines schema. Bumped on any incompatible change;
@@ -52,9 +52,35 @@ pub struct RunArgs {
     #[arg(long, conflicts_with = "session")]
     pub ephemeral: bool,
 
+    /// Start the turn and exit at once. Follow it later with `xshell wait`.
+    #[arg(long, conflicts_with = "ephemeral")]
+    pub detach: bool,
+
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     pub output: OutputFormat,
+}
+
+/// Options for `wait`, `status`, `result`, and `cancel`, which act on the
+/// session named by `--session`.
+#[derive(Debug, Args)]
+pub struct JobArgs {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub output: OutputFormat,
+}
+
+/// What to do with a session's turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCommand {
+    /// Follow the active turn to its end, or report the last one.
+    Wait,
+    /// Report the session's activity.
+    Status,
+    /// Report the last finished turn, or that a turn is still running.
+    Result,
+    /// Cancel the active turn and report how it ended.
+    Cancel,
 }
 
 /// The settings `run` shares with interactive xshell.
@@ -83,6 +109,11 @@ pub enum Outcome {
     Cancelled,
     ApprovalDenied,
     Unavailable,
+    /// The turn is still running: `result` found it active, or `wait` was
+    /// interrupted before it ended.
+    Running,
+    /// `run --detach` started the turn and left it running.
+    Detached,
 }
 
 impl Outcome {
@@ -95,6 +126,8 @@ impl Outcome {
             Self::Cancelled => 4,
             Self::ApprovalDenied => 5,
             Self::Unavailable => 6,
+            Self::Running => 7,
+            Self::Detached => 0,
         }
     }
 
@@ -107,6 +140,8 @@ impl Outcome {
             Self::Cancelled => "cancelled",
             Self::ApprovalDenied => "approval_denied",
             Self::Unavailable => "unavailable",
+            Self::Running => "running",
+            Self::Detached => "detached",
         }
     }
 }
@@ -164,13 +199,7 @@ fn execute(
     interrupted: &AtomicBool,
     output: &mut Output,
 ) -> std::result::Result<Outcome, RunError> {
-    let (config, _) = XshellConfig::load(shared.config.as_deref()).or_outcome(Outcome::Usage)?;
-    if !config.session_fabric.enabled {
-        return Err(anyhow::anyhow!(
-            "xshell run needs the session fabric: set session_fabric.enabled = true and start xshelld"
-        ))
-        .or_outcome(Outcome::Usage);
-    }
+    let config = load_config(shared)?;
     let active_model = config
         .resolve_startup(
             shared.profile.as_deref(),
@@ -191,13 +220,7 @@ fn execute(
         .or_outcome(Outcome::Usage)?;
     let prompt = read_prompt(args).or_outcome(Outcome::Usage)?;
 
-    let socket = config
-        .session_fabric
-        .resolved_socket()
-        .context("HOME and XDG_STATE_HOME are not set; configure session_fabric.socket")
-        .or_outcome(Outcome::Usage)?;
-    let mut client = SessionClient::connect(&socket, env!("CARGO_PKG_VERSION"))
-        .or_outcome(Outcome::Unavailable)?;
+    let mut client = connect(&config)?;
 
     let session_name = shared
         .session
@@ -229,7 +252,7 @@ fn execute(
     let session_id = snapshot.descriptor.id.clone();
 
     // Follow events from after anything already in the journal.
-    let mut after = client
+    let after = client
         .events(session_id.clone(), 0, 0)
         .or_outcome(Outcome::Unavailable)?
         .next_sequence
@@ -267,24 +290,239 @@ fn execute(
         "limits_profile": limits_name,
     }));
 
+    if args.detach {
+        if shared.approval == ApprovalPolicy::Ask {
+            output.warning(
+                "a detached turn's approval prompts wait until `xshell wait` or an interactive \
+client answers them; use --approval auto or off to avoid that",
+            );
+        }
+        output.event(json!({"event": "detached"}));
+        summary.outcome = Some(Outcome::Detached);
+        output.result(&summary);
+        return Ok(Outcome::Detached);
+    }
+    let outcome = follow_turn(
+        &mut client,
+        &session_id,
+        &turn_id,
+        after,
+        &mut summary,
+        output,
+        interrupted,
+        Following::Owner,
+    )?;
+    summary.outcome = Some(outcome);
+    output.result(&summary);
+    Ok(outcome)
+}
+
+fn load_config(shared: &SharedOptions) -> std::result::Result<XshellConfig, RunError> {
+    let (config, _) = XshellConfig::load(shared.config.as_deref()).or_outcome(Outcome::Usage)?;
+    if !config.session_fabric.enabled {
+        return Err(anyhow::anyhow!(
+            "headless runs need the session fabric: set session_fabric.enabled = true and start xshelld"
+        ))
+        .or_outcome(Outcome::Usage);
+    }
+    Ok(config)
+}
+
+fn connect(config: &XshellConfig) -> std::result::Result<SessionClient, RunError> {
+    let socket = config
+        .session_fabric
+        .resolved_socket()
+        .context("HOME and XDG_STATE_HOME are not set; configure session_fabric.socket")
+        .or_outcome(Outcome::Usage)?;
+    SessionClient::connect(&socket, env!("CARGO_PKG_VERSION")).or_outcome(Outcome::Unavailable)
+}
+
+/// Run `wait`, `status`, `result`, or `cancel` on the session named by
+/// `--session`, and return the exit code.
+pub fn job(
+    command: JobCommand,
+    shared: SharedOptions,
+    args: JobArgs,
+    interrupted: Arc<AtomicBool>,
+) -> i32 {
+    let mut output = Output::new(args.output);
+    let outcome = match execute_job(command, &shared, &interrupted, &mut output) {
+        Ok(outcome) => outcome,
+        Err(RunError { outcome, error }) => {
+            output.result(&Summary {
+                outcome: Some(outcome),
+                message: Some(format!("{error:#}")),
+                session: shared.session.clone(),
+                ..Summary::default()
+            });
+            outcome
+        }
+    };
+    let _ = std::io::stdout().flush();
+    outcome.exit_code()
+}
+
+fn execute_job(
+    command: JobCommand,
+    shared: &SharedOptions,
+    interrupted: &AtomicBool,
+    output: &mut Output,
+) -> std::result::Result<Outcome, RunError> {
+    let selector = shared
+        .session
+        .clone()
+        .context("name the session with --session (`xshell run --detach` prints it)")
+        .or_outcome(Outcome::Usage)?;
+    let config = load_config(shared)?;
+    let mut client = connect(&config)?;
+    let descriptor = client
+        .list()
+        .or_outcome(Outcome::Unavailable)?
+        .into_iter()
+        .find(|session| session.name == selector || session.id == selector)
+        .with_context(|| format!("no session named {selector:?}"))
+        .or_outcome(Outcome::Usage)?;
+
+    if command == JobCommand::Status {
+        let (activity, turn_id) = describe_activity(&descriptor.activity);
+        output.status(&descriptor.name, &descriptor.id, activity, turn_id);
+        return Ok(Outcome::Completed);
+    }
+
+    // Following events, cancelling, and answering prompts need the session
+    // to be this connection's current one.
+    client
+        .attach(descriptor.id.clone())
+        .or_outcome(Outcome::Failed)?;
+    let journal = client
+        .events(descriptor.id.clone(), 0, 0)
+        .or_outcome(Outcome::Unavailable)?;
+    let active = journal.active_turn_id.clone();
+    let turn_id = active
+        .clone()
+        .or_else(|| journal.events.last().map(|event| event.turn_id.clone()))
+        .context("the session has no turn to report")
+        .or_outcome(Outcome::Failed)?;
+    // Replay the turn from its first event the journal still holds.
+    let after = journal
+        .events
+        .iter()
+        .find(|event| event.turn_id == turn_id)
+        .map(|event| event.sequence.saturating_sub(1))
+        .unwrap_or_else(|| journal.next_sequence.saturating_sub(1));
+    let mut summary = Summary {
+        session: Some(descriptor.name.clone()),
+        session_id: Some(descriptor.id.clone()),
+        turn_id: Some(turn_id.clone()),
+        ..Summary::default()
+    };
+
+    let following = match command {
+        JobCommand::Result if active.is_some() => {
+            summary.outcome = Some(Outcome::Running);
+            output.result(&summary);
+            return Ok(Outcome::Running);
+        }
+        JobCommand::Cancel => {
+            if active.is_none() {
+                return Err(anyhow::anyhow!("the session has no active turn to cancel"))
+                    .or_outcome(Outcome::Failed);
+            }
+            client
+                .cancel(descriptor.id.clone(), turn_id.clone())
+                .or_outcome(Outcome::Failed)?;
+            output.event(json!({"event": "cancel_requested"}));
+            Following::Observer
+        }
+        JobCommand::Wait if active.is_some() => Following::Waiter,
+        _ => Following::Observer,
+    };
+    let outcome = follow_turn(
+        &mut client,
+        &descriptor.id,
+        &turn_id,
+        after,
+        &mut summary,
+        output,
+        interrupted,
+        following,
+    )?;
+    summary.outcome = Some(outcome);
+    output.result(&summary);
+    Ok(outcome)
+}
+
+/// A session's activity as a word, and the turn it concerns.
+fn describe_activity(activity: &SessionActivity) -> (&'static str, Option<&str>) {
+    match activity {
+        SessionActivity::Idle => ("idle", None),
+        SessionActivity::AgentTurn { turn_id, phase } => (
+            match phase {
+                AgentTurnPhase::Running => "agent_running",
+                AgentTurnPhase::WaitingApproval => "agent_waiting_approval",
+                AgentTurnPhase::Stopping => "agent_stopping",
+            },
+            Some(turn_id),
+        ),
+        SessionActivity::InteractiveProcess { .. } => ("interactive_process", None),
+    }
+}
+
+/// How a client follows a turn: what it does on a signal, and whether it
+/// answers approval prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Following {
+    /// The run that started the turn: a signal cancels it, and prompts are
+    /// answered.
+    Owner,
+    /// `wait`: a signal stops waiting and leaves the turn running; prompts
+    /// are answered.
+    Waiter,
+    /// Replaying a finished turn, or following a cancellation: nothing is
+    /// answered.
+    Observer,
+}
+
+/// Follow `turn_id`'s events after `after` until it ends.
+#[allow(clippy::too_many_arguments)]
+fn follow_turn(
+    client: &mut SessionClient,
+    session_id: &str,
+    turn_id: &str,
+    mut after: u64,
+    summary: &mut Summary,
+    output: &mut Output,
+    interrupted: &AtomicBool,
+    following: Following,
+) -> std::result::Result<Outcome, RunError> {
     let mut cancel_requested = false;
     let mut last_progress = Instant::now();
-    let outcome = loop {
+    loop {
         if interrupted.load(Ordering::SeqCst) && !cancel_requested {
-            cancel_requested = true;
-            output.event(json!({"event": "cancel_requested"}));
-            if let Err(error) = client.cancel(session_id.clone(), turn_id.clone()) {
-                output.warning(&format!("could not request cancellation: {error:#}"));
+            match following {
+                Following::Waiter => {
+                    output.warning("stopped waiting; the turn is still running");
+                    return Ok(Outcome::Running);
+                }
+                Following::Owner => {
+                    cancel_requested = true;
+                    output.event(json!({"event": "cancel_requested"}));
+                    if let Err(error) = client.cancel(session_id.to_owned(), turn_id.to_owned()) {
+                        output.warning(&format!("could not request cancellation: {error:#}"));
+                    }
+                }
+                Following::Observer => cancel_requested = true,
             }
         }
         let batch = client
-            .events(session_id.clone(), after, POLL_WAIT_MS)
+            .events(session_id.to_owned(), after, POLL_WAIT_MS)
             .or_outcome(Outcome::Unavailable)?;
         if let Some(sequence) = batch.truncated_before {
             output.warning(&format!(
                 "the session's event journal dropped events before sequence {sequence}"
             ));
         }
+        let answer = following != Following::Observer;
         let mut terminal = None;
         for record in batch.events {
             after = record.sequence;
@@ -294,30 +532,28 @@ fn execute(
             last_progress = Instant::now();
             if let Some(outcome) = handle_event(
                 record.event,
-                &mut client,
-                &session_id,
-                &turn_id,
-                &mut summary,
+                client,
+                session_id,
+                turn_id,
+                summary,
                 output,
+                answer,
             ) {
                 terminal = Some(outcome);
             }
         }
         if let Some(outcome) = terminal {
-            break outcome;
+            return Ok(outcome);
         }
-        if batch.active_turn_id.as_deref() != Some(turn_id.as_str())
+        if batch.active_turn_id.as_deref() != Some(turn_id)
             && last_progress.elapsed() > Duration::from_secs(5)
         {
-            break Err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "the turn ended without reporting how; see the session's history"
             ))
-            .or_outcome(Outcome::Failed)?;
+            .or_outcome(Outcome::Failed);
         }
-    };
-    summary.outcome = Some(outcome);
-    output.result(&summary);
-    Ok(outcome)
+    }
 }
 
 /// Report one event, answer an approval prompt, and return the outcome when
@@ -329,6 +565,7 @@ fn handle_event(
     turn_id: &str,
     summary: &mut Summary,
     output: &mut Output,
+    answer_approvals: bool,
 ) -> Option<Outcome> {
     match event {
         SessionEventKind::TurnStarted {
@@ -352,7 +589,16 @@ fn handle_event(
         }
         SessionEventKind::Execution { event } => {
             let (agent, event) = event.into_innermost();
-            handle_execution(event, agent, client, session_id, turn_id, summary, output);
+            handle_execution(
+                event,
+                agent,
+                client,
+                session_id,
+                turn_id,
+                summary,
+                output,
+                answer_approvals,
+            );
             None
         }
         SessionEventKind::TurnCompleted => {
@@ -384,6 +630,7 @@ fn handle_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_execution(
     event: ExecutionEvent,
     agent: Option<String>,
@@ -392,6 +639,7 @@ fn handle_execution(
     turn_id: &str,
     summary: &mut Summary,
     output: &mut Output,
+    answer_approvals: bool,
 ) {
     let tagged = |mut value: Value| {
         if let Some(agent) = &agent {
@@ -441,27 +689,32 @@ fn handle_execution(
                 "reason": reason,
             })));
             // Nobody is at a terminal to answer, so a prompt is denied. The
-            // model is told and the turn continues.
-            summary.approvals_denied += 1;
-            output.progress(&format!(
-                "denied {} (no approval channel; use --approval auto to run without prompts)",
-                call.name
-            ));
+            // model is told and the turn continues. A prompt replayed from
+            // the journal may already be answered; the daemon then refuses
+            // the reply, and the replay reports only what happened.
+            if !answer_approvals {
+                return;
+            }
             let sent = client.approve(
                 session_id.to_owned(),
                 turn_id.to_owned(),
                 call.id.clone(),
                 ApprovalDecision::Deny,
             );
+            if sent.is_err() {
+                return;
+            }
+            summary.approvals_denied += 1;
+            output.progress(&format!(
+                "denied {} (no approval channel; use --approval auto to run without prompts)",
+                call.name
+            ));
             output.event(tagged(json!({
                 "event": "approval_decided",
                 "call_id": call.id,
                 "decision": "deny",
                 "source": "no_approval_channel",
             })));
-            if let Err(error) = sent {
-                output.warning(&format!("could not send the approval decision: {error:#}"));
-            }
         }
         ExecutionEvent::ToolDecision { call_id, decision } => {
             output.event(tagged(json!({
@@ -560,6 +813,25 @@ impl Output {
         }
     }
 
+    fn status(&mut self, session: &str, session_id: &str, activity: &str, turn_id: Option<&str>) {
+        match self.format {
+            OutputFormat::Jsonl => self.event(json!({
+                "event": "status",
+                "schema": SCHEMA_VERSION,
+                "session": session,
+                "session_id": session_id,
+                "activity": activity,
+                "turn_id": turn_id,
+            })),
+            OutputFormat::Text => {
+                let turn = turn_id
+                    .map(|id| format!(" (turn {id})"))
+                    .unwrap_or_default();
+                println!("{session}: {}{turn}", activity.replace('_', " "));
+            }
+        }
+    }
+
     fn result(&mut self, summary: &Summary) {
         let outcome = summary.outcome.unwrap_or_default();
         match self.format {
@@ -576,6 +848,12 @@ impl Output {
                 "tool_calls": summary.tool_calls,
                 "approvals_denied": summary.approvals_denied,
             })),
+            OutputFormat::Text if outcome == Outcome::Detached => {
+                // The session name is what `xshell wait --session` needs.
+                if let Some(session) = &summary.session {
+                    println!("{session}");
+                }
+            }
             OutputFormat::Text => {
                 if !summary.answer.is_empty() {
                     let mut stdout = std::io::stdout().lock();
@@ -583,6 +861,10 @@ impl Output {
                 }
                 match (outcome, summary.message.as_deref()) {
                     (Outcome::Completed, _) => {}
+                    (Outcome::Running, _) => eprintln!(
+                        "xshell: the turn is still running; `xshell wait --session {}` follows it",
+                        summary.session.as_deref().unwrap_or("NAME")
+                    ),
                     (Outcome::Usage, Some(message)) => eprintln!("xshell: {message}"),
                     (_, message) => eprintln!(
                         "xshell: run {}{}",
