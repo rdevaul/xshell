@@ -395,11 +395,24 @@ fn profile_candidates(prefix: &str, profiles: &[String], replacement_prefix: &st
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
-    use std::path::Path;
+    use std::path::PathBuf;
+
+    /// The package directory, read when the test runs. `cargo test` sets
+    /// `CARGO_MANIFEST_DIR` for each test process. The compile-time `env!` form
+    /// is baked into the binary, and Cargo does not rebuild when only the checkout
+    /// path changes, so a test binary reused from another checkout (for example
+    /// one built into a shared target directory) would look in that old,
+    /// possibly deleted, location.
+    fn manifest_dir() -> PathBuf {
+        PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR is unset; run the tests through cargo"),
+        )
+    }
 
     #[test]
     fn path_completion_uses_xshell_cwd() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = &manifest_dir();
         let result = complete_shell("$cat Cargo", 10, root).unwrap();
         assert!(
             result
@@ -410,7 +423,7 @@ mod tests {
     }
 
     fn helper_with_profiles() -> XshellHelper {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = &manifest_dir();
         XshellHelper::new(
             root.to_owned(),
             vec![
@@ -427,7 +440,7 @@ mod tests {
 
     #[test]
     fn completes_control_commands() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = &manifest_dir();
         let helper = XshellHelper::new(root.to_owned(), Vec::new());
         let history = DefaultHistory::new();
         let context = Context::new(&history);
