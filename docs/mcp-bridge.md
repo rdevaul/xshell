@@ -1,7 +1,8 @@
 # MCP bridge: design and level of effort
 
-**Status:** Accepted, with the decisions recorded in §5
-**Updated:** 9 November 2026
+**Status:** §1–§5 accepted, with the decisions recorded in §5; §6 (large
+local stacks) proposed
+**Updated:** 10 November 2026
 
 ## 1. Summary
 
@@ -349,3 +350,194 @@ Image results (§3.7) are a small addition once A1–A4 land, about 1 day.
    this possible, and it would close the same-user credential gap (§3.3).
    It needs an install step that creates the user, and it should be
    decided together with the shell sandbox (CAD plan §8).
+
+## 6. Large local stacks (proposed)
+
+**Status:** Proposed, 10 November 2026. Nothing here changes a §5 decision;
+each item extends the accepted design for a case it does not yet cover.
+
+### 6.1 The case
+
+The design above is shaped by small remote services (a GitHub server, a
+documents server). The first concrete integration target is a different
+shape: **mechatron**, an agentic mechatronics platform that is a stack of
+local MCP servers (assembly graph, geometry kernel, COTS catalog, dynamics
+simulation, viewer, slicer, and others). Its gateway exposes the whole stack
+as one Streamable HTTP endpoint (`http://127.0.0.1:3100/mcp` by default),
+routes `tools/call` by tool-name prefix, and isolates clients by
+`Mcp-Session-Id`. Observed at mechatron `21ae43309`:
+
+| Property | Value | Why it matters here |
+|---|---|---|
+| Transport | Streamable HTTP on loopback, started outside xshell | No broker-launched instance, no sandbox profile, no OAuth |
+| Authentication | Static bearer key (`MECHATRON_API_KEYS`), or none in development mode | §3.3 covers only OAuth for HTTP servers |
+| Tool count | About 520 documented tools (assembly about 305, viewer about 125, sim about 36, others) | Name-by-name allowlists and an unfiltered `list` do not scale |
+| Call duration | `harness.turn` is documented to block for minutes; meshing, simulation, and rendering calls can also be long | Calls can outlive the default 60 s `run_shell` timeout and need defined cancellation |
+| Server-side state | A durable design world selected by an explicit `session` argument on every call; the `default` world is a human's live session | Isolation depends on an argument, not on the instance |
+| Own agent loop | `harness.turn` / `harness.submit_turn` run mechatron's model loop with its own model credentials and spend | A tool call that is itself an agent (roadmap M7) |
+
+The driving use is a benchmark of CAD agents (CADbakeoff), where xshell is
+the model-agnostic reference harness and mechatron would be one of the
+toolsets the agent drives, but none of the requirements below are
+benchmark-specific: any large local stack (a robotics, EDA, or lab-automation
+platform) has the same shape.
+
+### 6.2 Gaps and proposed changes
+
+**G1. Static-token and loopback HTTP servers.** §3.3 assumes an HTTP server
+uses the MCP authorization flow. Add two cases:
+
+```toml
+[mcp.servers.mechatron]
+transport = "http"
+url = "http://127.0.0.1:3100/mcp"
+auth = "bearer"            # "oauth" (default for http), "bearer", or "none"
+secret = "MECHATRON_API_KEY"   # bearer: keychain item the broker sends as the token
+```
+
+- `bearer`: the user stores the token with `xshell mcp set-secret SERVER`;
+  the broker reads it from the keychain and sends it as
+  `Authorization: Bearer`. It never appears in a file the agent can read or
+  in the child environment, as §3.3 already requires for stdio secrets.
+- `none`: allowed only for a loopback URL (`127.0.0.0/8`, `::1`, or a Unix
+  socket). A non-loopback URL with `auth = "none"` is a configuration error,
+  so an unauthenticated server is never reached across a network by
+  accident.
+- §3.4 sandboxing does not apply to a server xshell does not launch; `list`
+  and `servers` say so (`sandbox: external`), so nobody reads a loopback
+  server as confined.
+
+**G2. Hundreds of tools.**
+
+- **Allowlist patterns.** `tools` accepts `*` globs on dotted names
+  (`"assembly.*"`, `"viewer.render_*"`), and a `deny_tools` list applies after
+  it. Patterns are expanded against the pinned list (§3.5), and the pin
+  records the expanded set, so a new tool matching a pattern still needs
+  `xshell mcp approve` before it can be called.
+- **Filtered, paged listing.** `xshell-mcp list SERVER [--prefix P]
+  [--grep WORD] [--page N]` keeps each listing well inside the 64 KiB tool
+  output bound (at about 120 bytes a line, 520 one-line entries already
+  approach it). `list` with no filter on a large server
+  prints counts per prefix and a hint, not every tool.
+- **Readable approvals.** `xshell mcp approve` on a large list shows counts
+  of added, removed, and changed tools and the changed names first, then the
+  full diff on request; an actively developed stack changes its list often.
+
+**G3. Long calls and cancellation.** The design does not define timeouts or
+cancellation, and `run_shell` ends a command with a group-wide `SIGKILL`
+(`xshell-execution/src/process.rs`), so the CLI cannot clean up after itself.
+
+- **The broker treats a closed client connection as cancellation.** When the
+  CLI's socket closes before the result is written, the broker sends
+  `notifications/cancelled` for that request to the server and records the
+  call as *cancelled, outcome unknown*. A server may already have applied
+  the effect; xshell reports that honestly rather than as "not run" (roadmap
+  D2, M1.2).
+- **Call timeout.** `xshell-mcp call --timeout DURATION`, defaulting to a
+  per-server `call_timeout` in configuration. The CLI refuses a timeout longer
+  than the session's `shell_timeout`, so the broker, not `run_shell`'s kill,
+  ends an over-long call and the model gets a clear reason. Long CAD calls
+  use the `relaxed` limit profile (30 min) or a configured one.
+- **Progress keeps nothing alive.** Progress notifications stay logged only
+  (§3.6); they do not extend a timeout.
+- **Concurrency.** Today one turn's tool calls run one after another, but a
+  user or script can call the broker concurrently. The broker allows
+  concurrent requests to one instance up to a per-server `max_in_flight`
+  (default 4) and queues the rest; a queued call's timeout includes its wait.
+
+**G4. Server-side state selected by arguments.** §3.1's isolation ("server
+instances are per session") holds for servers the broker starts. A shared
+external server cannot be given one instance per session, and mechatron
+selects its world by an argument, not an instance. Add **bound arguments**:
+
+```toml
+[mcp.servers.mechatron.bind]
+session = "xshell/{session}"   # {session} is the xshell session name
+```
+
+- The broker sets each bound argument on every call whose schema has it, and
+  refuses (exit 2) a call that supplies a different value. The agent cannot
+  name another world, including the human's `default` one, by mistake or by
+  injection.
+- The broker also keeps one `Mcp-Session-Id` per xshell session per server,
+  so a server that isolates by MCP session gets the same per-session
+  separation.
+- Where neither applies, `servers` marks the server `state: shared`, so the
+  user knows sessions can see each other's effects through it.
+
+**G5. Large results.** A turn report or graph dump can exceed the 64 KiB
+bound. Rather than truncate structured output mid-object, the broker writes
+an over-limit sanitized result to a file under the session's state
+directory, as it already does for binary resources (§3.7), and prints its
+path, size, and the first part of the result. Agent read tools reach that
+file under the normal read policy.
+
+**G6. Calls that run another agent.** `harness.turn` hands the request to
+mechatron's own model loop, with its own model, credentials, and spend, so
+its work is not under xshell's approval policy, turn budget, or audit
+(roadmap M7: a connector must not bypass shared authorization because it
+supplies its own agent loop).
+
+- Such tools are **denied by default**: a server's configuration lists them
+  under `agent_tools`, and a pattern allowlist (G2) never admits them; only
+  an explicit entry in `tools` does.
+- When allowed, the audit record and headless `result` mark the call as
+  delegated to an external agent, and the documentation states that its
+  model spend and internal tool calls are outside xshell's budget and audit.
+- For benchmarking, this is also a measurement concern: an agent that hands
+  the design to mechatron's harness is measuring that harness, not itself.
+
+**G7. Structured arguments.** Mechatron tools take nested JSON arguments, and
+`--json-file` (§3.2) avoids quoting for them. This is the case most likely
+to produce the quoting errors that would justify `McpCall` (§3.8). Record
+argument-parse failures (exit 2) per server in the broker log, so the §5
+decision to start with the CLI can be revisited with evidence.
+
+### 6.3 Conformance tests
+
+Against a fixture server in the repository (no mechatron dependency): a
+loopback Streamable HTTP server that generates about 500 tools with dotted
+names, takes a `session` argument, has one tool that sleeps until cancelled,
+and one that returns a 1 MiB structured result.
+
+| Test | Pass condition |
+|---|---|
+| Loopback `auth = "none"` | Connects; the same entry with a non-loopback URL is a configuration error |
+| Bearer secret | Token reaches the server; it is absent from every file and environment the agent can read |
+| Pattern allowlist and pinning | `assembly.*` admits only matching tools; a new matching tool is refused with `pin_mismatch` until approved |
+| Filtered listing | Every `list` output, including the unfiltered summary, stays under the tool output bound |
+| `SIGKILL` mid-call | The server receives `notifications/cancelled`; the call is recorded as cancelled with unknown outcome |
+| Timeout above `shell_timeout` | Refused with a reason before the call is sent |
+| Bound argument | Set when omitted; a different supplied value is refused; two sessions never see each other's world |
+| Large result | Written to a file; the printed output is bounded and names the path |
+| Agent tool | Refused under a pattern allowlist; when listed explicitly, audit marks the call as external-agent |
+
+### 6.4 Estimate
+
+| # | Task | LoE (days) | Lands with |
+|---|---|---|---|
+| L1 | `auth = "bearer" / "none"`, loopback check, `set-secret` | 1 | M2 |
+| L2 | Pattern allowlists, `deny_tools`, filtered and paged `list`, approval summary | 1.5–2 | M1, M4 |
+| L3 | Disconnect-as-cancel, call timeouts, `max_in_flight` | 2–3 | M1 |
+| L4 | Bound arguments and per-session `Mcp-Session-Id` | 1–1.5 | M1 |
+| L5 | Over-limit results to file | 0.5–1 | M1 |
+| L6 | `agent_tools` default-deny and audit marking | 1 | M4 |
+| L7 | Fixture server and the §6.3 tests | 1.5–2 | M1–M4 |
+| | **Total** | **8.5–11.5** | |
+
+L3 is not mechatron-specific: every server with slow calls needs it, so it
+belongs in M1 regardless of this case. With §6, the bridge totals about
+26–37 engineer-days.
+
+### 6.5 Open questions
+
+1. **Bound arguments versus server-side isolation.** Bound arguments make a
+   server's world selection enforceable without the server's help. Should
+   the bridge prefer them, or ask servers to isolate by `Mcp-Session-Id` and
+   treat argument binding as a stopgap?
+2. **Where `agent_tools` is declared.** Configuration only (as above), or
+   also inferred from a server's documentation? Inference would be a server
+   hint, which §3.5 treats as untrusted.
+3. **Image results from renders.** Mechatron's viewer returns renders; those
+   need A1–A4 and the §3.7 image path, which this section assumes rather than
+   changes.

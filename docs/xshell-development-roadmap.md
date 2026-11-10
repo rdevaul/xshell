@@ -205,4 +205,11 @@ negotiation and the M2 operation contract. [XSHELL.md durable handoff and
 goals](xshell-md-continuity.md) reuses M1.3 prepared file access for its
 trust-by-hash check, so it should follow M1.3.
 
+The [MCP bridge](mcp-bridge.md) is an M7 connector: MCP servers are reached
+through an `xshell-mcp` CLI that `run_shell` runs, so every call passes the
+existing approval policy, and a broker holds credentials and pins tool
+lists. Its §6 (proposed) extends it to large local stacks such as
+mechatron, including disconnect-as-cancellation for long calls (needed by
+any slow server) and default denial of tools that run another agent.
+
 These are implementation tasks, not actions performed by this document update. Keep the review's finding IDs attached to fixes and evidence. When implementation begins, update the older plan/status entry points to link here and reconcile their immediate sequences; do not overwrite historical test or completion claims.
