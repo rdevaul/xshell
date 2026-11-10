@@ -191,6 +191,7 @@ impl ExecutionCoordinator {
         if let Err(error) = audit.append(AuditEvent::Input {
             route: route.into(),
             text,
+            images: Vec::new(),
         }) {
             execution.finish(&turn_id);
             return Err(error);
@@ -766,6 +767,7 @@ impl DaemonObserver {
                 call_id: call_id.clone(),
                 name: name.clone(),
                 result: result.clone(),
+                images: Vec::new(),
             }),
             ExecutionEvent::TurnAborted => {}
             ExecutionEvent::HistoryCompacted { report } => {

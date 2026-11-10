@@ -28,6 +28,15 @@ pub struct SessionRegistry {
     in_flight: HashMap<String, DurableInFlight>,
 }
 
+/// Format of `sessions.json` written by this daemon.
+///
+/// - 2: messages in session history may carry `images` (image references).
+///   Version 1 files load unchanged; an older daemon refuses a version 2 file
+///   rather than dropping the images it cannot represent.
+const SESSION_STATE_FORMAT_VERSION: u32 = 2;
+/// Oldest `sessions.json` format this daemon still loads.
+const MIN_SESSION_STATE_FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct DurableState {
     format_version: u32,
@@ -60,7 +69,9 @@ impl SessionRegistry {
                 .with_context(|| format!("cannot read session state {}", state_path.display()))?;
             let state: DurableState = serde_json::from_str(&source)
                 .with_context(|| format!("invalid session state {}", state_path.display()))?;
-            if state.format_version != 1 {
+            if !(MIN_SESSION_STATE_FORMAT_VERSION..=SESSION_STATE_FORMAT_VERSION)
+                .contains(&state.format_version)
+            {
                 bail!("unsupported session state format {}", state.format_version);
             }
             for mut snapshot in state.sessions {
@@ -394,7 +405,7 @@ impl SessionRegistry {
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.descriptor.name.cmp(&right.descriptor.name));
         let encoded = serde_json::to_vec_pretty(&DurableState {
-            format_version: 1,
+            format_version: SESSION_STATE_FORMAT_VERSION,
             sessions,
             in_flight: {
                 let mut operations = self.in_flight.values().cloned().collect::<Vec<_>>();
@@ -570,6 +581,85 @@ mod tests {
         let snapshot = restored.snapshot("ornithopter").unwrap();
         assert_eq!(snapshot.history, vec![ChatMessage::user("retain me")]);
         assert_eq!(snapshot.descriptor.status, SessionStatus::Detached);
+    }
+
+    fn load(path: &Path) -> Result<SessionRegistry> {
+        SessionRegistry::load(path.into(), "host".into(), "local".into(), "rich".into())
+    }
+
+    fn create_durable(path: &Path, history: Vec<ChatMessage>) {
+        let mut registry = load(path).unwrap();
+        let durable = registry
+            .create(
+                "client",
+                creation(
+                    "ornithopter",
+                    path,
+                    PersistenceMode::Durable,
+                    Visibility::Fabric,
+                    history,
+                ),
+            )
+            .unwrap();
+        registry.detach("client", &durable.descriptor.id).unwrap();
+    }
+
+    fn set_format_version(path: &Path, version: u32) {
+        let state_path = path.join("sessions.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        state["format_version"] = version.into();
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn image_references_survive_registry_restart() {
+        let temp = TempDir::new().unwrap();
+        let image = xshell_core::ImageRef::new(
+            "ab".repeat(32),
+            xshell_core::ImageMediaType::Png,
+            1568,
+            1176,
+            204_800,
+            "renders/bracket.png",
+        )
+        .unwrap();
+        let history = vec![ChatMessage::user("look at this").with_images([image])];
+        create_durable(temp.path(), history.clone());
+
+        let persisted = std::fs::read_to_string(temp.path().join("sessions.json")).unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(persisted["format_version"], SESSION_STATE_FORMAT_VERSION);
+
+        let restored = load(temp.path()).unwrap();
+        assert_eq!(restored.snapshot("ornithopter").unwrap().history, history);
+    }
+
+    #[test]
+    fn version_one_session_state_still_loads() {
+        let temp = TempDir::new().unwrap();
+        create_durable(temp.path(), vec![ChatMessage::user("retain me")]);
+        set_format_version(temp.path(), 1);
+
+        let restored = load(temp.path()).unwrap();
+        let snapshot = restored.snapshot("ornithopter").unwrap();
+        assert_eq!(snapshot.history, vec![ChatMessage::user("retain me")]);
+        assert!(snapshot.history[0].images.is_empty());
+    }
+
+    #[test]
+    fn newer_session_state_formats_are_refused() {
+        let temp = TempDir::new().unwrap();
+        create_durable(temp.path(), Vec::new());
+        set_format_version(temp.path(), SESSION_STATE_FORMAT_VERSION + 1);
+
+        let error = load(temp.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported session state format"),
+            "{error:#}"
+        );
     }
 
     #[test]

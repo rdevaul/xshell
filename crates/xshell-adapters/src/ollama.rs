@@ -133,6 +133,7 @@ impl AgentAdapter for OllamaAdapter {
         request: ChatRequest,
         events: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<AssistantResponse, AdapterError> {
+        crate::refuse_images(&request)?;
         let messages = request.messages.iter().map(OllamaMessage::from).collect();
         let tools = request
             .tools

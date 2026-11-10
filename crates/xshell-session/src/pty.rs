@@ -243,6 +243,7 @@ impl PtyCoordinator {
             audit.append(AuditEvent::Input {
                 route: "shell_terminal".into(),
                 text: format!("${command}"),
+                images: Vec::new(),
             })?;
         }
         if let Some(registry) = &self.registry {

@@ -174,6 +174,7 @@ requested \"{requested}\" was not applied"
                                 call_id,
                                 name,
                                 result: result.clone(),
+                                images: Vec::new(),
                             })?;
                             print!("{tag}");
                             print_tool_result(&result);
@@ -532,6 +533,7 @@ impl TurnObserver for LocalObserver<'_> {
                     call_id,
                     name,
                     result: result.clone(),
+                    images: Vec::new(),
                 });
                 print!("{tag}");
                 print_tool_result(&result);

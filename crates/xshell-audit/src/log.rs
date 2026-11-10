@@ -472,6 +472,7 @@ mod tests {
         AuditEvent::Input {
             route: "agent".into(),
             text: text.into(),
+            images: Vec::new(),
         }
     }
 
@@ -530,6 +531,56 @@ mod tests {
         );
         let body: AuditRecordBody = serde_json::from_str(&new).unwrap();
         assert_eq!(serde_json::to_string(&body).unwrap(), new);
+    }
+
+    #[test]
+    fn records_written_before_images_existed_hash_unchanged() {
+        // Byte-for-byte the shapes format-5 writers produced. `images` must
+        // not appear when empty, or the verifier's re-serialization would
+        // change the hash of every earlier input and tool-result record.
+        for old in [
+            r#"{"format_version":5,"session_id":"s","sequence":1,"daemon_timestamp_unix_ms":1,"client_uid":501,"previous_hash":"00","event":{"type":"input","route":"agent","text":"hi"}}"#,
+            r#"{"format_version":5,"session_id":"s","sequence":2,"daemon_timestamp_unix_ms":1,"client_uid":501,"previous_hash":"00","event":{"type":"tool_result","call_id":"c","name":"read_file","result":"ok"}}"#,
+        ] {
+            let body: AuditRecordBody = serde_json::from_str(old).unwrap();
+            assert_eq!(serde_json::to_string(&body).unwrap(), old);
+        }
+    }
+
+    #[test]
+    fn image_metadata_is_signed_with_the_record() {
+        let temp = TempDir::new().unwrap();
+        let identity = SigningIdentity::load_or_create(temp.path()).unwrap();
+        let public_key = temp.path().join("signing-key.pub");
+        let mut writer = AuditLogWriter::create(temp.path(), identity, 501, 2).unwrap();
+        let path = writer.path().to_owned();
+        let image = crate::AuditImage {
+            sha256: "ab".repeat(32),
+            media_type: "image/png".into(),
+            width: 1568,
+            height: 1176,
+            byte_len: 204_800,
+            label: "renders/bracket.png".into(),
+        };
+        writer
+            .append(AuditEvent::ToolResult {
+                call_id: "call-1".into(),
+                name: "view_image".into(),
+                result: "image attached".into(),
+                images: vec![image],
+            })
+            .unwrap();
+        writer.close().unwrap();
+        verify_log(&path, &public_key).unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains(r#""width":1568"#));
+        fs::write(
+            &path,
+            contents.replacen(r#""width":1568"#, r#""width":1569"#, 1),
+        )
+        .unwrap();
+        assert!(verify_log(&path, &public_key).is_err());
     }
 
     #[test]
