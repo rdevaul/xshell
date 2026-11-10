@@ -86,6 +86,7 @@ fn daemon_accepts_a_session_and_produces_a_verifiable_log() {
         .append(AuditEvent::Input {
             route: "shell".into(),
             text: "$true".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let checkpoint = client.close().unwrap();

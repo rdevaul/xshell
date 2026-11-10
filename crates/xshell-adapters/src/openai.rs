@@ -174,6 +174,7 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         request: ChatRequest,
         events: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<AssistantResponse, AdapterError> {
+        crate::refuse_images(&request)?;
         let messages = request.messages.iter().map(OpenAiMessage::from).collect();
         let tools = request
             .tools
@@ -330,6 +331,34 @@ mod tests {
             "http://localhost:1234/v1/chat/completions"
         );
         assert_eq!(with.endpoint(), without.endpoint());
+    }
+
+    #[tokio::test]
+    async fn requests_with_images_are_refused_before_sending() {
+        let image = xshell_core::ImageRef::new(
+            "ab".repeat(32),
+            xshell_core::ImageMediaType::Png,
+            8,
+            8,
+            64,
+            "plot.png",
+        )
+        .unwrap();
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user("look").with_images([image])],
+            tools: Vec::new(),
+        };
+        // An unroutable endpoint: the refusal must come before any request.
+        let mut openai = OpenAiCompatibleAdapter::new("http://127.0.0.1:9", "model", None);
+        let error = openai
+            .chat_stream(request.clone(), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::Unsupported(_)), "{error}");
+
+        let mut ollama = crate::OllamaAdapter::new("http://127.0.0.1:9", "model");
+        let error = ollama.chat_stream(request, &mut |_| {}).await.unwrap_err();
+        assert!(matches!(error, AdapterError::Unsupported(_)), "{error}");
     }
 
     #[tokio::test]

@@ -54,6 +54,13 @@ mainly a new client, not new execution machinery.
 
 ### 3.1 Design
 
+**Status:** A1 is implemented. `ChatMessage.images` holds validated
+`ImageRef`s; `sessions.json` is format 2 (format 1 still loads); audit is
+format 6 and protocol 7. Until A3, both adapters refuse a request that
+carries images rather than send only its text. The session protocol is
+unchanged: nothing produces images yet, and A2 bumps it together with image
+upload.
+
 **Message model.** Add `images: Vec<ImageRef>` to `ChatMessage`, with
 `#[serde(default)]` so existing sessions and transcripts still load. An
 `ImageRef` holds a SHA-256 hash, media type, pixel dimensions, byte length,

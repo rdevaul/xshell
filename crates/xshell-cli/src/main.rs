@@ -405,11 +405,13 @@ async fn main() -> Result<()> {
                 audit.append(AuditEvent::Input {
                     route: input_route_name(&route).into(),
                     text: line.clone(),
+                    images: Vec::new(),
                 })?;
             } else {
                 audit.append_execution(AuditEvent::Input {
                     route: input_route_name(&route).into(),
                     text: line.clone(),
+                    images: Vec::new(),
                 })?;
             }
         }

@@ -34,6 +34,23 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TOOL_CALLS: usize = 256;
 pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
+/// Refuse a request that carries images. Neither adapter encodes images yet
+/// (workstream A3), and sending only the text would silently drop content the
+/// user or a tool meant the model to see.
+pub(crate) fn refuse_images(request: &ChatRequest) -> Result<(), AdapterError> {
+    match request
+        .messages
+        .iter()
+        .map(|message| message.images.len())
+        .sum::<usize>()
+    {
+        0 => Ok(()),
+        count => Err(AdapterError::Unsupported(format!(
+            "the request carries {count} image(s), and this adapter cannot send images yet"
+        ))),
+    }
+}
+
 /// Build the HTTP client shared by all adapters. Every provider request goes
 /// through this so the timeout policy is defined in exactly one place.
 pub(crate) fn http_client() -> reqwest::Client {

@@ -7,6 +7,6 @@ pub use client::{AuditClient, DEFAULT_EXCHANGE_TIMEOUT};
 pub use log::{AuditLogWriter, SigningIdentity, VerificationReport, verify_log};
 pub use model::{
     AUDIT_FORMAT_VERSION, AUDIT_PROTOCOL_VERSION, AuditCheckpoint, AuditConfig, AuditEvent,
-    AuditLogEntry, AuditRecord, MIN_SUPPORTED_AUDIT_FORMAT_VERSION, WitnessCommitment,
+    AuditImage, AuditLogEntry, AuditRecord, MIN_SUPPORTED_AUDIT_FORMAT_VERSION, WitnessCommitment,
 };
 pub use protocol::{ClientRequest, ServerResponse};

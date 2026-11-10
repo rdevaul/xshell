@@ -12,14 +12,18 @@ use std::path::PathBuf;
 /// - 4: adds `AuditEvent::AutoContinued` and the `reasoning` and
 ///   `finish_reason` fields on `AuditEvent::AgentResponse`.
 /// - 5: adds `AuditEvent::SubagentStarted` and `AuditEvent::SubagentFinished`.
-pub const AUDIT_FORMAT_VERSION: u32 = 5;
+/// - 6: adds the `images` field on `AuditEvent::Input` and
+///   `AuditEvent::ToolResult`.
+pub const AUDIT_FORMAT_VERSION: u32 = 6;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 // Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
 // `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`;
-// version 6 adds `AuditEvent::SubagentStarted` and `SubagentFinished`.
+// version 6 adds `AuditEvent::SubagentStarted` and `SubagentFinished`;
+// version 7 adds `images` on `Input` and `ToolResult`.
 // Tagged enum variants are not forward-compatible in serde, so mixed-version
-// peers must fail at handshake.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 6;
+// peers must fail at handshake. New fields are not either: an older service
+// would drop them and sign a record without them.
+pub const AUDIT_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -74,6 +78,20 @@ impl Default for AuditConfig {
     }
 }
 
+/// An image as the audit trail records it: what it was, never its bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditImage {
+    /// SHA-256 of the stored (re-encoded) bytes, lowercase hex.
+    pub sha256: String,
+    pub media_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u64,
+    /// The source path or the tool that produced it.
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuditEvent {
@@ -110,6 +128,10 @@ pub enum AuditEvent {
     Input {
         route: String,
         text: String,
+        /// Images attached to the input. Absent when there are none, so
+        /// records from earlier formats hash unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<AuditImage>,
     },
     WorkingDirectoryChanged {
         cwd: String,
@@ -154,6 +176,10 @@ pub enum AuditEvent {
         call_id: String,
         name: String,
         result: String,
+        /// Images the tool returned to the model. Absent when there are
+        /// none, so records from earlier formats hash unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<AuditImage>,
     },
     ViewOperation {
         path: String,

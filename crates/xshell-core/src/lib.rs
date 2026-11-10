@@ -131,6 +131,11 @@ pub struct ChatMessage {
     /// before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Images that belong to this message, in order. Each is a reference into
+    /// the session's content-addressed image store; the bytes never travel
+    /// with the message. Absent in sessions written before images existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageRef>,
 }
 
 impl ChatMessage {
@@ -142,6 +147,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            images: Vec::new(),
         }
     }
 
@@ -153,6 +159,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            images: Vec::new(),
         }
     }
 
@@ -164,6 +171,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            images: Vec::new(),
         }
     }
 
@@ -175,6 +183,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_name: None,
             reasoning: None,
+            images: Vec::new(),
         }
     }
 
@@ -182,6 +191,12 @@ impl ChatMessage {
     /// is stored as `None`.
     pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
         self.reasoning = reasoning.filter(|text| !text.trim().is_empty());
+        self
+    }
+
+    /// Attach images to the message, after any it already has.
+    pub fn with_images(mut self, images: impl IntoIterator<Item = ImageRef>) -> Self {
+        self.images.extend(images);
         self
     }
 
@@ -193,6 +208,170 @@ impl ChatMessage {
             tool_call_id: Some(call.id.clone()),
             tool_name: Some(call.name.clone()),
             reasoning: None,
+            images: Vec::new(),
+        }
+    }
+}
+
+/// The encodings an image may have once ingested. Ingestion re-encodes every
+/// image, so nothing else ever reaches a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ImageMediaType {
+    #[serde(rename = "image/png")]
+    Png,
+    #[serde(rename = "image/jpeg")]
+    Jpeg,
+}
+
+impl ImageMediaType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+}
+
+impl fmt::Display for ImageMediaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why an [`ImageRef`] was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ImageRefError {
+    #[error("image hash must be 64 lowercase hexadecimal characters")]
+    InvalidHash,
+    #[error("image dimensions must be non-zero")]
+    EmptyDimensions,
+    #[error("image byte length must be non-zero")]
+    EmptyBytes,
+    #[error("image label must not contain control characters")]
+    InvalidLabel,
+}
+
+/// A reference to an ingested image: enough to find its bytes in the
+/// session's image store, charge it against the context, and describe it in
+/// audit records and placeholders. It never holds the bytes.
+///
+/// Fields are private so every value is validated, whether constructed or
+/// deserialized from a session file, a transcript, or the protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ImageRefFields", into = "ImageRefFields")]
+pub struct ImageRef {
+    sha256: String,
+    media_type: ImageMediaType,
+    width: u32,
+    height: u32,
+    byte_len: u64,
+    label: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageRefFields {
+    sha256: String,
+    media_type: ImageMediaType,
+    width: u32,
+    height: u32,
+    byte_len: u64,
+    label: String,
+}
+
+impl ImageRef {
+    /// Longest label kept, in characters; longer labels are truncated.
+    pub const MAX_LABEL_CHARS: usize = 256;
+
+    /// Validate and build a reference. `sha256` is the hash of the stored
+    /// (re-encoded) bytes, `byte_len` their length, and `label` a short
+    /// description such as the source path or the tool that produced it.
+    pub fn new(
+        sha256: impl Into<String>,
+        media_type: ImageMediaType,
+        width: u32,
+        height: u32,
+        byte_len: u64,
+        label: impl Into<String>,
+    ) -> Result<Self, ImageRefError> {
+        let sha256 = sha256.into();
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ImageRefError::InvalidHash);
+        }
+        if width == 0 || height == 0 {
+            return Err(ImageRefError::EmptyDimensions);
+        }
+        if byte_len == 0 {
+            return Err(ImageRefError::EmptyBytes);
+        }
+        let label: String = label.into();
+        if label.chars().any(char::is_control) {
+            return Err(ImageRefError::InvalidLabel);
+        }
+        let label = label.chars().take(Self::MAX_LABEL_CHARS).collect();
+        Ok(Self {
+            sha256,
+            media_type,
+            width,
+            height,
+            byte_len,
+            label,
+        })
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn media_type(&self) -> ImageMediaType {
+        self.media_type
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+impl TryFrom<ImageRefFields> for ImageRef {
+    type Error = ImageRefError;
+
+    fn try_from(fields: ImageRefFields) -> Result<Self, Self::Error> {
+        Self::new(
+            fields.sha256,
+            fields.media_type,
+            fields.width,
+            fields.height,
+            fields.byte_len,
+            fields.label,
+        )
+    }
+}
+
+impl From<ImageRef> for ImageRefFields {
+    fn from(image: ImageRef) -> Self {
+        Self {
+            sha256: image.sha256,
+            media_type: image.media_type,
+            width: image.width,
+            height: image.height,
+            byte_len: image.byte_len,
+            label: image.label,
         }
     }
 }
@@ -244,6 +423,11 @@ pub struct AgentDescriptor {
 
 #[derive(Debug, Error)]
 pub enum AdapterError {
+    /// The request needs something this adapter cannot send, such as images
+    /// to a provider without image support. Raised before any request is
+    /// made, so content is refused rather than silently dropped.
+    #[error("the agent endpoint cannot accept this request: {0}")]
+    Unsupported(String),
     #[error("the connection to the agent endpoint failed: {0}")]
     Transport(String),
     #[error("the agent endpoint rejected the request ({status}): {body}")]
@@ -268,6 +452,118 @@ pub enum AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image() -> ImageRef {
+        ImageRef::new(
+            "0f".repeat(32),
+            ImageMediaType::Png,
+            640,
+            480,
+            1024,
+            "plot.png",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn image_refs_reject_malformed_fields() {
+        let new = |hash: &str, width, height, bytes, label: &str| {
+            ImageRef::new(hash, ImageMediaType::Jpeg, width, height, bytes, label)
+        };
+        let hash = "a".repeat(64);
+        assert!(new(&hash, 1, 1, 1, "ok").is_ok());
+        assert_eq!(
+            new(&"a".repeat(63), 1, 1, 1, ""),
+            Err(ImageRefError::InvalidHash)
+        );
+        assert_eq!(
+            new(&"A".repeat(64), 1, 1, 1, ""),
+            Err(ImageRefError::InvalidHash)
+        );
+        assert_eq!(
+            new(&"g".repeat(64), 1, 1, 1, ""),
+            Err(ImageRefError::InvalidHash)
+        );
+        assert_eq!(new(&hash, 0, 1, 1, ""), Err(ImageRefError::EmptyDimensions));
+        assert_eq!(new(&hash, 1, 0, 1, ""), Err(ImageRefError::EmptyDimensions));
+        assert_eq!(new(&hash, 1, 1, 0, ""), Err(ImageRefError::EmptyBytes));
+        assert_eq!(
+            new(&hash, 1, 1, 1, "a\nb"),
+            Err(ImageRefError::InvalidLabel)
+        );
+        assert_eq!(
+            new(&hash, 1, 1, 1, "\u{1b}[31m"),
+            Err(ImageRefError::InvalidLabel)
+        );
+    }
+
+    #[test]
+    fn image_ref_labels_are_bounded() {
+        let long = "é".repeat(ImageRef::MAX_LABEL_CHARS + 10);
+        let image = ImageRef::new("a".repeat(64), ImageMediaType::Png, 1, 1, 1, long).unwrap();
+        assert_eq!(image.label().chars().count(), ImageRef::MAX_LABEL_CHARS);
+    }
+
+    #[test]
+    fn image_refs_round_trip_and_validate_on_deserialize() {
+        let encoded = serde_json::to_value(image()).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "sha256": "0f".repeat(32),
+                "media_type": "image/png",
+                "width": 640,
+                "height": 480,
+                "byte_len": 1024,
+                "label": "plot.png",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ImageRef>(encoded.clone()).unwrap(),
+            image()
+        );
+
+        let mut bad_hash = encoded.clone();
+        bad_hash["sha256"] = "not-a-hash".into();
+        assert!(serde_json::from_value::<ImageRef>(bad_hash).is_err());
+
+        let mut bad_type = encoded.clone();
+        bad_type["media_type"] = "image/svg+xml".into();
+        assert!(serde_json::from_value::<ImageRef>(bad_type).is_err());
+
+        let mut extra = encoded;
+        extra["bytes"] = "iVBORw0KGgo=".into();
+        assert!(serde_json::from_value::<ImageRef>(extra).is_err());
+    }
+
+    #[test]
+    fn messages_without_images_serialize_as_before() {
+        let message = ChatMessage::user("hello");
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"role":"user","content":"hello"}"#
+        );
+        let loaded: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(loaded, message);
+        assert!(loaded.images.is_empty());
+    }
+
+    #[test]
+    fn messages_carry_images_in_order() {
+        let second =
+            ImageRef::new("1e".repeat(32), ImageMediaType::Jpeg, 8, 8, 64, "photo.jpg").unwrap();
+        let message = ChatMessage::user("compare these")
+            .with_images([image()])
+            .with_images([second.clone()]);
+        assert_eq!(message.images, vec![image(), second]);
+
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ChatMessage>(&encoded).unwrap(),
+            message
+        );
+    }
 
     #[test]
     fn classifies_agent_input() {
