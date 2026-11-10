@@ -57,9 +57,20 @@ mainly a new client, not new execution machinery.
 **Status:** A1 is implemented. `ChatMessage.images` holds validated
 `ImageRef`s; `sessions.json` is format 2 (format 1 still loads); audit is
 format 6 and protocol 7. Until A3, both adapters refuse a request that
-carries images rather than send only its text. The session protocol is
-unchanged: nothing produces images yet, and A2 bumps it together with image
-upload.
+carries images rather than send only its text.
+
+A2's store is implemented: `ImageStore` in `xshell-execution`, one
+directory per session under `images/` in the daemon's state directory.
+Each session has its own store, so a session can only reference images
+stored for it, never another session's by its hash; the registry refuses
+client history that references anything else. Reads are verified against
+the reference's hash and length, and symlinks and hard links are refused.
+Limits per session: 20 MiB per image, 512 MiB and 2,048 images in all.
+Collection runs at daemon start (orphan stores, unreferenced images) and
+when a session ends, never on a history update, where an uploaded image
+not yet sent would look unreferenced. Protocol upload moved to A4: the
+daemon must decode an upload to trust its dimensions, which is ingestion,
+so the session protocol bump lands with A4 and `//attach`.
 
 **Message model.** Add `images: Vec<ImageRef>` to `ChatMessage`, with
 `#[serde(default)]` so existing sessions and transcripts still load. An
@@ -160,9 +171,9 @@ an external viewer or prints the path and dimensions.
 | ID | Task | Days |
 |---|---|---|
 | A1 | `ImageRef` on `ChatMessage`; serde compatibility; persistence and audit format version bumps | 3–4 |
-| A2 | Content-addressed image store: bounds, GC, protocol upload for remote sessions | 3–5 |
+| A2 | Content-addressed image store: bounds, GC (protocol upload moved to A4) | 3–5 |
 | A3 | Adapters: OpenAI content parts, tool-image follow-up message, Ollama `images`, `vision` capability, per-server verification | 3–4 |
-| A4 | Ingestion: prepared-access read, decode, bound, downscale, re-encode; `//attach`; `view_image` tool | 4–6 |
+| A4 | Ingestion: prepared-access read, decode, bound, downscale, re-encode; `//attach` and its protocol upload; `view_image` tool | 4–6 |
 | A5 | Token estimates and image-aware compaction | 2–3 |
 | A6 | *Optional:* terminal inline display and `//view` for images | 3–5 |
 | A7 | *Follow-on:* configurable render toolset, selected by file or package type; manifests; CAD fixture tests | 6–9 |

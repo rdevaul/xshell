@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use xshell_execution::validate_working_directory;
+use xshell_execution::{ImageStore, ImageStoreLimits, validate_working_directory};
 
 #[derive(Debug)]
 struct SessionRecord {
@@ -26,7 +26,12 @@ pub struct SessionRegistry {
     state_directory: PathBuf,
     sessions: HashMap<String, SessionRecord>,
     in_flight: HashMap<String, DurableInFlight>,
+    image_limits: ImageStoreLimits,
 }
+
+/// Directory under the state directory that holds each session's image
+/// store.
+const IMAGES_DIRECTORY: &str = "images";
 
 /// Format of `sessions.json` written by this daemon.
 ///
@@ -142,10 +147,12 @@ impl SessionRegistry {
             state_directory,
             sessions,
             in_flight: HashMap::new(),
+            image_limits: ImageStoreLimits::default(),
         };
         if recovered_in_flight {
             registry.persist()?;
         }
+        registry.collect_images()?;
         Ok(registry)
     }
 
@@ -207,6 +214,11 @@ impl SessionRegistry {
             created_at_unix_ms: now,
             last_active_at_unix_ms: now,
         };
+        // A new session's store is empty, so history from the client may not
+        // reference any image yet.
+        if let Some(image) = creation.history.iter().flat_map(|m| &m.images).next() {
+            bail!("image {} is not in this session's store", image.sha256());
+        }
         let snapshot = SessionSnapshot {
             descriptor,
             history: creation.history,
@@ -253,6 +265,7 @@ impl SessionRegistry {
             && record.snapshot.descriptor.persistence == PersistenceMode::Ephemeral;
         if remove {
             self.sessions.remove(session_id);
+            self.remove_images(session_id);
         }
         self.persist()?;
         Ok(Some(session_id.to_owned()))
@@ -277,6 +290,14 @@ impl SessionRegistry {
                 record.snapshot.descriptor.name
             );
         }
+        let images = history.iter().flat_map(|message| &message.images);
+        ImageStore::open(
+            &self.state_directory.join(IMAGES_DIRECTORY),
+            session_id,
+            self.image_limits,
+        )?
+        .require_all(images)
+        .context("the history references an image this session does not have")?;
         record.snapshot.descriptor.model = model;
         record.snapshot.descriptor.cwd = cwd;
         record.snapshot.descriptor.last_active_at_unix_ms = timestamp_ms()?;
@@ -364,7 +385,57 @@ impl SessionRegistry {
         }
         self.sessions.remove(&id);
         self.persist()?;
+        self.remove_images(&id);
         Ok(id)
+    }
+
+    /// The image store of a live session.
+    pub fn image_store(&self, session_id: &str) -> Result<ImageStore> {
+        if !self.sessions.contains_key(session_id) {
+            bail!("unknown session {session_id:?}");
+        }
+        ImageStore::open(&self.images_root(), session_id, self.image_limits)
+    }
+
+    fn images_root(&self) -> PathBuf {
+        self.state_directory.join(IMAGES_DIRECTORY)
+    }
+
+    /// Remove a closed session's images. A failure is not the close's
+    /// failure: the session is already gone, and the next daemon start
+    /// removes stores that belong to no session.
+    fn remove_images(&self, session_id: &str) {
+        let root = self.images_root();
+        if let Err(error) =
+            ImageStore::open(&root, session_id, self.image_limits).and_then(ImageStore::remove)
+        {
+            eprintln!(
+                "xshelld: cannot remove the images of closed session {session_id}: {error:#}"
+            );
+        }
+    }
+
+    /// At startup, remove stores that belong to no session (ephemeral
+    /// sessions do not survive a restart) and images no durable session's
+    /// history references any more.
+    ///
+    /// Collection runs only here and when a session ends, never on a history
+    /// update: an image stored for a message the user has not sent yet would
+    /// look unreferenced. The store limits bound growth in between.
+    fn collect_images(&self) -> Result<()> {
+        let root = self.images_root();
+        xshell_execution::remove_orphan_stores(&root, self.sessions.keys().map(String::as_str))?;
+        if !root.exists() {
+            return Ok(());
+        }
+        for (id, record) in &self.sessions {
+            if !root.join(id).exists() {
+                continue;
+            }
+            let store = ImageStore::open(&root, id, self.image_limits)?;
+            store.retain(record.snapshot.history.iter().flat_map(|m| &m.images))?;
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self, selector: &str) -> Result<SessionSnapshot> {
@@ -473,7 +544,7 @@ mod tests {
     use super::*;
     use crate::Visibility;
     use tempfile::TempDir;
-    use xshell_core::ChatMessage;
+    use xshell_core::{ChatMessage, ImageMediaType, ImageRef};
 
     fn model() -> ModelBinding {
         ModelBinding {
@@ -612,20 +683,56 @@ mod tests {
         std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
     }
 
+    fn put_image(registry: &SessionRegistry, session_id: &str, bytes: &[u8]) -> ImageRef {
+        registry
+            .image_store(session_id)
+            .unwrap()
+            .put(
+                bytes,
+                ImageMediaType::Png,
+                1568,
+                1176,
+                "renders/bracket.png",
+            )
+            .unwrap()
+    }
+
+    fn create_session(
+        registry: &mut SessionRegistry,
+        path: &Path,
+        name: &str,
+        persistence: PersistenceMode,
+    ) -> String {
+        registry
+            .create(
+                "client",
+                creation(name, path, persistence, Visibility::Fabric, Vec::new()),
+            )
+            .unwrap()
+            .descriptor
+            .id
+    }
+
     #[test]
-    fn image_references_survive_registry_restart() {
+    fn stored_images_survive_restart_and_unreferenced_ones_are_collected() {
         let temp = TempDir::new().unwrap();
-        let image = xshell_core::ImageRef::new(
-            "ab".repeat(32),
-            xshell_core::ImageMediaType::Png,
-            1568,
-            1176,
-            204_800,
-            "renders/bracket.png",
-        )
-        .unwrap();
-        let history = vec![ChatMessage::user("look at this").with_images([image])];
-        create_durable(temp.path(), history.clone());
+        let mut registry = load(temp.path()).unwrap();
+        let id = create_session(
+            &mut registry,
+            temp.path(),
+            "ornithopter",
+            PersistenceMode::Durable,
+        );
+        let kept = put_image(&registry, &id, b"referenced render");
+        let unsent = put_image(&registry, &id, b"never sent");
+        let history = vec![ChatMessage::user("look at this").with_images([kept.clone()])];
+        registry
+            .update("client", &id, model(), temp.path().into(), history.clone())
+            .unwrap();
+        // Not collected while the daemon runs: it may be about to be sent.
+        assert!(registry.image_store(&id).unwrap().contains(&unsent));
+        registry.detach("client", &id).unwrap();
+        drop(registry);
 
         let persisted = std::fs::read_to_string(temp.path().join("sessions.json")).unwrap();
         let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
@@ -633,6 +740,126 @@ mod tests {
 
         let restored = load(temp.path()).unwrap();
         assert_eq!(restored.snapshot("ornithopter").unwrap().history, history);
+        let store = restored.image_store(&id).unwrap();
+        assert_eq!(store.get(&kept).unwrap(), b"referenced render");
+        assert!(!store.contains(&unsent));
+    }
+
+    #[test]
+    fn history_may_reference_only_this_sessions_images() {
+        let temp = TempDir::new().unwrap();
+        let mut registry = load(temp.path()).unwrap();
+        let first = create_session(
+            &mut registry,
+            temp.path(),
+            "first",
+            PersistenceMode::Durable,
+        );
+        let second = create_session(
+            &mut registry,
+            temp.path(),
+            "second",
+            PersistenceMode::Durable,
+        );
+        let image = put_image(&registry, &first, b"first's render");
+
+        let history = vec![ChatMessage::user("steal").with_images([image.clone()])];
+        let error = registry
+            .update(
+                "client",
+                &second,
+                model(),
+                temp.path().into(),
+                history.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not in this session's store"),
+            "{error:#}"
+        );
+        assert!(registry.snapshot("second").unwrap().history.is_empty());
+
+        let error = registry
+            .create(
+                "client",
+                creation(
+                    "third",
+                    temp.path(),
+                    PersistenceMode::Durable,
+                    Visibility::Fabric,
+                    history,
+                ),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not in this session's store"),
+            "{error:#}"
+        );
+        assert!(registry.snapshot("third").is_err());
+    }
+
+    #[test]
+    fn ending_a_session_removes_its_images() {
+        let temp = TempDir::new().unwrap();
+        let mut registry = load(temp.path()).unwrap();
+        let durable = create_session(
+            &mut registry,
+            temp.path(),
+            "durable",
+            PersistenceMode::Durable,
+        );
+        let ephemeral = create_session(
+            &mut registry,
+            temp.path(),
+            "ephemeral",
+            PersistenceMode::Ephemeral,
+        );
+        put_image(&registry, &durable, b"durable render");
+        put_image(&registry, &ephemeral, b"ephemeral render");
+        let images = temp.path().join(IMAGES_DIRECTORY);
+
+        registry.detach("client", &ephemeral).unwrap();
+        assert!(!images.join(&ephemeral).exists());
+        assert!(images.join(&durable).exists());
+
+        registry.close("client", "durable").unwrap();
+        assert!(!images.join(&durable).exists());
+    }
+
+    #[test]
+    fn stores_of_sessions_that_no_longer_exist_are_removed_at_startup() {
+        let temp = TempDir::new().unwrap();
+        let mut registry = load(temp.path()).unwrap();
+        let durable = create_session(
+            &mut registry,
+            temp.path(),
+            "durable",
+            PersistenceMode::Durable,
+        );
+        let ephemeral = create_session(
+            &mut registry,
+            temp.path(),
+            "ephemeral",
+            PersistenceMode::Ephemeral,
+        );
+        let unreferenced = put_image(&registry, &durable, b"unreferenced");
+        put_image(&registry, &ephemeral, b"lost when the daemon stopped");
+        // The daemon stops without the ephemeral session ending cleanly.
+        drop(registry);
+
+        let images = temp.path().join(IMAGES_DIRECTORY);
+        assert!(images.join(&ephemeral).exists());
+        let restored = load(temp.path()).unwrap();
+        assert!(!images.join(&ephemeral).exists());
+        // The durable session's store stays; its unreferenced image is
+        // collected like any other.
+        assert!(images.join(&durable).is_dir());
+        assert!(
+            !restored
+                .image_store(&durable)
+                .unwrap()
+                .contains(&unreferenced)
+        );
     }
 
     #[test]

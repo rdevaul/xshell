@@ -2,6 +2,7 @@ mod budget;
 mod call_id;
 mod compaction;
 mod engine;
+mod images;
 mod policy;
 mod prepared;
 mod process;
@@ -21,6 +22,10 @@ pub use engine::{
     ExecutionEvent, TurnObserver, TurnPolicy, build_adapter, captured_cd_destination,
     run_agent_turn, run_agent_turn_with_budget, run_direct_shell, run_direct_shell_streaming,
     run_direct_shell_streaming_cancellable, validate_working_directory,
+};
+pub use images::{
+    CollectionReport, ImageStore, ImageStoreError, ImageStoreLimits, StoreUsage,
+    remove_orphan_stores,
 };
 pub use policy::{
     ApprovalRules, CallFacts, Policy, PolicyConfig, PolicyDecision, default_decision,
