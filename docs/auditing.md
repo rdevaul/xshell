@@ -157,6 +157,39 @@ subagent, and its tool-call ids carry its scope (`delegate-1/...`). View operati
 content hash and size when acquisition succeeded, media type, selected viewer,
 and outcome; file contents are not duplicated into the audit log.
 
+### Turn authority and decision basis
+
+Every agent turn starts with a `turn_started` record, written before any of
+its tool calls can run. It holds the turn ID, the effective approval mode
+and limits (plus what the client asked for, when the session host lowered
+it), and both policies: the session host's base policy and the client's
+overlay, each as `{"sha256": ..., "policy": ...}`. The hash is SHA-256 over
+the policy's JSON encoding, so the recorded content can be checked against
+it, and two turns under the same policy share an identity.
+
+Each `tool_decision` record says what decided it in `basis`:
+
+| `kind` | Meaning | Other fields |
+|---|---|---|
+| `entry` | A policy entry matched; the mode still applies (an allowed call is denied in `off` and prompted in `ask`) | `policy` (`base` or `overlay`), `list` (`denied`, `always_allowed`, `allowed`), `entry` as written |
+| `not_listed` | The policy has an `allowed` list and the call matched none of it | `policy` |
+| `uncheckable_command` | A shell denial exists and this command could not be checked against it, so it was not run unattended | `policy` |
+| `mode_default` | No entry matched: the mode's behaviour without a policy | |
+| `not_in_toolset` | The tool is not one this agent may use | |
+| `turn_limit` | The turn's limits refused the call before the policy was consulted | |
+
+When the base and overlay disagree, the stricter decision wins and its basis
+is recorded; on a tie, the base's. A prompted call also has `approval`, saying
+who answered: `interactive`, `approval_channel`, `no_approver` (with a
+`detail` such as `no_approval_channel` or `approval_channel_closed`),
+`cancelled`, or `unreported`. For a remote client this is the client's own
+report: the daemon cannot verify who sat at the terminal, but it keeps only
+the known approvers and short reason codes.
+
+Not yet recorded: an approval bound to the prepared operation it approved
+(the object a read opened, as M1.3 does for reads), and the identity of the
+sensitivity classes in effect.
+
 Audit logs contain prompts, source text, commands, and tool output. They should
 be treated as sensitive. At-rest encryption and retention policy are planned
 but are not in the initial format.
@@ -212,7 +245,9 @@ them to protocol 4 and format 3; auto-continue events and the `reasoning` and
 4; `subagent_started` and `subagent_finished` events advance them to protocol 6
 and format 5; the `images` field on `input` and `tool_result` events advances
 them to protocol 7 and format 6. Image records hold the hash, media type,
-dimensions, byte length, and label, never the image bytes. Upgrade and restart `xshell-auditd` together
+dimensions, byte length, and label, never the image bytes. `turn_started`
+and the `basis` and `approval` fields on `tool_decision` advance them to
+protocol 8 and format 7. Upgrade and restart `xshell-auditd` together
 with `xshelld` and the CLI — a version mismatch is reported at handshake with
 the expected and received versions. The verifier remains able to read every
 format from version 1 onward.

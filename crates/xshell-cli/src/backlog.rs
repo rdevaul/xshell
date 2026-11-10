@@ -178,7 +178,9 @@ fn render_events<'a>(
                         )?;
                         prompted_calls.insert(call.id.as_str());
                     }
-                    ExecutionEvent::ToolDecision { call_id, decision } => {
+                    ExecutionEvent::ToolDecision {
+                        call_id, decision, ..
+                    } => {
                         if prompted_calls.remove(call_id.as_str()) {
                             writeln!(
                                 output,
@@ -394,6 +396,8 @@ mod tests {
                 ExecutionEvent::ToolDecision {
                     call_id: "delegate-1/c1".into(),
                     decision: ApprovalDecision::Approve,
+                    basis: None,
+                    approval: None,
                 },
             ),
             execution(
@@ -474,6 +478,8 @@ mod tests {
                     event: ExecutionEvent::ToolDecision {
                         call_id: "c1".into(),
                         decision: ApprovalDecision::Deny,
+                        basis: None,
+                        approval: None,
                     },
                 },
             ),

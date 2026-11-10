@@ -102,7 +102,10 @@ for another call, an invalid line, or a closed channel denies the prompt;
 after the channel closes, later prompts are denied too. Every decision is
 reported in an `approval_decided` event whose `source` is `approval_channel`,
 `no_approval_channel`, `approval_channel_closed`, `approval_channel_invalid`,
-`approval_channel_mismatch`, or `interrupted`.
+`approval_channel_mismatch`, or `interrupted`. The run also sends the
+source to the daemon, which records it in the audit trail (`approval` on the
+call's `tool_decision` record: `approval_channel`, or `no_approver` with the
+source as its detail).
 
 ```python
 import json, os, subprocess
@@ -160,7 +163,7 @@ incompatible change increments `schema`.
 | `tool_requested` | `call_id`, `name`, `arguments` | The model asked for a tool |
 | `approval_needed` | `call_id`, `name`, `arguments`, `reason`? | A gated call needs a decision |
 | `approval_decided` | `call_id`, `decision`, `source` | The run's own decision on that call |
-| `tool_decision` | `call_id`, `decision` | The decision the daemon applied |
+| `tool_decision` | `call_id`, `decision`, `basis`? | The decision the daemon applied, and what made it (`basis.kind`: `entry`, `not_listed`, `uncheckable_command`, `mode_default`, `not_in_toolset`, `turn_limit`; see [auditing](auditing.md#turn-authority-and-decision-basis)) |
 | `tool_skipped` | `call_id`, `name` | A call not evaluated because the turn was aborted |
 | `tool_result` | `call_id`, `name`, `result` | A tool's output |
 | `history_compacted` | `report` | The conversation was shrunk to fit its budget |

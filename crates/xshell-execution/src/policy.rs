@@ -176,12 +176,131 @@ impl Rule {
     }
 }
 
+/// Which of the two policies a decision came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyLayer {
+    /// The session host's own policy.
+    Base,
+    /// The client's overlay, which can only restrict.
+    Overlay,
+}
+
+impl PolicyLayer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Overlay => "overlay",
+        }
+    }
+}
+
+/// A policy's three lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyList {
+    Denied,
+    AlwaysAllowed,
+    Allowed,
+}
+
+impl PolicyList {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::AlwaysAllowed => "always_allowed",
+            Self::Allowed => "allowed",
+        }
+    }
+}
+
+/// What settled a call before any person or program was asked: the part of
+/// the approval rules whose decision was the effective one. Recorded with
+/// every decision so the audit trail says what decided, not only what was
+/// decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DecisionBasis {
+    /// An entry in one of a policy's lists matched, as written in the
+    /// policy. The approval mode still applies: an allowed call is denied in
+    /// `off` mode and prompted in `ask` mode.
+    Entry {
+        layer: PolicyLayer,
+        list: PolicyList,
+        entry: String,
+    },
+    /// The policy has an `allowed` list and the call matched none of its
+    /// entries.
+    NotListed { layer: PolicyLayer },
+    /// The policy denies some shell commands by pattern, and this command
+    /// could not be read reliably enough to check it, so it is never run
+    /// unattended.
+    UncheckableCommand { layer: PolicyLayer },
+    /// No policy entry matched: the approval mode's behaviour without a
+    /// policy.
+    ModeDefault,
+    /// The tool is not one this agent may use, or does not exist. Refused
+    /// before the policy is consulted.
+    NotInToolset,
+    /// The turn's limits refused the call before the policy was consulted:
+    /// too many calls in one response, or the tool-call budget is spent.
+    TurnLimit,
+}
+
+impl DecisionBasis {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Entry { .. } => "entry",
+            Self::NotListed { .. } => "not_listed",
+            Self::UncheckableCommand { .. } => "uncheckable_command",
+            Self::ModeDefault => "mode_default",
+            Self::NotInToolset => "not_in_toolset",
+            Self::TurnLimit => "turn_limit",
+        }
+    }
+
+    pub fn layer(&self) -> Option<PolicyLayer> {
+        match self {
+            Self::Entry { layer, .. }
+            | Self::NotListed { layer }
+            | Self::UncheckableCommand { layer } => Some(*layer),
+            Self::ModeDefault | Self::NotInToolset | Self::TurnLimit => None,
+        }
+    }
+}
+
+/// A decision and what made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuledDecision {
+    pub decision: PolicyDecision,
+    pub basis: DecisionBasis,
+}
+
 /// One parsed policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Policy {
     always_allowed: Vec<Rule>,
     allowed: Option<Vec<Rule>>,
     denied: Vec<Rule>,
+    /// The configuration it was parsed from, so decisions can name entries
+    /// as written and the audit trail can record the policy itself.
+    config: PolicyConfig,
+    /// SHA-256 of the canonical encoding of `config`; `None` for an empty
+    /// policy, which decides nothing.
+    identity: Option<String>,
+}
+
+/// The identity of a policy configuration: SHA-256 over its JSON encoding.
+/// The encoding is canonical because `PolicyConfig` serializes its fields in
+/// declaration order and omits empty lists; entry order is part of the
+/// identity, as it is part of what was written.
+pub fn policy_identity(config: &PolicyConfig) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if config.is_empty() {
+        return None;
+    }
+    let encoded = serde_json::to_vec(config).expect("a policy configuration always serializes");
+    Some(hex::encode(Sha256::digest(encoded)))
 }
 
 impl Policy {
@@ -195,6 +314,8 @@ impl Policy {
             always_allowed: parse(&config.always_allowed)?,
             allowed: config.allowed.as_deref().map(parse).transpose()?,
             denied: parse(&config.denied)?,
+            config: config.clone(),
+            identity: policy_identity(config),
         };
         let mut warnings = Vec::new();
         let listed = config
@@ -225,11 +346,27 @@ impl Policy {
         Ok((policy, warnings))
     }
 
+    /// SHA-256 of the policy's configuration, or `None` for an empty
+    /// policy.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// The configuration the policy was parsed from.
+    pub fn config(&self) -> &PolicyConfig {
+        &self.config
+    }
+
     /// Decide `call` under `mode`. `base` is true for the session host's
     /// policy, which alone may let a named path skip the sensitive-path
     /// prompt, and whose silence means the default behaviour.
-    fn decide(&self, call: &CallFacts, mode: ApprovalPolicy, base: bool) -> PolicyDecision {
-        let decision = self.decide_by_rules(call, mode, base);
+    fn decide(&self, call: &CallFacts, mode: ApprovalPolicy, base: bool) -> RuledDecision {
+        let layer = if base {
+            PolicyLayer::Base
+        } else {
+            PolicyLayer::Overlay
+        };
+        let ruled = self.decide_by_rules(call, mode, layer);
         if self.denial_is_uncheckable(call) {
             // A shell denial exists but this command cannot be read reliably
             // enough to know it does not match. Fail closed: a person may
@@ -239,9 +376,32 @@ impl Policy {
             } else {
                 PolicyDecision::Deny
             };
-            return decision.min(ceiling);
+            if ceiling < ruled.decision {
+                return RuledDecision {
+                    decision: ceiling,
+                    basis: DecisionBasis::UncheckableCommand { layer },
+                };
+            }
         }
-        decision
+        ruled
+    }
+
+    /// The `index`th entry of `list`, as written.
+    fn entry(&self, layer: PolicyLayer, list: PolicyList, index: usize) -> DecisionBasis {
+        let written = match list {
+            PolicyList::Denied => &self.config.denied,
+            PolicyList::AlwaysAllowed => &self.config.always_allowed,
+            PolicyList::Allowed => self
+                .config
+                .allowed
+                .as_ref()
+                .expect("an allowed rule exists"),
+        };
+        DecisionBasis::Entry {
+            layer,
+            list,
+            entry: written[index].trim().to_owned(),
+        }
     }
 
     /// Whether this policy denies some shell commands by pattern and `call`
@@ -261,41 +421,55 @@ impl Policy {
         &self,
         call: &CallFacts,
         mode: ApprovalPolicy,
-        base: bool,
-    ) -> PolicyDecision {
-        if self.denied.iter().any(|rule| rule.denies(call)) {
-            return PolicyDecision::Deny;
+        layer: PolicyLayer,
+    ) -> RuledDecision {
+        let base = layer == PolicyLayer::Base;
+        let ruled = |decision, basis| RuledDecision { decision, basis };
+        if let Some(index) = self.denied.iter().position(|rule| rule.denies(call)) {
+            return ruled(
+                PolicyDecision::Deny,
+                self.entry(layer, PolicyList::Denied, index),
+            );
         }
-        let always = self.always_allowed.iter().find(|rule| rule.allows(call));
+        let always = self
+            .always_allowed
+            .iter()
+            .position(|rule| rule.allows(call));
         let allowed = self
             .allowed
             .as_ref()
-            .and_then(|rules| rules.iter().find(|rule| rule.allows(call)));
+            .and_then(|rules| rules.iter().position(|rule| rule.allows(call)));
         if self.allowed.is_some() && always.is_none() && allowed.is_none() {
-            return PolicyDecision::Deny;
+            return ruled(PolicyDecision::Deny, DecisionBasis::NotListed { layer });
         }
-        if always.is_some() || allowed.is_some() {
+        let matched = always
+            .map(|index| (PolicyList::AlwaysAllowed, index))
+            .or(allowed.map(|index| (PolicyList::Allowed, index)));
+        if let Some((list, index)) = matched {
+            let basis = self.entry(layer, list, index);
             if mode == ApprovalPolicy::Off {
-                return PolicyDecision::Deny;
+                return ruled(PolicyDecision::Deny, basis);
             }
-            let names_path = matches!(always, Some(Rule::Path { .. }));
+            let names_path =
+                always.is_some_and(|index| matches!(self.always_allowed[index], Rule::Path { .. }));
             let needs_prompt = match always {
                 // Always allowed: runs, unless the path is sensitive and
                 // only the host's policy naming it may skip that prompt.
                 Some(_) => call.sensitive && !(base && names_path),
                 None => true,
             };
-            return if needs_prompt && mode == ApprovalPolicy::Ask {
+            let decision = if needs_prompt && mode == ApprovalPolicy::Ask {
                 PolicyDecision::Prompt
             } else {
                 PolicyDecision::Run
             };
+            return ruled(decision, basis);
         }
         if !base {
             // An overlay is silent about calls it does not list.
-            return PolicyDecision::Run;
+            return ruled(PolicyDecision::Run, DecisionBasis::ModeDefault);
         }
-        default_decision(call, mode)
+        ruled(default_decision(call, mode), DecisionBasis::ModeDefault)
     }
 }
 
@@ -322,9 +496,23 @@ impl ApprovalRules {
     /// The decision for `call`: the stricter of the base's and the
     /// overlay's.
     pub fn decide(&self, call: &CallFacts, mode: ApprovalPolicy) -> PolicyDecision {
+        self.decide_with_basis(call, mode).decision
+    }
+
+    /// The decision for `call` and what made it. When the overlay is
+    /// stricter, its basis is reported; otherwise the base's, which also
+    /// covers an overlay that says nothing about the call.
+    pub fn decide_with_basis(&self, call: &CallFacts, mode: ApprovalPolicy) -> RuledDecision {
         let base = self.base.decide(call, mode, true);
         match &self.overlay {
-            Some(overlay) => base.min(overlay.decide(call, mode, false)),
+            Some(overlay) => {
+                let overlay = overlay.decide(call, mode, false);
+                if overlay.decision < base.decision {
+                    overlay
+                } else {
+                    base
+                }
+            }
             None => base,
         }
     }
@@ -478,7 +666,7 @@ mod tests {
     }
 
     fn base(policy: &Policy, call: &CallFacts) -> [PolicyDecision; 3] {
-        [Off, Ask, Auto].map(|mode| policy.decide(call, mode, true))
+        [Off, Ask, Auto].map(|mode| policy.decide(call, mode, true).decision)
     }
 
     #[test]
@@ -522,7 +710,7 @@ mod tests {
         assert_eq!(base(&by_path, &read(&secret, true)), [Deny, Run, Run]);
         // An overlay naming the path cannot skip the prompt.
         let overlay = by_path.decide(&read(&secret, true), Ask, false);
-        assert_eq!(overlay, Prompt);
+        assert_eq!(overlay.decision, Prompt);
     }
 
     #[test]
@@ -697,5 +885,170 @@ mod tests {
                 .any(|warning| warning.contains("\"read_file\""))
         );
         assert!(warnings.iter().any(|warning| warning.contains("git push")));
+    }
+
+    fn rules(base: Policy, overlay: Option<Policy>) -> ApprovalRules {
+        ApprovalRules { base, overlay }
+    }
+
+    fn entry(layer: PolicyLayer, list: PolicyList, entry: &str) -> DecisionBasis {
+        DecisionBasis::Entry {
+            layer,
+            list,
+            entry: entry.into(),
+        }
+    }
+
+    #[test]
+    fn decisions_name_the_entry_that_made_them() {
+        use PolicyLayer::Base;
+        let policy = policy(
+            &["run_shell: git status"],
+            Some(&["run_shell: cargo *"]),
+            &["  run_shell: rm *  "],
+        );
+        let rules = rules(policy, None);
+        let decide = |command, mode| rules.decide_with_basis(&shell(command), mode);
+
+        let denied = decide("rm -rf target", Auto);
+        assert_eq!(denied.decision, Deny);
+        // As written, without the surrounding whitespace.
+        assert_eq!(
+            denied.basis,
+            entry(Base, PolicyList::Denied, "run_shell: rm *")
+        );
+        // A part of a compound command is named the same way.
+        assert_eq!(
+            decide("cargo build && rm x", Auto).basis,
+            entry(Base, PolicyList::Denied, "run_shell: rm *")
+        );
+
+        let always = decide("git status", Ask);
+        assert_eq!(always.decision, Run);
+        assert_eq!(
+            always.basis,
+            entry(Base, PolicyList::AlwaysAllowed, "run_shell: git status")
+        );
+
+        let allowed = decide("cargo test", Ask);
+        assert_eq!(allowed.decision, Prompt);
+        assert_eq!(
+            allowed.basis,
+            entry(Base, PolicyList::Allowed, "run_shell: cargo *")
+        );
+        // In `off` mode the entry still matched; the mode denied it.
+        let off = decide("cargo test", Off);
+        assert_eq!(off.decision, Deny);
+        assert_eq!(
+            off.basis,
+            entry(Base, PolicyList::Allowed, "run_shell: cargo *")
+        );
+
+        let unlisted = decide("make", Auto);
+        assert_eq!(unlisted.decision, Deny);
+        assert_eq!(unlisted.basis, DecisionBasis::NotListed { layer: Base });
+    }
+
+    #[test]
+    fn unlisted_calls_and_uncheckable_commands_say_so() {
+        let rules = rules(policy(&[], None, &["run_shell: rm *"]), None);
+        let plain = rules.decide_with_basis(&shell("ls"), Ask);
+        assert_eq!(plain.decision, Prompt);
+        assert_eq!(plain.basis, DecisionBasis::ModeDefault);
+
+        // Allowed by the mode, but a denial cannot be checked against it.
+        let uncheckable = rules.decide_with_basis(&shell("echo $(whoami)"), Auto);
+        assert_eq!(uncheckable.decision, Deny);
+        assert_eq!(
+            uncheckable.basis,
+            DecisionBasis::UncheckableCommand {
+                layer: PolicyLayer::Base
+            }
+        );
+        // When the rules already decide as strictly, they are the basis.
+        let no_policy = ApprovalRules::default();
+        assert_eq!(
+            no_policy
+                .decide_with_basis(&shell("echo $(whoami)"), Auto)
+                .basis,
+            DecisionBasis::ModeDefault
+        );
+    }
+
+    #[test]
+    fn the_stricter_layer_is_the_basis() {
+        use PolicyLayer::{Base, Overlay};
+        let base = policy(&["run_shell"], None, &[]);
+        let overlay = policy(&[], None, &["run_shell: git push *"]);
+        let rules = rules(base, Some(overlay));
+
+        let push = rules.decide_with_basis(&shell("git push origin main"), Ask);
+        assert_eq!(push.decision, Deny);
+        assert_eq!(
+            push.basis,
+            entry(Overlay, PolicyList::Denied, "run_shell: git push *")
+        );
+
+        // The overlay is silent and so no stricter: the base decided.
+        let status = rules.decide_with_basis(&shell("git status"), Ask);
+        assert_eq!(status.decision, Run);
+        assert_eq!(
+            status.basis,
+            entry(Base, PolicyList::AlwaysAllowed, "run_shell")
+        );
+
+        // On a tie the base is reported.
+        let strict_base = policy(&[], None, &["run_shell: git push *"]);
+        let rules = super::ApprovalRules {
+            base: strict_base,
+            overlay: Some(policy(&[], None, &["run_shell: git *"])),
+        };
+        assert_eq!(
+            rules
+                .decide_with_basis(&shell("git push x"), Ask)
+                .basis
+                .layer(),
+            Some(Base)
+        );
+    }
+
+    #[test]
+    fn policy_identity_is_the_hash_of_what_was_written() {
+        let config = |denied: &[&str]| PolicyConfig {
+            denied: denied.iter().map(|s| (*s).to_owned()).collect(),
+            ..PolicyConfig::default()
+        };
+        assert_eq!(
+            Policy::parse(&PolicyConfig::default())
+                .unwrap()
+                .0
+                .identity(),
+            None
+        );
+        let (policy, _) = Policy::parse(&config(&["run_shell: rm *"])).unwrap();
+        let identity = policy.identity().unwrap();
+        assert_eq!(identity.len(), 64);
+        assert_eq!(Some(identity.to_owned()), policy_identity(policy.config()));
+        // Stable for the same text, different for any other.
+        assert_eq!(
+            Policy::parse(&config(&["run_shell: rm *"]))
+                .unwrap()
+                .0
+                .identity(),
+            Some(identity)
+        );
+        assert_ne!(
+            Policy::parse(&config(&["run_shell: rm -r *"]))
+                .unwrap()
+                .0
+                .identity(),
+            Some(identity)
+        );
+        // An empty `allowed` list denies everything, so it is a policy.
+        let deny_all = PolicyConfig {
+            allowed: Some(Vec::new()),
+            ..PolicyConfig::default()
+        };
+        assert!(Policy::parse(&deny_all).unwrap().0.identity().is_some());
     }
 }

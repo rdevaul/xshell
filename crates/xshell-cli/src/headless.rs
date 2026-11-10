@@ -727,11 +727,19 @@ fn handle_execution(
                 return;
             };
             let (decision, source) = responder.decide(&call.id, interrupted, output);
+            let approver = if source == "approval_channel" {
+                xshell_execution::ApprovalSource::new(xshell_execution::Approver::ApprovalChannel)
+            } else {
+                // Nobody usable answered; the reason code says why.
+                xshell_execution::ApprovalSource::new(xshell_execution::Approver::NoApprover)
+                    .with_detail(source)
+            };
             let sent = client.approve(
                 session_id.to_owned(),
                 turn_id.to_owned(),
                 call.id.clone(),
                 decision,
+                approver,
             );
             if sent.is_err() {
                 return;
@@ -759,11 +767,17 @@ fn handle_execution(
                 "source": source,
             })));
         }
-        ExecutionEvent::ToolDecision { call_id, decision } => {
+        ExecutionEvent::ToolDecision {
+            call_id,
+            decision,
+            basis,
+            ..
+        } => {
             output.event(tagged(json!({
                 "event": "tool_decision",
                 "call_id": call_id,
                 "decision": decision,
+                "basis": basis,
             })));
         }
         ExecutionEvent::ToolSkipped { call_id, name } => {

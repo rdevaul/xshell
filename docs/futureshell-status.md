@@ -95,7 +95,7 @@ replace FS2–FS4.
 | `xshell run`, `--detach`, `wait`, `status`, `cancel` | Connector `open`, `send`, detach/attach, `status`, `cancel` ([implementation plan §9.2](futureshell-implementation-plan.md#92-connector-contract)) | Usage reporting and stable operation IDs: jobs are addressed by session, not turn |
 | JSONL event schema v1 | Connector event stream | A presentation contract, not evidence (H1) |
 | Exit codes 0–7 | `xshell-run` command exit codes | One shared outcome vocabulary (H2) |
-| Approval policy with daemon base and client overlay | M2 decision function; gateway policy (§9.3); capability envelope (§9.5) | Policy identity and decision source are not audited (H3) |
+| Approval policy with daemon base and client overlay | M2 decision function; gateway policy (§9.3); capability envelope (§9.5) | Policy identity and decision source are audited (H3); approvals are not yet bound to the prepared operation |
 | Turn limits and the `relaxed` profile | Autonomy budget: model rounds and tool dispatches (§9.4) | Usage and assurance labels in the result (H4) |
 | Approval channel (`--approval-channel FD`) | Gateway human-decision events; `on_exhausted request_approval` | Decisions should carry an authorization identity (H3) |
 | Sensitivity `block` class | Read-capability denial | Covers agent read tools only, not `run_shell` (H6) |
@@ -157,8 +157,12 @@ replace FS2–FS4.
   cannot be split into parts read as written is prompted in `ask` mode and
   denied otherwise. Wrappers such as `xargs rm` remain the documented
   literal-word limit (H6).
-- **Audit binding (open, H3).** The client overlay is applied but not
-  audited, and `ToolDecision` audit records do not say what decided.
+- **Audit binding (H3, mostly closed).** Each agent turn's `turn_started`
+  audit record holds the effective mode and limits and both policies with
+  their identities, and every `tool_decision` records its basis (the policy
+  layer, list, and entry, or the mode default) and, when prompted, who
+  answered. Still open: binding an approval to the prepared operation it
+  approved, and recording the sensitivity classes' identity.
 - **Plan drift (open, H5).** The CAD plan specifies job commands on a turn
   ID and `wait` reading from the session snapshot. The implementation uses
   the session and the in-memory journal. Either update the plan or close the
@@ -181,8 +185,9 @@ replace FS2–FS4.
 
 ## Immediate sequence
 
-1. Record policy identity, the client overlay, and each decision's source in
-   the audit trail (H3), and resolve the job-identity drift (H5).
+1. ~~Record policy identity, the client overlay, and each decision's source
+   in the audit trail (H3)~~ (done, except binding approvals to prepared
+   operations), and resolve the job-identity drift (H5).
 2. Finish the remaining F10 budgets (per-session, global, byte, worker)
    before relaxed unattended runs are common, then F7 transactional
    persistence, which H5 also needs.
