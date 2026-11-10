@@ -604,7 +604,21 @@ pub(crate) fn truncate(mut output: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tokio::time::timeout;
+
+    /// The package directory, read when the test runs. `cargo test` sets
+    /// `CARGO_MANIFEST_DIR` for each test process. The compile-time `env!`
+    /// form is baked into the binary, and Cargo does not rebuild when only the
+    /// checkout path changes, so a test binary reused from another checkout
+    /// (for example one built into a shared target directory) would look in
+    /// that old, possibly deleted, location.
+    fn manifest_dir() -> PathBuf {
+        PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR is unset; run the tests through cargo"),
+        )
+    }
 
     #[test]
     fn tool_names_match_their_definitions() {
@@ -666,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocks_paths_outside_root() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = &manifest_dir();
         let output = execute_tool(&tool("read_file", json!({"path": "/etc/hosts"})), root).await;
         assert!(output.contains(prepared::OUTSIDE_ROOT), "{output}");
     }
@@ -753,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_tool_runs_without_login_profile_and_captures_output() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = &manifest_dir();
         let output = run_shell(
             &json!({"command": "printf out; printf err >&2; exit 3"}),
             root,
@@ -876,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn lists_current_crate_directory() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = &manifest_dir();
         let output = execute_tool(&tool("list_directory", json!({})), root).await;
         assert!(output.contains("Cargo.toml"));
         assert!(output.contains("src/"));

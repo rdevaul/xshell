@@ -364,6 +364,19 @@ mod tests {
     use super::*;
     use crate::view::PaginationMode;
 
+    /// The package directory, read when the test runs. `cargo test` sets
+    /// `CARGO_MANIFEST_DIR` for each test process. The compile-time `env!`
+    /// form is baked into the binary, and Cargo does not rebuild when only the
+    /// checkout path changes, so a test binary reused from another checkout
+    /// (for example one built into a shared target directory) would look in
+    /// that old, possibly deleted, location.
+    fn manifest_dir() -> PathBuf {
+        PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR is unset; run the tests through cargo"),
+        )
+    }
+
     fn sample() -> XshellConfig {
         toml::from_str(
             r#"
@@ -678,10 +691,8 @@ model = "m"
 
     #[test]
     fn the_example_configuration_loads_with_its_limit_examples_enabled() {
-        let source = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml"),
-        )
-        .unwrap();
+        let source =
+            std::fs::read_to_string(manifest_dir().join("../../config.example.toml")).unwrap();
         let shipped: XshellConfig = toml::from_str(&source).unwrap();
         shipped.validate_limits().unwrap();
 

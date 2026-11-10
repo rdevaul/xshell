@@ -1,13 +1,26 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use xshell_flow::{ContractExpression, Flow, NodeKind};
+
+/// The package directory, read when the test runs. `cargo test` sets
+/// `CARGO_MANIFEST_DIR` for each test process. The compile-time `env!` form
+/// is baked into the binary, and Cargo does not rebuild when only the checkout
+/// path changes, so a test binary reused from another checkout (for example
+/// one built into a shared target directory) would look in that old,
+/// possibly deleted, location.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is unset; run the tests through cargo"),
+    )
+}
 use xshell_plan::{
     PlanArtifact, PlanContractExpression, PredicateCatalog, ProgramCatalog, ResolutionBlocker,
     TaskOperation,
 };
 
 fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/futureshell")
+    manifest_dir().join("../../fixtures/futureshell")
 }
 
 fn load<T: serde::de::DeserializeOwned>(relative: &str) -> T {
