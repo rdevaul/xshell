@@ -10,14 +10,17 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+hex.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 shell-words = "1.1"
 thiserror.workspace = true
 tokio.workspace = true
 xshell-adapters = { path = "../xshell-adapters" }
 xshell-core = { path = "../xshell-core" }
+xshell-platform = { path = "../xshell-platform" }
 
 [dev-dependencies]
 tempfile = "3.21"
