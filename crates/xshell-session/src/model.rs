@@ -9,8 +9,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // progress. Version 13 adds `ExecutionEvent::AutoContinued` and the
 // `reasoning` and `finish_reason` fields on `ExecutionEvent::AgentResponse`.
 // Version 14 adds the `delegate_task` subagent events (`SubagentStarted`,
-// `Subagent`, `SubagentFinished`).
-pub const SESSION_PROTOCOL_VERSION: u32 = 16;
+// `Subagent`, `SubagentFinished`). Version 17 adds `source` on
+// `ApprovalReply` and `basis` and `approval` on `ExecutionEvent::ToolDecision`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 17;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -450,6 +451,10 @@ pub struct ApprovalReply {
     pub turn_id: String,
     pub call_id: String,
     pub decision: ApprovalDecision,
+    /// Who answered, as the client reports it: a person at a terminal, or
+    /// a headless run's approval channel. Recorded in the audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<xshell_execution::ApprovalSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

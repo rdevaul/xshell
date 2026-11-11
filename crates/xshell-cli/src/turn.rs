@@ -17,8 +17,8 @@ use xshell_adapters::AgentAdapter;
 use xshell_audit::AuditEvent;
 use xshell_core::{ChatMessage, ToolCall};
 use xshell_execution::{
-    ApprovalDecision, CancellationFlag, ExecutionEvent, GateReason, Tool, TurnObserver, TurnPolicy,
-    tool_summary,
+    ApprovalAnswer, ApprovalDecision, ApprovalSource, Approver, CancellationFlag, ExecutionEvent,
+    GateReason, Tool, TurnObserver, TurnPolicy, tool_summary,
 };
 use xshell_session::{SessionEventKind, SessionSnapshot};
 use xshell_view::{AgentRenderer, RenderOptions, escape_for_prompt, sanitize_terminal_text};
@@ -153,17 +153,26 @@ requested \"{requested}\" was not applied"
                                 }
                             }
                         }
-                        ExecutionEvent::ToolDecision { call_id, decision } => {
-                            audit.append_execution(AuditEvent::ToolDecision {
-                                call_id,
-                                decision: approval_decision_name(decision).into(),
-                            })?;
+                        ExecutionEvent::ToolDecision {
+                            call_id,
+                            decision,
+                            basis,
+                            approval,
+                        } => {
+                            audit.append_execution(xshell_session::audit_tool_decision(
+                                &call_id,
+                                approval_decision_name(decision),
+                                basis.as_ref(),
+                                approval.as_ref(),
+                            ))?;
                         }
                         ExecutionEvent::ToolSkipped { call_id, .. } => {
-                            audit.append_execution(AuditEvent::ToolDecision {
-                                call_id,
-                                decision: "skipped_after_abort".into(),
-                            })?;
+                            audit.append_execution(xshell_session::audit_tool_decision(
+                                &call_id,
+                                "skipped_after_abort",
+                                None,
+                                None,
+                            ))?;
                         }
                         ExecutionEvent::ToolResult {
                             call_id,
@@ -500,19 +509,23 @@ impl TurnObserver for LocalObserver<'_> {
                 self.approval_agent = agent;
                 Ok(())
             }
-            ExecutionEvent::ToolDecision { call_id, decision } => {
+            ExecutionEvent::ToolDecision {
+                call_id,
+                decision,
+                basis,
+                approval,
+            } => {
                 self.last_approved = decision == ApprovalDecision::Approve;
-                self.audit.append(AuditEvent::ToolDecision {
-                    call_id,
-                    decision: approval_decision_name(decision).into(),
-                })
+                self.audit.append(xshell_session::audit_tool_decision(
+                    &call_id,
+                    approval_decision_name(decision),
+                    basis.as_ref(),
+                    approval.as_ref(),
+                ))
             }
-            ExecutionEvent::ToolSkipped { call_id, .. } => {
-                self.audit.append(AuditEvent::ToolDecision {
-                    call_id,
-                    decision: "skipped_after_abort".into(),
-                })
-            }
+            ExecutionEvent::ToolSkipped { call_id, .. } => self.audit.append(
+                xshell_session::audit_tool_decision(&call_id, "skipped_after_abort", None, None),
+            ),
             ExecutionEvent::ToolResult {
                 call_id,
                 name,
@@ -574,17 +587,18 @@ impl TurnObserver for LocalObserver<'_> {
         self.cancellation.clone()
     }
 
-    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalDecision {
+    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalAnswer {
         if let Some(agent) = self.approval_agent.take() {
             print!("{}", agent_tag(Some(&agent)));
         }
-        match confirm_tool(call, reason) {
+        let decision = match confirm_tool(call, reason) {
             Ok(decision) => decision,
             Err(error) => {
                 self.record(Err(error));
                 ApprovalDecision::AbortTurn
             }
-        }
+        };
+        ApprovalAnswer::new(decision, ApprovalSource::new(Approver::Interactive))
     }
 }
 
@@ -597,6 +611,17 @@ pub(crate) async fn run_agent_turn(
     audit: &mut AuditRuntime,
     render_options: RenderOptions,
 ) -> Result<()> {
+    // This process executes, so it records the turn's authority before
+    // anything runs under it, as the daemon does. The mode and limits are
+    // the ones this process chose; nothing lowered them.
+    audit.append(xshell_session::audit_turn_started(
+        &uuid::Uuid::new_v4().to_string(),
+        policy.approval,
+        None,
+        &policy.limits,
+        None,
+        &policy.rules,
+    ))?;
     let mut observer = LocalObserver::new(audit, render_options, cwd);
     let outcome =
         xshell_execution::run_agent_turn(agent, history, message, cwd, policy, &mut observer).await;

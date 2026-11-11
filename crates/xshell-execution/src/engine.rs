@@ -3,9 +3,9 @@ use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
 use crate::tools::{execute_prepared, gate, prepare_call, truncate};
 use crate::{
-    ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, GateReason,
-    PolicyDecision, SensitivePaths, Tool, ToolSet, default_decision, drop_tool_payloads,
-    estimate_history_tokens, history_bytes,
+    ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
+    GateReason, PolicyDecision, SensitivePaths, Tool, ToolSet, default_decision,
+    drop_tool_payloads, estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -87,6 +87,93 @@ pub enum ApprovalDecision {
     AbortTurn,
 }
 
+/// Who answered an approval prompt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Approver {
+    /// A person at an interactive terminal.
+    Interactive,
+    /// A program on a headless run's approval channel.
+    ApprovalChannel,
+    /// Nobody could answer: a headless run without an approval channel, or
+    /// one whose channel closed or answered something unusable. The client
+    /// denied the call.
+    NoApprover,
+    /// The turn was cancelled while the prompt waited.
+    Cancelled,
+    /// The answering client did not say who answered.
+    Unreported,
+}
+
+impl Approver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::ApprovalChannel => "approval_channel",
+            Self::NoApprover => "no_approver",
+            Self::Cancelled => "cancelled",
+            Self::Unreported => "unreported",
+        }
+    }
+}
+
+/// Where an approval answer came from. `detail` is a short reason code from
+/// the client (for example `approval_channel_closed`); a remote client's
+/// claim, recorded as given after validation, not proof of who answered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalSource {
+    pub approver: Approver,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ApprovalSource {
+    /// Longest `detail` kept.
+    pub const MAX_DETAIL_LEN: usize = 64;
+
+    pub fn new(approver: Approver) -> Self {
+        Self {
+            approver,
+            detail: None,
+        }
+    }
+
+    /// Attach a reason code. Anything but a short `snake_case` code is
+    /// dropped, so a client cannot write arbitrary text into the audit
+    /// trail through it.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let valid = !detail.is_empty()
+            && detail.len() <= Self::MAX_DETAIL_LEN
+            && detail
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+        self.detail = valid.then_some(detail);
+        self
+    }
+}
+
+/// An answer to an approval prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalAnswer {
+    pub decision: ApprovalDecision,
+    pub source: ApprovalSource,
+}
+
+impl ApprovalAnswer {
+    pub fn new(decision: ApprovalDecision, source: ApprovalSource) -> Self {
+        Self { decision, source }
+    }
+
+    /// The turn was cancelled while waiting for an answer.
+    pub fn cancelled() -> Self {
+        Self::new(
+            ApprovalDecision::AbortTurn,
+            ApprovalSource::new(Approver::Cancelled),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionEvent {
@@ -124,6 +211,13 @@ pub enum ExecutionEvent {
     ToolDecision {
         call_id: String,
         decision: ApprovalDecision,
+        /// What settled the call, or led to its prompt. Absent in journals
+        /// written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<DecisionBasis>,
+        /// Who answered, when the call was prompted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval: Option<ApprovalSource>,
     },
     /// A tool call that was never evaluated because the user aborted the
     /// turn at an earlier call in the same response.
@@ -248,7 +342,7 @@ impl CancellationFlag {
 pub trait TurnObserver: Send {
     fn emit(&mut self, event: ExecutionEvent);
     fn cancellation(&self) -> CancellationFlag;
-    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalDecision;
+    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalAnswer;
 }
 
 pub fn build_adapter(config: &AdapterConfig) -> Result<Box<dyn AgentAdapter>> {
@@ -737,6 +831,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     history,
                     call,
                     scoped,
+                    DecisionBasis::TurnLimit,
                     format!(
                         "tool error: not run; the response exceeded the limit of \
 {per_response} tool calls per response"
@@ -754,6 +849,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                         history,
                         call,
                         scoped,
+                        DecisionBasis::TurnLimit,
                         format!("tool error: not run; {exhausted}"),
                     );
                 }
@@ -774,7 +870,14 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 } else {
                     format!("tool error: unknown tool {}", call.name)
                 };
-                refuse_tool_call(observer, history, call, scoped, result);
+                refuse_tool_call(
+                    observer,
+                    history,
+                    call,
+                    scoped,
+                    DecisionBasis::NotInToolset,
+                    result,
+                );
                 continue;
             };
             // Read-only tools are prepared here: the object they will read is
@@ -796,25 +899,29 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 gated: gate_reason.is_some(),
                 sensitive: gate_reason == Some(GateReason::SensitivePath),
             };
-            let policy_decision = policy.rules.decide(&facts, approval);
+            let ruled = policy.rules.decide_with_basis(&facts, approval);
+            let policy_decision = ruled.decision;
             // A denial the approval mode alone would not have made.
             let denied_by_policy = policy_decision == PolicyDecision::Deny
                 && default_decision(&facts, approval) != PolicyDecision::Deny;
-            let decision = match policy_decision {
-                PolicyDecision::Run => ApprovalDecision::Approve,
-                PolicyDecision::Deny => ApprovalDecision::Deny,
+            let (decision, answered_by) = match policy_decision {
+                PolicyDecision::Run => (ApprovalDecision::Approve, None),
+                PolicyDecision::Deny => (ApprovalDecision::Deny, None),
                 PolicyDecision::Prompt => {
                     let reason = gate_reason.unwrap_or(GateReason::Policy);
                     observer.emit(ExecutionEvent::ApprovalRequested {
                         call: scoped.clone(),
                         reason: Some(reason),
                     });
-                    observer.approve(scoped, reason).await
+                    let answer = observer.approve(scoped, reason).await;
+                    (answer.decision, Some(answer.source))
                 }
             };
             observer.emit(ExecutionEvent::ToolDecision {
                 call_id: scoped.id.clone(),
                 decision,
+                basis: Some(ruled.basis),
+                approval: answered_by,
             });
             // A decision is the last audit boundary before the action. An
             // observer can cancel when recording it fails; honor that before
@@ -1108,7 +1215,7 @@ impl TurnObserver for SubagentObserver<'_> {
         self.parent.cancellation()
     }
 
-    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalDecision {
+    async fn approve(&mut self, call: &ToolCall, reason: GateReason) -> ApprovalAnswer {
         self.parent.approve(call, reason).await
     }
 }
@@ -1120,11 +1227,14 @@ fn refuse_tool_call(
     history: &mut Vec<ChatMessage>,
     call: &ToolCall,
     scoped: &ToolCall,
+    basis: DecisionBasis,
     result: String,
 ) {
     observer.emit(ExecutionEvent::ToolDecision {
         call_id: scoped.id.clone(),
         decision: ApprovalDecision::Deny,
+        basis: Some(basis),
+        approval: None,
     });
     observer.emit(ExecutionEvent::ToolResult {
         call_id: scoped.id.clone(),
@@ -1578,8 +1688,11 @@ mod tests {
             self.cancellation.clone()
         }
 
-        async fn approve(&mut self, _call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
-            self.decisions.pop_front().expect("unscripted approval")
+        async fn approve(&mut self, _call: &ToolCall, _reason: GateReason) -> ApprovalAnswer {
+            ApprovalAnswer::new(
+                self.decisions.pop_front().expect("unscripted approval"),
+                ApprovalSource::new(Approver::Interactive),
+            )
         }
     }
 
@@ -1701,6 +1814,106 @@ mod tests {
         assert_eq!(adapter.requests.len(), 2);
     }
 
+    #[tokio::test]
+    async fn decisions_record_their_basis_and_who_answered() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    content: "working".into(),
+                    tool_calls: vec![
+                        list_call("a"),
+                        shell_call("b", "printf hi"),
+                        shell_call("c", "rm -rf build"),
+                    ],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([ApprovalDecision::Approve]);
+        let (base, _) = crate::Policy::parse(&crate::PolicyConfig {
+            denied: vec!["run_shell: rm *".into()],
+            ..crate::PolicyConfig::default()
+        })
+        .unwrap();
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_rules(ApprovalRules {
+            base,
+            overlay: None,
+        });
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        let decisions: Vec<_> = observer
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::ToolDecision {
+                    call_id,
+                    decision,
+                    basis,
+                    approval,
+                } => Some((call_id.as_str(), *decision, basis.clone(), approval.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            decisions,
+            [
+                // Read-only and unlisted: the mode's default runs it.
+                (
+                    "a",
+                    ApprovalDecision::Approve,
+                    Some(DecisionBasis::ModeDefault),
+                    None
+                ),
+                // Unlisted shell command: the default prompts, and a person
+                // answered.
+                (
+                    "b",
+                    ApprovalDecision::Approve,
+                    Some(DecisionBasis::ModeDefault),
+                    Some(ApprovalSource::new(Approver::Interactive))
+                ),
+                // Denied by the entry, without asking.
+                (
+                    "c",
+                    ApprovalDecision::Deny,
+                    Some(DecisionBasis::Entry {
+                        layer: crate::PolicyLayer::Base,
+                        list: crate::PolicyList::Denied,
+                        entry: "run_shell: rm *".into(),
+                    }),
+                    None
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_details_are_short_codes_only() {
+        let source = |detail: &str| ApprovalSource::new(Approver::NoApprover).with_detail(detail);
+        assert_eq!(
+            source("approval_channel_closed").detail.as_deref(),
+            Some("approval_channel_closed")
+        );
+        for bad in ["", "Closed", "closed\nforged record", &"x".repeat(65)] {
+            assert_eq!(source(bad).detail, None, "{bad:?}");
+        }
+    }
+
     fn recording_observer(
         decisions: impl IntoIterator<Item = ApprovalDecision>,
     ) -> RecordingObserver {
@@ -1774,6 +1987,8 @@ mod tests {
         assert!(observer.events.contains(&ExecutionEvent::ToolDecision {
             call_id: "a".into(),
             decision: ApprovalDecision::Deny,
+            basis: Some(DecisionBasis::NotInToolset),
+            approval: None,
         }));
     }
 
@@ -2558,7 +2773,7 @@ mod tests {
             self.cancellation.clone()
         }
 
-        async fn approve(&mut self, _call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
+        async fn approve(&mut self, _call: &ToolCall, _reason: GateReason) -> ApprovalAnswer {
             panic!("the prepared object was not sensitive; nothing should prompt")
         }
     }

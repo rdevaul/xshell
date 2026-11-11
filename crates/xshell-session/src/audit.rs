@@ -323,6 +323,84 @@ impl SessionAuditHandle {
     }
 }
 
+/// The audit record of what settled a tool call.
+pub fn audit_decision_basis(
+    basis: &xshell_execution::DecisionBasis,
+) -> xshell_audit::AuditDecisionBasis {
+    use xshell_execution::DecisionBasis;
+    let (list, entry) = match basis {
+        DecisionBasis::Entry { list, entry, .. } => {
+            (Some(list.as_str().to_owned()), Some(entry.clone()))
+        }
+        _ => (None, None),
+    };
+    xshell_audit::AuditDecisionBasis {
+        kind: basis.kind().to_owned(),
+        policy: basis.layer().map(|layer| layer.as_str().to_owned()),
+        list,
+        entry,
+    }
+}
+
+/// The audit record of who answered a prompted call.
+pub fn audit_approval(source: &xshell_execution::ApprovalSource) -> xshell_audit::AuditApproval {
+    xshell_audit::AuditApproval {
+        approver: source.approver.as_str().to_owned(),
+        detail: source.detail.clone(),
+    }
+}
+
+/// The audit `ToolDecision` record for an engine decision event.
+pub fn audit_tool_decision(
+    call_id: &str,
+    decision: &str,
+    basis: Option<&xshell_execution::DecisionBasis>,
+    approval: Option<&xshell_execution::ApprovalSource>,
+) -> xshell_audit::AuditEvent {
+    xshell_audit::AuditEvent::ToolDecision {
+        call_id: call_id.to_owned(),
+        decision: decision.to_owned(),
+        basis: basis.map(audit_decision_basis),
+        approval: approval.map(audit_approval),
+    }
+}
+
+/// The audit record of a policy, or `None` for an empty one.
+pub fn audit_policy(policy: &xshell_execution::Policy) -> Option<xshell_audit::AuditPolicy> {
+    Some(xshell_audit::AuditPolicy {
+        sha256: policy.identity()?.to_owned(),
+        policy: serde_json::to_value(policy.config())
+            .expect("a policy configuration always serializes"),
+    })
+}
+
+/// The audit `TurnStarted` record: the authority an agent turn runs under.
+pub fn audit_turn_started(
+    turn_id: &str,
+    approval: xshell_execution::ApprovalPolicy,
+    requested_approval: Option<xshell_execution::ApprovalPolicy>,
+    limits: &xshell_execution::TurnLimits,
+    requested_limits: Option<&xshell_execution::TurnLimits>,
+    rules: &xshell_execution::ApprovalRules,
+) -> xshell_audit::AuditEvent {
+    fn encode(value: impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(value).expect("approval modes and turn limits always serialize")
+    }
+    let mode = |mode| match encode(mode) {
+        serde_json::Value::String(mode) => mode,
+        other => other.to_string(),
+    };
+    xshell_audit::AuditEvent::TurnStarted {
+        turn_id: turn_id.to_owned(),
+        approval: mode(approval),
+        requested_approval: requested_approval.map(mode),
+        limits: encode(limits),
+        requested_limits: requested_limits.map(|limits| Box::new(encode(limits))),
+        base_policy: audit_policy(&rules.base).map(Box::new),
+        overlay_policy: rules.overlay.as_ref().and_then(audit_policy).map(Box::new),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

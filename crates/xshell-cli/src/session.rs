@@ -583,8 +583,15 @@ session's interactive process is running; stop it first"
         decision: ApprovalDecision,
     ) -> Result<()> {
         let session_id = self.active_session_id()?;
-        self.client_mut()?
-            .approve(session_id, turn_id, call_id, decision)
+        // Only the interactive client answers through here; headless runs
+        // use their own client and report their own source.
+        self.client_mut()?.approve(
+            session_id,
+            turn_id,
+            call_id,
+            decision,
+            xshell_execution::ApprovalSource::new(xshell_execution::Approver::Interactive),
+        )
     }
 
     pub fn refresh_snapshot(&mut self) -> Result<SessionSnapshot> {

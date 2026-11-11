@@ -1363,6 +1363,7 @@ fn f3_sigterm_cancels_agent_tool_process_group_before_exit() {
                         turn_id.clone(),
                         call.id,
                         ApprovalDecision::Approve,
+                        interactive(),
                     )
                     .unwrap();
             }
@@ -1622,6 +1623,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             turn_id,
             call_id,
             ApprovalDecision::Approve,
+            interactive(),
         )
         .unwrap();
 
@@ -1861,6 +1863,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
             turn_id,
             call_id,
             ApprovalDecision::Approve,
+            interactive(),
         )
         .unwrap();
 
@@ -1980,6 +1983,7 @@ fn f1_failed_agent_effect_survives_durable_session_reload() {
                             turn_id.clone(),
                             call.id,
                             ApprovalDecision::Approve,
+                            interactive(),
                         )
                         .unwrap(),
                     SessionEventKind::TurnFailed { .. } => failed = true,
@@ -2517,6 +2521,194 @@ fn start_audited_fabric(temporary: &TempDir, extra_audit_config: &str) -> Audite
         state,
         socket,
     }
+}
+
+/// The audit events in a daemon-written log, in order.
+fn audit_events(log: &str) -> Vec<serde_json::Value> {
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| {
+            record
+                .pointer("/body/event")
+                .or_else(|| record.get("event"))
+                .cloned()
+        })
+        .collect()
+}
+
+#[test]
+fn h3_audit_records_turn_authority_and_what_decided_each_call() {
+    let temporary = TempDir::new().unwrap();
+    let fabric = start_audited_fabric(
+        &temporary,
+        "[session_fabric.approval_policy]\ndenied = [\"run_shell: shutdown *\"]\n",
+    );
+    let calls = [("call-printf", "printf ok"), ("call-rm", "rm -rf build")];
+    let tool_calls: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, command))| {
+            serde_json::json!({
+                "index": index,
+                "id": id,
+                "function": {
+                    "name": "run_shell",
+                    "arguments": serde_json::json!({"command": command}).to_string(),
+                },
+            })
+        })
+        .collect();
+    let tool_response = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({"choices": [{"delta": {"tool_calls": tool_calls}}]})
+    );
+    let done_response =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+    let (base_url, _model_server) = serve_sse(vec![tool_response, done_response.into()]);
+
+    let mut client = connect_when_ready(&fabric.socket);
+    let session = client
+        .create(SessionCreation {
+            name: "h3".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+                max_history_bytes: None,
+                context_tokens: None,
+                reserve_output_tokens: None,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+        })
+        .unwrap();
+    let session_id = session.descriptor.id.clone();
+    let overlay = xshell_execution::PolicyConfig {
+        denied: vec!["run_shell: rm *".into()],
+        ..xshell_execution::PolicyConfig::default()
+    };
+    let turn_id = client
+        .submit_with_limits(
+            session_id.clone(),
+            TurnInput::Agent {
+                message: "clean up".into(),
+            },
+            ApprovalPolicy::Ask,
+            None,
+            Some(overlay.clone()),
+        )
+        .unwrap();
+
+    let mut after = 0;
+    let mut completed = false;
+    for _ in 0..200 {
+        let batch = client.events(session_id.clone(), after, 50).unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ApprovalRequested { call, .. },
+                } => client
+                    .approve(
+                        session_id.clone(),
+                        turn_id.clone(),
+                        call.id,
+                        ApprovalDecision::Approve,
+                        interactive(),
+                    )
+                    .unwrap(),
+                SessionEventKind::TurnCompleted => completed = true,
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    assert!(completed, "the turn did not complete");
+    client.close(Some("h3".into())).unwrap();
+    drop(client);
+
+    let sessions_dir = fabric.audit_directory.join("sessions");
+    let public_key = fabric.audit_directory.join("signing-key.pub");
+    let mut log = None;
+    for _ in 0..100 {
+        log = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                std::fs::read_to_string(path).is_ok_and(|text| {
+                    text.contains("\"turn_started\"") && text.contains("\"session_ended\"")
+                })
+            });
+        if log.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let log = log.expect("no audit log recorded the agent turn");
+    xshell_audit::verify_log(&log, &public_key).unwrap();
+    let events = audit_events(&std::fs::read_to_string(&log).unwrap());
+
+    let started = events
+        .iter()
+        .position(|event| event["type"] == "turn_started")
+        .unwrap();
+    let authority = &events[started];
+    assert_eq!(authority["turn_id"], turn_id);
+    assert_eq!(authority["approval"], "ask");
+    assert_eq!(
+        authority["limits"],
+        serde_json::to_value(xshell_execution::TurnLimits::default()).unwrap()
+    );
+    let base = xshell_execution::PolicyConfig {
+        denied: vec!["run_shell: shutdown *".into()],
+        ..xshell_execution::PolicyConfig::default()
+    };
+    assert_eq!(
+        authority["base_policy"]["sha256"],
+        xshell_execution::policy_identity(&base).unwrap()
+    );
+    assert_eq!(
+        authority["base_policy"]["policy"],
+        serde_json::to_value(&base).unwrap()
+    );
+    assert_eq!(
+        authority["overlay_policy"]["sha256"],
+        xshell_execution::policy_identity(&overlay).unwrap()
+    );
+
+    let decision = |call_id: &str| {
+        events[started..]
+            .iter()
+            .find(|event| event["type"] == "tool_decision" && event["call_id"] == call_id)
+            .unwrap_or_else(|| panic!("no decision for {call_id}"))
+            .clone()
+    };
+    let printf = decision("call-printf");
+    assert_eq!(printf["decision"], "approve");
+    assert_eq!(printf["basis"], serde_json::json!({"kind": "mode_default"}));
+    assert_eq!(
+        printf["approval"],
+        serde_json::json!({"approver": "interactive"})
+    );
+    let rm = decision("call-rm");
+    assert_eq!(rm["decision"], "deny");
+    assert_eq!(
+        rm["basis"],
+        serde_json::json!({
+            "kind": "entry",
+            "policy": "overlay",
+            "list": "denied",
+            "entry": "run_shell: rm *",
+        })
+    );
+    assert!(rm.get("approval").is_none(), "nobody was asked about rm");
 }
 
 /// Run one terminal job to completion through the daemon, feeding it `input`
@@ -3128,4 +3320,8 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
         reason,
         Some(xshell_session::TurnFailureReason::BudgetExhausted)
     );
+}
+
+fn interactive() -> xshell_execution::ApprovalSource {
+    xshell_execution::ApprovalSource::new(xshell_execution::Approver::Interactive)
 }
