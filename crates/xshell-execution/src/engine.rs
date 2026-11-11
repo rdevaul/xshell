@@ -1,7 +1,7 @@
 use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
-use crate::tools::{execute_prepared, gate, prepare_call, truncate};
+use crate::tools::{Preparation, execute_prepared, gate, prepare_call, truncate};
 use crate::{
     ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
     GateReason, PolicyDecision, SensitivePaths, Tool, ToolSet, default_decision,
@@ -885,6 +885,19 @@ Start a new session with //new or lower max_history_bytes to continue.",
             // object, and execution reads from it (F5).
             let preparation =
                 prepare_call(call, cwd, &policy.sensitive_paths, &policy.blocked_paths).await;
+            // A blocked path is refused whatever the mode and policy say, and
+            // recorded as such: the policy never saw this call.
+            if let Preparation::Blocked(result) = &preparation {
+                refuse_tool_call(
+                    observer,
+                    history,
+                    call,
+                    scoped,
+                    DecisionBasis::BlockedPath,
+                    result.clone(),
+                );
+                continue;
+            }
             let gate_reason = gate(call, &preparation);
             let facts = CallFacts {
                 tool: &call.name,
@@ -917,6 +930,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     (answer.decision, Some(answer.source))
                 }
             };
+            let approver = answered_by.as_ref().map(|source| source.approver);
             observer.emit(ExecutionEvent::ToolDecision {
                 call_id: scoped.id.clone(),
                 decision,
@@ -963,7 +977,15 @@ Start a new session with //new or lower max_history_bytes to continue.",
             let result = if denied_by_policy {
                 "tool denied by the approval policy".into()
             } else if decision != ApprovalDecision::Approve {
-                "tool denied by user".into()
+                // Say who denied it: the model is told, and so is anyone
+                // reading the transcript.
+                match approver {
+                    None => "tool denied: the approval mode is off".into(),
+                    Some(Approver::NoApprover) => {
+                        "tool denied: nobody was available to approve it".into()
+                    }
+                    Some(_) => "tool denied by user".into(),
+                }
             } else if tool == Tool::DelegateTask {
                 // A delegation counts as tool activity even if the subagent
                 // ran nothing, so the parent's turn never rolls back over

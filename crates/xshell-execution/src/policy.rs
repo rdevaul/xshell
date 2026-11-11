@@ -245,6 +245,9 @@ pub enum DecisionBasis {
     /// The turn's limits refused the call before the policy was consulted:
     /// too many calls in one response, or the tool-call budget is spent.
     TurnLimit,
+    /// The call would read a path in the session host's `block` class.
+    /// Refused before the policy is consulted, in every approval mode.
+    BlockedPath,
 }
 
 impl DecisionBasis {
@@ -256,6 +259,7 @@ impl DecisionBasis {
             Self::ModeDefault => "mode_default",
             Self::NotInToolset => "not_in_toolset",
             Self::TurnLimit => "turn_limit",
+            Self::BlockedPath => "blocked_path",
         }
     }
 
@@ -264,7 +268,7 @@ impl DecisionBasis {
             Self::Entry { layer, .. }
             | Self::NotListed { layer }
             | Self::UncheckableCommand { layer } => Some(*layer),
-            Self::ModeDefault | Self::NotInToolset | Self::TurnLimit => None,
+            Self::ModeDefault | Self::NotInToolset | Self::TurnLimit | Self::BlockedPath => None,
         }
     }
 }

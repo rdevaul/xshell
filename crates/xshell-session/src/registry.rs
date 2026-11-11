@@ -152,7 +152,7 @@ impl SessionRegistry {
         if recovered_in_flight {
             registry.persist()?;
         }
-        registry.collect_images()?;
+        registry.collect_images();
         Ok(registry)
     }
 
@@ -290,14 +290,21 @@ impl SessionRegistry {
                 record.snapshot.descriptor.name
             );
         }
-        let images = history.iter().flat_map(|message| &message.images);
-        ImageStore::open(
-            &self.state_directory.join(IMAGES_DIRECTORY),
-            session_id,
-            self.image_limits,
-        )?
-        .require_all(images)
-        .context("the history references an image this session does not have")?;
+        let mut images = history
+            .iter()
+            .flat_map(|message| &message.images)
+            .peekable();
+        // A text-only history needs no store, so a store problem cannot
+        // break an ordinary update.
+        if images.peek().is_some() {
+            ImageStore::open(
+                &self.state_directory.join(IMAGES_DIRECTORY),
+                session_id,
+                self.image_limits,
+            )?
+            .require_all(images)
+            .context("the history references an image this session does not have")?;
+        }
         record.snapshot.descriptor.model = model;
         record.snapshot.descriptor.cwd = cwd;
         record.snapshot.descriptor.last_active_at_unix_ms = timestamp_ms()?;
@@ -422,20 +429,39 @@ impl SessionRegistry {
     /// Collection runs only here and when a session ends, never on a history
     /// update: an image stored for a message the user has not sent yet would
     /// look unreferenced. The store limits bound growth in between.
-    fn collect_images(&self) -> Result<()> {
+    ///
+    /// Collection is best-effort: a store it cannot clean is reported and
+    /// left for the next start, and never stops the daemon from serving
+    /// its sessions.
+    fn collect_images(&self) {
         let root = self.images_root();
-        xshell_execution::remove_orphan_stores(&root, self.sessions.keys().map(String::as_str))?;
-        if !root.exists() {
-            return Ok(());
+        match xshell_execution::remove_orphan_stores(
+            &root,
+            self.sessions.keys().map(String::as_str),
+        ) {
+            Ok(report) => {
+                for error in report.errors {
+                    eprintln!("xshelld warning: cannot remove an orphaned image store: {error:#}");
+                }
+            }
+            Err(error) => {
+                eprintln!("xshelld warning: cannot collect unused images: {error:#}");
+                return;
+            }
         }
         for (id, record) in &self.sessions {
             if !root.join(id).exists() {
                 continue;
             }
-            let store = ImageStore::open(&root, id, self.image_limits)?;
-            store.retain(record.snapshot.history.iter().flat_map(|m| &m.images))?;
+            let result = ImageStore::open(&root, id, self.image_limits).and_then(|store| {
+                store.retain(record.snapshot.history.iter().flat_map(|m| &m.images))
+            });
+            if let Err(error) = result {
+                eprintln!(
+                    "xshelld warning: cannot collect unused images of session {id}: {error:#}"
+                );
+            }
         }
-        Ok(())
     }
 
     pub fn snapshot(&self, selector: &str) -> Result<SessionSnapshot> {
@@ -860,6 +886,30 @@ mod tests {
                 .unwrap()
                 .contains(&unreferenced)
         );
+    }
+
+    #[test]
+    fn an_image_store_that_cannot_be_cleaned_does_not_stop_startup() {
+        let temp = TempDir::new().unwrap();
+        let mut registry = load(temp.path()).unwrap();
+        let durable = create_session(
+            &mut registry,
+            temp.path(),
+            "durable",
+            PersistenceMode::Durable,
+        );
+        put_image(&registry, &durable, b"render");
+        drop(registry);
+        let images = temp.path().join(IMAGES_DIRECTORY);
+        // An orphaned store with something unexpected in it, and a stray
+        // directory in the live session's store.
+        let orphan = images.join("22222222-2222-4222-8222-222222222222");
+        fs::create_dir_all(orphan.join("unexpected")).unwrap();
+        fs::create_dir(images.join(&durable).join("unexpected")).unwrap();
+
+        let restored = load(temp.path()).unwrap();
+        assert!(restored.snapshot("durable").is_ok());
+        assert!(orphan.exists(), "left for the next start");
     }
 
     #[test]

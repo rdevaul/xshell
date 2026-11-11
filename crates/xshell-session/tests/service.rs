@@ -2439,7 +2439,10 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
     assert!(saw_clamp, "TurnStarted did not report the clamped policy");
     assert!(!saw_prompt, "policy off must not prompt");
     assert_eq!(decision, Some(ApprovalDecision::Deny));
-    assert_eq!(result.as_deref(), Some("tool denied by user"));
+    assert_eq!(
+        result.as_deref(),
+        Some("tool denied: the approval mode is off")
+    );
 }
 
 /// Decode the `TerminalStream` records of one direction from an audit log,

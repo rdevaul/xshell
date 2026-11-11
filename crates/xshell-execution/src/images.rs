@@ -173,6 +173,11 @@ impl ImageStore {
             file.sync_all()?;
             fs::rename(&temporary, &path)
                 .with_context(|| format!("cannot store image {}", path.display()))?;
+            // Make the rename itself durable: a session that records this
+            // image must still find it after a crash.
+            File::open(&self.directory)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| format!("cannot sync {}", self.directory.display()))?;
             Ok(())
         })();
         if result.is_err() {
@@ -314,30 +319,50 @@ impl ImageStore {
 
 /// Remove the stores under `root` that belong to no session in `live`:
 /// ephemeral sessions that ended while the daemon was down, or sessions
-/// whose removal failed part-way. Returns how many stores were removed.
+/// whose removal failed part-way.
+///
+/// One store that cannot be removed does not stop the others: its error is
+/// returned in the report, and the store is tried again at the next start.
+/// Only a root that cannot be checked or read is an error.
 pub fn remove_orphan_stores<'a>(
     root: &Path,
     live: impl IntoIterator<Item = &'a str>,
-) -> Result<usize> {
+) -> Result<OrphanReport> {
+    let mut report = OrphanReport::default();
     if !root.exists() {
-        return Ok(0);
+        return Ok(report);
     }
     xshell_platform::ensure_secure_directory(root, "image store")?;
     let live: HashSet<&str> = live.into_iter().collect();
-    let mut removed = 0;
     for entry in fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if live.contains(name.as_ref()) || validate_session_id(&name).is_err() {
-            continue;
-        }
-        if entry.file_type()?.is_dir() {
-            remove_store_directory(&entry.path())?;
-            removed += 1;
+        let result = entry.map_err(anyhow::Error::from).and_then(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if live.contains(name.as_ref())
+                || validate_session_id(&name).is_err()
+                || !entry.file_type()?.is_dir()
+            {
+                return Ok(false);
+            }
+            remove_store_directory(&entry.path())
+                .with_context(|| format!("cannot remove {}", entry.path().display()))?;
+            Ok(true)
+        });
+        match result {
+            Ok(true) => report.removed += 1,
+            Ok(false) => {}
+            Err(error) => report.errors.push(error),
         }
     }
-    Ok(removed)
+    Ok(report)
+}
+
+/// What [`remove_orphan_stores`] did.
+#[derive(Debug, Default)]
+pub struct OrphanReport {
+    pub removed: usize,
+    /// One error per store that could not be removed.
+    pub errors: Vec<anyhow::Error>,
 }
 
 /// Remove one session's store directory: its files, then the directory.
@@ -598,6 +623,26 @@ mod tests {
     }
 
     #[test]
+    fn an_orphan_that_cannot_be_removed_does_not_stop_the_others() {
+        let (_temp, root) = root();
+        let live = store(&root, ImageStoreLimits::default());
+        put(&live, b"live").unwrap();
+        // A store with a subdirectory in it is left in place with an error.
+        let stuck = ImageStore::open(&root, OTHER, ImageStoreLimits::default()).unwrap();
+        fs::create_dir(stuck.directory().join("unexpected")).unwrap();
+        let third = "33333333-3333-4333-8333-333333333333";
+        let removable = ImageStore::open(&root, third, ImageStoreLimits::default()).unwrap();
+        put(&removable, b"orphan").unwrap();
+
+        let report = remove_orphan_stores(&root, [SESSION]).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(root.join(OTHER).exists());
+        assert!(!root.join(third).exists());
+        assert!(live.directory().exists());
+    }
+
+    #[test]
     fn removing_a_store_and_orphans() {
         let (_temp, root) = root();
         let live = store(&root, ImageStoreLimits::default());
@@ -606,7 +651,7 @@ mod tests {
         put(&orphan, b"orphan").unwrap();
         fs::create_dir(root.join("not-a-session")).unwrap();
 
-        assert_eq!(remove_orphan_stores(&root, [SESSION]).unwrap(), 1);
+        assert_eq!(remove_orphan_stores(&root, [SESSION]).unwrap().removed, 1);
         assert!(live.directory().exists());
         assert!(!root.join(OTHER).exists());
         assert!(
@@ -617,7 +662,12 @@ mod tests {
         let directory = live.directory().to_owned();
         live.remove().unwrap();
         assert!(!directory.exists());
-        assert_eq!(remove_orphan_stores(&root.join("absent"), []).unwrap(), 0);
+        assert_eq!(
+            remove_orphan_stores(&root.join("absent"), [])
+                .unwrap()
+                .removed,
+            0
+        );
     }
 
     #[test]

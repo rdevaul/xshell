@@ -256,6 +256,9 @@ pub(crate) enum Preparation {
     Read(PreparedObject),
     /// The read could not be prepared; this is the tool's result.
     Failed(String),
+    /// The read would open a path the session host blocks. Refused before
+    /// the approval rules are consulted; this is the tool's result.
+    Blocked(String),
     Other,
 }
 
@@ -277,7 +280,7 @@ pub(crate) async fn prepare_call(
     let sensitive = sensitive.clone();
     match run_blocking(move || prepared::prepare(&root, &path, kind, &sensitive)).await {
         // A blocked path is never read, whatever the approval policy says.
-        Ok(object) if blocked.matches(object.path()) => Preparation::Failed(format!(
+        Ok(object) if blocked.matches(object.path()) => Preparation::Blocked(format!(
             "tool error: {} is blocked by the session host's policy",
             object.path().display()
         )),
@@ -392,7 +395,7 @@ pub(crate) async fn execute_prepared(
     shell_timeout: Duration,
 ) -> String {
     let output = match preparation {
-        Preparation::Failed(message) => return message,
+        Preparation::Failed(message) | Preparation::Blocked(message) => return message,
         Preparation::Read(object) => match Tool::from_name(&call.name) {
             Some(Tool::ReadFile) => {
                 let max_bytes = call

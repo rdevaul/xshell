@@ -714,12 +714,20 @@ fn a_blocked_path_is_never_read_whatever_the_mode() {
         "read it",
     ]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    let result = tool_result(&events(&output));
+    let events = events(&output);
+    let result = tool_result(&events);
     assert!(
         result.contains("blocked by the session host's policy"),
         "{result}"
     );
     assert!(!result.contains("PRIVATE KEY"));
+    // Recorded as a refusal of its own, not as a call the mode approved.
+    let decision = events
+        .iter()
+        .find(|event| event["event"] == "tool_decision")
+        .expect("a tool_decision event");
+    assert_eq!(decision["decision"], "deny", "{decision}");
+    assert_eq!(decision["basis"]["kind"], "blocked_path", "{decision}");
 }
 
 /// Spawn `xshell run` with a pipe on descriptor 3 for approval decisions.
