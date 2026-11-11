@@ -68,6 +68,25 @@ fn wait_for_path(path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
+/// Waits until a shell's `echo $$ > path` has finished writing and returns the PID.
+///
+/// The redirection creates (and truncates) the file before `echo` writes to it, so the path can
+/// exist while still empty. Only a newline-terminated line is a complete PID.
+fn wait_for_pid(path: &Path) -> i32 {
+    for _ in 0..200 {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Some(line) = contents.strip_suffix('\n')
+        {
+            return line
+                .trim()
+                .parse()
+                .unwrap_or_else(|error| panic!("{} holds {line:?}: {error}", path.display()));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for a PID in {}", path.display());
+}
+
 #[test]
 fn daemon_rejects_the_previous_protocol_during_handshake() {
     let temporary = TempDir::new().unwrap();
@@ -1442,6 +1461,7 @@ fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
     let shell_pid = temporary.path().join("shell-pid");
     let command = format!("echo $$ > {}; sleep 30", shell_pid.display());
     let session_id;
+    let process_group;
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_xshelld"))
             .arg("--no-user-config")
@@ -1472,17 +1492,12 @@ fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
                 ApprovalPolicy::Ask,
             )
             .unwrap();
-        wait_for_path(&shell_pid);
+        process_group = wait_for_pid(&shell_pid);
     }
 
     daemon.0.kill().unwrap();
     let status = daemon.0.wait().unwrap();
     assert!(!status.success(), "SIGKILL unexpectedly reported success");
-    let process_group = std::fs::read_to_string(&shell_pid)
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
     // SAFETY: kill(2) has no memory-safety preconditions.
     unsafe {
         libc::kill(-process_group, libc::SIGKILL);
