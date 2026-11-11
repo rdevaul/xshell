@@ -169,6 +169,7 @@ fn render_events<'a>(
                         let why = match reason {
                             Some(GateReason::SensitivePath) => " (matches sensitive-path policy)",
                             Some(GateReason::Policy) => " (the approval policy requires approval)",
+                            Some(GateReason::ToolDeclared) => " (the tool requires approval)",
                             _ => "",
                         };
                         write!(

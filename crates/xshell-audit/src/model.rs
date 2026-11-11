@@ -92,6 +92,31 @@ pub struct AuditPolicy {
     pub policy: Value,
 }
 
+/// The tools providers added to a turn's agent, beyond the built-in tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditProvidedTools {
+    /// The tool registry's identity: SHA-256 of the canonical encoding of
+    /// every provided tool's provider, name, description, schema, access,
+    /// and approval, lowercase hex. Descriptions and schemas are not
+    /// repeated here; they come from the binary that registered them.
+    pub sha256: String,
+    /// Each provided tool, in the order the model was offered them.
+    pub tools: Vec<AuditProvidedTool>,
+}
+
+/// One provided tool and the facts authorization used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditProvidedTool {
+    pub provider: String,
+    pub name: String,
+    /// `read_only` or `read_write`.
+    pub access: String,
+    /// `required` or `not_required`.
+    pub approval: String,
+}
+
 /// What settled a tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -235,6 +260,10 @@ pub enum AuditEvent {
         /// The client's overlay; absent when the client sent none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overlay_policy: Option<Box<AuditPolicy>>,
+        /// Tools providers registered with the session host; absent when it
+        /// has none, so records without them hash as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provided_tools: Option<Box<AuditProvidedTools>>,
     },
     ToolDecision {
         call_id: String,

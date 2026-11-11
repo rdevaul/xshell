@@ -11,8 +11,10 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // Version 14 adds the `delegate_task` subagent events (`SubagentStarted`,
 // `Subagent`, `SubagentFinished`). Version 17 adds `source` on
 // `ApprovalReply` and `basis` and `approval` on `ExecutionEvent::ToolDecision`.
-// Version 18 adds the `blocked_path` decision basis.
-pub const SESSION_PROTOCOL_VERSION: u32 = 18;
+// Version 18 adds the `blocked_path` decision basis. Version 19 adds the
+// `tool_declared` gate reason on `ExecutionEvent::ApprovalRequested`, sent for
+// provided tools that require approval.
+pub const SESSION_PROTOCOL_VERSION: u32 = 19;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

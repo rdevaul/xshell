@@ -382,6 +382,7 @@ pub fn audit_turn_started(
     limits: &xshell_execution::TurnLimits,
     requested_limits: Option<&xshell_execution::TurnLimits>,
     rules: &xshell_execution::ApprovalRules,
+    tools: &xshell_execution::ToolRegistry,
 ) -> xshell_audit::AuditEvent {
     fn encode(value: impl serde::Serialize) -> serde_json::Value {
         serde_json::to_value(value).expect("approval modes and turn limits always serialize")
@@ -398,7 +399,27 @@ pub fn audit_turn_started(
         requested_limits: requested_limits.map(|limits| Box::new(encode(limits))),
         base_policy: audit_policy(&rules.base).map(Box::new),
         overlay_policy: rules.overlay.as_ref().and_then(audit_policy).map(Box::new),
+        provided_tools: audit_provided_tools(tools).map(Box::new),
     }
+}
+
+/// The audit form of a tool registry, or `None` when it provides no tools.
+pub fn audit_provided_tools(
+    tools: &xshell_execution::ToolRegistry,
+) -> Option<xshell_audit::AuditProvidedTools> {
+    Some(xshell_audit::AuditProvidedTools {
+        sha256: tools.identity()?.to_owned(),
+        tools: tools
+            .tools()
+            .iter()
+            .map(|tool| xshell_audit::AuditProvidedTool {
+                provider: tool.provider_name().to_owned(),
+                name: tool.name().to_owned(),
+                access: tool.access().as_str().to_owned(),
+                approval: tool.approval().as_str().to_owned(),
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -649,5 +670,73 @@ mod tests {
         other.append(ordinary_event()).unwrap();
         assert!(started.elapsed() < DEADLINE, "closing b waited on a");
         waiting.join().unwrap().unwrap_err();
+    }
+
+    struct OneTool;
+
+    #[async_trait::async_trait]
+    impl xshell_execution::ToolProvider for OneTool {
+        fn name(&self) -> &str {
+            "memory"
+        }
+
+        fn tools(&self) -> Vec<xshell_execution::ProvidedTool> {
+            vec![xshell_execution::ProvidedTool {
+                definition: xshell_core::ToolDefinition {
+                    name: "memory_purge".into(),
+                    description: "Forget everything.".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                access: xshell_execution::ToolAccess::ReadWrite,
+                approval: xshell_execution::ToolApproval::Required,
+            }]
+        }
+
+        async fn call(
+            &self,
+            _tool: &str,
+            _context: xshell_execution::ToolContext,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn turn_records_name_provided_tools_only_when_there_are_some() {
+        let rules = xshell_execution::ApprovalRules::default();
+        let limits = xshell_execution::TurnLimits::default();
+        let started = |tools: &xshell_execution::ToolRegistry| {
+            serde_json::to_value(audit_turn_started(
+                "t1",
+                xshell_execution::ApprovalPolicy::Ask,
+                None,
+                &limits,
+                None,
+                &rules,
+                tools,
+            ))
+            .unwrap()
+        };
+        // Without providers the record is unchanged, so it hashes as before.
+        let plain = started(&xshell_execution::ToolRegistry::empty());
+        assert!(plain.get("provided_tools").is_none(), "{plain}");
+
+        let registry = xshell_execution::ToolRegistry::builder()
+            .provider(Arc::new(OneTool))
+            .build()
+            .unwrap();
+        let record = started(&registry);
+        assert_eq!(
+            record["provided_tools"],
+            serde_json::json!({
+                "sha256": registry.identity().unwrap(),
+                "tools": [{
+                    "provider": "memory",
+                    "name": "memory_purge",
+                    "access": "read_write",
+                    "approval": "required",
+                }],
+            })
+        );
     }
 }
