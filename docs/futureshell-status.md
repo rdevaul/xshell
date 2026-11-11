@@ -52,7 +52,7 @@ prerequisites:
 | Lifecycle and cancellation | F1–F3 corrections; cancelled process groups are re-killed until empty (#95) | FS2 cancellation acceptance ("kills complete process groups") builds on this |
 | Prepared file access | M1.3: one opened object shared by authorization and acquisition, canonical-path sensitivity, bounded reads (F4, F5, F8; #98) | The pattern FS3 manifests and FS4 artifact evidence need: decide and act on the same object |
 | Provider and audit bounds | Only finished provider responses dispatch tools (F9, #97); bounded audit I/O without a global lock (F6, #99) | Required-audit failure stopping at the next pre-action boundary is an FS2 acceptance item |
-| Turn budgets | Whole-turn budget shared with subagents (#84), raised counts (#101), configurable limits with a `relaxed` profile and a daemon ceiling (#107) | First implementation of the FS5 autonomy budget; per-session, global, byte and worker budgets (rest of F10) remain open |
+| Turn budgets | Whole-turn budget shared with subagents (#84), raised counts (#101), configurable limits with a `relaxed` profile and a daemon ceiling (#107); daemon-wide concurrent-turn and session budgets and a per-turn tool output budget | First implementation of the FS5 autonomy budget; a session's budget across turns (with goals) and retained-history bounds remain open |
 | Subagents | `delegate_task` with per-agent toolsets under the parent's budget (#86) | Start of the `xshell-session` connector's capability narrowing |
 | Agentic CAD plan | Images, configurable limits, headless mode, and approval policy planned and decided (#105, #106) | See the harmonized direction below |
 | Headless runs | `xshell run` with versioned JSONL events and exit codes (#108); `--detach`, `wait`, `status`, `result`, `cancel` (#109) | Surface of the FS5 `xshell-session` connector |
@@ -196,9 +196,9 @@ replace FS2–FS4.
 1. ~~Record policy identity, the client overlay, and each decision's source
    in the audit trail (H3)~~ (done, except binding approvals to prepared
    operations), and resolve the job-identity drift (H5).
-2. Finish the remaining F10 budgets (per-session, global, byte, worker)
-   before relaxed unattended runs are common, then F7 transactional
-   persistence, which H5 also needs.
+2. ~~Global F10 budgets~~ (concurrent turns, sessions, and per-turn tool
+   output bytes landed); a session's cumulative budget waits on goals. Next,
+   F7 transactional persistence, which H5 also needs.
 3. Establish the M2 authorization/provider boundary, starting from the
    approval policy's decision function. Grants bind to the prepared
    operations produced by M1.3.

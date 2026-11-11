@@ -230,6 +230,7 @@ Step 2 implements this as `TurnLimits` (on `TurnPolicy`) and `TurnBudget`
 | `wall_time` | 60 min | Elapsed time since the root turn started | Checked before every request and call, and enforced during provider requests; a running tool is bounded by its own timeout |
 | `shell_timeout` | 60 s | One `run_shell` call | The command's process group is killed and the call reports the timeout |
 | `auto_continues` | 2 | Automatic continuations per agent | The turn ends with the response it has |
+| `tool_output_bytes` | 8 MiB | Bytes of tool results returned to the model | The crossing result is kept; the turn fails at its next request or call |
 
 The defaults are the built-in `default` profile; limit profiles are
 configurable, and the daemon clamps them to its `max_limits`
