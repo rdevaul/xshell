@@ -177,6 +177,7 @@ Each `tool_decision` record says what decided it in `basis`:
 | `mode_default` | No entry matched: the mode's behaviour without a policy | |
 | `not_in_toolset` | The tool is not one this agent may use | |
 | `turn_limit` | The turn's limits refused the call before the policy was consulted | |
+| `blocked_path` | The call would read a path in the session host's `block` sensitivity class; refused in every mode, before the policy was consulted | |
 
 When the base and overlay disagree, the stricter decision wins and its basis
 is recorded; on a tie, the base's. A prompted call also has `approval`, saying
@@ -184,7 +185,9 @@ who answered: `interactive`, `approval_channel`, `no_approver` (with a
 `detail` such as `no_approval_channel` or `approval_channel_closed`),
 `cancelled`, or `unreported`. For a remote client this is the client's own
 report: the daemon cannot verify who sat at the terminal, but it keeps only
-the known approvers and short reason codes.
+the known approvers and short reason codes, and refuses reports that
+contradict themselves. Only the daemon records `cancelled`, and
+`no_approver` only comes with a denial.
 
 Not yet recorded: an approval bound to the prepared operation it approved
 (the object a read opened, as M1.3 does for reads), and the identity of the

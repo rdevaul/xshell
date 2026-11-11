@@ -163,7 +163,7 @@ incompatible change increments `schema`.
 | `tool_requested` | `call_id`, `name`, `arguments` | The model asked for a tool |
 | `approval_needed` | `call_id`, `name`, `arguments`, `reason`? | A gated call needs a decision |
 | `approval_decided` | `call_id`, `decision`, `source` | The run's own decision on that call |
-| `tool_decision` | `call_id`, `decision`, `basis`? | The decision the daemon applied, and what made it (`basis.kind`: `entry`, `not_listed`, `uncheckable_command`, `mode_default`, `not_in_toolset`, `turn_limit`; see [auditing](auditing.md#turn-authority-and-decision-basis)) |
+| `tool_decision` | `call_id`, `decision`, `basis`? | The decision the daemon applied, and what made it (`basis.kind`: `entry`, `not_listed`, `uncheckable_command`, `mode_default`, `not_in_toolset`, `turn_limit`, `blocked_path`; see [auditing](auditing.md#turn-authority-and-decision-basis)) |
 | `tool_skipped` | `call_id`, `name` | A call not evaluated because the turn was aborted |
 | `tool_result` | `call_id`, `name`, `result` | A tool's output |
 | `history_compacted` | `report` | The conversation was shrunk to fit its budget |

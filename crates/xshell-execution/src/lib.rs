@@ -24,7 +24,7 @@ pub use engine::{
     run_direct_shell_streaming, run_direct_shell_streaming_cancellable, validate_working_directory,
 };
 pub use images::{
-    CollectionReport, ImageStore, ImageStoreError, ImageStoreLimits, StoreUsage,
+    CollectionReport, ImageStore, ImageStoreError, ImageStoreLimits, OrphanReport, StoreUsage,
     remove_orphan_stores,
 };
 pub use policy::{

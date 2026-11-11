@@ -97,7 +97,7 @@ pub struct AuditPolicy {
 #[serde(deny_unknown_fields)]
 pub struct AuditDecisionBasis {
     /// `entry`, `not_listed`, `uncheckable_command`, `mode_default`,
-    /// `not_in_toolset`, or `turn_limit`.
+    /// `not_in_toolset`, `turn_limit`, or `blocked_path`.
     pub kind: String,
     /// `base` or `overlay`, for a decision a policy made.
     #[serde(default, skip_serializing_if = "Option::is_none")]

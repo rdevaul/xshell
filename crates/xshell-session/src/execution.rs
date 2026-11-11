@@ -353,19 +353,13 @@ impl ExecutionCoordinator {
         if state.active.as_ref().map(|turn| turn.id.as_str()) != Some(reply.turn_id.as_str()) {
             bail!("turn is no longer active");
         }
+        // The client says who answered. Its claim is checked before the
+        // prompt is consumed, so a rejected reply leaves the call waiting.
+        let source = validated_source(reply.decision, reply.source)?;
         let key = (reply.turn_id, reply.call_id);
         if !state.pending_approvals.remove(&key) {
             bail!("tool call is not waiting for approval");
         }
-        // The client says who answered. Its detail code is re-validated here:
-        // deserialization does not apply `with_detail`'s check.
-        let source = reply.source.map_or_else(
-            || ApprovalSource::new(Approver::Unreported),
-            |source| {
-                let detail = source.detail.unwrap_or_default();
-                ApprovalSource::new(source.approver).with_detail(detail)
-            },
-        );
         state
             .approvals
             .insert(key, ApprovalAnswer::new(reply.decision, source));
@@ -878,4 +872,93 @@ fn finish_locked(state: &mut ExecutionState, turn_id: &str) {
     state
         .approvals
         .retain(|(pending_turn, _), _| pending_turn != turn_id);
+}
+
+/// Check a client's account of who answered an approval prompt before the
+/// audit trail records it.
+///
+/// - `cancelled` is the daemon's own record of a prompt ended by
+///   cancellation; a client cannot claim it.
+/// - `no_approver` means nobody could answer and the client denied the
+///   call, so it cannot come with an approval.
+/// - The detail code is re-validated: deserialization does not apply
+///   `with_detail`'s check.
+fn validated_source(
+    decision: ApprovalDecision,
+    source: Option<ApprovalSource>,
+) -> Result<ApprovalSource> {
+    let Some(source) = source else {
+        return Ok(ApprovalSource::new(Approver::Unreported));
+    };
+    match (source.approver, decision) {
+        (Approver::Cancelled, _) => {
+            bail!("a client cannot report a prompt as cancelled; cancel the turn instead")
+        }
+        (Approver::NoApprover, ApprovalDecision::Approve) => {
+            bail!("an approval cannot come from no approver")
+        }
+        _ => {}
+    }
+    let detail = source.detail.unwrap_or_default();
+    Ok(ApprovalSource::new(source.approver).with_detail(detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(approver: Approver, detail: Option<&str>) -> Option<ApprovalSource> {
+        Some(ApprovalSource {
+            approver,
+            detail: detail.map(str::to_owned),
+        })
+    }
+
+    #[test]
+    fn clients_cannot_claim_a_cancelled_prompt() {
+        for decision in [
+            ApprovalDecision::Approve,
+            ApprovalDecision::Deny,
+            ApprovalDecision::AbortTurn,
+        ] {
+            assert!(validated_source(decision, source(Approver::Cancelled, None)).is_err());
+        }
+    }
+
+    #[test]
+    fn no_approver_only_denies() {
+        assert!(
+            validated_source(
+                ApprovalDecision::Approve,
+                source(Approver::NoApprover, Some("no_approval_channel"))
+            )
+            .is_err()
+        );
+        for decision in [ApprovalDecision::Deny, ApprovalDecision::AbortTurn] {
+            let accepted = validated_source(
+                decision,
+                source(Approver::NoApprover, Some("no_approval_channel")),
+            )
+            .unwrap();
+            assert_eq!(accepted.approver, Approver::NoApprover);
+            assert_eq!(accepted.detail.as_deref(), Some("no_approval_channel"));
+        }
+    }
+
+    #[test]
+    fn reported_sources_are_kept_and_details_revalidated() {
+        assert_eq!(
+            validated_source(ApprovalDecision::Approve, None)
+                .unwrap()
+                .approver,
+            Approver::Unreported
+        );
+        let accepted = validated_source(
+            ApprovalDecision::Approve,
+            source(Approver::ApprovalChannel, Some("Not A Code!")),
+        )
+        .unwrap();
+        assert_eq!(accepted.approver, Approver::ApprovalChannel);
+        assert_eq!(accepted.detail, None);
+    }
 }

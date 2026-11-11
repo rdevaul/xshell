@@ -163,6 +163,14 @@ replace FS2–FS4.
   layer, list, and entry, or the mode default) and, when prompted, who
   answered. Still open: binding an approval to the prepared operation it
   approved, and recording the sensitivity classes' identity.
+  - *History note:* the H3 implementation landed in the commit for #116
+    (4ebfd6a), whose message describes only the MCP bridge design; the #117
+    commit (b7301f4) is empty. Look at 4ebfd6a when bisecting or blaming
+    the audit code.
+  - *Review follow-ups (#119):* a read of a `block`-class path is recorded
+    with its own `blocked_path` basis rather than as a mode-default
+    approval; the daemon refuses approver reports that contradict
+    themselves (`cancelled` from a client, `no_approver` with an approval).
 - **Plan drift (open, H5).** The CAD plan specifies job commands on a turn
   ID and `wait` reading from the session snapshot. The implementation uses
   the session and the in-memory journal. Either update the plan or close the
