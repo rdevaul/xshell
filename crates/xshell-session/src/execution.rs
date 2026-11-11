@@ -14,10 +14,10 @@ use uuid::Uuid;
 use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, ApprovalRules, BudgetExhausted,
-    CancellationFlag, CompactionConfig, ExecutionEvent, GateReason, ModelBudget, Policy,
-    SensitivePaths, TurnLimits, TurnObserver, TurnPolicy, build_adapter, run_agent_turn,
-    run_direct_shell_streaming_cancellable,
+    AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalRules, ApprovalSource,
+    Approver, BudgetExhausted, CancellationFlag, CompactionConfig, ExecutionEvent, GateReason,
+    ModelBudget, Policy, SensitivePaths, TurnLimits, TurnObserver, TurnPolicy, build_adapter,
+    run_agent_turn, run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
 
@@ -79,7 +79,7 @@ struct ExecutionState {
     event_bytes: usize,
     next_sequence: u64,
     active: Option<ActiveTurn>,
-    approvals: HashMap<(String, String), ApprovalDecision>,
+    approvals: HashMap<(String, String), ApprovalAnswer>,
     pending_approvals: HashSet<(String, String)>,
 }
 
@@ -195,6 +195,25 @@ impl ExecutionCoordinator {
         }) {
             execution.finish(&turn_id);
             return Err(error);
+        }
+        // An agent turn's authority is recorded before anything can run
+        // under it: decisions later in the log are read against it.
+        if matches!(input, TurnInput::Agent { .. }) {
+            let rules = ApprovalRules {
+                base: self.inner.policy.rules.clone(),
+                overlay: overlay.clone(),
+            };
+            if let Err(error) = audit.append(crate::audit_turn_started(
+                &turn_id,
+                approval,
+                requested_approval,
+                &limits,
+                requested_limits.as_ref(),
+                &rules,
+            )) {
+                execution.finish(&turn_id);
+                return Err(error);
+            }
         }
         if let Err(error) = self.inner.registry.lock_recover().begin_execution(
             &snapshot.descriptor.id,
@@ -338,7 +357,18 @@ impl ExecutionCoordinator {
         if !state.pending_approvals.remove(&key) {
             bail!("tool call is not waiting for approval");
         }
-        state.approvals.insert(key, reply.decision);
+        // The client says who answered. Its detail code is re-validated here:
+        // deserialization does not apply `with_detail`'s check.
+        let source = reply.source.map_or_else(
+            || ApprovalSource::new(Approver::Unreported),
+            |source| {
+                let detail = source.detail.unwrap_or_default();
+                ApprovalSource::new(source.approver).with_detail(detail)
+            },
+        );
+        state
+            .approvals
+            .insert(key, ApprovalAnswer::new(reply.decision, source));
         execution.changed.notify_all();
         execution.approvals_ready.notify_waiters();
         Ok(())
@@ -693,17 +723,17 @@ impl TurnObserver for DaemonObserver {
         self.cancellation.clone()
     }
 
-    async fn approve(&mut self, call: &ToolCall, _reason: GateReason) -> ApprovalDecision {
+    async fn approve(&mut self, call: &ToolCall, _reason: GateReason) -> ApprovalAnswer {
         let key = (self.turn_id.clone(), call.id.clone());
         loop {
             if self.cancellation.is_cancelled() {
-                return ApprovalDecision::AbortTurn;
+                return ApprovalAnswer::cancelled();
             }
             // Register for the wake-up before checking, so a reply that
             // arrives between the check and the await is not missed.
             let notified = self.execution.approvals_ready.notified();
-            if let Some(decision) = self.execution.state.lock_recover().approvals.remove(&key) {
-                return decision;
+            if let Some(answer) = self.execution.state.lock_recover().approvals.remove(&key) {
+                return answer;
             }
             tokio::select! {
                 () = notified => {}
@@ -744,21 +774,27 @@ impl DaemonObserver {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             }),
-            ExecutionEvent::ToolDecision { call_id, decision } => {
-                self.audit(AuditEvent::ToolDecision {
-                    call_id: call_id.clone(),
-                    decision: match decision {
-                        ApprovalDecision::Approve => "approve",
-                        ApprovalDecision::Deny => "deny",
-                        ApprovalDecision::AbortTurn => "abort_turn",
-                    }
-                    .into(),
-                })
-            }
-            ExecutionEvent::ToolSkipped { call_id, .. } => self.audit(AuditEvent::ToolDecision {
-                call_id: call_id.clone(),
-                decision: "skipped_after_abort".into(),
-            }),
+            ExecutionEvent::ToolDecision {
+                call_id,
+                decision,
+                basis,
+                approval,
+            } => self.audit(crate::audit_tool_decision(
+                call_id,
+                match decision {
+                    ApprovalDecision::Approve => "approve",
+                    ApprovalDecision::Deny => "deny",
+                    ApprovalDecision::AbortTurn => "abort_turn",
+                },
+                basis.as_ref(),
+                approval.as_ref(),
+            )),
+            ExecutionEvent::ToolSkipped { call_id, .. } => self.audit(crate::audit_tool_decision(
+                call_id,
+                "skipped_after_abort",
+                None,
+                None,
+            )),
             ExecutionEvent::ToolResult {
                 call_id,
                 name,

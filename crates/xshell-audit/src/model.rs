@@ -14,16 +14,19 @@ use std::path::PathBuf;
 /// - 5: adds `AuditEvent::SubagentStarted` and `AuditEvent::SubagentFinished`.
 /// - 6: adds the `images` field on `AuditEvent::Input` and
 ///   `AuditEvent::ToolResult`.
-pub const AUDIT_FORMAT_VERSION: u32 = 6;
+/// - 7: adds `AuditEvent::TurnStarted` and the `basis` and `approval` fields
+///   on `AuditEvent::ToolDecision`.
+pub const AUDIT_FORMAT_VERSION: u32 = 7;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 // Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
 // `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`;
 // version 6 adds `AuditEvent::SubagentStarted` and `SubagentFinished`;
-// version 7 adds `images` on `Input` and `ToolResult`.
+// version 7 adds `images` on `Input` and `ToolResult`; version 8 adds
+// `TurnStarted` and `basis` and `approval` on `ToolDecision`.
 // Tagged enum variants are not forward-compatible in serde, so mixed-version
 // peers must fail at handshake. New fields are not either: an older service
 // would drop them and sign a record without them.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 7;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -76,6 +79,47 @@ impl Default for AuditConfig {
             ack_timeout_ms: Self::DEFAULT_ACK_TIMEOUT_MS,
         }
     }
+}
+
+/// A policy as the audit trail records it: its identity and its content, so
+/// the identity can be checked against what was applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditPolicy {
+    /// SHA-256 of the policy's canonical JSON encoding, lowercase hex.
+    pub sha256: String,
+    /// The policy as configured: `always_allowed`, `allowed`, `denied`.
+    pub policy: Value,
+}
+
+/// What settled a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditDecisionBasis {
+    /// `entry`, `not_listed`, `uncheckable_command`, `mode_default`,
+    /// `not_in_toolset`, or `turn_limit`.
+    pub kind: String,
+    /// `base` or `overlay`, for a decision a policy made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// `denied`, `always_allowed`, or `allowed`, for a matched entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
+    /// The matched entry as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+}
+
+/// Who answered a prompted call. For a remote client this is the client's
+/// own report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditApproval {
+    /// `interactive`, `approval_channel`, `no_approver`, `cancelled`, or
+    /// `unreported`.
+    pub approver: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// An image as the audit trail records it: what it was, never its bytes.
@@ -168,9 +212,40 @@ pub enum AuditEvent {
         name: String,
         arguments: Value,
     },
+    /// The authority an agent turn runs under, recorded before its first
+    /// tool call: the effective approval mode and limits, and each policy
+    /// with its identity. Decisions that follow, up to the next
+    /// `TurnStarted`, were made under it.
+    TurnStarted {
+        turn_id: String,
+        /// The effective mode: `off`, `ask`, or `auto`.
+        approval: String,
+        /// The mode the client asked for, when the session host lowered it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_approval: Option<String>,
+        /// The effective turn limits.
+        limits: Value,
+        /// The limits the client asked for, when the session host lowered
+        /// any of them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_limits: Option<Box<Value>>,
+        /// The session host's policy; absent when it has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_policy: Option<Box<AuditPolicy>>,
+        /// The client's overlay; absent when the client sent none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overlay_policy: Option<Box<AuditPolicy>>,
+    },
     ToolDecision {
         call_id: String,
         decision: String,
+        /// What settled the call, or led to its prompt. Absent in records
+        /// from earlier formats.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<AuditDecisionBasis>,
+        /// Who answered, when the call was prompted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval: Option<AuditApproval>,
     },
     ToolResult {
         call_id: String,

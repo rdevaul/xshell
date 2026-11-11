@@ -510,6 +510,7 @@ impl SessionClient {
         turn_id: String,
         call_id: String,
         decision: ApprovalDecision,
+        source: xshell_execution::ApprovalSource,
     ) -> Result<()> {
         self.send(&ClientRequest::Approve {
             session_id,
@@ -517,6 +518,7 @@ impl SessionClient {
                 turn_id,
                 call_id,
                 decision,
+                source: Some(source),
             },
         })?;
         match self.receive()? {

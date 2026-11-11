@@ -18,17 +18,18 @@ pub use compaction::{
     drop_tool_payloads, estimate_history_tokens, estimate_tokens, history_bytes, message_bytes,
 };
 pub use engine::{
-    AdapterConfig, ApprovalDecision, ApprovalPolicy, CancellationFlag, DirectShellResult,
-    ExecutionEvent, TurnObserver, TurnPolicy, build_adapter, captured_cd_destination,
-    run_agent_turn, run_agent_turn_with_budget, run_direct_shell, run_direct_shell_streaming,
-    run_direct_shell_streaming_cancellable, validate_working_directory,
+    AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalSource, Approver,
+    CancellationFlag, DirectShellResult, ExecutionEvent, TurnObserver, TurnPolicy, build_adapter,
+    captured_cd_destination, run_agent_turn, run_agent_turn_with_budget, run_direct_shell,
+    run_direct_shell_streaming, run_direct_shell_streaming_cancellable, validate_working_directory,
 };
 pub use images::{
     CollectionReport, ImageStore, ImageStoreError, ImageStoreLimits, StoreUsage,
     remove_orphan_stores,
 };
 pub use policy::{
-    ApprovalRules, CallFacts, Policy, PolicyConfig, PolicyDecision, default_decision,
+    ApprovalRules, CallFacts, DecisionBasis, Policy, PolicyConfig, PolicyDecision, PolicyLayer,
+    PolicyList, RuledDecision, default_decision, policy_identity,
 };
 pub use sensitive::{DEFAULT_SENSITIVE_PATTERNS, SensitivePaths};
 pub use tools::{

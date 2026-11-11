@@ -548,6 +548,61 @@ mod tests {
     }
 
     #[test]
+    fn decisions_written_before_their_basis_existed_hash_unchanged() {
+        let old = r#"{"format_version":6,"session_id":"s","sequence":3,"daemon_timestamp_unix_ms":1,"client_uid":501,"previous_hash":"00","event":{"type":"tool_decision","call_id":"c","decision":"approve"}}"#;
+        let body: AuditRecordBody = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&body).unwrap(), old);
+    }
+
+    #[test]
+    fn turn_authority_and_decision_basis_are_signed_with_the_record() {
+        let temp = TempDir::new().unwrap();
+        let identity = SigningIdentity::load_or_create(temp.path()).unwrap();
+        let public_key = temp.path().join("signing-key.pub");
+        let mut writer = AuditLogWriter::create(temp.path(), identity, 501, 2).unwrap();
+        let path = writer.path().to_owned();
+        writer
+            .append(AuditEvent::TurnStarted {
+                turn_id: "t1".into(),
+                approval: "ask".into(),
+                requested_approval: Some("auto".into()),
+                limits: serde_json::json!({"tool_calls": 256}),
+                requested_limits: None,
+                base_policy: Some(Box::new(crate::AuditPolicy {
+                    sha256: "ab".repeat(32),
+                    policy: serde_json::json!({"denied": ["run_shell: rm *"]}),
+                })),
+                overlay_policy: None,
+            })
+            .unwrap();
+        writer
+            .append(AuditEvent::ToolDecision {
+                call_id: "c1".into(),
+                decision: "deny".into(),
+                basis: Some(crate::AuditDecisionBasis {
+                    kind: "entry".into(),
+                    policy: Some("base".into()),
+                    list: Some("denied".into()),
+                    entry: Some("run_shell: rm *".into()),
+                }),
+                approval: None,
+            })
+            .unwrap();
+        writer.close().unwrap();
+        verify_log(&path, &public_key).unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        for (original, forged) in [
+            (r#""list":"denied""#, r#""list":"allowed""#),
+            (r#""approval":"ask""#, r#""approval":"off""#),
+        ] {
+            assert!(contents.contains(original), "{original}");
+            fs::write(&path, contents.replacen(original, forged, 1)).unwrap();
+            assert!(verify_log(&path, &public_key).is_err(), "{forged} verified");
+        }
+    }
+
+    #[test]
     fn image_metadata_is_signed_with_the_record() {
         let temp = TempDir::new().unwrap();
         let identity = SigningIdentity::load_or_create(temp.path()).unwrap();

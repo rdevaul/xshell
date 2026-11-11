@@ -9,7 +9,10 @@ mod pty_stream;
 mod registry;
 mod view;
 
-pub use audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy};
+pub use audit::{
+    DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy, audit_approval,
+    audit_decision_basis, audit_policy, audit_tool_decision, audit_turn_started,
+};
 pub use client::{
     RemoteBootstrapAction, RemoteDaemonProbe, RemoteRepair, RemoteTarget, SessionClient,
     SessionHandshake,
