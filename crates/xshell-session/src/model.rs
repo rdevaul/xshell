@@ -15,8 +15,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `tool_output_bytes` to the turn limits. Version 20 adds the
 // `tool_declared` gate reason on `ExecutionEvent::ApprovalRequested`, sent for
 // provided tools that require approval. Version 21 adds
-// `SessionEventKind::TurnSummary`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 21;
+// `SessionEventKind::TurnSummary`. Version 23 adds `ClientRequest::LocateTurn`
+// and durable turn records (22 is taken by the image work).
+pub const SESSION_PROTOCOL_VERSION: u32 = 23;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

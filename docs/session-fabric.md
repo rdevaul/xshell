@@ -320,7 +320,18 @@ binding stores only the name of the credential environment variable.
 | `durable` | Retained | Restored from disk |
 
 Durable state is written to `sessions.json` through a same-directory temporary
-file, `fsync`, and atomic rename. Restored sessions are always detached.
+file, `fsync`, atomic rename, and an `fsync` of the directory. Restored
+sessions are always detached. A change that cannot be written is undone: the
+request fails, and the live registry and a restarted daemon both keep the
+previous state. Only the registry's metadata is undone, not effects an
+operation already had; an agent or `$` turn in a durable session is recorded
+as in flight before it runs, so a crash leaves an `outcome_unknown` record
+instead of silence. Changes to sessions that are not durable are never
+written.
+
+Each finished agent turn also leaves a record under `turns/` in the state
+directory (the 256 most recent are kept), which `xshell result --turn` reads
+after a restart; see [headless runs](headless.md#long-running-jobs).
 The `xshelld serve-stdio` boundary exports only `fabric` descriptors and rejects
 remote create, attach, switch, and named-close operations involving `host_only`
 sessions.
