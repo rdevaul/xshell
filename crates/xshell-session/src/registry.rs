@@ -51,7 +51,10 @@ const IMAGES_DIRECTORY: &str = "images";
 /// - 2: messages in session history may carry `images` (image references).
 ///   Version 1 files load unchanged; an older daemon refuses a version 2 file
 ///   rather than dropping the images it cannot represent.
-const SESSION_STATE_FORMAT_VERSION: u32 = 2;
+/// - 3: session descriptors may carry `tools` (a tool selection). An older
+///   daemon refuses a version 3 file rather than dropping a selection, which
+///   would give that session's agent every tool.
+const SESSION_STATE_FORMAT_VERSION: u32 = 3;
 /// Oldest `sessions.json` format this daemon still loads.
 const MIN_SESSION_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -249,6 +252,7 @@ close one to create another",
             attached_clients: 1,
             created_at_unix_ms: now,
             last_active_at_unix_ms: now,
+            tools: creation.tools,
         };
         // A new session's store is empty, so history from the client may not
         // reference any image yet.
@@ -754,6 +758,7 @@ mod tests {
             persistence,
             visibility,
             history,
+            tools: Default::default(),
         }
     }
 
@@ -1006,6 +1011,46 @@ mod tests {
             .unwrap();
         registry.detach("client", &session.descriptor.id).unwrap();
         assert_eq!(registry.fail_next_persist.get(), Some(PersistStep::Write));
+    }
+
+    #[test]
+    fn a_durable_session_keeps_its_tool_selection_across_restarts() {
+        let temp = TempDir::new().unwrap();
+        let load = || {
+            SessionRegistry::load(
+                temp.path().into(),
+                "host".into(),
+                "local".into(),
+                "rich".into(),
+            )
+            .unwrap()
+        };
+        let only = crate::SessionTools::Only(vec!["read_file".into(), "memory_get".into()]);
+        let mut registry = load();
+        for (name, tools) in [("chat", only.clone()), ("full", crate::SessionTools::All)] {
+            let mut creation = creation(
+                name,
+                temp.path(),
+                PersistenceMode::Durable,
+                Visibility::Fabric,
+                Vec::new(),
+            );
+            creation.tools = tools;
+            let created = registry.create("client", creation).unwrap();
+            registry.detach("client", &created.descriptor.id).unwrap();
+        }
+        drop(registry);
+
+        let restored = load();
+        assert_eq!(restored.snapshot("chat").unwrap().descriptor.tools, only);
+        assert_eq!(
+            restored.snapshot("full").unwrap().descriptor.tools,
+            crate::SessionTools::All
+        );
+        // An unrestricted session is saved without the field, so state written
+        // before selections existed reads back as every tool.
+        let saved = std::fs::read_to_string(temp.path().join("sessions.json")).unwrap();
+        assert_eq!(saved.matches("\"tools\"").count(), 1, "{saved}");
     }
 
     fn create_durable(path: &Path, history: Vec<ChatMessage>) {

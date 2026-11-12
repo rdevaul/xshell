@@ -167,6 +167,12 @@ overlay, each as `{"sha256": ..., "policy": ...}`. The hash is SHA-256 over
 the policy's JSON encoding, so the recorded content can be checked against
 it, and two turns under the same policy share an identity.
 
+When the session host has compiled-in tool providers, `turn_started` also
+holds `provided_tools`: the registry's identity and each provided tool's
+provider, name, access and approval. When the session limits its agent to
+some tools, `offered_tools` lists the names the agent was offered. Both are
+absent otherwise. See [tool providers](tool-providers.md#47-audit).
+
 Each `tool_decision` record says what decided it in `basis`:
 
 | `kind` | Meaning | Other fields |
