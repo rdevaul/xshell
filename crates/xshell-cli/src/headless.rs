@@ -293,6 +293,7 @@ fn execute(
             },
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system(shared.system_prompt.clone())],
+            tools: Default::default(),
         })
     }
     .map_err(|error| RunError {

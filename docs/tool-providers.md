@@ -1,6 +1,6 @@
 # Tool providers: design
 
-**Status:** proposed; stages S1 and S2 implemented (`crates/xshell-execution/src/provider.rs`, `crates/xshell-session/src/daemon.rs`).
+**Status:** proposed; stages S1, S2 and S4 implemented (`crates/xshell-execution/src/provider.rs`, `crates/xshell-session/src/daemon.rs`).
 **Updated:** 12 November 2026
 
 ## 1. Summary
@@ -199,6 +199,11 @@ authority. Descriptions and schemas are not repeated in every turn record. A
 reviewer checks `sha256` against the definitions in the binary that
 registered them (§7, question 2).
 
+When a session limits its agent to some tools (§5.2), `TurnStarted` also
+carries `offered_tools`: the names of the tools the agent was offered, in
+the order the model saw them. It is absent when the agent was offered every
+built-in and provided tool.
+
 ### 4.8 What a provider is responsible for
 
 - **Validating arguments** against its schema. The engine checks only that
@@ -270,14 +275,64 @@ Programs that do not want the whole daemon can still build an
 `ExecutionCoordinator` with their own `DaemonPolicy`, or call
 `run_agent_turn` directly.
 
+### 5.2 Per-session tool selections
+
+One daemon often serves agents that should not have the same tools. A chat
+gateway, for example, gives each user a session with memory tools but no
+`run_shell`. A session's creation can name the tools its agent may use:
+
+```rust
+client.create(SessionCreation {
+    // ...
+    tools: SessionTools::Only(vec![
+        "read_file".into(),
+        "memory_get".into(),
+        "memory_put".into(),
+    ]),
+})?;
+```
+
+On the wire this is `"tools": {"only": ["read_file", "memory_get", "memory_put"]}`.
+Omitting the field, or sending `"all"`, gives every tool the daemon offers.
+
+- **Only narrows.** A selection can name built-in and provided tools. The
+  agent is offered exactly those, and a call to any other tool is refused as
+  "not available to this agent" before policy or approval, as for any tool
+  outside a toolset. Subagents are bounded by the session's tools, because
+  they are bounded by their parent's. The approval mode and policy still
+  apply to the tools that remain. `Only([])` leaves the agent no tools.
+- **Checked at creation.** A name the daemon does not offer, or a repeated
+  name, makes creation fail, so a typo cannot silently leave an agent
+  without a tool.
+- **Fixed for the session's life.** A selection cannot be changed later, so
+  a session's authority never grows after it is created. To change a
+  user's tools, create a new session.
+- **Persisted.** Durable sessions keep their selection across daemon
+  restarts. If a later build no longer offers a selected tool, a restored
+  session simply does not get it. The session state file moves to format 3,
+  so an older daemon refuses the file instead of dropping selections, which
+  would give those sessions every tool.
+- **Visible.** The selection is part of the session descriptor (`tools`,
+  absent for `all`), so catalogs show it, and each turn's audit record
+  names the offered tools (§4.7).
+
+The selection is set by the client that creates the session. Clients are
+trusted the way they already are: they connect as the daemon's own OS user,
+over its socket or over SSH. A selection lets a trusted client, such as a
+gateway, give less authority to the agents it runs on others' behalf. It is
+not a defense against the client itself.
+
+The `xshell` CLI does not yet offer a way to choose a selection; a
+`--tools` option on `//new` and `xshell run` would be a small follow-up.
+
 ## 6. Staged plan
 
 | Stage | Content | Status |
 |---|---|---|
 | S1 | Provider trait, registry, toolset, engine dispatch, gate reason, delegation, `DaemonPolicy.tools`, session id, audit field | Done (#121) |
-| S2 | **Embeddable daemon.** `xshelld` moved into the library as `xshell_session::daemon::Daemon`, with `with_tools` (§5.1) | Done |
+| S2 | **Embeddable daemon.** `xshelld` moved into the library as `xshell_session::daemon::Daemon`, with `with_tools` (§5.1) | Done (#122) |
 | S3 | **Argument-scoped policy.** An optional `ToolProvider::policy_subject(tool, arguments) -> Option<String>` returning the string an argument pattern matches, so rules such as `memory_put: shared/*` work | When a provider needs it |
-| S4 | **Per-session toolsets.** A session's creation names which provided tools it gets (always within the registry and within the daemon's policy), so one daemon can give its users different tool sets | Needed for multi-user gateways |
+| S4 | **Per-session tool selections.** A session's creation names the built-in and provided tools its agent may use (§5.2) | Done |
 | S5 | **Model-facing errors and output.** Optional structured results (images through the content-addressed image store, A1–A4) | After A4 |
 
 Out-of-process providers are not planned. A tool that has to run out of

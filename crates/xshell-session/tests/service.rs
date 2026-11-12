@@ -186,6 +186,7 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let size = PtySize {
@@ -306,6 +307,7 @@ fn creating_a_session_preserves_the_previous_sessions_interactive_process() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test prompt")],
+            tools: Default::default(),
         })
         .unwrap();
     owner
@@ -328,6 +330,7 @@ fn creating_a_session_preserves_the_previous_sessions_interactive_process() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test prompt")],
+            tools: Default::default(),
         })
         .unwrap();
     assert_eq!(second.descriptor.name, "additional-work");
@@ -373,6 +376,7 @@ fn unauthorized_close_does_not_terminate_another_clients_process() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     owner
@@ -431,6 +435,7 @@ fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let size = PtySize {
@@ -525,6 +530,7 @@ fn daemon_preserves_and_switches_named_sessions() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("be helpful")],
+            tools: Default::default(),
         })
         .unwrap();
     client
@@ -544,6 +550,7 @@ fn daemon_preserves_and_switches_named_sessions() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::HostOnly,
             history: vec![ChatMessage::user("design a robot")],
+            tools: Default::default(),
         })
         .unwrap();
     assert_eq!(client.list().unwrap().len(), 2);
@@ -587,6 +594,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let private = readiness
@@ -597,6 +605,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::HostOnly,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     drop(readiness);
@@ -777,6 +786,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
                 persistence: PersistenceMode::Daemon,
                 visibility: Visibility::Fabric,
                 history: Vec::new(),
+                tools: Default::default(),
             },
         },
     );
@@ -968,6 +978,7 @@ fn shell_turn_continues_after_disconnect_and_replays_on_attach() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     let turn_id = client
@@ -1035,6 +1046,7 @@ fn running_turn_survives_switching_to_another_session_and_back() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let other = client
@@ -1045,6 +1057,7 @@ fn running_turn_survives_switching_to_another_session_and_back() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     client.switch(running.descriptor.id.clone()).unwrap();
@@ -1110,6 +1123,7 @@ fn event_journal_retains_completed_turns_until_its_bounds_require_eviction() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id;
@@ -1180,6 +1194,7 @@ fn running_shell_turn_can_be_cancelled() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let turn_id = client
@@ -1245,6 +1260,7 @@ fn f3_sigterm_cancels_captured_shell_process_group_before_exit() {
             persistence: PersistenceMode::Durable,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     client
@@ -1310,6 +1326,7 @@ fn f3_sigterm_cancels_agent_tool_process_group_before_exit() {
             persistence: PersistenceMode::Durable,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id;
@@ -1389,6 +1406,7 @@ fn f3_sigterm_terminates_pty_process_group_before_exit() {
             persistence: PersistenceMode::Durable,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     client
@@ -1438,6 +1456,7 @@ fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
                 persistence: PersistenceMode::Durable,
                 visibility: Visibility::Fabric,
                 history: vec![ChatMessage::system("test")],
+                tools: Default::default(),
             })
             .unwrap();
         session_id = session.descriptor.id;
@@ -1513,6 +1532,7 @@ fn a_vision_model_is_shown_the_sessions_stored_images() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id.clone();
@@ -1652,6 +1672,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     let other = client
@@ -1662,6 +1683,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     client.switch(session.descriptor.id.clone()).unwrap();
@@ -1808,6 +1830,7 @@ fn f9_tool_call_from_an_unfinished_stream_never_runs() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     client
@@ -1909,6 +1932,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     let turn_id = client
@@ -2049,6 +2073,7 @@ fn f1_failed_agent_effect_survives_durable_session_reload() {
                 persistence: PersistenceMode::Durable,
                 visibility: Visibility::Fabric,
                 history: vec![ChatMessage::system("test")],
+                tools: Default::default(),
             })
             .unwrap();
         session_id = session.descriptor.id.clone();
@@ -2190,6 +2215,7 @@ fn daemon_audits_execution_without_an_attached_client() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     client
@@ -2353,6 +2379,7 @@ fn required_audit_failure_releases_turn_reservation_and_prevents_execution() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
 
@@ -2462,6 +2489,7 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     // The client asks for unattended execution; the daemon must not grant it.
@@ -2685,6 +2713,7 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id.clone();
@@ -2863,6 +2892,7 @@ fn run_terminal_job_and_collect_log(
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let ticket = client
@@ -2949,6 +2979,7 @@ fn f3_sigterm_records_shell_resolution_before_final_audit_closure() {
             persistence: PersistenceMode::Durable,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     client
@@ -2986,6 +3017,7 @@ fn rejected_duplicate_submit_is_not_recorded_as_accepted_input() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let accepted = "sleep 0.25; printf accepted-marker";
@@ -3101,6 +3133,7 @@ fn terminating_an_active_process_finalizes_stream_before_completion() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: Vec::new(),
+            tools: Default::default(),
         })
         .unwrap();
     let command = "printf capture-ready; cat";
@@ -3266,6 +3299,7 @@ fn f6_a_hung_audit_peer_cannot_freeze_other_sessions_control_or_shutdown() {
                 persistence: PersistenceMode::Daemon,
                 visibility: Visibility::Fabric,
                 history: Vec::new(),
+                tools: Default::default(),
             })
             .unwrap()
             .descriptor
@@ -3388,6 +3422,7 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
         })
         .unwrap();
     let requested = xshell_execution::TurnLimits {

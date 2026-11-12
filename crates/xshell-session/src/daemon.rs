@@ -1050,6 +1050,7 @@ fn process_request(
                     .canonicalize()
                     .context("cannot resolve session host home directory")?;
             }
+            execution.check_session_tools(&creation.tools)?;
             let session = registry.lock_recover().create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
                 detach_session(registry, execution, ptys, client_id, &previous)?;

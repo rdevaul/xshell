@@ -626,7 +626,7 @@ pub(crate) async fn run_agent_turn(
         &policy.limits,
         None,
         &policy.rules,
-        policy.tools.registry(),
+        &policy.tools,
     ))?;
     let mut observer = LocalObserver::new(audit, render_options, cwd);
     let outcome =

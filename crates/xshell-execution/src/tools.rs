@@ -198,6 +198,34 @@ impl ToolSet {
         }
     }
 
+    /// The tools of this set whose names are in `names`. Names this set
+    /// does not hold are ignored, so the result never exceeds this set.
+    pub fn only<S: AsRef<str>>(&self, names: &[S]) -> Self {
+        let named = |name: &str| names.iter().any(|wanted| wanted.as_ref() == name);
+        let builtins = Tool::ALL
+            .into_iter()
+            .filter(|tool| named(tool.name()))
+            .fold(0, |bits, tool| bits | tool.bit());
+        let provided = self
+            .registry
+            .tools()
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| named(tool.name()))
+            .fold(0, |bits, (index, _)| bits | (1 << index));
+        Self {
+            builtins: self.builtins & builtins,
+            registry: Arc::clone(&self.registry),
+            provided: self.provided & provided,
+        }
+    }
+
+    /// Whether this set holds every tool its engine knows: every built-in
+    /// tool and every tool in its registry.
+    pub fn is_complete(&self) -> bool {
+        *self == Self::all().with_provided(Arc::clone(&self.registry))
+    }
+
     /// The read-only tools of this set, built-in and provided.
     pub fn read_only_subset(&self) -> Self {
         let provided = self
@@ -945,6 +973,28 @@ mod tests {
         // unavailable.
         assert!(!ToolSet::all().knows("memory_put"));
         assert!(ToolSet::all().get("memory_put").is_none());
+    }
+
+    #[test]
+    fn only_keeps_named_tools_of_the_set_and_ignores_other_names() {
+        let registry = provided_registry();
+        let set = ToolSet::all().with_provided(Arc::clone(&registry));
+        assert!(set.is_complete());
+        assert!(ToolSet::all().is_complete());
+        let chat = set.only(&["memory_get", "read_file", "memory_nope", "memory_put"]);
+        // Set order, not the order the names were given in.
+        assert_eq!(chat.names(), ["read_file", "memory_get", "memory_put"]);
+        assert!(!chat.is_complete());
+        // Narrowing a narrowed set never brings a tool back.
+        assert_eq!(
+            chat.only(&["run_shell", "memory_get"]).names(),
+            ["memory_get"]
+        );
+        assert_eq!(
+            set.only::<&str>(&[]),
+            ToolSet::none().with_provided(registry).only::<&str>(&[])
+        );
+        assert!(set.only::<&str>(&[]).names().is_empty());
     }
 
     #[test]

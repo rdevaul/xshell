@@ -8,6 +8,7 @@
 mod common;
 
 use common::{connect_when_ready, serve_sse, sse_text, sse_tool_call};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -19,7 +20,8 @@ use xshell_execution::{
 };
 use xshell_session::daemon::Daemon;
 use xshell_session::{
-    ModelBinding, PersistenceMode, SessionCreation, SessionEventKind, TurnInput, Visibility,
+    ModelBinding, PersistenceMode, SessionClient, SessionCreation, SessionEventKind, SessionTools,
+    TurnInput, Visibility,
 };
 
 type Calls = Arc<Mutex<Vec<ToolContext>>>;
@@ -56,11 +58,89 @@ impl ToolProvider for Memory {
     }
 }
 
+fn creation(name: &str, base_url: &str, cwd: &Path, tools: SessionTools) -> SessionCreation {
+    SessionCreation {
+        name: name.into(),
+        model: ModelBinding {
+            profile_name: Some("fake".into()),
+            provider: "openai".into(),
+            model: "fake-model".into(),
+            base_url: base_url.into(),
+            api_key_env: None,
+            max_history_bytes: None,
+            context_tokens: None,
+            reserve_output_tokens: None,
+            vision: false,
+        },
+        cwd: cwd.into(),
+        persistence: PersistenceMode::Daemon,
+        visibility: Visibility::Fabric,
+        history: vec![ChatMessage::system("test")],
+        tools,
+    }
+}
+
+/// Run one agent turn to its end and return its tool results and whether
+/// anything asked for approval.
+fn run_turn(
+    client: &mut SessionClient,
+    session_id: &str,
+    message: &str,
+    approval: ApprovalPolicy,
+) -> (Vec<String>, bool) {
+    let after_start = client
+        .events(session_id.to_owned(), 0, 0)
+        .unwrap()
+        .events
+        .last()
+        .map_or(0, |record| record.sequence);
+    client
+        .submit(
+            session_id.to_owned(),
+            TurnInput::Agent {
+                message: message.into(),
+                images: Vec::new(),
+            },
+            approval,
+        )
+        .unwrap();
+    let mut after = after_start;
+    let mut results = Vec::new();
+    let mut prompted = false;
+    for _ in 0..100 {
+        let batch = client.events(session_id.to_owned(), after, 500).unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::Execution { event } => match event {
+                    ExecutionEvent::ToolResult { result, .. } => results.push(result),
+                    ExecutionEvent::ApprovalRequested { .. } => prompted = true,
+                    _ => {}
+                },
+                SessionEventKind::TurnCompleted => return (results, prompted),
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+    }
+    panic!("the turn did not complete");
+}
+
 #[test]
 fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
     let (base_url, model_server) = serve_sse(vec![
+        // The unrestricted session's turn.
         sse_tool_call("call_1", "memory_get", serde_json::json!({})),
         sse_text("remembered"),
+        // The restricted session's turn: a tool outside its selection, then
+        // one inside it.
+        sse_tool_call(
+            "call_1",
+            "run_shell",
+            serde_json::json!({"command": "touch marker"}),
+        ),
+        sse_tool_call("call_2", "memory_get", serde_json::json!({})),
+        sse_text("restricted done"),
     ]);
     let temporary = TempDir::new().unwrap();
     let state = temporary.path().join("state");
@@ -86,63 +166,22 @@ fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
 
     let mut client = connect_when_ready(&socket);
     let session = client
-        .create(SessionCreation {
-            name: "memory".into(),
-            model: ModelBinding {
-                profile_name: Some("fake".into()),
-                provider: "openai".into(),
-                model: "fake-model".into(),
-                base_url,
-                api_key_env: None,
-                max_history_bytes: None,
-                context_tokens: None,
-                reserve_output_tokens: None,
-                vision: false,
-            },
-            cwd: temporary.path().into(),
-            persistence: PersistenceMode::Daemon,
-            visibility: Visibility::Fabric,
-            history: vec![ChatMessage::system("test")],
-        })
+        .create(creation(
+            "memory",
+            &base_url,
+            temporary.path(),
+            SessionTools::All,
+        ))
         .unwrap();
     let session_id = session.descriptor.id.clone();
-    client
-        .submit(
-            session_id.clone(),
-            TurnInput::Agent {
-                message: "what do you remember?".into(),
-                images: Vec::new(),
-            },
-            // Ask with nobody to answer: the read-only, ungated tool must run
-            // without a prompt.
-            ApprovalPolicy::Ask,
-        )
-        .unwrap();
-
-    let mut after = 0;
-    let mut results = Vec::new();
-    let mut prompted = false;
-    let mut completed = false;
-    for _ in 0..100 {
-        let batch = client.events(session_id.clone(), after, 500).unwrap();
-        for record in batch.events {
-            after = record.sequence;
-            match record.event {
-                SessionEventKind::Execution { event } => match event {
-                    ExecutionEvent::ToolResult { result, .. } => results.push(result),
-                    ExecutionEvent::ApprovalRequested { .. } => prompted = true,
-                    _ => {}
-                },
-                SessionEventKind::TurnCompleted => completed = true,
-                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
-                _ => {}
-            }
-        }
-        if completed {
-            break;
-        }
-    }
-    assert!(completed, "the turn did not complete");
+    // Ask with nobody to answer: the read-only, ungated tool must run
+    // without a prompt.
+    let (results, prompted) = run_turn(
+        &mut client,
+        &session_id,
+        "what do you remember?",
+        ApprovalPolicy::Ask,
+    );
     assert!(!prompted, "an ungated provided tool prompted");
     assert_eq!(results, [format!("memory_get for session {session_id}")]);
     {
@@ -155,6 +194,53 @@ fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
     }
     let history = client.snapshot(session_id).unwrap().history;
     assert_eq!(history.last().unwrap().content, "remembered");
+
+    // A session limited to one tool: names the daemon does not offer, or
+    // repeated names, are refused when the session is created.
+    for (tools, message) in [
+        (vec!["memory_nope"], "offers no tool named \"memory_nope\""),
+        (vec!["memory_get", "memory_get"], "listed twice"),
+    ] {
+        let tools = SessionTools::Only(tools.into_iter().map(String::from).collect());
+        let error = client
+            .create(creation("bad", &base_url, temporary.path(), tools))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+    }
+    let only_memory = SessionTools::Only(vec!["memory_get".into()]);
+    let restricted = client
+        .create(creation(
+            "restricted",
+            &base_url,
+            temporary.path(),
+            only_memory.clone(),
+        ))
+        .unwrap();
+    assert_eq!(restricted.descriptor.tools, only_memory);
+    let listed = client.list().unwrap();
+    let listed = listed
+        .iter()
+        .find(|session| session.name == "restricted")
+        .unwrap();
+    assert_eq!(listed.tools, only_memory);
+    let restricted_id = restricted.descriptor.id.clone();
+    let (results, prompted) = run_turn(
+        &mut client,
+        &restricted_id,
+        "try everything",
+        ApprovalPolicy::Ask,
+    );
+    // run_shell is refused as unavailable before any approval, so nothing
+    // prompts and nothing runs.
+    assert!(!prompted, "a tool outside the session's selection prompted");
+    assert!(!temporary.path().join("marker").exists());
+    assert_eq!(
+        results,
+        [
+            "tool error: run_shell is not available to this agent".to_owned(),
+            format!("memory_get for session {restricted_id}"),
+        ]
+    );
     model_server.join().unwrap();
 
     // Stop the daemon the way a service manager would.
