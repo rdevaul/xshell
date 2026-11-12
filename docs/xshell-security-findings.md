@@ -22,6 +22,8 @@ historical review.
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
 | F17 | [#133](https://github.com/rdevaul/xshell/issues/133) | P0 | M1.2 cancellation and shutdown | Corrected (processes that `setsid` away are not contained) | A background job holding the pipes is killed at the timeout, at cancellation (its marker never appears), and after a short grace following a normal exit; the call returns promptly |
 | F18 | [#134](https://github.com/rdevaul/xshell/issues/134) | P0 | M1.4 credential bounds | Corrected (allowlist is a constant; configurability is follow-up) | The provider key variable and an arbitrary daemon variable are absent from `run_shell` output |
+| F13 | [#129](https://github.com/rdevaul/xshell/issues/129) | P0 | M1.3 prepared file access | Corrected | Case variants (`.ENV`, `.SSH/ID_ED25519`, `server.PEM`, `.GIT/config`) are sensitive, blocked and denied exactly like their stored names on a case-insensitive volume |
+| F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 
 ## Evidence rules
 
@@ -141,7 +143,26 @@ authorization and acquisition resolved the path independently.
   Patterns containing `/` match at any depth and a leading `/` anchors one, so
   the same file is classified the same from every cwd, nested repositories'
   `.git/config` and everything under `.aws` are covered, and a project inside
-  a sensitive directory stays sensitive.
+  a sensitive directory stays sensitive. This guarantee was incomplete on
+  case-insensitive volumes until F13: the canonical path kept the names as
+  spelled, so `.ENV` opened `.env` but matched no pattern.
+- **F13.** On a case-insensitive volume (the macOS APFS default) a name in
+  any case opens the stored object, and APFS also folds `ſ`, the Kelvin sign,
+  `ß` and ligatures such as `ﬁ` to ASCII. The prepared path now records the
+  names the filesystem stores where the platform reports them (macOS
+  `F_GETPATH`, checked against the open object; a file with several hard
+  links keeps the spelled name), and sensitive, `block` and policy `denied`
+  path patterns are matched case-folded on every platform, which can only
+  classify more paths as sensitive. Policy `always_allowed` and `allowed`
+  path patterns match exactly, so folding never widens a grant; on macOS
+  they see the stored names, and elsewhere a differently cased request is
+  unlisted, which is stricter. Evidence:
+  `f13_matching_ignores_case_and_folds_like_a_case_insensitive_volume`,
+  `f13_path_denials_ignore_case_and_allows_do_not`,
+  `f13_case_variants_classify_like_the_stored_name`,
+  `f13_unicode_foldings_classify_like_the_stored_name` and
+  `f13_block_prompt_and_policy_denials_hold_under_any_case`. The filesystem
+  tests skip, with a message, on a case-sensitive temporary directory.
 - **F8.** Reads take at most `max_bytes + 1` bytes from the descriptor (tested
   against a 1 GiB sparse file), listings stop reading entries after their
   limit, and preparation and reads run on a blocking worker with a deadline so
@@ -182,6 +203,16 @@ sessions taking one deadline rather than eight.
 The review also asks for deadlines on the CLI's own connection to the session
 service (local socket and SSH). That is client-side hardening outside F6's
 acceptance condition and is not part of this correction.
+
+F16 is corrected (#132). An execution record written after a provider
+failure is a `system` message, and it is folded into the system prompt of
+every later request. It now states only a fixed class written by xshell (an
+HTTP status number, "stream error", "invalid tool arguments", "context
+overflow", and so on; `AdapterError::record_summary`), never the provider's
+error body, a mid-stream error message, or a tool name the model chose. The
+full error still reaches the user and the audit log. Records saved before the
+fix lose their quoted detail when merged. Tests: `f16_*` in
+`xshell-execution/src/engine.rs` and `xshell-core/src/lib.rs`.
 
 The [development roadmap](xshell-development-roadmap.md) remains the
 cross-product sequencing authority.

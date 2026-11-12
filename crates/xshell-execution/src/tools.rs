@@ -1442,6 +1442,87 @@ print $f $$; close $f; sleep 1000000' & sleep 1000000",
         );
     }
 
+    /// F13: on a case-insensitive volume, the `block` class, the `prompt`
+    /// class and a policy's path denial all hold under any case spelling.
+    #[tokio::test]
+    async fn f13_block_prompt_and_policy_denials_hold_under_any_case() {
+        use crate::PolicyDecision;
+        use crate::{ApprovalPolicy, ApprovalRules, CallFacts, Policy, PolicyConfig};
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        if !prepared::tests::case_insensitive(&root) {
+            eprintln!(
+                "skipping f13 filesystem test: {} is case-sensitive",
+                root.display()
+            );
+            return;
+        }
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(root.join("server.pem"), "pem").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "token").unwrap();
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/token"), "t").unwrap();
+        let read = |path: &str| tool("read_file", json!({"path": path}));
+        let sensitive = SensitivePaths::default();
+        let blocked = SensitivePaths::new(["*.pem".to_owned(), "id_ed25519".to_owned()]);
+
+        for path in [
+            "server.PEM",
+            "SERVER.pem",
+            ".SSH/ID_ED25519",
+            ".ssh/ID_ed25519",
+        ] {
+            let preparation = prepare_call(&read(path), &root, &sensitive, &blocked).await;
+            assert!(
+                matches!(preparation, Preparation::Blocked(_)),
+                "f13: {path} must be blocked, got {preparation:?}"
+            );
+        }
+        for path in [".ENV", ".Env", ".GIT/config", ".git/CONFIG"] {
+            assert_eq!(
+                requires_approval(&read(path), &root, &sensitive),
+                Some(GateReason::SensitivePath),
+                "f13: {path} must be gated"
+            );
+        }
+
+        let config = PolicyConfig {
+            denied: vec!["read_file: secrets/**".to_owned()],
+            ..PolicyConfig::default()
+        };
+        let rules = ApprovalRules {
+            base: Policy::parse(&config).unwrap().0,
+            overlay: None,
+        };
+        for path in ["secrets/token", "SECRETS/token", "Secrets/TOKEN"] {
+            let preparation =
+                prepare_call(&read(path), &root, &sensitive, &SensitivePaths::none()).await;
+            let facts = CallFacts {
+                tool: "read_file",
+                command: None,
+                path: preparation.path(),
+                gated: false,
+                sensitive: false,
+                writes: false,
+            };
+            assert!(facts.path.is_some(), "{path} prepares");
+            for mode in [
+                ApprovalPolicy::Off,
+                ApprovalPolicy::Ask,
+                ApprovalPolicy::Auto,
+            ] {
+                assert_eq!(
+                    rules.decide(&facts, mode),
+                    PolicyDecision::Deny,
+                    "f13: {path} must be denied in {mode:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn lists_current_crate_directory() {
         let root = &manifest_dir();

@@ -5,8 +5,8 @@
 //! `run_shell` with a pattern matched against the command's parsed argument
 //! vector (`run_shell: yapcad export *`), or a read-only tool with a path
 //! pattern matched against the canonical path of the object it opens
-//! (`read_file: config/.env`). A call is decided by the first rule of this
-//! table that matches:
+//! (`read_file: config/.env`; denials ignore letter case, allows do not). A
+//! call is decided by the first rule of this table that matches:
 //!
 //! | The call | `off` | `ask` | `auto` |
 //! |---|---|---|---|
@@ -155,7 +155,10 @@ impl Rule {
                 .command
                 .and_then(simple_command)
                 .is_some_and(|words| words_match(pattern, &words)),
-            Self::Path { pattern, .. } => call.path.is_some_and(|path| path_matches(pattern, path)),
+            // Exact: an allow must not reach a differently cased object.
+            Self::Path { pattern, .. } => call
+                .path
+                .is_some_and(|path| path_matches(pattern, path, false)),
         }
     }
 
@@ -171,7 +174,11 @@ impl Rule {
                     .iter()
                     .any(|words| words_match(pattern, words))
             }),
-            _ => self.allows(call),
+            // Case-folded: a denial must not be dodged by spelling (F13).
+            Self::Path { pattern, .. } => call
+                .path
+                .is_some_and(|path| path_matches(pattern, path, true)),
+            Self::Tool(_) => true,
         }
     }
 
@@ -638,8 +645,25 @@ fn wildcard(pattern: &str, text: &str) -> bool {
 
 /// Path patterns follow sensitive-path matching: a pattern with `/` matches at
 /// any depth, a leading `/` anchors it, and a bare name matches a file name.
-fn path_matches(pattern: &str, path: &Path) -> bool {
-    SensitivePaths::new([pattern.to_owned()]).matches(path)
+///
+/// Letter case (finding F13): `path` is the prepared object's path, which
+/// carries the names the filesystem stores where the platform reports them
+/// (macOS). A denial folds case, like sensitive and blocked paths, so it
+/// cannot be dodged by spelling the name differently on a case-insensitive
+/// volume; on a case-sensitive one it also denies differently cased
+/// siblings, which only restricts. An allow matches exactly. On macOS the
+/// stored names already make `DOCS/x` read as `docs/x` when that is the
+/// object opened, so an allow for `docs/**` still applies to it; where stored
+/// names are unavailable (Linux case-folding directories) a differently
+/// spelled request falls outside the allow and is decided as unlisted, which
+/// is stricter, never looser. Write allow patterns in the case stored on disk.
+fn path_matches(pattern: &str, path: &Path, fold: bool) -> bool {
+    let patterns = SensitivePaths::new([pattern.to_owned()]);
+    if fold {
+        patterns.matches(path)
+    } else {
+        patterns.matches_exact(path)
+    }
 }
 
 #[cfg(test)]
@@ -753,6 +777,39 @@ mod tests {
         // An overlay naming the path cannot skip the prompt.
         let overlay = by_path.decide(&read(&secret, true), Ask, false);
         assert_eq!(overlay.decision, Prompt);
+    }
+
+    /// F13: a path denial cannot be dodged by letter case, and an allow
+    /// does not become easier to satisfy.
+    #[test]
+    fn f13_path_denials_ignore_case_and_allows_do_not() {
+        let deny = policy(&[], None, &["read_file: secrets/**", "read_file: *.pem"]);
+        for path in [
+            "/work/secrets/token",
+            "/work/SECRETS/token",
+            "/work/Secrets/deep/token",
+            "/work/server.PEM",
+            "/work/\u{17F}ecrets/token",
+        ] {
+            let path = PathBuf::from(path);
+            assert_eq!(
+                base(&deny, &read(&path, false)),
+                [Deny, Deny, Deny],
+                "f13: {} must be denied",
+                path.display()
+            );
+        }
+        // An allow list matches exactly: a differently cased path is unlisted
+        // and therefore denied, never allowed by folding.
+        let allow = policy(&[], Some(&["read_file: docs/**"]), &[]);
+        let listed = PathBuf::from("/work/docs/a.md");
+        let cased = PathBuf::from("/work/DOCS/a.md");
+        assert_eq!(base(&allow, &read(&listed, false)), [Deny, Prompt, Run]);
+        assert_eq!(base(&allow, &read(&cased, false)), [Deny, Deny, Deny]);
+        // The host naming a sensitive path lifts its prompt only exactly.
+        let named = policy(&["read_file: config/.env"], None, &[]);
+        let spelled = PathBuf::from("/work/config/.ENV");
+        assert_eq!(base(&named, &read(&spelled, true)), [Deny, Prompt, Run]);
     }
 
     #[test]
