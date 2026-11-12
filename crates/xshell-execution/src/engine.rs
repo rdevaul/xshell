@@ -1056,6 +1056,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 name: call.name.clone(),
                 result: result.clone(),
             });
+            budget.record_tool_output(result.len());
             history.push(ChatMessage::tool_result(call, result));
             // The user aborting a subagent's tool aborts the whole turn, as
             // it would for one of the parent's own tools.
@@ -2289,6 +2290,42 @@ mod tests {
                 .content
                 .contains("exhausted its budget of 3 provider requests")
         );
+    }
+
+    #[tokio::test]
+    async fn tool_output_budget_stops_the_turn_after_the_result_that_crosses_it() {
+        let temporary = TempDir::new().unwrap();
+        std::fs::write(temporary.path().join("listed.txt"), "x").unwrap();
+        let mut adapter = listing_responses(3, 2);
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        let error = run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_limits(TurnLimits {
+                tool_output_bytes: 1,
+                ..TurnLimits::default()
+            }),
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(exhaustion(&error), BudgetExhausted::ToolOutputBytes(1));
+        assert_eq!(adapter.requests.len(), 1);
+        // The first result is kept; the second call is answered with a
+        // refusal, so every call still has a result.
+        let results = tool_results(&observer.events);
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].1.starts_with("tool error"));
+        assert!(
+            results[1]
+                .1
+                .contains("exhausted its budget of 1 bytes of tool output")
+        );
+        assert_tool_results_complete(&history);
     }
 
     #[tokio::test]

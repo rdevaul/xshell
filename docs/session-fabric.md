@@ -220,6 +220,7 @@ subagents it starts. The limits come from a named profile:
 | Wall time | 1 hour | 8 hours |
 | `run_shell` timeout | 60 seconds | 30 minutes |
 | Automatic continuations | 2 | 50 |
+| Tool output returned to the model | 8 MiB | 128 MiB |
 
 - **Choosing a profile:** `--limits NAME` (or `XSHELL_LIMITS`), `//limits
   NAME` during a session, `limits = "NAME"` on a model profile, or
@@ -237,8 +238,41 @@ subagents it starts. The limits come from a named profile:
 Calls past the per-response limit are refused and the turn continues;
 exhausting any other limit fails the turn with a message naming it, and
 follows the usual failure rules: rolled back if no tool ran, otherwise kept
-with an execution record. Per-session and global budgets are not implemented
-yet (finding F10).
+with an execution record. The tool output limit (`tool_output_bytes`, in
+bytes) counts each tool result as it is returned; the result that crosses it
+is kept, and the turn stops at its next provider request or tool call.
+
+## Daemon budgets
+
+Two limits apply across the whole daemon, whatever clients ask for:
+
+| Setting | Default | Limits |
+|---|---|---|
+| `max_concurrent_turns` | 8 | Turns (agent or `$`) running at once across all sessions |
+| `max_sessions` | 256 | Sessions kept at once, attached or detached |
+
+```toml
+[session_fabric]
+max_concurrent_turns = 4
+max_sessions = 64
+```
+
+- **Refusal, not queueing:** a turn submitted while the limit is reached is
+  refused, as is a new session beyond `max_sessions`. Clients get the error
+  code `capacity`; `xshell run` exits 6 (`unavailable`), meaning "try again
+  later". A run that created its own session for the refused turn closes it
+  again.
+- **What holds a turn's place:** the turn, from acceptance until it ends. A
+  detached turn waiting at an approval prompt still holds its place, so use
+  `--approval auto` or `off` for unattended jobs.
+- **Sessions:** sessions restored at startup are kept even beyond
+  `max_sessions`; only new ones are refused. `xshell run` keeps each run's
+  session unless it is `--ephemeral`, so a supervisor starting many runs
+  should use `--ephemeral` or close sessions it no longer needs.
+
+Not yet budgeted (finding F10): a session's total use across turns, which
+waits on persistent goals, and the size of a session's retained history,
+which compaction bounds only when it is configured.
 
 ## Subagents
 

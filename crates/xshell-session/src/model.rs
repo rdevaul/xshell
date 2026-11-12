@@ -11,10 +11,11 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // Version 14 adds the `delegate_task` subagent events (`SubagentStarted`,
 // `Subagent`, `SubagentFinished`). Version 17 adds `source` on
 // `ApprovalReply` and `basis` and `approval` on `ExecutionEvent::ToolDecision`.
-// Version 18 adds the `blocked_path` decision basis. Version 19 adds the
+// Version 18 adds the `blocked_path` decision basis. Version 19 adds
+// `tool_output_bytes` to the turn limits. Version 20 adds the
 // `tool_declared` gate reason on `ExecutionEvent::ApprovalRequested`, sent for
 // provided tools that require approval.
-pub const SESSION_PROTOCOL_VERSION: u32 = 19;
+pub const SESSION_PROTOCOL_VERSION: u32 = 20;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,7 +85,36 @@ pub struct SessionConfig {
     /// Sensitivity classes: paths agent read tools need approval for
     /// (`prompt`, added to `sensitive_paths`) or may never read (`block`).
     pub sensitivity: Vec<SensitivityClass>,
+    /// Most sessions this daemon keeps at once, attached or not. Creating
+    /// another is refused until one is closed, so detached runs cannot
+    /// accumulate without bound.
+    pub max_sessions: usize,
+    /// Most turns (agent or `$`) running at once across all sessions. A
+    /// submission beyond it is refused, so one long job cannot be joined by
+    /// an unbounded number of others.
+    pub max_concurrent_turns: usize,
 }
+
+/// Built-in `max_sessions`.
+pub const DEFAULT_MAX_SESSIONS: usize = 256;
+/// Built-in `max_concurrent_turns`.
+pub const DEFAULT_MAX_CONCURRENT_TURNS: usize = 8;
+
+/// A request refused because a daemon-wide budget is spent: too many
+/// sessions or too many running turns. Reported to clients with the error
+/// code `capacity`, so a supervisor can retry later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityExhausted {
+    pub message: String,
+}
+
+impl std::fmt::Display for CapacityExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CapacityExhausted {}
 
 /// A set of path patterns and what agent read tools must do with them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +173,19 @@ impl SessionConfig {
             .apply_to(xshell_execution::TurnLimits::relaxed())
             .map_err(|error| error.context("in session_fabric.max_limits"))
     }
+
+    /// Check the daemon-wide budgets: each must allow at least one.
+    pub fn validate_budgets(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("max_sessions", self.max_sessions),
+            ("max_concurrent_turns", self.max_concurrent_turns),
+        ] {
+            if value == 0 {
+                anyhow::bail!("session_fabric.{name} must be at least 1");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for SessionConfig {
@@ -161,6 +204,8 @@ impl Default for SessionConfig {
             max_limits: xshell_execution::LimitSettings::default(),
             approval_policy: xshell_execution::PolicyConfig::default(),
             sensitivity: Vec::new(),
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
         }
     }
 }
@@ -497,6 +542,24 @@ pub struct PtyTicket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_budgets_default_and_must_allow_one() {
+        let config = SessionConfig::default();
+        assert_eq!(config.max_sessions, DEFAULT_MAX_SESSIONS);
+        assert_eq!(config.max_concurrent_turns, DEFAULT_MAX_CONCURRENT_TURNS);
+        config.validate_budgets().unwrap();
+        let zero = SessionConfig {
+            max_concurrent_turns: 0,
+            ..SessionConfig::default()
+        };
+        assert!(
+            zero.validate_budgets()
+                .unwrap_err()
+                .to_string()
+                .contains("max_concurrent_turns")
+        );
+    }
 
     #[test]
     fn session_activity_is_typed_and_reads_legacy_durable_values() {

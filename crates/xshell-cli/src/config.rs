@@ -713,7 +713,9 @@ model = "m"
                     || uncommented.starts_with("limits = ")
                     || uncommented.starts_with("wall_time = ")
                     || uncommented.starts_with("shell_timeout = ")
-                    || uncommented.starts_with("tool_calls = ");
+                    || uncommented.starts_with("tool_calls = ")
+                    || uncommented.starts_with("max_concurrent_turns = ")
+                    || uncommented.starts_with("max_sessions = ");
                 if is_limits_example { uncommented } else { line }
             })
             .collect::<Vec<_>>()
@@ -725,6 +727,9 @@ model = "m"
             config.limit_profile("cad-render").unwrap().shell_timeout,
             std::time::Duration::from_secs(45 * 60)
         );
+        config.session_fabric.validate_budgets().unwrap();
+        assert_eq!(config.session_fabric.max_concurrent_turns, 8);
+        assert_eq!(config.session_fabric.max_sessions, 256);
         let ceiling = config.session_fabric.limit_ceiling().unwrap();
         assert_eq!(ceiling.wall_time, std::time::Duration::from_secs(4 * 3600));
         assert_eq!(ceiling.tool_calls, 2000);

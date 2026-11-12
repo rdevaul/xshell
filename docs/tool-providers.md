@@ -133,7 +133,7 @@ built-in call:
 3. **Gate:** `ToolApproval::Required` produces the new
    `GateReason::ToolDeclared`, which is treated exactly like `run_shell`'s
    gate: prompted in `ask` mode, run in `auto`, denied in `off`. The new
-   reason is a wire change, so this change moves to session protocol 19.
+   reason is a wire change, so this change moves to session protocol 20.
    `NotRequired` tools are ungated, like the read-only built-in tools,
    with one exception: **`off` denies every `ReadWrite` tool**, gated or
    not, so `off` keeps meaning the agent changes nothing. A `ReadOnly`

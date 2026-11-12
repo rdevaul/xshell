@@ -7,6 +7,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +36,9 @@ struct CoordinatorInner {
     sessions: Mutex<HashMap<String, Arc<SessionExecution>>>,
     admission: Mutex<bool>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Turns running across all sessions, against
+    /// `DaemonPolicy::max_concurrent_turns`.
+    running_turns: Arc<AtomicUsize>,
     audit: DaemonAudit,
     policy: DaemonPolicy,
 }
@@ -50,6 +54,8 @@ pub struct DaemonPolicy {
     pub compaction: CompactionConfig,
     /// Tools that compiled-in providers add to every agent turn.
     pub tools: Arc<ToolRegistry>,
+    /// Most turns running at once across all sessions.
+    pub max_concurrent_turns: usize,
 }
 
 impl Default for DaemonPolicy {
@@ -62,6 +68,7 @@ impl Default for DaemonPolicy {
             rules: Policy::default(),
             compaction: CompactionConfig::default(),
             tools: ToolRegistry::empty(),
+            max_concurrent_turns: crate::DEFAULT_MAX_CONCURRENT_TURNS,
         }
     }
 }
@@ -89,6 +96,31 @@ struct ExecutionState {
 struct ActiveTurn {
     id: String,
     cancellation: CancellationFlag,
+    /// Held for as long as the turn is active: releasing the turn releases
+    /// its place in the daemon-wide budget, on every path.
+    _slot: TurnSlot,
+}
+
+/// One place in the daemon's concurrent-turn budget, given back when
+/// dropped.
+struct TurnSlot(Arc<AtomicUsize>);
+
+impl TurnSlot {
+    /// Take a place, unless `limit` turns are already running.
+    fn acquire(running: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        running
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(running)))
+    }
+}
+
+impl Drop for TurnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ExecutionCoordinator {
@@ -107,6 +139,7 @@ impl ExecutionCoordinator {
                 sessions: Mutex::new(HashMap::new()),
                 admission: Mutex::new(true),
                 workers: Mutex::new(Vec::new()),
+                running_turns: Arc::new(AtomicUsize::new(0)),
                 audit,
                 policy,
             }),
@@ -119,6 +152,15 @@ impl ExecutionCoordinator {
 
     pub fn max_limits(&self) -> TurnLimits {
         self.inner.policy.max_limits
+    }
+
+    pub fn max_concurrent_turns(&self) -> usize {
+        self.inner.policy.max_concurrent_turns
+    }
+
+    /// Turns running now across all sessions.
+    pub fn running_turns(&self) -> usize {
+        self.inner.running_turns.load(Ordering::Acquire)
     }
 
     pub fn audit(&self) -> &DaemonAudit {
@@ -175,11 +217,22 @@ impl ExecutionCoordinator {
             if let Some(active) = &state.active {
                 bail!("session already has active turn {}", active.id);
             }
+            let limit = self.inner.policy.max_concurrent_turns;
+            let Some(slot) = TurnSlot::acquire(&self.inner.running_turns, limit) else {
+                return Err(crate::CapacityExhausted {
+                    message: format!(
+                        "this host is already running {limit} turns, its limit \
+(session_fabric.max_concurrent_turns); try again when one finishes"
+                    ),
+                }
+                .into());
+            };
             state.approvals.clear();
             state.pending_approvals.clear();
             state.active = Some(ActiveTurn {
                 id: turn_id.clone(),
                 cancellation: cancellation.clone(),
+                _slot: slot,
             });
         }
         // Record the input at the execution boundary before anything runs.
@@ -920,6 +973,19 @@ mod tests {
             approver,
             detail: detail.map(str::to_owned),
         })
+    }
+
+    #[test]
+    fn turn_slots_stop_at_the_limit_and_are_given_back_when_dropped() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let first = TurnSlot::acquire(&running, 2).unwrap();
+        let second = TurnSlot::acquire(&running, 2).unwrap();
+        assert!(TurnSlot::acquire(&running, 2).is_none());
+        drop(first);
+        let third = TurnSlot::acquire(&running, 2).unwrap();
+        drop(second);
+        drop(third);
+        assert_eq!(running.load(Ordering::Acquire), 0);
     }
 
     #[test]

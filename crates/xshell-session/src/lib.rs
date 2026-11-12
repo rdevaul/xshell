@@ -21,7 +21,8 @@ pub use client::{
 pub use completion::complete_shell;
 pub use execution::{DaemonPolicy, ExecutionCoordinator};
 pub use model::{
-    AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, DAEMON_PROBE_SCHEMA_VERSION,
+    AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, CapacityExhausted,
+    DAEMON_PROBE_SCHEMA_VERSION, DEFAULT_MAX_CONCURRENT_TURNS, DEFAULT_MAX_SESSIONS,
     DaemonProbeReport, DaemonProbeStatus, EventBatch, ModelBinding, PersistenceMode, PtySize,
     PtyTicket, SESSION_PROTOCOL_VERSION, SensitivityAction, SensitivityClass, SessionActivity,
     SessionConfig, SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind,

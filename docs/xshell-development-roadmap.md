@@ -195,7 +195,7 @@ Do not allow a connector to bypass shared authorization because it supplies its 
 2. Preserve the landed F1–F3 lifecycle corrections and F11 cwd boundary while completing the remaining findings.
 3. Done: prepared bounded file reads and stable sensitivity semantics for F4/F5/F8 as one boundary in `xshell-execution` (`prepared.rs`): classification on the canonical absolute path, descriptor-bound prepared operations that authorization and acquisition share, and acquisition bounded before allocation.
 4. Done: per-session audit connections with acknowledgement deadlines and no global lock across audit I/O (F6), and stream-completion handling (F9). Deadlines on the CLI's own session-service connection (local socket and SSH) remain a separate hardening item.
-5. **Next:** the remaining F10 budgets (per-session, global, byte, and worker; the whole-turn budget landed in #84), then F7 transactional persistence.
+5. **Next:** F7 transactional persistence. F10's global budgets landed (concurrent turns and sessions per daemon, and a per-turn tool output byte budget, on top of the whole-turn budget from #84); a session's budget across turns waits on persistent goals, and retained history is bounded only by configured compaction.
 6. Draft the M2 operation/grant/provider contract and run one operation through personal and restrictive mock policies.
 7. Baseline the M3 home-lab journeys while the controlled deployment owner selects the M4 target environment.
 

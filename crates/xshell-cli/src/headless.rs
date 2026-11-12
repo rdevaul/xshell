@@ -272,7 +272,10 @@ fn execute(
             history: vec![ChatMessage::system(shared.system_prompt.clone())],
         })
     }
-    .or_outcome(Outcome::Failed)?;
+    .map_err(|error| RunError {
+        outcome: refusal_outcome(&error),
+        error,
+    })?;
     let session_id = snapshot.descriptor.id.clone();
 
     // Follow events from after anything already in the journal.
@@ -290,14 +293,16 @@ fn execute(
             overlay,
         )
         .map_err(|error| {
-            // The daemon refuses the turn outright when required auditing
-            // cannot record its input.
-            let outcome = if format!("{error:#}").contains("required audit") {
-                Outcome::Unavailable
-            } else {
-                Outcome::Failed
-            };
-            RunError { outcome, error }
+            // A session this run created for a turn that never started is
+            // closed again, so refused runs do not use up the daemon's
+            // session budget. An ephemeral one goes when the client does.
+            if !existing && !args.ephemeral {
+                let _ = client.close(Some(session_id.clone()));
+            }
+            RunError {
+                outcome: refusal_outcome(&error),
+                error,
+            }
         })?;
 
     let mut summary = Summary {
@@ -1063,6 +1068,18 @@ fn read_prompt(args: &RunArgs) -> Result<String> {
         bail!("the prompt is empty");
     }
     Ok(prompt)
+}
+
+/// The outcome of a request the daemon refused before a turn started. A
+/// spent daemon-wide budget (error code `capacity`) and a required audit that
+/// cannot record the input are both "try again later"; anything else failed.
+fn refusal_outcome(error: &anyhow::Error) -> Outcome {
+    let text = format!("{error:#}");
+    if text.contains("(capacity)") || text.contains("required audit") {
+        Outcome::Unavailable
+    } else {
+        Outcome::Failed
+    }
 }
 
 /// A unique, sortable name for a run's own session.
