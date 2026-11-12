@@ -247,6 +247,8 @@ fn render_events<'a>(
                 renderer.finish(&mut output)?;
                 writeln!(output, "xshell: session turn was cancelled")?;
             }
+            // Usage and audit identifiers are for headless supervisors.
+            SessionEventKind::TurnSummary { .. } => {}
         }
     }
     renderer.finish(&mut output)?;

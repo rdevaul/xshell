@@ -182,11 +182,55 @@ incompatible change increments `schema`.
 | `turn_completed` | | The turn finished |
 | `turn_failed` | `message`, `reason`? | The turn failed; `reason` is `budget_exhausted` or `audit_unavailable` when known |
 | `turn_cancelled` | | The turn was cancelled |
-| `result` | `schema`, `outcome`, `exit_code`, `answer`, `message`?, `session`?, `session_id`?, `turn_id`?, `tool_calls`, `approvals_denied` | How the run ended; `answer` is the final text of the main agent |
+| `result` | `schema`, `outcome`, `exit_code`, `answer`, `message`?, `session`?, `session_id`?, `turn_id`?, `tool_calls`, `approvals_denied`, `usage`?, `audit`? | How the run ended; `answer` is the final text of the main agent. `usage` and `audit` are described below |
 
 A run that fails before its turn starts (bad configuration, no daemon) prints
 only a `result` line. `wait` and `result` print the replayed turn's events,
 starting at `turn_started`, followed by a `result` line.
+
+### Usage
+
+`usage` in the `result` line reports what the turn used against each of its
+limits, counted by the daemon across the turn and its subagents. Each
+measure has an `assurance`: `enforced` means the engine counted it and
+would have stopped the turn at the limit; `unavailable` means it is not
+known.
+
+```json
+"usage": {
+  "model_rounds":      {"used": 3, "limit": 128, "assurance": "enforced"},
+  "tool_dispatches":   {"used": 5, "limit": 256, "assurance": "enforced"},
+  "tool_output_bytes": {"used": 18234, "limit": 8388608, "assurance": "enforced"},
+  "wall_time_ms":      {"used": 41210, "limit": 3600000, "assurance": "enforced"},
+  "tokens":            {"assurance": "unavailable"}
+}
+```
+
+*Model rounds* are provider requests, including automatic continuations;
+*tool dispatches* are evaluated tool calls, whether run, denied, or refused.
+Token counts are not collected yet.
+
+### Audit reference
+
+The JSONL stream is a presentation of the turn, not evidence of it: it is
+rendered by the client and can be replayed or cut short. When the daemon
+audits, the `result` line says where the turn's signed records are:
+
+```json
+"audit": {
+  "audit_session_id": "6f0c…",
+  "first_sequence": 41,
+  "last_sequence": 58,
+  "record_hash": "9d2e…"
+}
+```
+
+The records from `first_sequence` (the turn's `input`) to `last_sequence`
+(its `turn_finished`, whose hash is `record_hash`) in that audit session are
+the turn's. `first_sequence` is left out when the audit connection was
+replaced during the turn. `audit` is absent when auditing is off, or when
+the daemon could not record the end of the turn. See
+[auditing](auditing.md#turn-authority-and-decision-basis).
 
 ## Examples
 

@@ -265,6 +265,8 @@ requested \"{requested}\" was not applied"
                     sessions.acknowledge_event(sequence)?;
                     bail!("session turn was cancelled");
                 }
+                // Usage and audit identifiers are for headless supervisors.
+                SessionEventKind::TurnSummary { .. } => {}
             }
             sessions.acknowledge_event(sequence)?;
         }

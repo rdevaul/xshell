@@ -203,6 +203,10 @@ struct Summary {
     turn_id: Option<String>,
     tool_calls: usize,
     approvals_denied: usize,
+    /// Use against each turn limit, as the daemon counted it.
+    usage: Option<xshell_execution::TurnUsage>,
+    /// Where the turn's records are in the audit log.
+    audit: Option<xshell_session::TurnAuditRef>,
 }
 
 fn execute(
@@ -659,6 +663,11 @@ fn handle_event(
                 None => Outcome::Failed,
             })
         }
+        SessionEventKind::TurnSummary { usage, audit } => {
+            summary.usage = usage;
+            summary.audit = audit;
+            None
+        }
         // Agent turns produce no shell events; ignore them if one appears.
         SessionEventKind::ShellOutput { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
@@ -1006,6 +1015,8 @@ impl Output {
                 "turn_id": summary.turn_id,
                 "tool_calls": summary.tool_calls,
                 "approvals_denied": summary.approvals_denied,
+                "usage": summary.usage,
+                "audit": summary.audit,
             })),
             OutputFormat::Text if outcome == Outcome::Detached => {
                 // The session name is what `xshell wait --session` needs.

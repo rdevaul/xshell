@@ -1,9 +1,9 @@
-use crate::TurnFailureReason;
-use crate::audit::{DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
+use crate::audit::{AuditReceipt, DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
 use crate::{
     AgentTurnPhase, ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind,
     SessionRegistry, TurnInput,
 };
+use crate::{TurnAuditRef, TurnFailureReason};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,8 +17,9 @@ use xshell_core::ToolCall;
 use xshell_execution::{
     AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalRules, ApprovalSource,
     Approver, BudgetExhausted, CancellationFlag, CompactionConfig, ExecutionEvent, GateReason,
-    ModelBudget, Policy, SensitivePaths, ToolRegistry, ToolSet, TurnLimits, TurnObserver,
-    TurnPolicy, build_adapter, run_agent_turn, run_direct_shell_streaming_cancellable,
+    ModelBudget, Policy, SensitivePaths, ToolRegistry, ToolSet, TurnBudget, TurnLimits,
+    TurnObserver, TurnPolicy, TurnUsage, build_adapter, run_agent_turn_with_budget,
+    run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
 
@@ -249,14 +250,17 @@ impl ExecutionCoordinator {
             TurnInput::Agent { message } => ("agent", message.clone()),
             TurnInput::Shell { command } => ("shell", format!("${command}")),
         };
-        if let Err(error) = audit.append(AuditEvent::Input {
+        let first_record = match audit.append_with_receipt(AuditEvent::Input {
             route: route.into(),
             text,
             images: Vec::new(),
         }) {
-            execution.finish(&turn_id);
-            return Err(error);
-        }
+            Ok(receipt) => receipt,
+            Err(error) => {
+                execution.finish(&turn_id);
+                return Err(error);
+            }
+        };
         // An agent turn's authority is recorded before anything can run
         // under it: decisions later in the log are read against it.
         if matches!(input, TurnInput::Agent { .. }) {
@@ -323,6 +327,7 @@ impl ExecutionCoordinator {
                     snapshot,
                     cancellation,
                     audit,
+                    first_record,
                 );
             });
         let worker = match worker {
@@ -509,8 +514,11 @@ impl ExecutionCoordinator {
         mut snapshot: crate::SessionSnapshot,
         cancellation: CancellationFlag,
         audit: SessionAuditHandle,
+        first_record: Option<AuditReceipt>,
     ) {
         let execution = self.session(&session_id);
+        let agent_turn = matches!(input, TurnInput::Agent { .. });
+        let budget = TurnBudget::new(limits);
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -561,12 +569,13 @@ impl ExecutionCoordinator {
                             context_tokens: model.context_tokens,
                             reserve_output_tokens: model.reserve_output_tokens,
                         }));
-                    let outcome = run_agent_turn(
+                    let outcome = run_agent_turn_with_budget(
                         agent.as_mut(),
                         &mut snapshot.history,
                         message,
                         &snapshot.descriptor.cwd,
                         &policy,
+                        &budget,
                         &mut observer,
                     )
                     .await;
@@ -663,6 +672,26 @@ impl ExecutionCoordinator {
         } else {
             SessionEventKind::TurnCompleted
         };
+        if agent_turn {
+            let usage = budget.usage();
+            let audit_ref = record_turn_finished(&audit, &turn_id, &terminal, &usage).map(|last| {
+                TurnAuditRef {
+                    first_sequence: first_record
+                        .filter(|first| first.audit_session_id == last.audit_session_id)
+                        .map(|first| first.sequence),
+                    audit_session_id: last.audit_session_id,
+                    last_sequence: last.sequence,
+                    record_hash: last.record_hash,
+                }
+            });
+            execution.append(
+                &turn_id,
+                SessionEventKind::TurnSummary {
+                    usage: Some(usage),
+                    audit: audit_ref,
+                },
+            );
+        }
         execution.conclude(&turn_id, terminal);
     }
 }
@@ -938,6 +967,41 @@ fn finish_locked(state: &mut ExecutionState, turn_id: &str) {
     state
         .approvals
         .retain(|(pending_turn, _), _| pending_turn != turn_id);
+}
+
+/// Append an agent turn's `turn_finished` audit record and return where it
+/// landed. The turn's effects have already happened, so a failure here does
+/// not change its outcome: the summary simply carries no audit reference,
+/// which a supervisor reads as "not verifiable".
+fn record_turn_finished(
+    audit: &SessionAuditHandle,
+    turn_id: &str,
+    terminal: &SessionEventKind,
+    usage: &TurnUsage,
+) -> Option<AuditReceipt> {
+    let (outcome, reason) = match terminal {
+        SessionEventKind::TurnCompleted => ("completed", None),
+        SessionEventKind::TurnCancelled => ("cancelled", None),
+        SessionEventKind::TurnFailed { reason, .. } => ("failed", *reason),
+        _ => ("failed", None),
+    };
+    let reason = reason.map(|reason| match reason {
+        TurnFailureReason::BudgetExhausted => "budget_exhausted".to_owned(),
+        TurnFailureReason::AuditUnavailable => "audit_unavailable".to_owned(),
+    });
+    let usage = serde_json::to_value(usage).ok().map(Box::new);
+    match audit.append_with_receipt(AuditEvent::TurnFinished {
+        turn_id: turn_id.to_owned(),
+        outcome: outcome.to_owned(),
+        reason,
+        usage,
+    }) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            eprintln!("xshelld audit warning: cannot record the end of turn {turn_id}: {error:#}");
+            None
+        }
+    }
 }
 
 /// Check a client's account of who answered an approval prompt before the

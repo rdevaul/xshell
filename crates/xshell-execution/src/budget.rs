@@ -289,6 +289,7 @@ pub struct TurnBudget(Arc<BudgetInner>);
 #[derive(Debug)]
 struct BudgetInner {
     limits: TurnLimits,
+    started: Instant,
     deadline: Instant,
     provider_requests: AtomicUsize,
     tool_calls: AtomicUsize,
@@ -305,6 +306,7 @@ impl TurnBudget {
             .unwrap_or_else(|| now + MAX_LIMIT_DURATION);
         Self(Arc::new(BudgetInner {
             limits,
+            started: now,
             deadline,
             provider_requests: AtomicUsize::new(0),
             tool_calls: AtomicUsize::new(0),
@@ -371,6 +373,22 @@ impl TurnBudget {
         self.0.tool_output_bytes.load(Ordering::Acquire)
     }
 
+    /// What the turn has used so far, against each limit.
+    pub fn usage(&self) -> TurnUsage {
+        let limits = self.0.limits;
+        let count = |used: usize, limit: usize| UsageMeasure::enforced(used as u64, limit as u64);
+        TurnUsage {
+            model_rounds: count(self.provider_requests_used(), limits.provider_requests),
+            tool_dispatches: count(self.tool_calls_used(), limits.tool_calls),
+            tool_output_bytes: count(self.tool_output_bytes_used(), limits.tool_output_bytes),
+            wall_time_ms: UsageMeasure::enforced(
+                duration_ms(self.0.started.elapsed()),
+                duration_ms(limits.wall_time),
+            ),
+            tokens: UsageMeasure::unavailable(),
+        }
+    }
+
     /// Resolves when the time budget runs out.
     pub async fn expired(&self) {
         tokio::time::sleep_until(self.0.deadline.into()).await;
@@ -383,6 +401,63 @@ impl TurnBudget {
     pub fn tool_calls_used(&self) -> usize {
         self.0.tool_calls.load(Ordering::Acquire)
     }
+}
+
+/// How much of each limit a turn used, in FutureShell's autonomy-budget
+/// vocabulary: provider requests are *model rounds* and evaluated tool calls
+/// are *tool dispatches*. Each measure says how far it can be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnUsage {
+    pub model_rounds: UsageMeasure,
+    pub tool_dispatches: UsageMeasure,
+    pub tool_output_bytes: UsageMeasure,
+    pub wall_time_ms: UsageMeasure,
+    /// Providers' token counts are not collected yet.
+    pub tokens: UsageMeasure,
+}
+
+/// One measure of use against its limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageMeasure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    pub assurance: Assurance,
+}
+
+impl UsageMeasure {
+    fn enforced(used: u64, limit: u64) -> Self {
+        Self {
+            used: Some(used),
+            limit: Some(limit),
+            assurance: Assurance::Enforced,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            used: None,
+            limit: None,
+            assurance: Assurance::Unavailable,
+        }
+    }
+}
+
+/// How far a usage measure can be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Assurance {
+    /// Counted by the engine, which stopped the turn at the limit.
+    Enforced,
+    /// Reported by a provider, not enforced by the engine.
+    Measured,
+    /// Not known.
+    Unavailable,
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Increment `counter` unless it has reached `limit`. A compare-exchange loop
@@ -447,6 +522,27 @@ mod tests {
             tool_calls,
             ..TurnLimits::default()
         }
+    }
+
+    #[test]
+    fn usage_reports_each_limit_with_its_assurance() {
+        let budget = TurnBudget::new(limits(4, 5));
+        budget.charge_provider_request().unwrap();
+        budget.charge_tool_call().unwrap();
+        budget.charge_tool_call().unwrap();
+        budget.record_tool_output(10);
+        let usage = budget.usage();
+        assert_eq!(usage.model_rounds.used, Some(1));
+        assert_eq!(usage.model_rounds.limit, Some(4));
+        assert_eq!(usage.tool_dispatches.used, Some(2));
+        assert_eq!(usage.tool_output_bytes.used, Some(10));
+        assert_eq!(usage.wall_time_ms.limit, Some(3_600_000));
+        assert_eq!(usage.model_rounds.assurance, Assurance::Enforced);
+        assert_eq!(usage.tokens.assurance, Assurance::Unavailable);
+        assert_eq!(
+            serde_json::to_value(usage.tokens).unwrap(),
+            serde_json::json!({"assurance": "unavailable"})
+        );
     }
 
     #[test]

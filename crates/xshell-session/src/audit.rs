@@ -238,9 +238,9 @@ impl SessionAudit {
         };
     }
 
-    fn append(&mut self, config: &AuditConfig, event: AuditEvent) -> Result<()> {
+    fn append(&mut self, config: &AuditConfig, event: AuditEvent) -> Result<Option<AuditReceipt>> {
         match self.state {
-            Connection::Closed => return Ok(()),
+            Connection::Closed => return Ok(None),
             Connection::Unopened => self.open(config, ATTACH_ACTION),
             Connection::Failed(at) if at.elapsed() >= config.ack_timeout() => {
                 self.open(config, RESUME_ACTION)
@@ -251,10 +251,14 @@ impl SessionAudit {
             if config.required {
                 anyhow::bail!("required auditing is unavailable for this session");
             }
-            return Ok(());
+            return Ok(None);
         };
         match client.append(event) {
-            Ok(_) => Ok(()),
+            Ok((sequence, record_hash)) => Ok(Some(AuditReceipt {
+                audit_session_id: client.session_id().to_owned(),
+                sequence,
+                record_hash,
+            })),
             Err(error) => {
                 self.state = Connection::Failed(Instant::now());
                 if config.required {
@@ -266,7 +270,7 @@ impl SessionAudit {
                         "xshelld audit warning: session {}: {error:#}; records are dropped until the audit service responds again",
                         self.session_id
                     );
-                    Ok(())
+                    Ok(None)
                 }
             }
         }
@@ -316,11 +320,26 @@ impl SessionAuditHandle {
     /// service responds again; otherwise the failure is reported and the
     /// record dropped.
     pub fn append(&self, event: AuditEvent) -> Result<()> {
+        self.append_with_receipt(event).map(|_| ())
+    }
+
+    /// As [`append`](Self::append), also saying where the record landed.
+    /// `None` when auditing is off, or the record was dropped by
+    /// best-effort auditing.
+    pub fn append_with_receipt(&self, event: AuditEvent) -> Result<Option<AuditReceipt>> {
         let (Some(inner), Some(entry)) = (&self.inner, &self.entry) else {
-            return Ok(());
+            return Ok(None);
         };
         entry.lock_recover().append(&inner.config, event)
     }
+}
+
+/// Where one appended record landed in the audit log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditReceipt {
+    pub audit_session_id: String,
+    pub sequence: u64,
+    pub record_hash: String,
 }
 
 /// The audit record of what settled a tool call.
