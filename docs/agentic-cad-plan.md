@@ -59,6 +59,20 @@ mainly a new client, not new execution machinery.
 format 6 and protocol 7. Until A3, both adapters refuse a request that
 carries images rather than send only its text.
 
+A3 is implemented. Model profiles have `vision = true|false` (default
+false), carried to the daemon on the session's model binding (session
+protocol 22). Before each provider request the engine reads the images the
+request refers to from the session's store, newest first, up to 64 MiB per
+request. Both adapters share one layout: a user message carries its images
+(OpenAI-compatible `image_url` data-URL parts; Ollama's `images` array),
+and images on a tool result go in a `user` message after the block of tool
+results, naming the call. Without vision, or when an image's bytes cannot be
+read, the model gets a placeholder such as `[image: renders/bracket.png,
+1568x1176, not shown: this model is not configured for images]`, so a
+session switched between models never fails on its history. Behaviour on
+specific servers (vLLM, TabbyAPI, Ollama) still needs checking per model;
+nothing produces images until A4.
+
 A2's store is implemented: `ImageStore` in `xshell-execution`, one
 directory per session under `images/` in the daemon's state directory.
 Each session has its own store, so a session can only reference images

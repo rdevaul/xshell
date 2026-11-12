@@ -43,6 +43,10 @@ pub struct ModelProfile {
     /// `//limits` chose one.
     #[serde(default)]
     pub limits: Option<String>,
+    /// Whether the model takes images. Without it, images in the
+    /// conversation are sent as short text placeholders.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 /// Turn limits: which profile applies when nothing else chooses one, and
@@ -91,6 +95,7 @@ impl ActiveModel {
             max_history_bytes: self.max_history_bytes,
             context_tokens: self.context_tokens,
             reserve_output_tokens: self.reserve_output_tokens,
+            vision: self.vision,
         }
     }
 
@@ -113,6 +118,7 @@ impl ActiveModel {
             max_history_bytes: binding.max_history_bytes,
             context_tokens: binding.context_tokens,
             reserve_output_tokens: binding.reserve_output_tokens,
+            vision: binding.vision,
         })
     }
 }
@@ -135,6 +141,7 @@ pub struct ActiveModel {
     pub max_history_bytes: Option<usize>,
     pub context_tokens: Option<usize>,
     pub reserve_output_tokens: Option<usize>,
+    pub vision: bool,
 }
 
 impl XshellConfig {
@@ -211,6 +218,7 @@ impl XshellConfig {
             max_history_bytes: selected.and_then(|profile| profile.max_history_bytes),
             context_tokens: selected.and_then(|profile| profile.context_tokens),
             reserve_output_tokens: selected.and_then(|profile| profile.reserve_output_tokens),
+            vision: selected.is_some_and(|profile| profile.vision),
         })
     }
 
@@ -232,6 +240,7 @@ impl XshellConfig {
             max_history_bytes: profile.max_history_bytes,
             context_tokens: profile.context_tokens,
             reserve_output_tokens: profile.reserve_output_tokens,
+            vision: profile.vision,
         })
     }
 

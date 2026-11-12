@@ -18,6 +18,20 @@ pub fn connect_when_ready(socket: &Path) -> SessionClient {
 }
 
 pub fn serve_sse(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+    let (url, handle, _bodies) = serve_sse_recording(responses);
+    (url, handle)
+}
+
+/// As [`serve_sse`], also keeping each request body the server received.
+pub fn serve_sse_recording(
+    responses: Vec<String>,
+) -> (
+    String,
+    thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&bodies);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
@@ -46,6 +60,10 @@ pub fn serve_sse(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
                 let count = socket.read(&mut buffer).unwrap();
                 request.extend_from_slice(&buffer[..count]);
             }
+            recorded
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request[header_end..]).into_owned());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -53,7 +71,7 @@ pub fn serve_sse(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
             socket.write_all(response.as_bytes()).unwrap();
         }
     });
-    (format!("http://{address}"), handle)
+    (format!("http://{address}"), handle, bodies)
 }
 
 pub fn sse_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> String {

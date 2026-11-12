@@ -26,7 +26,7 @@ use tokio::sync::{Notify, mpsc};
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{
     AdapterError, AgentEvent, AssistantResponse, ChatMessage, ChatRequest, DEFAULT_SYSTEM_PROMPT,
-    MessageRole, ToolCall,
+    ImageBytes, ImageSource, MessageRole, ToolCall,
 };
 
 /// How many times one turn may be nudged to keep going after the model ends a
@@ -293,6 +293,9 @@ pub struct AdapterConfig {
     pub model: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    /// Whether the model takes images. Without it, images are sent as text
+    /// placeholders.
+    pub vision: bool,
 }
 
 /// A one-way "stop" signal shared between a running turn and whoever may
@@ -348,12 +351,13 @@ pub trait TurnObserver: Send {
 
 pub fn build_adapter(config: &AdapterConfig) -> Result<Box<dyn AgentAdapter>> {
     let adapter: Box<dyn AgentAdapter> = match config.provider.as_str() {
-        "ollama" => Box::new(OllamaAdapter::new(&config.base_url, &config.model)),
-        "openai" => Box::new(OpenAiCompatibleAdapter::new(
-            &config.base_url,
-            &config.model,
-            resolve_api_key(config)?,
-        )),
+        "ollama" => {
+            Box::new(OllamaAdapter::new(&config.base_url, &config.model).with_vision(config.vision))
+        }
+        "openai" => Box::new(
+            OpenAiCompatibleAdapter::new(&config.base_url, &config.model, resolve_api_key(config)?)
+                .with_vision(config.vision),
+        ),
         provider => bail!("unsupported agent provider {provider:?}"),
     };
     Ok(adapter)
@@ -394,6 +398,9 @@ pub struct TurnPolicy {
     /// The daemon session the turn belongs to, passed to tool providers so
     /// they can keep per-session state. `None` outside a daemon.
     pub session_id: Option<String>,
+    /// Where the bytes of the conversation's images are read from, when the
+    /// model takes images. `None` sends every image as a placeholder.
+    pub images: Option<Arc<dyn ImageSource>>,
     /// Limits for a root turn. A child agent draws from its root turn's
     /// [`TurnBudget`] instead (see [`run_agent_turn_with_budget`]).
     pub limits: TurnLimits,
@@ -410,6 +417,7 @@ impl std::fmt::Debug for TurnPolicy {
             .field("tools", &self.tools)
             .field("agent_scope", &self.agent_scope)
             .field("session_id", &self.session_id)
+            .field("images", &self.images.is_some())
             .field("limits", &self.limits)
             .finish()
     }
@@ -426,6 +434,7 @@ impl Clone for TurnPolicy {
             tools: self.tools.clone(),
             agent_scope: self.agent_scope.clone(),
             session_id: self.session_id.clone(),
+            images: self.images.clone(),
             limits: self.limits,
         }
     }
@@ -442,12 +451,19 @@ impl TurnPolicy {
             tools: ToolSet::all(),
             agent_scope: None,
             session_id: None,
+            images: None,
             limits: TurnLimits::default(),
         }
     }
 
     pub fn with_tools(mut self, tools: ToolSet) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Read image bytes from `images` for models that take images.
+    pub fn with_images(mut self, images: Arc<dyn ImageSource>) -> Self {
+        self.images = Some(images);
         self
     }
 
@@ -649,6 +665,11 @@ pub async fn run_agent_turn_with_budget(
             tokio::select! {
                 response = agent.chat_stream(
                     ChatRequest {
+                        images: if agent.accepts_images() {
+                            read_images(policy.images.as_deref(), &request_messages)
+                        } else {
+                            ImageBytes::new()
+                        },
                         messages: request_messages,
                         tools: tools.clone(),
                     },
@@ -1279,6 +1300,43 @@ impl TurnObserver for SubagentObserver<'_> {
 
 /// Answer a call without evaluating it: a policy denial with `result` as the
 /// tool's output, so history stays consistent and the record says why.
+/// Most image bytes sent with one provider request. The newest images are
+/// read first; older ones beyond this go as placeholders.
+const MAX_REQUEST_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read the bytes of the images `messages` refer to, newest first, until
+/// [`MAX_REQUEST_IMAGE_BYTES`]. An image that cannot be read is left out, so
+/// the adapter sends a placeholder for it instead of failing the turn.
+fn read_images(source: Option<&dyn ImageSource>, messages: &[ChatMessage]) -> ImageBytes {
+    let mut bytes = ImageBytes::new();
+    let Some(source) = source else {
+        return bytes;
+    };
+    let mut total = 0_u64;
+    for image in messages
+        .iter()
+        .rev()
+        .flat_map(|message| message.images.iter().rev())
+    {
+        if bytes.contains_key(image.sha256()) {
+            continue;
+        }
+        if total.saturating_add(image.byte_len()) > MAX_REQUEST_IMAGE_BYTES {
+            break;
+        }
+        match source.image_bytes(image) {
+            Ok(data) => {
+                total = total.saturating_add(data.len() as u64);
+                bytes.insert(image.sha256().to_owned(), Arc::new(data));
+            }
+            // The engine has no logger of its own; the daemon's stderr is
+            // its log.
+            Err(error) => eprintln!("xshell: image {} is not readable: {error}", image.sha256()),
+        }
+    }
+    bytes
+}
+
 fn refuse_tool_call(
     observer: &mut dyn TurnObserver,
     history: &mut Vec<ChatMessage>,
@@ -4427,6 +4485,65 @@ mod tests {
         ] {
             assert!(!announces_next_step(line), "{line}");
         }
+    }
+
+    /// Serves image bytes from memory; anything else is unreadable.
+    struct MemoryImages(std::collections::HashMap<String, Vec<u8>>);
+
+    impl ImageSource for MemoryImages {
+        fn image_bytes(&self, image: &xshell_core::ImageRef) -> Result<Vec<u8>, String> {
+            self.0
+                .get(image.sha256())
+                .cloned()
+                .ok_or_else(|| "missing".to_owned())
+        }
+    }
+
+    fn image_ref(byte: u8, byte_len: u64) -> xshell_core::ImageRef {
+        xshell_core::ImageRef::new(
+            format!("{byte:064x}"),
+            xshell_core::ImageMediaType::Png,
+            4,
+            4,
+            byte_len,
+            format!("image-{byte}.png"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn images_are_read_newest_first_within_the_request_cap() {
+        let half = MAX_REQUEST_IMAGE_BYTES / 2;
+        let (old, middle, new, missing) = (
+            image_ref(1, half),
+            image_ref(2, half),
+            image_ref(3, 8),
+            image_ref(4, 8),
+        );
+        let source = MemoryImages(
+            [&old, &middle, &new]
+                .into_iter()
+                .map(|image| {
+                    (
+                        image.sha256().to_owned(),
+                        vec![0; usize::try_from(image.byte_len()).unwrap()],
+                    )
+                })
+                .collect(),
+        );
+        let messages = vec![
+            ChatMessage::user("first").with_images([old.clone()]),
+            ChatMessage::user("second").with_images([middle.clone()]),
+            ChatMessage::user("third").with_images([missing.clone(), new.clone()]),
+        ];
+        let read = read_images(Some(&source), &messages);
+        // The newest image and the next fit; the oldest would pass the cap,
+        // and the unreadable one is left for a placeholder.
+        assert!(read.contains_key(new.sha256()));
+        assert!(read.contains_key(middle.sha256()));
+        assert!(!read.contains_key(old.sha256()));
+        assert!(!read.contains_key(missing.sha256()));
+        assert!(read_images(None, &messages).is_empty());
     }
 
     /// Records the context of every call it runs and answers "<tool> ran".

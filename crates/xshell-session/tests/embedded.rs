@@ -70,6 +70,7 @@ fn creation(name: &str, base_url: &str, cwd: &Path, tools: SessionTools) -> Sess
             max_history_bytes: None,
             context_tokens: None,
             reserve_output_tokens: None,
+            vision: false,
         },
         cwd: cwd.into(),
         persistence: PersistenceMode::Daemon,
