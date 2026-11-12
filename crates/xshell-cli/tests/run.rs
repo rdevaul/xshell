@@ -626,6 +626,21 @@ fn a_finished_turn_is_reported_by_id_after_the_daemon_restarts() {
 }
 
 #[test]
+fn an_ephemeral_runs_turn_leaves_no_record() {
+    let fabric = Fabric::new(&serve(vec![sse_text("gone")]), true, true);
+    let output = fabric.run(&["--output", "jsonl", "--ephemeral", "hi"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let turn = events(&output)[0]["turn_id"].as_str().unwrap().to_owned();
+    let lookup = fabric.job("result", &["--turn", &turn]);
+    assert_eq!(lookup.status.code(), Some(2), "{lookup:?}");
+    let records = fabric.directory.path().join("state").join("turns");
+    let kept = std::fs::read_dir(&records)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(kept, 0, "an ephemeral turn left a record");
+}
+
+#[test]
 fn a_running_turn_can_be_followed_and_cancelled_by_id() {
     let fabric = Fabric::new(&serve(vec![HOLD.into()]), true, true);
     let started = fabric.run(&[

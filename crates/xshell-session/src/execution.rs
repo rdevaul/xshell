@@ -592,6 +592,10 @@ impl ExecutionCoordinator {
             approvals_denied: 0,
         };
         let session_name = snapshot.descriptor.name.clone();
+        // An ephemeral session promises to leave nothing behind when it
+        // ends, and nobody can wait on its turns afterwards, so its turns
+        // get no durable record.
+        let keep_record = snapshot.descriptor.persistence != crate::PersistenceMode::Ephemeral;
         let result = runtime.block_on(async {
             match input {
                 TurnInput::Agent { message } => {
@@ -736,7 +740,7 @@ impl ExecutionCoordinator {
             });
             // The durable record is written before the turn is released, so
             // a client that sees the end can look the turn up at once.
-            if let Some(turns) = &self.inner.turns {
+            if let Some(turns) = self.inner.turns.as_ref().filter(|_| keep_record) {
                 let (outcome, reason, message) = match &terminal {
                     SessionEventKind::TurnCompleted => (TurnOutcome::Completed, None, None),
                     SessionEventKind::TurnCancelled => (TurnOutcome::Cancelled, None, None),

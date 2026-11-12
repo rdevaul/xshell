@@ -70,7 +70,8 @@ With text output, `run --detach` prints the session name, for
   daemon no longer has its events, for example after a restart, which also
   ends sessions that are not `durable`. They then print a warning and the
   `result` line, with the same exit code the turn had. The daemon keeps the
-  256 most recent records.
+  256 most recent records. Turns in an `--ephemeral` session get no record:
+  the session leaves nothing behind when it ends.
 - **`--session` follows the journal.** The session forms report the latest
   turn the daemon's in-memory journal still holds, so after a restart they
   have nothing to report; use `--turn`.
