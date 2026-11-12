@@ -63,7 +63,8 @@ pub enum ImageStoreError {
     Empty,
     #[error(
         "the session's image store is full ({images} images, {bytes} bytes); \
-         remove images from the conversation or start a new session"
+         its space is freed when the session ends or the session host restarts, \
+         so start a new session to add more images"
     )]
     SessionFull { images: usize, bytes: u64 },
     #[error("image {0} is not in this session's store")]
@@ -144,6 +145,7 @@ impl ImageStore {
             .context("invalid image reference")?;
         let path = self.directory.join(&sha256);
         if self.verify_file(&path, &sha256, length).is_ok() {
+            self.write_metadata(&image)?;
             return Ok(image);
         }
 
@@ -173,8 +175,46 @@ impl ImageStore {
             file.sync_all()?;
             fs::rename(&temporary, &path)
                 .with_context(|| format!("cannot store image {}", path.display()))?;
-            // Make the rename itself durable: a session that records this
-            // image must still find it after a crash.
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+        // The metadata record is written after the image and synced with
+        // it below: an image without its record is refused by `contains`,
+        // never trusted on a client's word.
+        self.write_metadata(&image)?;
+        Ok(image)
+    }
+
+    /// Record the media type and dimensions ingestion decoded for `image`,
+    /// so history from a client can be checked against them.
+    fn write_metadata(&self, image: &ImageRef) -> Result<()> {
+        let record = metadata_record(image);
+        let path = self.metadata_path(image.sha256());
+        if fs::read(&path).is_ok_and(|existing| existing == record) {
+            return Ok(());
+        }
+        let temporary = self.directory.join(format!(
+            ".{}.meta.{}.tmp",
+            image.sha256(),
+            uuid_like_suffix()
+        ));
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)
+                .with_context(|| format!("cannot create {}", temporary.display()))?;
+            file.write_all(&record)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &path)
+                .with_context(|| format!("cannot store {}", path.display()))?;
+            // Make the renames durable: a session that records this image
+            // must still find it, and its record, after a crash.
             File::open(&self.directory)
                 .and_then(|directory| directory.sync_all())
                 .with_context(|| format!("cannot sync {}", self.directory.display()))?;
@@ -183,8 +223,11 @@ impl ImageStore {
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result?;
-        Ok(image)
+        result
+    }
+
+    fn metadata_path(&self, sha256: &str) -> PathBuf {
+        self.directory.join(format!("{sha256}{METADATA_SUFFIX}"))
     }
 
     /// The bytes of `image`, verified against its hash and length.
@@ -215,11 +258,21 @@ impl ImageStore {
         Ok(bytes)
     }
 
-    /// Whether the store holds `image`. Checks presence and length only; use
-    /// [`get`](Self::get) for a verified read.
+    /// Whether the store holds `image` as described: present with its
+    /// length, and with the media type and dimensions ingestion recorded for
+    /// it. A reference that claims other dimensions or another media type
+    /// is not held. Use [`get`](Self::get) for a verified read of the bytes.
     pub fn contains(&self, image: &ImageRef) -> bool {
-        fs::symlink_metadata(self.directory.join(image.sha256()))
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == image.byte_len())
+        let present = fs::symlink_metadata(self.directory.join(image.sha256()))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == image.byte_len());
+        present
+            && open_regular(&self.metadata_path(image.sha256()))
+                .and_then(|file| {
+                    let mut record = Vec::new();
+                    file.take(MAX_METADATA_BYTES).read_to_end(&mut record)?;
+                    Ok(record)
+                })
+                .is_ok_and(|record| record == metadata_record(image))
     }
 
     /// Fail unless every image in `images` is in the store. Used to refuse
@@ -259,6 +312,12 @@ impl ImageStore {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if is_hash(&name) && keep.contains(name.as_ref()) {
+                continue;
+            }
+            if name
+                .strip_suffix(METADATA_SUFFIX)
+                .is_some_and(|hash| is_hash(hash) && keep.contains(hash))
+            {
                 continue;
             }
             let metadata = entry.metadata()?;
@@ -321,6 +380,37 @@ impl xshell_core::ImageSource for ImageStore {
     fn image_bytes(&self, image: &ImageRef) -> std::result::Result<Vec<u8>, String> {
         self.get(image).map_err(|error| format!("{error:#}"))
     }
+}
+
+/// A session's images as an agent turn uses them: read what the
+/// conversation refers to, and add images a tool produced. Every image
+/// added goes through ingestion.
+pub trait SessionImages: xshell_core::ImageSource {
+    /// Ingest `source` and store it, labelled `label`.
+    fn ingest(&self, source: &[u8], label: &str) -> std::result::Result<ImageRef, String>;
+}
+
+impl SessionImages for ImageStore {
+    fn ingest(&self, source: &[u8], label: &str) -> std::result::Result<ImageRef, String> {
+        crate::ingest::ingest_into(self, source, label).map_err(|error| format!("{error:#}"))
+    }
+}
+
+/// Suffix of the file beside each image that records what ingestion decoded.
+const METADATA_SUFFIX: &str = ".meta";
+/// Longest metadata record read back.
+const MAX_METADATA_BYTES: u64 = 256;
+
+/// The metadata record for `image`: its media type and dimensions, as
+/// ingestion decoded them. Labels are free text and are not recorded.
+fn metadata_record(image: &ImageRef) -> Vec<u8> {
+    format!(
+        "{} {} {}\n",
+        image.media_type().as_str(),
+        image.width(),
+        image.height()
+    )
+    .into_bytes()
 }
 
 /// Remove the stores under `root` that belong to no session in `live`:
@@ -496,6 +586,39 @@ mod tests {
     }
 
     #[test]
+    fn references_must_match_the_recorded_media_type_and_dimensions() {
+        let (_temp, root) = root();
+        let store = store(&root, ImageStoreLimits::default());
+        let image = put(&store, b"rendered bytes").unwrap();
+        assert!(store.require_all([&image]).is_ok());
+        // A client claiming other dimensions for the same bytes is refused.
+        let forged = ImageRef::new(
+            image.sha256(),
+            ImageMediaType::Png,
+            4000,
+            3000,
+            image.byte_len(),
+            "plot.png",
+        )
+        .unwrap();
+        assert!(!store.contains(&forged));
+        assert!(store.require_all([&forged]).is_err());
+        let wrong_type = ImageRef::new(
+            image.sha256(),
+            ImageMediaType::Jpeg,
+            4,
+            3,
+            image.byte_len(),
+            "plot.png",
+        )
+        .unwrap();
+        assert!(!store.contains(&wrong_type));
+        // An image whose record is missing is not trusted either.
+        fs::remove_file(store.directory().join(format!("{}.meta", image.sha256()))).unwrap();
+        assert!(!store.contains(&image));
+    }
+
+    #[test]
     fn identical_bytes_are_stored_once() {
         let (_temp, root) = root();
         let limits = ImageStoreLimits {
@@ -625,7 +748,8 @@ mod tests {
         );
         assert!(store.contains(&kept));
         assert!(!store.contains(&dropped));
-        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 1);
+        // The kept image and its metadata record.
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 2);
     }
 
     #[test]
