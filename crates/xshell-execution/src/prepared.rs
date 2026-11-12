@@ -22,6 +22,11 @@
 //!   replacements of the path or its ancestors cannot change what is read.
 //!   Writes to the same file *can* change its bytes: approval authorizes the
 //!   object, not a snapshot of its content.
+//! - **Letter case.** On a case-insensitive volume a name may be spelled in
+//!   any case and still open the object (finding F13). The path recorded and
+//!   classified uses the names the filesystem stores where the platform
+//!   reports them (macOS, `F_GETPATH`), and sensitive-path matching folds
+//!   case in any event, so `.ENV` is classified as `.env`.
 //! - **Hard links.** A hard link is a second name for the same file and is
 //!   classified by the name used. Detecting every name of an inode is not
 //!   possible in general, so a hard link to a credential under an innocent
@@ -216,7 +221,10 @@ pub(crate) fn prepare(
             directory | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
         .with_context(|| format!("cannot open {}", display(&root, &opened, &component)))?;
-        opened.push((descriptor, component));
+        // Record the name the filesystem stores, not the one spelled: on a
+        // case-insensitive volume `.ENV` opens `.env` (finding F13).
+        let name = stored_name(parent, descriptor.as_raw_fd(), &component).unwrap_or(component);
+        opened.push((descriptor, name));
     }
 
     let path = opened
@@ -260,6 +268,47 @@ fn relative_to_root(root: &Path, spelled_root: &Path, requested: &Path) -> Resul
         .ok()
         .and_then(|canonical| canonical.strip_prefix(root).ok().map(Path::to_owned))
         .ok_or_else(|| anyhow::anyhow!(OUTSIDE_ROOT))
+}
+
+/// The name under which `parent` stores the object `descriptor` opened as
+/// `spelled`, when the platform can say and the answer is unambiguous. `None`
+/// keeps the spelled name, which is then matched case-insensitively.
+///
+/// On macOS `fcntl(F_GETPATH)` returns the path with the case the volume
+/// stores. A directory has one name, and so does a file with one link; a
+/// file with several hard links reports whichever name the kernel has
+/// cached, which may be another link than the one opened, so those keep the
+/// spelled name. The answer is used only if it names, in `parent`, the same
+/// object that is open, so a rename racing the walk cannot substitute a
+/// name from elsewhere.
+#[cfg(target_os = "macos")]
+fn stored_name(parent: RawFd, descriptor: RawFd, spelled: &OsStr) -> Option<OsString> {
+    let status = stat_descriptor(descriptor).ok()?;
+    if file_type(&status) != libc::S_IFDIR && status.st_nlink != 1 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX
+    // bytes into the buffer, which has that length.
+    if unsafe { libc::fcntl(descriptor, libc::F_GETPATH, buffer.as_mut_ptr()) } < 0 {
+        return None;
+    }
+    let length = buffer.iter().position(|byte| *byte == 0)?;
+    buffer.truncate(length);
+    let stored = Path::new(OsStr::from_bytes(&buffer))
+        .file_name()?
+        .to_owned();
+    if stored == spelled {
+        return Some(stored);
+    }
+    let named = stat_at(parent, &c_name(&stored).ok()?).ok()?;
+    (named.st_dev == status.st_dev && named.st_ino == status.st_ino).then_some(stored)
+}
+
+/// Other platforms keep the spelled name; matching folds case for them.
+#[cfg(not(target_os = "macos"))]
+fn stored_name(_parent: RawFd, _descriptor: RawFd, _spelled: &OsStr) -> Option<OsString> {
+    None
 }
 
 fn push_front_components(pending: &mut VecDeque<OsString>, path: &Path) {
@@ -360,7 +409,7 @@ fn file_type(status: &libc::stat) -> libc::mode_t {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -478,6 +527,94 @@ mod tests {
             assert_eq!(read_all(prepared), "SECRET=1");
             let error = prepare_file(given_root, "via-spelling-up").unwrap_err();
             assert!(error.to_string().contains(OUTSIDE_ROOT), "{error:#}");
+        }
+    }
+
+    /// Whether `directory` is on a case-insensitive volume, by experiment.
+    pub(crate) fn case_insensitive(directory: &Path) -> bool {
+        let probe = directory.join("f13-case-probe");
+        fs::write(&probe, "").unwrap();
+        let insensitive = directory.join("F13-CASE-PROBE").exists();
+        fs::remove_file(probe).unwrap();
+        insensitive
+    }
+
+    /// F13: on a case-insensitive volume a name spelled in another case opens
+    /// the stored object; it must be classified exactly as that object is.
+    #[test]
+    fn f13_case_variants_classify_like_the_stored_name() {
+        let (_temporary, root) = workspace();
+        if !case_insensitive(&root) {
+            eprintln!(
+                "skipping f13 filesystem test: {} is case-sensitive",
+                root.display()
+            );
+            return;
+        }
+        fs::create_dir_all(root.join(".ssh")).unwrap();
+        fs::write(root.join(".ssh/id_ed25519"), "key").unwrap();
+        fs::create_dir_all(root.join("deploy")).unwrap();
+        fs::write(root.join("deploy/server.pem"), "pem").unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config"), "token").unwrap();
+        for (variant, stored) in [
+            (".ENV", ".env"),
+            (".SSH/ID_ED25519", ".ssh/id_ed25519"),
+            ("deploy/server.PEM", "deploy/server.pem"),
+            ("DEPLOY/SERVER.PEM", "deploy/server.pem"),
+            (".GIT/config", ".git/config"),
+            (".Git/CONFIG", ".git/config"),
+        ] {
+            let canonical = prepare_file(&root, stored).unwrap();
+            assert!(canonical.sensitive(), "{stored} is sensitive");
+            let prepared = prepare_file(&root, variant).unwrap();
+            assert!(
+                prepared.sensitive(),
+                "f13: {variant} must be sensitive like {stored}"
+            );
+            // macOS reports the stored names, so the recorded path is the
+            // object's own path however it was spelled.
+            #[cfg(target_os = "macos")]
+            assert_eq!(prepared.path(), root.join(stored), "f13: {variant}");
+        }
+        let directory = prepare(
+            &root,
+            ".SSH",
+            ObjectKind::Directory,
+            &SensitivePaths::default(),
+        )
+        .unwrap();
+        assert!(directory.sensitive(), "f13: .SSH must be sensitive");
+        // A hard link keeps the spelled name (the kernel may report another
+        // link's), and folding still classifies it.
+        fs::hard_link(root.join(".env"), root.join("linked.txt")).unwrap();
+        let linked = prepare_file(&root, ".ENV").unwrap();
+        assert!(linked.sensitive(), "f13: a hard-linked .ENV is sensitive");
+        // Ordinary files keep classifying as before.
+        assert!(!prepare_file(&root, "NOTES.TXT").unwrap().sensitive());
+    }
+
+    /// F13 on macOS: APFS folds more than ASCII case. These spellings open
+    /// `server.key` there, and the stored name is what gets classified.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn f13_unicode_foldings_classify_like_the_stored_name() {
+        let (_temporary, root) = workspace();
+        if !case_insensitive(&root) {
+            eprintln!(
+                "skipping f13 filesystem test: {} is case-sensitive",
+                root.display()
+            );
+            return;
+        }
+        fs::write(root.join("server.key"), "key").unwrap();
+        for variant in ["\u{17F}erver.key", "server.\u{212A}ey", "SERVER.KEY"] {
+            let Ok(prepared) = prepare_file(&root, variant) else {
+                // This volume does not fold this spelling; nothing to dodge.
+                continue;
+            };
+            assert!(prepared.sensitive(), "f13: {variant:?} must be sensitive");
+            assert_eq!(prepared.path(), root.join("server.key"), "f13: {variant:?}");
         }
     }
 
