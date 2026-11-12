@@ -140,12 +140,10 @@ fn main() -> Result<()> {
     )?;
     let user = args.user.unwrap_or_else(system_user);
     let host_id = load_or_create_host_id(&state_directory)?;
-    let registry = Arc::new(Mutex::new(SessionRegistry::load(
-        state_directory.clone(),
-        host_id,
-        host_alias,
-        user,
-    )?));
+    config.validate_budgets()?;
+    let mut registry = SessionRegistry::load(state_directory.clone(), host_id, host_alias, user)?;
+    registry.set_max_sessions(config.max_sessions);
+    let registry = Arc::new(Mutex::new(registry));
     let audit = DaemonAudit::from_config(&audit_config)?;
     let (rules, warnings) = config.approval_policy()?;
     for warning in warnings {
@@ -161,6 +159,7 @@ fn main() -> Result<()> {
             blocked_paths: config.blocked_paths(),
             rules,
             compaction: config.compaction.clone(),
+            max_concurrent_turns: config.max_concurrent_turns,
         },
     );
     let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
@@ -180,6 +179,11 @@ fn main() -> Result<()> {
     drop(identity);
     println!("max approval: {}", execution.max_approval());
     println!("max limits: {}", execution.max_limits().summary());
+    println!(
+        "budgets: {} sessions, {} concurrent turns",
+        config.max_sessions,
+        execution.max_concurrent_turns()
+    );
     println!(
         "audit: {}",
         match (execution.audit().enabled(), execution.audit().required()) {
@@ -853,7 +857,19 @@ fn handle_client(
         );
         let sent = match response {
             Ok(response) => send(&mut writer, &response),
-            Err(error) => send_error(&mut writer, "request_failed", &format!("{error:#}")),
+            Err(error) => {
+                // A spent daemon-wide budget has its own code, so a client
+                // can tell "try later" from a failure.
+                let code = if error
+                    .chain()
+                    .any(|cause| cause.is::<xshell_session::CapacityExhausted>())
+                {
+                    "capacity"
+                } else {
+                    "request_failed"
+                };
+                send_error(&mut writer, code, &format!("{error:#}"))
+            }
         };
         if let Err(error) = sent {
             break Err(error);

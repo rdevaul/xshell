@@ -63,9 +63,11 @@ ack_timeout_ms = 5000
 # Turn limits. Every agent turn, with the subagents it starts, draws from one
 # budget. Two profiles are built in:
 #   default: 128 provider requests, 256 tool calls (64 per response), 1h wall
-#            time, 60s shell timeout, 2 automatic continuations
+#            time, 60s shell timeout, 2 automatic continuations, 8 MiB of
+#            tool output (tool_output_bytes)
 #   relaxed: 2000 provider requests, 5000 tool calls (128 per response), 8h
-#            wall time, 30m shell timeout, 50 automatic continuations
+#            wall time, 30m shell timeout, 50 automatic continuations,
+#            128 MiB of tool output
 # Choose one with --limits NAME, //limits NAME, `limits = "NAME"` on a model
 # profile, or `limits` below (checked in that order). A table named after a
 # built-in profile overrides only the fields it sets; any other name defines a
@@ -130,6 +132,11 @@ default_session = "default"
 # this value and told so. Raise to "auto" only on a host where you would run
 # `xshell --approval auto` yourself.
 max_approval = "ask"
+# Daemon-wide budgets: turns running at once across all sessions, and sessions
+# kept at once. Beyond either, new turns or sessions are refused (xshell run
+# exits 6) until one finishes or is closed.
+# max_concurrent_turns = 8
+# max_sessions = 256
 # Read-only agent tools (read_file, list_directory) normally run without a
 # prompt. Paths matching these globs are promoted to approval-gated so a model
 # cannot silently read credentials. Patterns are matched against the canonical

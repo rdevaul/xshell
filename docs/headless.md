@@ -71,6 +71,11 @@ xshell cancel --session "$session"     # cancel and report (exit 4)
   detached turn's prompt waits until `wait` or an interactive client answers
   it, so `run --detach` in `ask` mode warns about this. Use `--approval auto`
   or `off` for unattended jobs.
+- **Daemon budgets:** the daemon runs at most `max_concurrent_turns` turns
+  and keeps at most `max_sessions` sessions; a run beyond either exits 6.
+  A detached turn holds its place until it ends, and each run's session is
+  kept unless the run is `--ephemeral`
+  (see [daemon budgets](session-fabric.md#daemon-budgets)).
 - **Retention:** turns are replayed from the daemon's in-memory event
   journal, which keeps recent turns until its size bound evicts them and does
   not survive a daemon restart. The session and its conversation persist as
@@ -137,7 +142,7 @@ with os.fdopen(write_fd, "w") as channel:
 | 3 | `budget_exhausted` | A turn limit ran out |
 | 4 | `cancelled` | The turn was cancelled, by a signal or another client |
 | 5 | `approval_denied` | The turn failed after the run denied an approval |
-| 6 | `unavailable` | The daemon could not be reached, or required auditing failed |
+| 6 | `unavailable` | Try again later: the daemon could not be reached, required auditing failed, or a [daemon budget](session-fabric.md#daemon-budgets) is spent |
 | 7 | `running` | The turn is still running (`result`, or an interrupted `wait`) |
 
 `run --detach` and `status` exit 0.

@@ -483,6 +483,56 @@ fn cancel_stops_a_detached_turn_and_reports_it() {
 }
 
 #[test]
+fn daemon_budgets_refuse_extra_turns_and_sessions_with_exit_six() {
+    let fabric = Fabric::with_config(
+        &serve(vec![HOLD.into(), sse_text("done")]),
+        true,
+        true,
+        "max_sessions = 2\nmax_concurrent_turns = 1",
+        "",
+    );
+    let started = fabric.run(&[
+        "--detach",
+        "--approval",
+        "auto",
+        "--session",
+        "stuck",
+        "think",
+    ]);
+    assert_eq!(started.status.code(), Some(0), "{started:?}");
+
+    // A second turn anywhere on the host is refused while the first runs.
+    let refused = fabric.run(&["--output", "jsonl", "hi"]);
+    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
+    let result = events(&refused).pop().unwrap();
+    assert_eq!(result["outcome"], "unavailable");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_concurrent_turns"),
+        "{result}"
+    );
+
+    // Once it ends, the next run starts. It fits in the session budget only
+    // because the refused run closed the session it had created.
+    let cancelled = fabric.job("cancel", &["--session", "stuck"]);
+    assert_eq!(cancelled.status.code(), Some(4), "{cancelled:?}");
+    let second = fabric.run(&["--session", "second", "hi"]);
+    assert_eq!(second.status.code(), Some(0), "{second:?}");
+    assert_eq!(String::from_utf8_lossy(&second.stdout), "done\n");
+
+    // Two sessions are kept; a third is refused.
+    let full = fabric.run(&["--output", "jsonl", "--session", "third", "hi"]);
+    assert_eq!(full.status.code(), Some(6), "{full:?}");
+    let result = events(&full).pop().unwrap();
+    assert!(
+        result["message"].as_str().unwrap().contains("max_sessions"),
+        "{result}"
+    );
+}
+
+#[test]
 fn job_commands_need_an_existing_session() {
     let fabric = Fabric::new(&serve(Vec::new()), true, true);
     let unnamed = fabric.job("wait", &[]);

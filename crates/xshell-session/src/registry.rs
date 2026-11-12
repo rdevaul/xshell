@@ -27,6 +27,8 @@ pub struct SessionRegistry {
     sessions: HashMap<String, SessionRecord>,
     in_flight: HashMap<String, DurableInFlight>,
     image_limits: ImageStoreLimits,
+    /// Most sessions kept at once; creating another is refused.
+    max_sessions: usize,
 }
 
 /// Directory under the state directory that holds each session's image
@@ -148,12 +150,19 @@ impl SessionRegistry {
             sessions,
             in_flight: HashMap::new(),
             image_limits: ImageStoreLimits::default(),
+            max_sessions: crate::DEFAULT_MAX_SESSIONS,
         };
         if recovered_in_flight {
             registry.persist()?;
         }
         registry.collect_images();
         Ok(registry)
+    }
+
+    /// Set the most sessions this registry keeps. Sessions restored beyond
+    /// it stay; only new ones are refused.
+    pub fn set_max_sessions(&mut self, max_sessions: usize) {
+        self.max_sessions = max_sessions;
     }
 
     pub fn host_id(&self) -> &str {
@@ -185,6 +194,16 @@ impl SessionRegistry {
     ) -> Result<SessionSnapshot> {
         validate_name(&creation.name)?;
         creation.cwd = validate_working_directory(&creation.cwd)?;
+        if self.sessions.len() >= self.max_sessions {
+            return Err(crate::CapacityExhausted {
+                message: format!(
+                    "this host already has {} sessions, its limit (session_fabric.max_sessions); \
+close one to create another",
+                    self.sessions.len()
+                ),
+            }
+            .into());
+        }
         if self
             .sessions
             .values()

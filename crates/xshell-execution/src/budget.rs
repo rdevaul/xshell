@@ -37,7 +37,14 @@ pub struct TurnLimits {
     /// Automatic continuations per agent, after a response that ended
     /// without finishing (for example, cut off by the output token limit).
     pub auto_continues: usize,
+    /// Bytes of tool results the turn may hand back to the model, summed
+    /// over every agent in the turn. The result that crosses it is kept;
+    /// the turn then stops at its next provider request or tool call.
+    pub tool_output_bytes: usize,
 }
+
+/// One mebibyte, for the byte limits below.
+const MIB: usize = 1024 * 1024;
 
 impl Default for TurnLimits {
     fn default() -> Self {
@@ -48,6 +55,7 @@ impl Default for TurnLimits {
             wall_time: Duration::from_secs(60 * 60),
             shell_timeout: Duration::from_secs(60),
             auto_continues: 2,
+            tool_output_bytes: 8 * MIB,
         }
     }
 }
@@ -64,6 +72,7 @@ impl TurnLimits {
             wall_time: Duration::from_secs(8 * 60 * 60),
             shell_timeout: Duration::from_secs(30 * 60),
             auto_continues: 50,
+            tool_output_bytes: 128 * MIB,
         }
     }
 
@@ -88,6 +97,7 @@ impl TurnLimits {
             wall_time: self.wall_time.min(ceiling.wall_time),
             shell_timeout: self.shell_timeout.min(ceiling.shell_timeout),
             auto_continues: self.auto_continues.min(ceiling.auto_continues),
+            tool_output_bytes: self.tool_output_bytes.min(ceiling.tool_output_bytes),
         };
         (clamped, clamped != self)
     }
@@ -100,6 +110,7 @@ impl TurnLimits {
             ("provider_requests", self.provider_requests),
             ("tool_calls", self.tool_calls),
             ("tool_calls_per_response", self.tool_calls_per_response),
+            ("tool_output_bytes", self.tool_output_bytes),
         ] {
             if value == 0 {
                 bail!("{name} must be at least 1");
@@ -123,13 +134,14 @@ impl TurnLimits {
     pub fn summary(&self) -> String {
         format!(
             "{} provider requests, {} tool calls ({} per response), {} wall time, \
-{} shell timeout, {} automatic continuations",
+{} shell timeout, {} automatic continuations, {} of tool output",
             self.provider_requests,
             self.tool_calls,
             self.tool_calls_per_response,
             format_span(self.wall_time),
             format_span(self.shell_timeout),
             self.auto_continues,
+            format_bytes(self.tool_output_bytes),
         )
     }
 }
@@ -160,6 +172,8 @@ pub struct LimitSettings {
     pub shell_timeout: Option<Duration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_continues: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_output_bytes: Option<usize>,
 }
 
 impl LimitSettings {
@@ -175,6 +189,7 @@ impl LimitSettings {
             wall_time: self.wall_time.unwrap_or(base.wall_time),
             shell_timeout: self.shell_timeout.unwrap_or(base.shell_timeout),
             auto_continues: self.auto_continues.unwrap_or(base.auto_continues),
+            tool_output_bytes: self.tool_output_bytes.unwrap_or(base.tool_output_bytes),
         };
         limits.validate()?;
         Ok(limits)
@@ -261,6 +276,8 @@ pub enum BudgetExhausted {
     ToolCalls(usize),
     #[error("agent turn exhausted its {} time budget", format_duration(*.0))]
     WallTime(Duration),
+    #[error("agent turn exhausted its budget of {} of tool output", format_bytes(*.0))]
+    ToolOutputBytes(usize),
 }
 
 /// The shared, consumable form of [`TurnLimits`] for one root turn. Clones
@@ -275,6 +292,7 @@ struct BudgetInner {
     deadline: Instant,
     provider_requests: AtomicUsize,
     tool_calls: AtomicUsize,
+    tool_output_bytes: AtomicUsize,
 }
 
 impl TurnBudget {
@@ -290,6 +308,7 @@ impl TurnBudget {
             deadline,
             provider_requests: AtomicUsize::new(0),
             tool_calls: AtomicUsize::new(0),
+            tool_output_bytes: AtomicUsize::new(0),
         }))
     }
 
@@ -300,6 +319,7 @@ impl TurnBudget {
     /// Reserve one provider request, or report the limit that prevents it.
     pub fn charge_provider_request(&self) -> Result<(), BudgetExhausted> {
         self.check_time()?;
+        self.check_output()?;
         charge(
             &self.0.provider_requests,
             self.0.limits.provider_requests,
@@ -310,6 +330,7 @@ impl TurnBudget {
     /// Reserve one tool call, or report the limit that prevents it.
     pub fn charge_tool_call(&self) -> Result<(), BudgetExhausted> {
         self.check_time()?;
+        self.check_output()?;
         charge(
             &self.0.tool_calls,
             self.0.limits.tool_calls,
@@ -323,6 +344,31 @@ impl TurnBudget {
         } else {
             Ok(())
         }
+    }
+
+    /// Count `bytes` of tool result handed back to the model. Never fails:
+    /// the result is already produced, and keeping it keeps the history
+    /// consistent. The next charge reports the exhaustion.
+    pub fn record_tool_output(&self, bytes: usize) {
+        let _ =
+            self.0
+                .tool_output_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    Some(used.saturating_add(bytes))
+                });
+    }
+
+    fn check_output(&self) -> Result<(), BudgetExhausted> {
+        let limit = self.0.limits.tool_output_bytes;
+        if self.0.tool_output_bytes.load(Ordering::Acquire) >= limit {
+            Err(BudgetExhausted::ToolOutputBytes(limit))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn tool_output_bytes_used(&self) -> usize {
+        self.0.tool_output_bytes.load(Ordering::Acquire)
     }
 
     /// Resolves when the time budget runs out.
@@ -364,6 +410,18 @@ fn format_duration(duration: Duration) -> String {
         format!("{seconds}-second")
     } else {
         format!("{}-millisecond", duration.as_millis())
+    }
+}
+
+/// A byte count for messages: `"8 MiB"`, `"512 KiB"`, `"100 bytes"`.
+fn format_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
