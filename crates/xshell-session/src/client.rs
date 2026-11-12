@@ -487,6 +487,35 @@ impl SessionClient {
         }
     }
 
+    /// Upload an image file for the session's next agent message. The daemon
+    /// decodes, bounds and re-encodes it, stores it in the session's store,
+    /// and returns its reference to attach with
+    /// [`TurnInput::Agent`]'s `images`.
+    pub fn upload_image(
+        &mut self,
+        session_id: String,
+        bytes: &[u8],
+        label: String,
+    ) -> Result<xshell_core::ImageRef> {
+        use base64::Engine as _;
+        if bytes.len() as u64 > crate::MAX_UPLOAD_IMAGE_BYTES {
+            bail!(
+                "the image is {} bytes; the limit is {}",
+                bytes.len(),
+                crate::MAX_UPLOAD_IMAGE_BYTES
+            );
+        }
+        self.send(&ClientRequest::UploadImage {
+            session_id,
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            label,
+        })?;
+        match self.receive()? {
+            ServerResponse::ImageStored { image } => Ok(image),
+            response => response_error("image upload", response),
+        }
+    }
+
     pub fn events(
         &mut self,
         session_id: String,

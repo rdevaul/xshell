@@ -1318,6 +1318,7 @@ fn f3_sigterm_cancels_agent_tool_process_group_before_exit() {
             session_id.clone(),
             TurnInput::Agent {
                 message: "run the tool".into(),
+                images: Vec::new(),
             },
             ApprovalPolicy::Auto,
         )
@@ -1552,6 +1553,7 @@ fn a_vision_model_is_shown_the_sessions_stored_images() {
                 session_id.clone(),
                 TurnInput::Agent {
                     message: "what is it?".into(),
+                    images: Vec::new(),
                 },
                 ApprovalPolicy::Ask,
             )
@@ -1668,6 +1670,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             session.descriptor.id.clone(),
             TurnInput::Agent {
                 message: "use the tool".into(),
+                images: Vec::new(),
             },
             ApprovalPolicy::Ask,
         )
@@ -1812,6 +1815,7 @@ fn f9_tool_call_from_an_unfinished_stream_never_runs() {
             session.descriptor.id.clone(),
             TurnInput::Agent {
                 message: "run it".into(),
+                images: Vec::new(),
             },
             ApprovalPolicy::Ask,
         )
@@ -1912,6 +1916,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
             session.descriptor.id.clone(),
             TurnInput::Agent {
                 message: "delegate it".into(),
+                images: Vec::new(),
             },
             ApprovalPolicy::Ask,
         )
@@ -2052,6 +2057,7 @@ fn f1_failed_agent_effect_survives_durable_session_reload() {
                 session_id.clone(),
                 TurnInput::Agent {
                     message: "perform effect".into(),
+                    images: Vec::new(),
                 },
                 ApprovalPolicy::Auto,
             )
@@ -2464,6 +2470,7 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
             session.descriptor.id.clone(),
             TurnInput::Agent {
                 message: "run it".into(),
+                images: Vec::new(),
             },
             ApprovalPolicy::Auto,
         )
@@ -2690,6 +2697,7 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
             session_id.clone(),
             TurnInput::Agent {
                 message: "clean up".into(),
+                images: Vec::new(),
             },
             ApprovalPolicy::Ask,
             None,
@@ -3391,6 +3399,7 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
             session.descriptor.id.clone(),
             TurnInput::Agent {
                 message: "look around".into(),
+                images: Vec::new(),
             },
             ApprovalPolicy::Ask,
             Some(requested),

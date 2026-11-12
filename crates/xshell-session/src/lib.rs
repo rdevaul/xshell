@@ -30,7 +30,7 @@ pub use model::{
     SessionSnapshot, SessionStatus, ShellCompletionCandidate, ShellCompletionResult, TurnAuditRef,
     TurnFailureReason, TurnInput, ViewResource, Visibility,
 };
-pub use protocol::{ClientRequest, ServerResponse};
+pub use protocol::{ClientRequest, MAX_UPLOAD_IMAGE_BYTES, ServerResponse};
 pub use pty::{PtyAudit, PtyClaim, PtyCoordinator, PtyReadResult};
 pub use pty_stream::{
     ClientPtyFrame, PtyStreamClient, ServerPtyFrame, read_client_frame, read_server_frame,

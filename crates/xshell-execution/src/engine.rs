@@ -408,6 +408,9 @@ pub struct TurnPolicy {
     /// for models that take images; `None` sends every image as a
     /// placeholder and leaves `view_image` out of the toolset.
     pub images: Option<Arc<dyn SessionImages>>,
+    /// Images attached to the turn's user message, such as files the user
+    /// attached. The caller has checked they are in the session's store.
+    pub message_images: Vec<xshell_core::ImageRef>,
     /// Limits for a root turn. A child agent draws from its root turn's
     /// [`TurnBudget`] instead (see [`run_agent_turn_with_budget`]).
     pub limits: TurnLimits,
@@ -425,6 +428,7 @@ impl std::fmt::Debug for TurnPolicy {
             .field("agent_scope", &self.agent_scope)
             .field("session_id", &self.session_id)
             .field("images", &self.images.is_some())
+            .field("message_images", &self.message_images)
             .field("limits", &self.limits)
             .finish()
     }
@@ -442,6 +446,7 @@ impl Clone for TurnPolicy {
             agent_scope: self.agent_scope.clone(),
             session_id: self.session_id.clone(),
             images: self.images.clone(),
+            message_images: self.message_images.clone(),
             limits: self.limits,
         }
     }
@@ -459,8 +464,15 @@ impl TurnPolicy {
             agent_scope: None,
             session_id: None,
             images: None,
+            message_images: Vec::new(),
             limits: TurnLimits::default(),
         }
+    }
+
+    /// Attach `images` to the turn's user message.
+    pub fn with_message_images(mut self, images: Vec<xshell_core::ImageRef>) -> Self {
+        self.message_images = images;
+        self
     }
 
     pub fn with_tools(mut self, tools: ToolSet) -> Self {
@@ -642,7 +654,7 @@ pub async fn run_agent_turn_with_budget(
     let approval = policy.approval;
     // Keep the exact prior history for failed/cancelled-turn rollback.
     let mut rollback_history = history.clone();
-    history.push(ChatMessage::user(message));
+    history.push(ChatMessage::user(message).with_images(policy.message_images.iter().cloned()));
     let tools = policy.tools.definitions();
     let mut call_ids = CallIds::new(policy.agent_scope.as_deref());
     let mut delegations = 0;
@@ -1236,10 +1248,13 @@ async fn run_delegation(
         Some(scope) => format!("{scope}/delegate-{number}"),
         None => format!("delegate-{number}"),
     };
+    // The subagent's task is text only: images attached to the parent's
+    // message stay with the parent.
     let child_policy = policy
         .clone()
         .with_tools(tools.clone())
-        .with_agent_scope(name.clone());
+        .with_agent_scope(name.clone())
+        .with_message_images(Vec::new());
     observer.emit(ExecutionEvent::SubagentStarted {
         agent: name.clone(),
         task: task.clone(),

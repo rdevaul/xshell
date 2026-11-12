@@ -111,6 +111,7 @@ fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
             session_id.clone(),
             TurnInput::Agent {
                 message: "what do you remember?".into(),
+                images: Vec::new(),
             },
             // Ask with nobody to answer: the read-only, ungated tool must run
             // without a prompt.

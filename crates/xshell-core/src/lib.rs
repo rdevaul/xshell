@@ -26,6 +26,9 @@ pub enum ControlCommand {
     Limits(Vec<String>),
     Agent(Vec<String>),
     View(String),
+    /// Attach an image file to the next agent message: the path, or empty to
+    /// list or clear pending attachments.
+    Attach(String),
     Connect(Vec<String>),
     Sessions,
     Resume(Vec<String>),
@@ -67,6 +70,9 @@ fn parse_control(input: &str) -> ControlCommand {
     let rest = words.next().unwrap_or("").trim();
     if name == "view" {
         return ControlCommand::View(rest.to_owned());
+    }
+    if name == "attach" {
+        return ControlCommand::Attach(rest.to_owned());
     }
     let args: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
 

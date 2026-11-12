@@ -90,7 +90,21 @@ pub enum ClientRequest {
     Close {
         selector: Option<String>,
     },
+    /// Add an image to the session's store, for the client to attach to its
+    /// next agent message. The daemon decodes and re-encodes it itself, so
+    /// the dimensions it reports are its own, never the client's.
+    UploadImage {
+        session_id: String,
+        /// The image file, base64-encoded. At most
+        /// [`MAX_UPLOAD_IMAGE_BYTES`] once decoded.
+        data: String,
+        /// A short description, such as the file's name.
+        label: String,
+    },
 }
+
+/// Largest image file a client may upload: the store's per-image limit.
+pub const MAX_UPLOAD_IMAGE_BYTES: u64 = xshell_execution::MAX_SOURCE_BYTES;
 
 impl ClientRequest {
     pub fn open(client_version: impl Into<String>) -> Self {
@@ -155,6 +169,9 @@ pub enum ServerResponse {
     Closed {
         session_id: String,
     },
+    ImageStored {
+        image: xshell_core::ImageRef,
+    },
     Error {
         code: String,
         message: String,
@@ -171,6 +188,7 @@ mod tests {
             session_id: "session-1".into(),
             input: TurnInput::Agent {
                 message: "hello".into(),
+                images: Vec::new(),
             },
             approval: ApprovalPolicy::Ask,
             limits: None,
