@@ -15,8 +15,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `tool_output_bytes` to the turn limits. Version 20 adds the
 // `tool_declared` gate reason on `ExecutionEvent::ApprovalRequested`, sent for
 // provided tools that require approval. Version 21 adds
-// `SessionEventKind::TurnSummary`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 21;
+// `SessionEventKind::TurnSummary`. Version 22 adds `tools` on
+// `SessionCreation` and `SessionDescriptor`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 22;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -399,6 +400,34 @@ pub struct SessionDescriptor {
     pub attached_clients: u32,
     pub created_at_unix_ms: u64,
     pub last_active_at_unix_ms: u64,
+    /// The tools this session's agent may use. Fixed when the session is
+    /// created; sessions saved before it existed offer every tool.
+    #[serde(default, skip_serializing_if = "SessionTools::is_all")]
+    pub tools: SessionTools,
+}
+
+/// Which tools a session's agent may use, out of those its daemon offers:
+/// the built-in tools and any tools compiled-in providers add.
+///
+/// A selection only narrows. It is fixed when the session is created, so a
+/// session's authority never grows after the fact, and it bounds the
+/// session's subagents too. A name the daemon does not offer is refused when
+/// the session is created; if a later daemon build drops a tool, a restored
+/// session simply no longer gets it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTools {
+    /// Every tool the daemon offers.
+    #[default]
+    All,
+    /// Only these tools, by name. An empty list leaves the agent no tools.
+    Only(Vec<String>),
+}
+
+impl SessionTools {
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +444,9 @@ pub struct SessionCreation {
     pub persistence: PersistenceMode,
     pub visibility: Visibility,
     pub history: Vec<ChatMessage>,
+    /// The tools the session's agent may use; every tool when omitted.
+    #[serde(default, skip_serializing_if = "SessionTools::is_all")]
+    pub tools: SessionTools,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

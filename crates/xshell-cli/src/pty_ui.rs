@@ -531,6 +531,7 @@ mod tests {
             attached_clients: 0,
             created_at_unix_ms: 0,
             last_active_at_unix_ms: 0,
+            tools: Default::default(),
         }
     }
 

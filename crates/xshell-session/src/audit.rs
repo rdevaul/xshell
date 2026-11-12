@@ -401,7 +401,7 @@ pub fn audit_turn_started(
     limits: &xshell_execution::TurnLimits,
     requested_limits: Option<&xshell_execution::TurnLimits>,
     rules: &xshell_execution::ApprovalRules,
-    tools: &xshell_execution::ToolRegistry,
+    tools: &xshell_execution::ToolSet,
 ) -> xshell_audit::AuditEvent {
     fn encode(value: impl serde::Serialize) -> serde_json::Value {
         serde_json::to_value(value).expect("approval modes and turn limits always serialize")
@@ -418,7 +418,8 @@ pub fn audit_turn_started(
         requested_limits: requested_limits.map(|limits| Box::new(encode(limits))),
         base_policy: audit_policy(&rules.base).map(Box::new),
         overlay_policy: rules.overlay.as_ref().and_then(audit_policy).map(Box::new),
-        provided_tools: audit_provided_tools(tools).map(Box::new),
+        provided_tools: audit_provided_tools(tools.registry()).map(Box::new),
+        offered_tools: (!tools.is_complete()).then(|| tools.names()),
     }
 }
 
@@ -724,7 +725,7 @@ mod tests {
     fn turn_records_name_provided_tools_only_when_there_are_some() {
         let rules = xshell_execution::ApprovalRules::default();
         let limits = xshell_execution::TurnLimits::default();
-        let started = |tools: &xshell_execution::ToolRegistry| {
+        let started = |tools: &xshell_execution::ToolSet| {
             serde_json::to_value(audit_turn_started(
                 "t1",
                 xshell_execution::ApprovalPolicy::Ask,
@@ -737,14 +738,22 @@ mod tests {
             .unwrap()
         };
         // Without providers the record is unchanged, so it hashes as before.
-        let plain = started(&xshell_execution::ToolRegistry::empty());
+        let plain = started(&xshell_execution::ToolSet::all());
         assert!(plain.get("provided_tools").is_none(), "{plain}");
 
         let registry = xshell_execution::ToolRegistry::builder()
             .provider(Arc::new(OneTool))
             .build()
             .unwrap();
-        let record = started(&registry);
+        let all = xshell_execution::ToolSet::all().with_provided(Arc::clone(&registry));
+        let record = started(&all);
+        // Every tool offered: the record lists no selection.
+        assert!(record.get("offered_tools").is_none(), "{record}");
+        let restricted = started(&all.only(&["read_file", "memory_purge"]));
+        assert_eq!(
+            restricted["offered_tools"],
+            serde_json::json!(["read_file", "memory_purge"])
+        );
         assert_eq!(
             record["provided_tools"],
             serde_json::json!({

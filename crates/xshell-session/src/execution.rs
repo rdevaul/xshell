@@ -1,7 +1,7 @@
 use crate::audit::{AuditReceipt, DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
 use crate::{
     AgentTurnPhase, ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind,
-    SessionRegistry, TurnInput,
+    SessionRegistry, SessionTools, TurnInput,
 };
 use crate::{TurnAuditRef, TurnFailureReason};
 use anyhow::{Context, Result, bail};
@@ -169,6 +169,36 @@ impl ExecutionCoordinator {
         &self.inner.policy.tools
     }
 
+    /// Refuse a session tool selection that names a tool this daemon does
+    /// not offer, or names one twice, so a typo fails when the session is
+    /// created instead of silently leaving the agent without the tool.
+    pub fn check_session_tools(&self, tools: &SessionTools) -> Result<()> {
+        let SessionTools::Only(names) = tools else {
+            return Ok(());
+        };
+        let offered = self.toolset(&SessionTools::All);
+        let mut seen = HashSet::new();
+        for name in names {
+            if offered.get(name).is_none() {
+                bail!("this session host offers no tool named {name:?}");
+            }
+            if !seen.insert(name.as_str()) {
+                bail!("tool {name:?} is listed twice");
+            }
+        }
+        Ok(())
+    }
+
+    /// The tools a session's agent turns are offered: every built-in and
+    /// provided tool, narrowed by the session's selection.
+    fn toolset(&self, tools: &SessionTools) -> ToolSet {
+        let all = ToolSet::all().with_provided(Arc::clone(&self.inner.policy.tools));
+        match tools {
+            SessionTools::All => all,
+            SessionTools::Only(names) => all.only(names),
+        }
+    }
+
     pub fn audit(&self) -> &DaemonAudit {
         &self.inner.audit
     }
@@ -275,7 +305,7 @@ impl ExecutionCoordinator {
                 &limits,
                 requested_limits.as_ref(),
                 &rules,
-                &self.inner.policy.tools,
+                &self.toolset(&snapshot.descriptor.tools),
             )) {
                 execution.finish(&turn_id);
                 return Err(error);
@@ -553,9 +583,7 @@ impl ExecutionCoordinator {
                         api_key_env: model.api_key_env.clone(),
                     })?;
                     let policy = TurnPolicy::new(approval)
-                        .with_tools(
-                            ToolSet::all().with_provided(Arc::clone(&self.inner.policy.tools)),
-                        )
+                        .with_tools(self.toolset(&snapshot.descriptor.tools))
                         .with_session_id(session_id.clone())
                         .with_limits(limits)
                         .with_rules(ApprovalRules {
