@@ -321,10 +321,13 @@ mod tests {
 
     fn assert_refused(result: Result<AssistantResponse, AdapterError>, reason: &str) {
         match result {
-            Err(AdapterError::InvalidResponse(message)) => assert!(
-                message.contains(reason),
-                "expected {reason:?} in {message:?}"
-            ),
+            Err(error @ (AdapterError::InvalidResponse(_) | AdapterError::StreamError(_))) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(reason),
+                    "expected {reason:?} in {message:?}"
+                );
+            }
             other => panic!("expected a refused response, got {other:?}"),
         }
     }

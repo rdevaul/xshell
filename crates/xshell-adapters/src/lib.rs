@@ -333,9 +333,7 @@ pub(crate) fn stream_error(error: &serde_json::Value) -> AdapterError {
         quoted.truncate(end);
         quoted.push('…');
     }
-    AdapterError::InvalidResponse(format!(
-        "the agent endpoint reported an error mid-stream: {quoted}"
-    ))
+    AdapterError::StreamError(quoted)
 }
 
 /// Refuse to hand tool calls to the engine unless the provider finished the

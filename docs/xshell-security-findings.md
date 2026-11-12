@@ -21,6 +21,7 @@ historical review.
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn and daemon-wide budgets landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
 | F13 | [#129](https://github.com/rdevaul/xshell/issues/129) | P0 | M1.3 prepared file access | Corrected | Case variants (`.ENV`, `.SSH/ID_ED25519`, `server.PEM`, `.GIT/config`) are sensitive, blocked and denied exactly like their stored names on a case-insensitive volume |
+| F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 
 ## Evidence rules
 
@@ -170,6 +171,16 @@ sessions taking one deadline rather than eight.
 The review also asks for deadlines on the CLI's own connection to the session
 service (local socket and SSH). That is client-side hardening outside F6's
 acceptance condition and is not part of this correction.
+
+F16 is corrected (#132). An execution record written after a provider
+failure is a `system` message, and it is folded into the system prompt of
+every later request. It now states only a fixed class written by xshell (an
+HTTP status number, "stream error", "invalid tool arguments", "context
+overflow", and so on; `AdapterError::record_summary`), never the provider's
+error body, a mid-stream error message, or a tool name the model chose. The
+full error still reaches the user and the audit log. Records saved before the
+fix lose their quoted detail when merged. Tests: `f16_*` in
+`xshell-execution/src/engine.rs` and `xshell-core/src/lib.rs`.
 
 The [development roadmap](xshell-development-roadmap.md) remains the
 cross-product sequencing authority.

@@ -349,10 +349,10 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
                     Value::Object(Default::default())
                 } else {
                     serde_json::from_str(&call.arguments).map_err(|error| {
-                        AdapterError::InvalidResponse(format!(
-                            "invalid arguments for tool {}: {error}",
-                            call.name
-                        ))
+                        AdapterError::InvalidToolArguments {
+                            tool: call.name.clone(),
+                            detail: error.to_string(),
+                        }
                     })?
                 };
                 Ok(ToolCall {
@@ -489,10 +489,17 @@ mod tests {
 
     fn assert_refused(result: Result<AssistantResponse, AdapterError>, reason: &str) {
         match result {
-            Err(AdapterError::InvalidResponse(message)) => assert!(
-                message.contains(reason),
-                "expected {reason:?} in {message:?}"
-            ),
+            Err(
+                error @ (AdapterError::InvalidResponse(_)
+                | AdapterError::StreamError(_)
+                | AdapterError::InvalidToolArguments { .. }),
+            ) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(reason),
+                    "expected {reason:?} in {message:?}"
+                );
+            }
             other => panic!("expected a refused response, got {other:?}"),
         }
     }
