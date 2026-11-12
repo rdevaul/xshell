@@ -900,11 +900,12 @@ impl DaemonObserver {
                 call_id,
                 name,
                 result,
+                images,
             } => self.audit(AuditEvent::ToolResult {
                 call_id: call_id.clone(),
                 name: name.clone(),
                 result: result.clone(),
-                images: Vec::new(),
+                images: images.iter().map(crate::audit_image).collect(),
             }),
             ExecutionEvent::TurnAborted => {}
             ExecutionEvent::HistoryCompacted { report } => {

@@ -362,6 +362,19 @@ pub fn audit_decision_basis(
 }
 
 /// The audit record of who answered a prompted call.
+/// The audit record of an image: its identity and what ingestion decoded,
+/// never its bytes.
+pub fn audit_image(image: &xshell_core::ImageRef) -> xshell_audit::AuditImage {
+    xshell_audit::AuditImage {
+        sha256: image.sha256().to_owned(),
+        media_type: image.media_type().as_str().to_owned(),
+        width: image.width(),
+        height: image.height(),
+        byte_len: image.byte_len(),
+        label: image.label().to_owned(),
+    }
+}
+
 pub fn audit_approval(source: &xshell_execution::ApprovalSource) -> xshell_audit::AuditApproval {
     xshell_audit::AuditApproval {
         approver: source.approver.as_str().to_owned(),

@@ -805,12 +805,14 @@ fn handle_execution(
             call_id,
             name,
             result,
+            images,
         } => {
             output.event(tagged(json!({
                 "event": "tool_result",
                 "call_id": call_id,
                 "name": name,
                 "result": result,
+                "images": (!images.is_empty()).then_some(images),
             })));
         }
         ExecutionEvent::TurnAborted => {
