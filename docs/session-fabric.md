@@ -68,7 +68,8 @@ denied         = ["run_shell: rm *", "run_shell: git push *"]
 An entry names a tool, `run_shell` with a pattern matched word for word
 against the command's parsed arguments (`*` matches within a word, and a final
 `*` matches any remaining words), or `read_file` or `list_directory` with a
-path pattern (matched as sensitive paths are). Each call is decided by the
+path pattern (matched as sensitive paths are, except that only `denied`
+entries ignore letter case; write allow patterns in the case stored on disk). Each call is decided by the
 first rule that matches:
 
 | The call | `off` | `ask` | `auto` |
@@ -120,7 +121,12 @@ open object, so the file cannot be swapped between the decision and the read,
 and the answer does not depend on the cwd. Patterns without `/` match a file
 name; patterns with `/` match at any depth, so `.git/config` covers nested
 repositories and `.aws/**` covers a project kept inside `.aws`; a leading `/`
-anchors a pattern to the filesystem root. A match is reported through `approval_requested` with
+anchors a pattern to the filesystem root. Matching ignores letter case, so
+`.ENV` and `.SSH/ID_ED25519` are classified like `.env` and
+`.ssh/id_ed25519` on a case-insensitive volume such as the macOS default
+(and on a case-sensitive one, where they are different files, they are
+classified the same way to be safe); on macOS the path also carries the names
+the filesystem stores. A match is reported through `approval_requested` with
 `reason = "sensitive_path"` (shell tools report `"shell_execution"`) and then
 follows the turn's approval policy exactly like a shell tool. Omitting the key
 selects the built-in defaults; an empty list disables the check.

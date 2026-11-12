@@ -17,6 +17,22 @@
 //!   under any `.aws` directory, including a project kept inside one;
 //! - a pattern that starts with `/` is anchored to the filesystem root, for
 //!   administrators who mean one specific location.
+//!
+//! Matching ignores letter case (finding F13). The default macOS volume is
+//! case-insensitive, so `.ENV`, `.SSH/ID_ED25519` and `server.PEM` open the
+//! same objects as their lowercase spellings, and so do spellings that differ
+//! by more than ASCII case: APFS folds `ſ` (long s) to `s`, the Kelvin sign
+//! to `k`, `ß` to `ss` and `ﬁ` to `fi`. Both pattern and path are case-folded
+//! before they are compared ([`fold_case`]), on every platform and volume:
+//! folding can only make more paths sensitive, which is the safe direction,
+//! and on a case-sensitive volume it means `.ENV` is gated like `.env` even
+//! though they are different files. `crate::prepared` also records the names
+//! the filesystem stores where it can (macOS), so the path classified is the
+//! path on disk whichever way the caller spelled it.
+//!
+//! Allow rules must not become easier to satisfy, so the approval policy
+//! matches its `always_allowed` and `allowed` path patterns case-sensitively
+//! ([`SensitivePaths::matches_exact`]); see `crate::policy`.
 
 use std::path::Path;
 
@@ -87,16 +103,36 @@ impl SensitivePaths {
         &self.patterns
     }
 
-    /// Does `path` match any pattern? Callers pass the canonical absolute
-    /// path of the object; a relative path is matched the same way, from its
-    /// first component.
+    /// Does `path` match any pattern, ignoring case? Callers pass the
+    /// canonical absolute path of the object; a relative path is matched the
+    /// same way, from its first component. Use this wherever a match
+    /// restricts (sensitive, blocked and denied paths).
     pub fn matches(&self, path: &Path) -> bool {
+        self.matches_with(path, true)
+    }
+
+    /// Does `path` match any pattern exactly as spelled? For rules where a
+    /// match grants something (allow lists), so that case folding never makes
+    /// a grant reach a different object on a case-sensitive volume.
+    pub fn matches_exact(&self, path: &Path) -> bool {
+        self.matches_with(path, false)
+    }
+
+    fn matches_with(&self, path: &Path, fold: bool) -> bool {
         let path = path
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
+        let path = if fold { fold_case(&path) } else { path };
         let path = path.trim_start_matches("./").trim_start_matches('/');
         let file_name = path.rsplit('/').next().unwrap_or(path);
         self.patterns.iter().any(|pattern| {
+            let folded;
+            let pattern = if fold {
+                folded = fold_case(pattern);
+                &folded
+            } else {
+                pattern
+            };
             if let Some(anchored) = pattern.strip_prefix('/') {
                 glob_match(anchored, path)
             } else if pattern.contains('/') {
@@ -107,6 +143,31 @@ impl SensitivePaths {
             }
         })
     }
+}
+
+/// Case-fold `text` for comparison: Unicode lowercase, plus the full case
+/// foldings that turn a non-ASCII character into ASCII letters, which
+/// lowercasing alone misses (`ſ` is already lowercase, `ß` lowercases to
+/// itself). Those are the spellings that would let a name such as
+/// `ſerver.key` or `.ſsh/id_rsa` open a file matched by an ASCII pattern on a
+/// case-insensitive volume. Folding never changes `/`, `*` or `?`.
+pub(crate) fn fold_case(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\u{17F}' => folded.push('s'), // ſ LATIN SMALL LETTER LONG S
+            '\u{DF}' | '\u{1E9E}' => folded.push_str("ss"), // ß, ẞ
+            '\u{FB00}' => folded.push_str("ff"), // ﬀ
+            '\u{FB01}' => folded.push_str("fi"), // ﬁ
+            '\u{FB02}' => folded.push_str("fl"), // ﬂ
+            '\u{FB03}' => folded.push_str("ffi"), // ﬃ
+            '\u{FB04}' => folded.push_str("ffl"), // ﬄ
+            '\u{FB05}' | '\u{FB06}' => folded.push_str("st"), // ﬅ, ﬆ
+            // Includes the Kelvin sign, which lowercases to `k`.
+            _ => folded.extend(c.to_lowercase()),
+        }
+    }
+    folded
 }
 
 /// Minimal glob: `*` matches within one path segment, `**` matches across
@@ -267,6 +328,51 @@ mod tests {
         assert!(!anchored.matches(Path::new("/home/user/srv/vault/keys/a")));
         let floating = SensitivePaths::new(vec!["srv/vault/**".to_owned()]);
         assert!(floating.matches(Path::new("/home/user/srv/vault/keys/a")));
+    }
+
+    /// F13: on a case-insensitive volume each of these opens the canonical
+    /// file, so each must classify the same. This checks the matching logic
+    /// alone, so it runs on every platform.
+    #[test]
+    fn f13_matching_ignores_case_and_folds_like_a_case_insensitive_volume() {
+        let s = SensitivePaths::default();
+        for (variant, canonical) in [
+            (".ENV", ".env"),
+            (".Env.Production", ".env.production"),
+            (".SSH/ID_ED25519", ".ssh/id_ed25519"),
+            ("/home/user/.SSH", "/home/user/.ssh"),
+            ("deploy/server.PEM", "deploy/server.pem"),
+            (".GIT/config", ".git/config"),
+            ("/srv/repo/sub/.Git/CONFIG", "/srv/repo/sub/.git/config"),
+            ("/home/user/.AWS/credentials", "/home/user/.aws/credentials"),
+            ("ID_RSA", "id_rsa"),
+            // APFS also folds these to ASCII (checked on macOS 26).
+            ("\u{17F}erver.key", "server.key"),  // long s
+            ("server.\u{212A}ey", "server.key"), // Kelvin sign
+            (".\u{DF}h/config", ".ssh/config"),
+            ("\u{FB01}le.secret", "file.secret"),
+            (".\u{17F}sh/id_ed25519", ".ssh/id_ed25519"),
+        ] {
+            assert!(s.matches(Path::new(canonical)), "{canonical} is sensitive");
+            assert!(
+                s.matches(Path::new(variant)),
+                "f13: {variant} must be sensitive like {canonical}"
+            );
+        }
+        // Folding a pattern folds it too, and spares unrelated names.
+        let upper = SensitivePaths::new(vec!["SECRETS/**".to_owned()]);
+        assert!(upper.matches(Path::new("/w/secrets/a")));
+        for miss in ["README.MD", "SRC/MAIN.RS", ".GITIGNORE", "KEYBOARD.RS"] {
+            assert!(
+                !s.matches(Path::new(miss)),
+                "{miss} should not be sensitive"
+            );
+        }
+        // Exact matching, for allow rules, does not fold.
+        let env = SensitivePaths::new(vec![".env".to_owned()]);
+        assert!(env.matches_exact(Path::new("/w/.env")));
+        assert!(!env.matches_exact(Path::new("/w/.ENV")));
+        assert!(env.matches(Path::new("/w/.ENV")));
     }
 
     #[test]

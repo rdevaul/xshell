@@ -1,6 +1,6 @@
 # xshell security finding ledger
 
-**Updated:** 2 November 2026
+**Updated:** 12 November 2026
 
 **Authority:** The evidence and acceptance conditions in the
 [design, security, and usability review](xshell-design-security-usability-review.md)
@@ -20,6 +20,7 @@ historical review.
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Corrected | Incomplete/error/refusal streams cannot produce executable tool calls |
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn and daemon-wide budgets landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
+| F13 | [#129](https://github.com/rdevaul/xshell/issues/129) | P0 | M1.3 prepared file access | Corrected | Case variants (`.ENV`, `.SSH/ID_ED25519`, `server.PEM`, `.GIT/config`) are sensitive, blocked and denied exactly like their stored names on a case-insensitive volume |
 | F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 
 ## Evidence rules
@@ -110,7 +111,26 @@ authorization and acquisition resolved the path independently.
   Patterns containing `/` match at any depth and a leading `/` anchors one, so
   the same file is classified the same from every cwd, nested repositories'
   `.git/config` and everything under `.aws` are covered, and a project inside
-  a sensitive directory stays sensitive.
+  a sensitive directory stays sensitive. This guarantee was incomplete on
+  case-insensitive volumes until F13: the canonical path kept the names as
+  spelled, so `.ENV` opened `.env` but matched no pattern.
+- **F13.** On a case-insensitive volume (the macOS APFS default) a name in
+  any case opens the stored object, and APFS also folds `ſ`, the Kelvin sign,
+  `ß` and ligatures such as `ﬁ` to ASCII. The prepared path now records the
+  names the filesystem stores where the platform reports them (macOS
+  `F_GETPATH`, checked against the open object; a file with several hard
+  links keeps the spelled name), and sensitive, `block` and policy `denied`
+  path patterns are matched case-folded on every platform, which can only
+  classify more paths as sensitive. Policy `always_allowed` and `allowed`
+  path patterns match exactly, so folding never widens a grant; on macOS
+  they see the stored names, and elsewhere a differently cased request is
+  unlisted, which is stricter. Evidence:
+  `f13_matching_ignores_case_and_folds_like_a_case_insensitive_volume`,
+  `f13_path_denials_ignore_case_and_allows_do_not`,
+  `f13_case_variants_classify_like_the_stored_name`,
+  `f13_unicode_foldings_classify_like_the_stored_name` and
+  `f13_block_prompt_and_policy_denials_hold_under_any_case`. The filesystem
+  tests skip, with a message, on a case-sensitive temporary directory.
 - **F8.** Reads take at most `max_bytes + 1` bytes from the descriptor (tested
   against a 1 GiB sparse file), listings stop reading entries after their
   limit, and preparation and reads run on a blocking worker with a deadline so
