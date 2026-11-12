@@ -582,6 +582,7 @@ mod tests {
                         approval: "required".into(),
                     }],
                 })),
+                offered_tools: Some(vec!["read_file".into(), "memory_purge".into()]),
             })
             .unwrap();
         writer
@@ -605,6 +606,10 @@ mod tests {
             (r#""list":"denied""#, r#""list":"allowed""#),
             (r#""approval":"ask""#, r#""approval":"off""#),
             (r#""approval":"required""#, r#""approval":"not_required""#),
+            (
+                r#""offered_tools":["read_file","#,
+                r#""offered_tools":["run_shell","#,
+            ),
         ] {
             assert!(contents.contains(original), "{original}");
             fs::write(&path, contents.replacen(original, forged, 1)).unwrap();

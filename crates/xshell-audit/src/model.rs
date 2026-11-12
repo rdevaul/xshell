@@ -18,18 +18,20 @@ use std::path::PathBuf;
 ///   on `AuditEvent::ToolDecision`.
 /// - 8: adds `AuditEvent::TurnFinished` and the `provided_tools` field on
 ///   `AuditEvent::TurnStarted`.
-pub const AUDIT_FORMAT_VERSION: u32 = 8;
+/// - 9: adds the `offered_tools` field on `AuditEvent::TurnStarted`.
+pub const AUDIT_FORMAT_VERSION: u32 = 9;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 // Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
 // `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`;
 // version 6 adds `AuditEvent::SubagentStarted` and `SubagentFinished`;
 // version 7 adds `images` on `Input` and `ToolResult`; version 8 adds
 // `TurnStarted` and `basis` and `approval` on `ToolDecision`; version 9 adds
-// `TurnFinished` and `provided_tools` on `TurnStarted`.
+// `TurnFinished` and `provided_tools` on `TurnStarted`; version 10 adds
+// `offered_tools` on `TurnStarted`.
 // Tagged enum variants are not forward-compatible in serde, so mixed-version
 // peers must fail at handshake. New fields are not either: an older service
 // would drop them and sign a record without them.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 9;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -267,6 +269,11 @@ pub enum AuditEvent {
         /// has none, so records without them hash as before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provided_tools: Option<Box<AuditProvidedTools>>,
+        /// The tools the agent was offered, when not every built-in and
+        /// provided tool: the session limits its agent to these. Absent when
+        /// it offers them all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offered_tools: Option<Vec<String>>,
     },
     /// How an agent turn ended and what it used: the turn's last record.
     /// A supervisor finds it from the identifiers a headless run reports,
