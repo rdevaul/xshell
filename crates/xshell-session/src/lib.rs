@@ -26,7 +26,7 @@ pub use model::{
     DaemonProbeReport, DaemonProbeStatus, EventBatch, ModelBinding, PersistenceMode, PtySize,
     PtyTicket, SESSION_PROTOCOL_VERSION, SensitivityAction, SensitivityClass, SessionActivity,
     SessionConfig, SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind,
-    SessionSnapshot, SessionStatus, ShellCompletionCandidate, ShellCompletionResult,
+    SessionSnapshot, SessionStatus, ShellCompletionCandidate, ShellCompletionResult, TurnAuditRef,
     TurnFailureReason, TurnInput, ViewResource, Visibility,
 };
 pub use protocol::{ClientRequest, ServerResponse};

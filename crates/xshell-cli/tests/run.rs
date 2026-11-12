@@ -277,6 +277,21 @@ fn a_completed_run_streams_jsonl_and_exits_zero() {
         .find(|event| event["event"] == "turn_started")
         .unwrap();
     assert_eq!(started["limits"]["provider_requests"], 128);
+    // The result reports use against each limit (H4). Auditing is off here,
+    // so there is no audit reference (H1).
+    let usage = &result["usage"];
+    assert_eq!(
+        usage["model_rounds"],
+        serde_json::json!({"used": 1, "limit": 128, "assurance": "enforced"})
+    );
+    assert_eq!(usage["tool_dispatches"]["used"], 0);
+    assert_eq!(usage["tool_output_bytes"]["limit"], 8 * 1024 * 1024);
+    assert_eq!(usage["wall_time_ms"]["limit"], 3_600_000);
+    assert_eq!(
+        usage["tokens"],
+        serde_json::json!({"assurance": "unavailable"})
+    );
+    assert!(result.get("audit").is_none(), "{result}");
 }
 
 #[test]
@@ -451,6 +466,8 @@ fn a_detached_turn_can_be_inspected_and_waited_for() {
     let result = waited.last().unwrap();
     assert_eq!(result["outcome"], "completed");
     assert_eq!(result["answer"], "finished later");
+    // A replayed turn reports its usage too.
+    assert_eq!(result["usage"]["model_rounds"]["used"], 1);
 
     // Once finished, `result` reports the same outcome without waiting.
     let late = fabric.job("result", &["--session", "job"]);

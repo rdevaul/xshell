@@ -16,17 +16,20 @@ use std::path::PathBuf;
 ///   `AuditEvent::ToolResult`.
 /// - 7: adds `AuditEvent::TurnStarted` and the `basis` and `approval` fields
 ///   on `AuditEvent::ToolDecision`.
-pub const AUDIT_FORMAT_VERSION: u32 = 7;
+/// - 8: adds `AuditEvent::TurnFinished` and the `provided_tools` field on
+///   `AuditEvent::TurnStarted`.
+pub const AUDIT_FORMAT_VERSION: u32 = 8;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 // Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
 // `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`;
 // version 6 adds `AuditEvent::SubagentStarted` and `SubagentFinished`;
 // version 7 adds `images` on `Input` and `ToolResult`; version 8 adds
-// `TurnStarted` and `basis` and `approval` on `ToolDecision`.
+// `TurnStarted` and `basis` and `approval` on `ToolDecision`; version 9 adds
+// `TurnFinished` and `provided_tools` on `TurnStarted`.
 // Tagged enum variants are not forward-compatible in serde, so mixed-version
 // peers must fail at handshake. New fields are not either: an older service
 // would drop them and sign a record without them.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 8;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -264,6 +267,21 @@ pub enum AuditEvent {
         /// has none, so records without them hash as before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provided_tools: Option<Box<AuditProvidedTools>>,
+    },
+    /// How an agent turn ended and what it used: the turn's last record.
+    /// A supervisor finds it from the identifiers a headless run reports,
+    /// and checks the run's own account against it.
+    TurnFinished {
+        turn_id: String,
+        /// `completed`, `failed`, or `cancelled`.
+        outcome: String,
+        /// Why it failed, when known: `budget_exhausted` or
+        /// `audit_unavailable`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Use against each turn limit, with its assurance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Box<Value>>,
     },
     ToolDecision {
         call_id: String,

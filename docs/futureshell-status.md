@@ -171,6 +171,12 @@ replace FS2–FS4.
     with its own `blocked_path` basis rather than as a mode-default
     approval; the daemon refuses approver reports that contradict
     themselves (`cancelled` from a client, `no_approver` with an approval).
+- **Result record (H1, H4, closed).** Each agent turn ends with a signed
+  `turn_finished` audit record holding its outcome and usage. The headless
+  `result` line reports usage against each limit, in model rounds and tool
+  dispatches with an assurance label (`enforced`; tokens `unavailable`),
+  and the audit session, sequence range and record hash of the turn's
+  records.
 - **Plan drift (open, H5).** The CAD plan specifies job commands on a turn
   ID and `wait` reading from the session snapshot. The implementation uses
   the session and the in-memory journal. Either update the plan or close the

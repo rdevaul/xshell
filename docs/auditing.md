@@ -189,6 +189,15 @@ the known approvers and short reason codes, and refuses reports that
 contradict themselves. Only the daemon records `cancelled`, and
 `no_approver` only comes with a denial.
 
+Every agent turn ends with a `turn_finished` record: the turn ID, its
+`outcome` (`completed`, `failed`, or `cancelled`), a `reason` for a failure
+the client can act on (`budget_exhausted`, `audit_unavailable`), and `usage`
+against each turn limit (see [headless runs](headless.md#usage)). It is the
+turn's last record. A headless run's `result` line names its audit session,
+sequence, and hash, so a supervisor can check the run's own account against
+the signed log. If the record cannot be written, the turn's outcome stands
+and the run reports no audit reference.
+
 Not yet recorded: an approval bound to the prepared operation it approved
 (the object a read opened, as M1.3 does for reads), and the identity of the
 sensitivity classes in effect.

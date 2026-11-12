@@ -2623,6 +2623,7 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
 
     let mut after = 0;
     let mut completed = false;
+    let mut summary = None;
     for _ in 0..200 {
         let batch = client.events(session_id.clone(), after, 50).unwrap();
         for record in batch.events {
@@ -2639,6 +2640,7 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
                         interactive(),
                     )
                     .unwrap(),
+                SessionEventKind::TurnSummary { usage, audit } => summary = Some((usage, audit)),
                 SessionEventKind::TurnCompleted => completed = true,
                 SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
                 _ => {}
@@ -2727,6 +2729,37 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
         })
     );
     assert!(rm.get("approval").is_none(), "nobody was asked about rm");
+
+    // H1/H4: the turn ends with a signed record of its outcome and usage, and
+    // the summary the client saw points at exactly that record.
+    let (usage, audit) = summary.expect("the turn reported no summary");
+    let usage = usage.expect("an agent turn reports its usage");
+    assert_eq!(usage.model_rounds.used, Some(2));
+    assert_eq!(usage.tool_dispatches.used, Some(2));
+    let audit = audit.expect("an audited turn reports where its records are");
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|record: &serde_json::Value| record.pointer("/body/sequence").is_some())
+        .collect();
+    let at = |sequence: u64| {
+        records
+            .iter()
+            .find(|record| record["body"]["sequence"] == sequence)
+            .unwrap_or_else(|| panic!("no record {sequence}"))
+    };
+    let last = at(audit.last_sequence);
+    assert_eq!(last["record_hash"], audit.record_hash);
+    assert_eq!(last["body"]["session_id"], audit.audit_session_id);
+    let finished = &last["body"]["event"];
+    assert_eq!(finished["type"], "turn_finished");
+    assert_eq!(finished["turn_id"], turn_id);
+    assert_eq!(finished["outcome"], "completed");
+    assert_eq!(finished["usage"], serde_json::to_value(usage).unwrap());
+    let first = at(audit.first_sequence.expect("one audit connection"));
+    assert_eq!(first["body"]["event"]["type"], "input");
+    assert!(audit.first_sequence.unwrap() < audit.last_sequence);
 }
 
 /// Run one terminal job to completion through the daemon, feeding it `input`

@@ -14,8 +14,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // Version 18 adds the `blocked_path` decision basis. Version 19 adds
 // `tool_output_bytes` to the turn limits. Version 20 adds the
 // `tool_declared` gate reason on `ExecutionEvent::ApprovalRequested`, sent for
-// provided tools that require approval.
-pub const SESSION_PROTOCOL_VERSION: u32 = 20;
+// provided tools that require approval. Version 21 adds
+// `SessionEventKind::TurnSummary`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 21;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -466,6 +467,32 @@ pub enum SessionEventKind {
         reason: Option<TurnFailureReason>,
     },
     TurnCancelled,
+    /// What an agent turn used and where its audit records are. Sent just
+    /// before the turn's terminal event; absent from journals written
+    /// before it existed and for `$` commands.
+    TurnSummary {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<xshell_execution::TurnUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audit: Option<TurnAuditRef>,
+    },
+}
+
+/// Where an agent turn's records are in the audit log, so a supervisor can
+/// verify the turn there instead of trusting the event stream (H1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnAuditRef {
+    /// The audit-service session holding the turn's `turn_finished` record.
+    pub audit_session_id: String,
+    /// The sequence of the turn's first record (its `input`). Absent when
+    /// that record is in another audit session, because the connection was
+    /// replaced during the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_sequence: Option<u64>,
+    /// The sequence of the turn's `turn_finished` record.
+    pub last_sequence: u64,
+    /// The hash of that record, as the audit service acknowledged it.
+    pub record_hash: String,
 }
 
 /// A failure cause a client can act on without parsing the message.
