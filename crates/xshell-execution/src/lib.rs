@@ -6,6 +6,7 @@ mod images;
 mod policy;
 mod prepared;
 mod process;
+mod provider;
 mod sensitive;
 mod tools;
 
@@ -31,8 +32,12 @@ pub use policy::{
     ApprovalRules, CallFacts, DecisionBasis, Policy, PolicyConfig, PolicyDecision, PolicyLayer,
     PolicyList, RuledDecision, default_decision, policy_identity,
 };
+pub use provider::{
+    MAX_PROVIDED_TOOLS, ProvidedTool, RegisteredTool, ToolAccess, ToolApproval, ToolContext,
+    ToolProvider, ToolRegistry, ToolRegistryBuilder,
+};
 pub use sensitive::{DEFAULT_SENSITIVE_PATTERNS, SensitivePaths};
 pub use tools::{
-    GateReason, Tool, ToolSet, definitions, execute_tool, requires_approval,
+    GateReason, Tool, ToolRef, ToolSet, definitions, execute_tool, requires_approval,
     requires_approval_by_name, tool_summary,
 };

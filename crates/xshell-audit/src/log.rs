@@ -573,6 +573,15 @@ mod tests {
                     policy: serde_json::json!({"denied": ["run_shell: rm *"]}),
                 })),
                 overlay_policy: None,
+                provided_tools: Some(Box::new(crate::AuditProvidedTools {
+                    sha256: "cd".repeat(32),
+                    tools: vec![crate::AuditProvidedTool {
+                        provider: "memory".into(),
+                        name: "memory_purge".into(),
+                        access: "read_write".into(),
+                        approval: "required".into(),
+                    }],
+                })),
             })
             .unwrap();
         writer
@@ -595,6 +604,7 @@ mod tests {
         for (original, forged) in [
             (r#""list":"denied""#, r#""list":"allowed""#),
             (r#""approval":"ask""#, r#""approval":"off""#),
+            (r#""approval":"required""#, r#""approval":"not_required""#),
         ] {
             assert!(contents.contains(original), "{original}");
             fs::write(&path, contents.replacen(original, forged, 1)).unwrap();

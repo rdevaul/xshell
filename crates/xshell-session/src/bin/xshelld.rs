@@ -159,6 +159,8 @@ fn main() -> Result<()> {
             blocked_paths: config.blocked_paths(),
             rules,
             compaction: config.compaction.clone(),
+            // The stock daemon compiles in no tool providers.
+            tools: xshell_execution::ToolRegistry::empty(),
             max_concurrent_turns: config.max_concurrent_turns,
         },
     );

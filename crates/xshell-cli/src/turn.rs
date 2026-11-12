@@ -313,6 +313,7 @@ fn confirm_daemon_tool(
         GateReason::ShellExecution => String::new(),
         GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
         GateReason::Policy => " (the approval policy requires approval)".to_owned(),
+        GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),
     };
     print!(
         "Approve `{}`{why}? [y/N/q] ",
@@ -621,6 +622,7 @@ pub(crate) async fn run_agent_turn(
         &policy.limits,
         None,
         &policy.rules,
+        policy.tools.registry(),
     ))?;
     let mut observer = LocalObserver::new(audit, render_options, cwd);
     let outcome =
@@ -757,6 +759,7 @@ pub(crate) fn confirm_tool(call: &ToolCall, reason: GateReason) -> Result<Approv
             GateReason::ShellExecution => String::new(),
             GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
             GateReason::Policy => " (the approval policy requires approval)".to_owned(),
+            GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),
         };
         print!(
             "Approve `{}`{why}? [y/N/q] ",

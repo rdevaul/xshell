@@ -471,6 +471,7 @@ rollback guarantees.
 - [Security finding ledger](docs/xshell-security-findings.md)
 - [Execution mode conformance](docs/xshell-mode-conformance.md)
 - [Subagents: design and staged plan](docs/subagents-design.md)
+- [Tool providers: compiled-in tools for programs that embed the engine](docs/tool-providers.md)
 - [XSHELL.md durable handoff and goals (proposal)](docs/xshell-md-continuity.md)
 - [Home-lab service runner](docs/runall.md)
 - [Original implementation plan and detailed backlog](xshell-implementation-plan.md)

@@ -18,7 +18,8 @@
 //!
 //! The default is the behaviour without a policy: read-only calls on
 //! non-sensitive paths run, and gated calls are denied, prompted, or run by
-//! mode. A path in a `prompt` sensitivity class stays gated even when an
+//! mode. In `off`, a call that can change anything (a shell command, or a
+//! read-write provided tool) is denied even when it is not gated. A path in a `prompt` sensitivity class stays gated even when an
 //! entry always allows its tool, unless the session host's own policy names
 //! the path.
 //!
@@ -84,6 +85,11 @@ pub struct CallFacts<'a> {
     pub gated: bool,
     /// Whether the path is in a `prompt` sensitivity class.
     pub sensitive: bool,
+    /// Whether the call can change anything: a shell command, or a
+    /// provided tool declared read-write. The `off` mode denies these by
+    /// default, so `off` keeps meaning the agent changes nothing, even for
+    /// a provided tool that needs no approval.
+    pub writes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,6 +485,9 @@ impl Policy {
 
 /// The behaviour without a policy.
 pub fn default_decision(call: &CallFacts, mode: ApprovalPolicy) -> PolicyDecision {
+    if mode == ApprovalPolicy::Off && call.writes {
+        return PolicyDecision::Deny;
+    }
     if !call.gated {
         return PolicyDecision::Run;
     }
@@ -656,6 +665,19 @@ mod tests {
             path: None,
             gated: true,
             sensitive: false,
+            writes: true,
+        }
+    }
+
+    /// A provided tool that needs no approval.
+    fn provided(tool: &str, writes: bool) -> CallFacts<'_> {
+        CallFacts {
+            tool,
+            command: None,
+            path: None,
+            gated: false,
+            sensitive: false,
+            writes,
         }
     }
 
@@ -666,11 +688,27 @@ mod tests {
             path: Some(path),
             gated: sensitive,
             sensitive,
+            writes: false,
         }
     }
 
     fn base(policy: &Policy, call: &CallFacts) -> [PolicyDecision; 3] {
         [Off, Ask, Auto].map(|mode| policy.decide(call, mode, true).decision)
+    }
+
+    #[test]
+    fn off_denies_ungated_calls_that_can_change_anything() {
+        let open = policy(&[], None, &[]);
+        // A read-write provided tool that needs no approval runs in `ask` and
+        // `auto`, but `off` still means the agent changes nothing.
+        assert_eq!(base(&open, &provided("memory_put", true)), [Deny, Run, Run]);
+        assert_eq!(base(&open, &provided("memory_get", false)), [Run, Run, Run]);
+        // Listing it does not loosen `off`.
+        let listed = policy(&["memory_put"], None, &[]);
+        assert_eq!(
+            base(&listed, &provided("memory_put", true)),
+            [Deny, Run, Run]
+        );
     }
 
     #[test]

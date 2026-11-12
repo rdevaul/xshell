@@ -1,11 +1,12 @@
 use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
-use crate::tools::{Preparation, execute_prepared, gate, prepare_call, truncate};
+use crate::provider::{CallScope, execute_provided};
+use crate::tools::{Preparation, ToolRef, execute_prepared, gate, prepare_call, truncate};
 use crate::{
     ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
-    GateReason, PolicyDecision, SensitivePaths, Tool, ToolSet, default_decision,
-    drop_tool_payloads, estimate_history_tokens, history_bytes,
+    GateReason, PolicyDecision, SensitivePaths, Tool, ToolAccess, ToolApproval, ToolSet,
+    default_decision, drop_tool_payloads, estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -390,6 +391,9 @@ pub struct TurnPolicy {
     /// root turn never collide in events, approvals, or audit records.
     /// `None` for the root agent.
     pub agent_scope: Option<String>,
+    /// The daemon session the turn belongs to, passed to tool providers so
+    /// they can keep per-session state. `None` outside a daemon.
+    pub session_id: Option<String>,
     /// Limits for a root turn. A child agent draws from its root turn's
     /// [`TurnBudget`] instead (see [`run_agent_turn_with_budget`]).
     pub limits: TurnLimits,
@@ -405,6 +409,7 @@ impl std::fmt::Debug for TurnPolicy {
             .field("compactor", &self.compactor.name())
             .field("tools", &self.tools)
             .field("agent_scope", &self.agent_scope)
+            .field("session_id", &self.session_id)
             .field("limits", &self.limits)
             .finish()
     }
@@ -418,8 +423,9 @@ impl Clone for TurnPolicy {
             blocked_paths: self.blocked_paths.clone(),
             rules: self.rules.clone(),
             compactor: Arc::clone(&self.compactor),
-            tools: self.tools,
+            tools: self.tools.clone(),
             agent_scope: self.agent_scope.clone(),
+            session_id: self.session_id.clone(),
             limits: self.limits,
         }
     }
@@ -435,12 +441,18 @@ impl TurnPolicy {
             compactor: Arc::from(CompactionConfig::default().build()),
             tools: ToolSet::all(),
             agent_scope: None,
+            session_id: None,
             limits: TurnLimits::default(),
         }
     }
 
     pub fn with_tools(mut self, tools: ToolSet) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
 
@@ -865,7 +877,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
             // tool this agent was not offered, or to no tool at all, is
             // refused without approval and without counting as tool activity.
             let Some(tool) = policy.tools.get(&call.name) else {
-                let result = if Tool::from_name(&call.name).is_some() {
+                let result = if policy.tools.knows(&call.name) {
                     format!("tool error: {} is not available to this agent", call.name)
                 } else {
                     format!("tool error: unknown tool {}", call.name)
@@ -898,10 +910,15 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 );
                 continue;
             }
-            let gate_reason = gate(call, &preparation);
+            let gate_reason = match tool {
+                ToolRef::Provided(provided) => (provided.approval() == ToolApproval::Required)
+                    .then_some(GateReason::ToolDeclared),
+                ToolRef::Builtin(_) => gate(call, &preparation),
+            };
             let facts = CallFacts {
                 tool: &call.name,
-                command: (tool == Tool::RunShell)
+                command: tool
+                    .is(Tool::RunShell)
                     .then(|| {
                         call.arguments
                             .get("command")
@@ -911,6 +928,10 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 path: preparation.path(),
                 gated: gate_reason.is_some(),
                 sensitive: gate_reason == Some(GateReason::SensitivePath),
+                writes: match tool {
+                    ToolRef::Provided(provided) => provided.access() == ToolAccess::ReadWrite,
+                    ToolRef::Builtin(builtin) => builtin == Tool::RunShell,
+                },
             };
             let ruled = policy.rules.decide_with_basis(&facts, approval);
             let policy_decision = ruled.decision;
@@ -986,7 +1007,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     }
                     Some(_) => "tool denied by user".into(),
                 }
-            } else if tool == Tool::DelegateTask {
+            } else if tool.is(Tool::DelegateTask) {
                 // A delegation counts as tool activity even if the subagent
                 // ran nothing, so the parent's turn never rolls back over
                 // effects a subagent may have had.
@@ -1004,6 +1025,21 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 .await;
                 subagent_aborted = delegation.aborted;
                 delegation.result
+            } else if let ToolRef::Provided(provided) = tool {
+                observed_tool_activity = true;
+                execute_provided(
+                    provided,
+                    call,
+                    CallScope {
+                        cwd,
+                        session_id: policy.session_id.as_deref(),
+                        agent: policy.agent_scope.as_deref(),
+                        call_id: &scoped.id,
+                        cancellation: observer.cancellation(),
+                        timeout: budget.limits().shell_timeout,
+                    },
+                )
+                .await
             } else {
                 observed_tool_activity = true;
                 execute_prepared(
@@ -1129,29 +1165,27 @@ async fn run_delegation(
         .get("tools")
         .and_then(serde_json::Value::as_str)
     {
-        None | Some("read_only") => ToolSet::read_only(),
-        Some("inherit") => ToolSet::all(),
+        None | Some("read_only") => policy.tools.read_only_subset(),
+        Some("inherit") => policy.tools.clone(),
         Some(other) => {
             return refused(format!(
                 "delegate_task \"tools\" must be \"read_only\" or \"inherit\", not {other:?}"
             ));
         }
     };
-    let tools = requested
-        .intersect(policy.tools)
-        .without(Tool::DelegateTask);
+    let tools = requested.without(Tool::DelegateTask);
     let name = match &policy.agent_scope {
         Some(scope) => format!("{scope}/delegate-{number}"),
         None => format!("delegate-{number}"),
     };
     let child_policy = policy
         .clone()
-        .with_tools(tools)
+        .with_tools(tools.clone())
         .with_agent_scope(name.clone());
     observer.emit(ExecutionEvent::SubagentStarted {
         agent: name.clone(),
         task: task.clone(),
-        tools: tools.tools().map(|tool| tool.name().to_owned()).collect(),
+        tools: tools.names(),
     });
 
     let mut history = vec![ChatMessage::system(format!(
@@ -4393,5 +4427,374 @@ mod tests {
         ] {
             assert!(!announces_next_step(line), "{line}");
         }
+    }
+
+    /// Records the context of every call it runs and answers "<tool> ran".
+    struct RecordingProvider {
+        calls: Arc<std::sync::Mutex<Vec<(String, crate::ToolContext)>>>,
+    }
+
+    #[async_trait]
+    impl crate::ToolProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "memory"
+        }
+
+        fn tools(&self) -> Vec<crate::ProvidedTool> {
+            use crate::{ToolAccess::*, ToolApproval::*};
+            [
+                ("memory_get", ReadOnly, NotRequired),
+                ("memory_put", ReadWrite, NotRequired),
+                ("memory_purge", ReadWrite, Required),
+            ]
+            .into_iter()
+            .map(|(name, access, approval)| crate::ProvidedTool {
+                definition: xshell_core::ToolDefinition {
+                    name: name.into(),
+                    description: format!("The {name} tool."),
+                    parameters: json!({"type": "object", "properties": {}}),
+                },
+                access,
+                approval,
+            })
+            .collect()
+        }
+
+        async fn call(&self, tool: &str, context: crate::ToolContext) -> Result<String> {
+            let answer = format!("{tool} ran");
+            self.calls.lock().unwrap().push((tool.to_owned(), context));
+            Ok(answer)
+        }
+    }
+
+    /// `calls`, under a name the tests below do not shadow.
+    fn calls_response(tool_calls: Vec<ToolCall>) -> AssistantResponse {
+        calls(tool_calls)
+    }
+
+    type ProviderCalls = Arc<std::sync::Mutex<Vec<(String, crate::ToolContext)>>>;
+
+    fn provided_policy(approval: ApprovalPolicy) -> (TurnPolicy, ProviderCalls) {
+        let calls = ProviderCalls::default();
+        let registry = crate::ToolRegistry::builder()
+            .provider(Arc::new(RecordingProvider {
+                calls: Arc::clone(&calls),
+            }))
+            .build()
+            .unwrap();
+        let policy = TurnPolicy::new(approval)
+            .with_tools(ToolSet::all().with_provided(registry))
+            .with_session_id("session-1");
+        (policy, calls)
+    }
+
+    fn provided_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({"key": "value"}),
+        }
+    }
+
+    fn approval_reasons(events: &[ExecutionEvent]) -> Vec<Option<GateReason>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::ApprovalRequested { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn provided_tools_are_offered_after_builtins_and_run_with_their_context() {
+        let temporary = TempDir::new().unwrap();
+        let (policy, calls) = provided_policy(ApprovalPolicy::Ask);
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls_response(vec![
+                    provided_call("a", "memory_get"),
+                    provided_call("b", "memory_put"),
+                ]),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        // No scripted decisions: neither call may prompt.
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            offered(&adapter.requests[0]),
+            [
+                "read_file",
+                "list_directory",
+                "run_shell",
+                "delegate_task",
+                "memory_get",
+                "memory_put",
+                "memory_purge"
+            ]
+        );
+        assert_eq!(
+            tool_results(&observer.events),
+            [("a", "memory_get ran"), ("b", "memory_put ran")]
+        );
+        let calls = calls.lock().unwrap();
+        let (tool, context) = &calls[0];
+        assert_eq!(tool, "memory_get");
+        assert_eq!(context.session_id.as_deref(), Some("session-1"));
+        assert_eq!(context.agent, None);
+        assert_eq!(context.call_id, "a");
+        assert_eq!(context.cwd, temporary.path());
+        assert_eq!(context.arguments["key"], "value");
+        assert!(observer.events.contains(&ExecutionEvent::ToolDecision {
+            call_id: "b".into(),
+            decision: ApprovalDecision::Approve,
+            basis: Some(DecisionBasis::ModeDefault),
+            approval: None,
+        }));
+    }
+
+    #[tokio::test]
+    async fn off_mode_denies_read_write_provided_tools_that_need_no_approval() {
+        let temporary = TempDir::new().unwrap();
+        let (policy, calls) = provided_policy(ApprovalPolicy::Off);
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls_response(vec![
+                    provided_call("r", "memory_get"),
+                    provided_call("w", "memory_put"),
+                ]),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tool_results(&observer.events),
+            [
+                ("r", "memory_get ran"),
+                ("w", "tool denied: the approval mode is off")
+            ]
+        );
+        assert!(approval_reasons(&observer.events).is_empty());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the write never reached the provider");
+    }
+
+    #[tokio::test]
+    async fn provided_tools_that_require_approval_are_gated_by_mode() {
+        let temporary = TempDir::new().unwrap();
+        for (mode, decisions, expected) in [
+            (
+                ApprovalPolicy::Ask,
+                vec![ApprovalDecision::Deny],
+                "tool denied by user",
+            ),
+            (
+                ApprovalPolicy::Off,
+                vec![],
+                "tool denied: the approval mode is off",
+            ),
+            (ApprovalPolicy::Auto, vec![], "memory_purge ran"),
+        ] {
+            let (policy, calls) = provided_policy(mode);
+            let mut adapter = ScriptedAdapter {
+                responses: VecDeque::from([
+                    calls_response(vec![provided_call("p", "memory_purge")]),
+                    answer("done"),
+                ]),
+                requests: Vec::new(),
+            };
+            let mut observer = recording_observer(decisions);
+            run_agent_turn(
+                &mut adapter,
+                &mut Vec::new(),
+                "hello".into(),
+                temporary.path(),
+                &policy,
+                &mut observer,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tool_results(&observer.events),
+                [("p", expected)],
+                "{mode:?}"
+            );
+            let prompted = mode == ApprovalPolicy::Ask;
+            assert_eq!(
+                approval_reasons(&observer.events),
+                if prompted {
+                    vec![Some(GateReason::ToolDeclared)]
+                } else {
+                    vec![]
+                },
+                "{mode:?}"
+            );
+            let ran = mode == ApprovalPolicy::Auto;
+            assert_eq!(calls.lock().unwrap().len(), usize::from(ran), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_policies_name_provided_tools_like_builtins() {
+        let temporary = TempDir::new().unwrap();
+        let (base, _) = crate::Policy::parse(&crate::PolicyConfig {
+            always_allowed: vec!["memory_get".into()],
+            allowed: Some(vec!["memory_put".into()]),
+            denied: vec!["memory_purge".into()],
+        })
+        .unwrap();
+        let (policy, calls) = provided_policy(ApprovalPolicy::Ask);
+        let policy = policy.with_rules(ApprovalRules {
+            base,
+            overlay: None,
+        });
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls_response(vec![
+                    provided_call("g", "memory_get"),
+                    provided_call("p", "memory_put"),
+                    provided_call("x", "memory_purge"),
+                    list_call("l"),
+                ]),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([ApprovalDecision::Approve]);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        let results = tool_results(&observer.events);
+        assert_eq!(results[0], ("g", "memory_get ran"));
+        // `allowed` prompts in ask mode, as for a built-in tool.
+        assert_eq!(results[1], ("p", "memory_put ran"));
+        assert_eq!(
+            approval_reasons(&observer.events),
+            [Some(GateReason::Policy)]
+        );
+        assert_eq!(results[2], ("x", "tool denied by the approval policy"));
+        // With an `allowed` list, unlisted tools are denied.
+        assert_eq!(results[3], ("l", "tool denied by the approval policy"));
+        let ran: Vec<_> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(ran, ["memory_get", "memory_put"]);
+    }
+
+    #[tokio::test]
+    async fn subagents_get_only_the_provided_tools_their_request_allows() {
+        let temporary = TempDir::new().unwrap();
+        let (policy, calls) = provided_policy(ApprovalPolicy::Auto);
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls_response(vec![
+                    delegate_call("r", "task", None),
+                    delegate_call("i", "task", Some("inherit")),
+                ]),
+                // The read-only subagent tries a read-write tool.
+                calls_response(vec![
+                    provided_call("put", "memory_put"),
+                    provided_call("get", "memory_get"),
+                ]),
+                answer("read-only done"),
+                calls_response(vec![provided_call("put", "memory_put")]),
+                answer("inherit done"),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            offered(&adapter.requests[1]),
+            ["read_file", "list_directory", "memory_get"]
+        );
+        assert_eq!(
+            offered(&adapter.requests[3]),
+            [
+                "read_file",
+                "list_directory",
+                "run_shell",
+                "memory_get",
+                "memory_put",
+                "memory_purge"
+            ]
+        );
+        let child_results: Vec<_> = subagent_events(&observer.events, "delegate-1")
+            .into_iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::ToolResult { result, .. } => Some(result.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            child_results,
+            [
+                "tool error: memory_put is not available to this agent",
+                "memory_get ran"
+            ]
+        );
+        let calls = calls.lock().unwrap();
+        let agents: Vec<_> = calls
+            .iter()
+            .map(|(tool, context)| (tool.as_str(), context.agent.as_deref()))
+            .collect();
+        assert_eq!(
+            agents,
+            [
+                ("memory_get", Some("delegate-1")),
+                ("memory_put", Some("delegate-2"))
+            ]
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|(_, context)| context.session_id.as_deref() == Some("session-1"))
+        );
     }
 }

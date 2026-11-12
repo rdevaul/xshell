@@ -41,6 +41,11 @@ it, images are saved to files and only their paths are printed.
 | Credentials | Tokens live wherever the engine runs tools | Tokens live only in the broker |
 | Audit, approvals, headless | Need MCP-specific events | Already cover `run_shell` calls |
 
+Tools written as Rust code and compiled into the binary that builds the
+engine are a separate seam with none of these concerns; see
+[tool providers](tool-providers.md). MCP servers are never registered that
+way.
+
 The protocol also includes features that work against xshell's model:
 *sampling* lets a server send prompts to the user's model, and
 *elicitation* lets a server ask the user questions mid-call. The bridge does

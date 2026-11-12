@@ -12,8 +12,10 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `Subagent`, `SubagentFinished`). Version 17 adds `source` on
 // `ApprovalReply` and `basis` and `approval` on `ExecutionEvent::ToolDecision`.
 // Version 18 adds the `blocked_path` decision basis. Version 19 adds
-// `tool_output_bytes` to the turn limits.
-pub const SESSION_PROTOCOL_VERSION: u32 = 19;
+// `tool_output_bytes` to the turn limits. Version 20 adds the
+// `tool_declared` gate reason on `ExecutionEvent::ApprovalRequested`, sent for
+// provided tools that require approval.
+pub const SESSION_PROTOCOL_VERSION: u32 = 20;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

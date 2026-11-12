@@ -17,8 +17,8 @@ use xshell_core::ToolCall;
 use xshell_execution::{
     AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalRules, ApprovalSource,
     Approver, BudgetExhausted, CancellationFlag, CompactionConfig, ExecutionEvent, GateReason,
-    ModelBudget, Policy, SensitivePaths, TurnLimits, TurnObserver, TurnPolicy, build_adapter,
-    run_agent_turn, run_direct_shell_streaming_cancellable,
+    ModelBudget, Policy, SensitivePaths, ToolRegistry, ToolSet, TurnLimits, TurnObserver,
+    TurnPolicy, build_adapter, run_agent_turn, run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
 
@@ -52,6 +52,8 @@ pub struct DaemonPolicy {
     pub blocked_paths: SensitivePaths,
     pub rules: Policy,
     pub compaction: CompactionConfig,
+    /// Tools that compiled-in providers add to every agent turn.
+    pub tools: Arc<ToolRegistry>,
     /// Most turns running at once across all sessions.
     pub max_concurrent_turns: usize,
 }
@@ -65,6 +67,7 @@ impl Default for DaemonPolicy {
             blocked_paths: SensitivePaths::none(),
             rules: Policy::default(),
             compaction: CompactionConfig::default(),
+            tools: ToolRegistry::empty(),
             max_concurrent_turns: crate::DEFAULT_MAX_CONCURRENT_TURNS,
         }
     }
@@ -263,6 +266,7 @@ impl ExecutionCoordinator {
                 &limits,
                 requested_limits.as_ref(),
                 &rules,
+                &self.inner.policy.tools,
             )) {
                 execution.finish(&turn_id);
                 return Err(error);
@@ -536,6 +540,10 @@ impl ExecutionCoordinator {
                         api_key_env: model.api_key_env.clone(),
                     })?;
                     let policy = TurnPolicy::new(approval)
+                        .with_tools(
+                            ToolSet::all().with_provided(Arc::clone(&self.inner.policy.tools)),
+                        )
+                        .with_session_id(session_id.clone())
                         .with_limits(limits)
                         .with_rules(ApprovalRules {
                             base: self.inner.policy.rules.clone(),

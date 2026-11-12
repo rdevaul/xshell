@@ -99,6 +99,8 @@ Agents are integrated behind a versioned local RPC contract. A provider adapter 
 
 Core operations are: send message, stream events, request/cancel tool invocation, attach artifact, obtain session state, and stop/restart the provider. Initial adapters should target a local OpenAI-compatible endpoint or Ollama, plus a generic external-process adapter. Integrations for Berd, Codex, Hermes, and OpenClaw must be built only where their supported API/CLI semantics allow durable sessions and explicit approval boundaries.
 
+Beyond the built-in tools, a program that embeds the engine may register compiled-in tool providers. Their tools pass through the same toolset, policy, approval, audit and budget path as built-in tools, and the set is fixed when the engine is built; see [tool providers](docs/tool-providers.md). Tools from untrusted sources, such as MCP servers, use the [MCP bridge](docs/mcp-bridge.md).
+
 ## 6. Connection and lifecycle
 
 `//connect <ssh-destination> [--session NAME]` uses the normal SSH configuration, host-key verification, and SSH agent of the invoking user. It first asks a small remote bootstrap program whether a compatible session manager is available.

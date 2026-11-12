@@ -2,11 +2,13 @@ use crate::SensitivePaths;
 use crate::engine::CancellationFlag;
 use crate::prepared::{self, ObjectKind, PreparedObject};
 use crate::process::{ProcessGroupGuard, configure_process_group};
+use crate::provider::{RegisteredTool, ToolAccess, ToolRegistry};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -67,59 +69,193 @@ impl Tool {
 /// The tools one agent may use: both what is advertised to the model and what
 /// the engine will dispatch. A call outside the set is refused before
 /// approval, so narrowing a set narrows authority, not just the prompt.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct ToolSet(u8);
+///
+/// A set holds built-in tools and, optionally, tools from one
+/// [`ToolRegistry`]. Sets built without a registry hold built-in tools only.
+#[derive(Clone)]
+pub struct ToolSet {
+    builtins: u8,
+    registry: Arc<ToolRegistry>,
+    /// Bit `i` is the registry's tool `i`; the registry holds at most
+    /// [`MAX_PROVIDED_TOOLS`](crate::MAX_PROVIDED_TOOLS) tools.
+    provided: u64,
+}
+
+/// A tool in a [`ToolSet`].
+#[derive(Debug, Clone, Copy)]
+pub enum ToolRef<'a> {
+    Builtin(Tool),
+    Provided(&'a RegisteredTool),
+}
+
+impl ToolRef<'_> {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Builtin(tool) => tool.name(),
+            Self::Provided(tool) => tool.name(),
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Self::Builtin(tool) => tool.is_read_only(),
+            Self::Provided(tool) => tool.access() == ToolAccess::ReadOnly,
+        }
+    }
+
+    /// Whether this is the built-in `tool`.
+    pub fn is(&self, tool: Tool) -> bool {
+        matches!(self, Self::Builtin(builtin) if *builtin == tool)
+    }
+}
 
 impl ToolSet {
+    /// Every built-in tool.
     pub fn all() -> Self {
         Self::from_tools(Tool::ALL)
     }
 
     pub fn none() -> Self {
-        Self(0)
+        Self::from_tools([])
     }
 
+    /// The read-only built-in tools.
     pub fn read_only() -> Self {
         Self::from_tools(Tool::ALL.into_iter().filter(|tool| tool.is_read_only()))
     }
 
     pub fn from_tools(tools: impl IntoIterator<Item = Tool>) -> Self {
-        Self(tools.into_iter().fold(0, |bits, tool| bits | tool.bit()))
+        Self {
+            builtins: tools.into_iter().fold(0, |bits, tool| bits | tool.bit()),
+            registry: ToolRegistry::empty(),
+            provided: 0,
+        }
     }
 
-    pub fn contains(self, tool: Tool) -> bool {
-        self.0 & tool.bit() != 0
+    /// This set's built-in tools plus every tool in `registry`, replacing
+    /// any provided tools the set held before.
+    pub fn with_provided(self, registry: Arc<ToolRegistry>) -> Self {
+        let provided = match registry.len() {
+            0 => 0,
+            count => u64::MAX >> (64 - count),
+        };
+        Self {
+            builtins: self.builtins,
+            registry,
+            provided,
+        }
+    }
+
+    pub fn contains(&self, tool: Tool) -> bool {
+        self.builtins & tool.bit() != 0
+    }
+
+    /// The registry this set draws provided tools from.
+    pub fn registry(&self) -> &ToolRegistry {
+        &self.registry
     }
 
     /// The tool named `name`, if it exists and is in this set.
-    pub fn get(self, name: &str) -> Option<Tool> {
-        Tool::from_name(name).filter(|tool| self.contains(*tool))
+    pub fn get(&self, name: &str) -> Option<ToolRef<'_>> {
+        if let Some(tool) = Tool::from_name(name) {
+            return self.contains(tool).then_some(ToolRef::Builtin(tool));
+        }
+        let index = self.registry.position(name)?;
+        (self.provided & (1 << index) != 0)
+            .then(|| self.registry.get(index).map(ToolRef::Provided))
+            .flatten()
     }
 
-    pub fn without(self, tool: Tool) -> Self {
-        Self(self.0 & !tool.bit())
+    /// Whether `name` is a tool this set's engine knows, in this set or not:
+    /// the difference between "not available to this agent" and "unknown".
+    pub fn knows(&self, name: &str) -> bool {
+        Tool::from_name(name).is_some() || self.registry.position(name).is_some()
+    }
+
+    pub fn without(mut self, tool: Tool) -> Self {
+        self.builtins &= !tool.bit();
+        self
     }
 
     /// The tools in both sets: how a child's request is bounded by its
-    /// parent's authority.
-    pub fn intersect(self, other: Self) -> Self {
-        Self(self.0 & other.0)
+    /// parent's authority. Provided tools are kept only when both sets draw
+    /// on the same registry.
+    pub fn intersect(&self, other: &Self) -> Self {
+        let same_registry = Arc::ptr_eq(&self.registry, &other.registry);
+        Self {
+            builtins: self.builtins & other.builtins,
+            registry: Arc::clone(&self.registry),
+            provided: if same_registry {
+                self.provided & other.provided
+            } else {
+                0
+            },
+        }
     }
 
-    pub fn tools(self) -> impl Iterator<Item = Tool> {
+    /// The read-only tools of this set, built-in and provided.
+    pub fn read_only_subset(&self) -> Self {
+        let provided = self
+            .registry
+            .tools()
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| tool.access() == ToolAccess::ReadOnly)
+            .fold(0, |bits, (index, _)| bits | (1 << index));
+        Self {
+            builtins: self.builtins & Self::read_only().builtins,
+            registry: Arc::clone(&self.registry),
+            provided: self.provided & provided,
+        }
+    }
+
+    /// The built-in tools in this set, in `Tool::ALL` order.
+    pub fn tools(&self) -> impl Iterator<Item = Tool> + '_ {
         Tool::ALL
             .into_iter()
             .filter(move |tool| self.contains(*tool))
     }
 
-    /// Definitions for the tools in this set, in the stable `Tool::ALL` order.
-    pub fn definitions(self) -> Vec<ToolDefinition> {
-        definitions()
+    /// Every tool in this set: built-in tools in `Tool::ALL` order, then
+    /// provided tools in registry order.
+    pub fn iter(&self) -> impl Iterator<Item = ToolRef<'_>> + '_ {
+        let provided = self
+            .registry
+            .tools()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.provided & (1 << index) != 0)
+            .map(|(_, tool)| ToolRef::Provided(tool));
+        self.tools().map(ToolRef::Builtin).chain(provided)
+    }
+
+    /// The names of every tool in this set, in [`iter`](Self::iter) order.
+    pub fn names(&self) -> Vec<String> {
+        self.iter().map(|tool| tool.name().to_owned()).collect()
+    }
+
+    /// Definitions for the tools in this set, in [`iter`](Self::iter) order.
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        let builtins = definitions()
             .into_iter()
-            .filter(|definition| self.get(&definition.name).is_some())
-            .collect()
+            .filter(|definition| self.get(&definition.name).is_some());
+        let provided = self.iter().filter_map(|tool| match tool {
+            ToolRef::Provided(tool) => Some(tool.definition().clone()),
+            ToolRef::Builtin(_) => None,
+        });
+        builtins.chain(provided).collect()
     }
 }
+
+impl PartialEq for ToolSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.builtins == other.builtins
+            && self.provided == other.provided
+            && (self.provided == 0 || Arc::ptr_eq(&self.registry, &other.registry))
+    }
+}
+
+impl Eq for ToolSet {}
 
 impl Default for ToolSet {
     fn default() -> Self {
@@ -129,7 +265,7 @@ impl Default for ToolSet {
 
 impl std::fmt::Debug for ToolSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_set().entries(self.tools().map(Tool::name)).finish()
+        f.debug_set().entries(self.names()).finish()
     }
 }
 
@@ -211,6 +347,8 @@ pub enum GateReason {
     SensitivePath,
     /// The approval policy lists the call as needing approval.
     Policy,
+    /// A provided tool declares that its calls need approval.
+    ToolDeclared,
 }
 
 impl std::fmt::Display for GateReason {
@@ -219,6 +357,7 @@ impl std::fmt::Display for GateReason {
             Self::ShellExecution => "shell execution",
             Self::SensitivePath => "sensitive path",
             Self::Policy => "approval policy",
+            Self::ToolDeclared => "tool requires approval",
         })
     }
 }
@@ -640,8 +779,12 @@ mod tests {
         assert!(read_only.contains(Tool::ReadFile));
         assert!(read_only.contains(Tool::ListDirectory));
         assert!(!read_only.contains(Tool::RunShell));
-        assert_eq!(read_only.get("run_shell"), None);
-        assert_eq!(read_only.get("read_file"), Some(Tool::ReadFile));
+        assert!(read_only.get("run_shell").is_none());
+        assert!(
+            read_only
+                .get("read_file")
+                .is_some_and(|tool| tool.is(Tool::ReadFile))
+        );
         assert_eq!(
             read_only
                 .definitions()
@@ -660,17 +803,106 @@ mod tests {
             read_only
         );
         assert_eq!(
-            ToolSet::all().intersect(ToolSet::from_tools([Tool::ReadFile, Tool::RunShell])),
+            ToolSet::all().intersect(&ToolSet::from_tools([Tool::ReadFile, Tool::RunShell])),
             ToolSet::from_tools([Tool::ReadFile, Tool::RunShell])
         );
         assert_eq!(
-            read_only.intersect(ToolSet::from_tools([Tool::RunShell])),
+            read_only.intersect(&ToolSet::from_tools([Tool::RunShell])),
             ToolSet::none()
         );
         assert_eq!(
             format!("{read_only:?}"),
             r#"{"read_file", "list_directory"}"#
         );
+    }
+
+    fn provided_registry() -> Arc<ToolRegistry> {
+        use crate::provider::tests::{Fixed, tool};
+        use crate::{ToolAccess, ToolApproval};
+        ToolRegistry::builder()
+            .provider(Arc::new(Fixed {
+                name: "memory",
+                tools: vec![
+                    tool(
+                        "memory_get",
+                        ToolAccess::ReadOnly,
+                        ToolApproval::NotRequired,
+                    ),
+                    tool(
+                        "memory_put",
+                        ToolAccess::ReadWrite,
+                        ToolApproval::NotRequired,
+                    ),
+                    tool(
+                        "memory_purge",
+                        ToolAccess::ReadWrite,
+                        ToolApproval::Required,
+                    ),
+                ],
+            }))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn toolsets_hold_provided_tools_after_the_builtins() {
+        let registry = provided_registry();
+        let set = ToolSet::all().with_provided(Arc::clone(&registry));
+        assert_eq!(
+            set.names(),
+            [
+                "read_file",
+                "list_directory",
+                "run_shell",
+                "delegate_task",
+                "memory_get",
+                "memory_put",
+                "memory_purge"
+            ]
+        );
+        assert_eq!(
+            set.definitions()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            set.names()
+        );
+        let Some(ToolRef::Provided(tool)) = set.get("memory_put") else {
+            panic!("memory_put is provided");
+        };
+        assert_eq!(tool.provider_name(), "memory");
+        assert!(set.knows("memory_put"));
+        assert!(!set.knows("memory_nope"));
+        assert!(set.get("memory_nope").is_none());
+
+        // Without the registry, provided names are unknown, not merely
+        // unavailable.
+        assert!(!ToolSet::all().knows("memory_put"));
+        assert!(ToolSet::all().get("memory_put").is_none());
+    }
+
+    #[test]
+    fn read_only_subsets_and_intersections_bound_provided_tools() {
+        let registry = provided_registry();
+        let set = ToolSet::all().with_provided(Arc::clone(&registry));
+        assert_eq!(
+            set.read_only_subset().names(),
+            ["read_file", "list_directory", "memory_get"]
+        );
+        let narrowed = set.intersect(&ToolSet::none().with_provided(Arc::clone(&registry)));
+        assert_eq!(
+            narrowed.names(),
+            ["memory_get", "memory_put", "memory_purge"]
+        );
+        // A set without the registry grants none of its tools, from either
+        // side of the intersection.
+        assert_eq!(set.intersect(&ToolSet::all()), ToolSet::all());
+        assert_eq!(ToolSet::all().intersect(&set), ToolSet::all());
+        // A different registry with the same tools is a different authority.
+        let other = ToolSet::all().with_provided(provided_registry());
+        assert_eq!(set.intersect(&other), ToolSet::all());
+        assert_eq!(set.intersect(&other).names().len(), Tool::ALL.len());
+        assert_ne!(set, other);
     }
 
     fn tool(name: &str, arguments: Value) -> ToolCall {
