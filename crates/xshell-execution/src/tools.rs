@@ -2,7 +2,10 @@ use crate::SensitivePaths;
 use crate::engine::CancellationFlag;
 use crate::environment::apply_agent_environment;
 use crate::prepared::{self, ObjectKind, PreparedObject};
-use crate::process::{LINGER_GRACE, ShellEnd, Stream, configure_process_group, supervise_shell};
+use crate::process::{
+    LINGER_GRACE, ShellEnd, Stream, configure_process_group, restrict_inherited_descriptors,
+    supervise_shell,
+};
 use crate::provider::{RegisteredTool, ToolAccess, ToolRegistry};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -756,6 +759,7 @@ async fn run_shell_with_grace(
         .stderr(Stdio::piped());
     apply_agent_environment(&mut process);
     configure_process_group(&mut process);
+    restrict_inherited_descriptors(&mut process);
     let child = process
         .spawn()
         .with_context(|| format!("could not launch shell {shell}"))?;
@@ -1123,6 +1127,24 @@ mod tests {
             requires_approval(&read("README.md"), root, &sensitive),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn f12_a_run_shell_child_cannot_see_a_live_pty_master() {
+        use crate::process::descriptor_leak::{leaky_pty_master, probe};
+        use std::os::fd::AsRawFd;
+        let master = leaky_pty_master();
+        let output = run_shell(
+            &json!({"command": probe(master.as_raw_fd())}),
+            &manifest_dir(),
+            CancellationFlag::default(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("swept"), "{output}");
+        assert!(!output.contains("leak:"), "{output}");
+        assert!(!output.contains("tty:"), "{output}");
     }
 
     #[tokio::test]

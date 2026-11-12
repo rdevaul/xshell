@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
-use nix::pty::{OpenptyResult, Winsize, openpty};
+use nix::pty::Winsize;
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use std::env;
+use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -652,8 +653,7 @@ fn spawn_child(
     size: Winsize,
     terminal_type: Option<&str>,
 ) -> Result<(OwnedFd, Child)> {
-    let OpenptyResult { master, slave } =
-        openpty(Some(&size), terminal).context("cannot allocate pseudoterminal")?;
+    let (master, slave) = open_pty(size, terminal)?;
     let stdin = File::from(slave.try_clone().context("cannot clone PTY slave")?);
     let stdout = File::from(slave.try_clone().context("cannot clone PTY slave")?);
     let stderr = File::from(slave);
@@ -687,10 +687,94 @@ fn spawn_child(
             Ok(())
         });
     }
+    // Keep every descriptor above 2 (other jobs' PTY masters, daemon
+    // sockets) from crossing exec (finding F12).
+    xshell_platform::descriptors::restrict_inherited_descriptors(&mut process);
     let child = process
         .spawn()
         .with_context(|| format!("could not launch PTY shell {shell}"))?;
     Ok((master, child))
+}
+
+/// Allocate a pseudoterminal whose master and slave are both close-on-exec.
+///
+/// `openpty(3)` sets close-on-exec on neither descriptor, so before F12 every
+/// later child inherited every live job's master and could type into it.
+/// Here both descriptors are opened with `O_CLOEXEC`, so there is no window
+/// in which another thread's fork can inherit them. Should `posix_openpt`
+/// reject `O_CLOEXEC`, the master is opened without it and marked straight
+/// after; the descriptor sweep in each xshell child covers that window.
+/// The slave still reaches the child's stdio: `Command` `dup2`s it onto
+/// descriptors 0 to 2, and `dup2` clears close-on-exec on the copy.
+fn open_pty(size: Winsize, terminal: Option<&Termios>) -> Result<(OwnedFd, OwnedFd)> {
+    let master = open_pty_master().context("cannot allocate pseudoterminal")?;
+    let raw_master = master.as_raw_fd();
+    // SAFETY: grantpt(3) and unlockpt(3) act only on the master descriptor passed.
+    if unsafe { libc::grantpt(raw_master) } != 0 || unsafe { libc::unlockpt(raw_master) } != 0 {
+        return Err(io::Error::last_os_error()).context("cannot unlock pseudoterminal");
+    }
+    let mut name = [0 as libc::c_char; 128];
+    // SAFETY: `name` is writable for the length passed, and ptsname_r(3) writes a
+    // NUL-terminated path within it.
+    let named = unsafe { ptsname_r(raw_master, name.as_mut_ptr(), name.len()) };
+    if named != 0 {
+        // glibc returns the error number; macOS returns -1 and sets errno.
+        let error = if named < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::from_raw_os_error(named)
+        };
+        return Err(error).context("cannot name pseudoterminal");
+    }
+    // SAFETY: ptsname_r succeeded, so `name` holds a NUL-terminated string.
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+    // SAFETY: `name` is a valid C string; the returned descriptor is owned below.
+    let raw_slave = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_slave < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("cannot open pseudoterminal {}", name.to_string_lossy()));
+    }
+    // SAFETY: open succeeded, so `raw_slave` is a new descriptor nothing else owns.
+    let slave = unsafe { OwnedFd::from_raw_fd(raw_slave) };
+    if let Some(terminal) = terminal {
+        tcsetattr(&slave, SetArg::TCSANOW, terminal)
+            .context("cannot set pseudoterminal attributes")?;
+    }
+    set_pty_size(slave.as_raw_fd(), size)?;
+    Ok((master, slave))
+}
+
+fn open_pty_master() -> io::Result<OwnedFd> {
+    let flags = libc::O_RDWR | libc::O_NOCTTY;
+    // SAFETY: posix_openpt(3) takes only flags; the returned descriptor is owned below.
+    let mut raw = unsafe { libc::posix_openpt(flags | libc::O_CLOEXEC) };
+    if raw < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // SAFETY: as above, without O_CLOEXEC for a libc that rejects it.
+        raw = unsafe { libc::posix_openpt(flags) };
+    }
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: posix_openpt succeeded, so `raw` is a new descriptor nothing else owns.
+    let master = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Idempotent when O_CLOEXEC was honoured; closes the gap when it was not.
+    xshell_platform::descriptors::set_cloexec(raw)?;
+    Ok(master)
+}
+
+#[cfg(not(target_os = "macos"))]
+use libc::ptsname_r;
+
+// The libc crate does not bind macOS's ptsname_r(3) (macOS 10.13.4 and
+// later), and ptsname(3) returns a static buffer, so it is not thread-safe.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn ptsname_r(fd: libc::c_int, buffer: *mut libc::c_char, length: libc::size_t) -> libc::c_int;
 }
 
 fn relay(
@@ -1011,6 +1095,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::pty::{OpenptyResult, openpty};
     use nix::sys::termios::{LocalFlags, OutputFlags};
     use std::io::Read;
     use std::os::unix::net::UnixStream;
@@ -1220,6 +1305,111 @@ mod tests {
         assert!(output.contains("got:remote"));
         assert!(output.contains("30 100"));
         assert_eq!(status, "exit status: 0");
+    }
+
+    fn pty_cloexec(fd: RawFd) -> bool {
+        // SAFETY: fcntl(F_GETFD) only queries the descriptor flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        flags >= 0 && flags & libc::FD_CLOEXEC != 0
+    }
+
+    #[test]
+    fn f12_pty_master_and_slave_are_close_on_exec() {
+        let (master, slave) = open_pty(Winsize::from(PtySize::default()), None).unwrap();
+        assert!(pty_cloexec(master.as_raw_fd()));
+        assert!(pty_cloexec(slave.as_raw_fd()));
+    }
+
+    /// Exchange with `process` until `done` holds for its output so far, it
+    /// exits, or `deadline` passes.
+    fn drain_until(
+        process: &mut RemotePtyProcess,
+        mut input: Vec<u8>,
+        deadline: Duration,
+        done: impl Fn(&str) -> bool,
+    ) -> (String, Option<String>) {
+        let start = std::time::Instant::now();
+        let mut output = Vec::new();
+        loop {
+            let chunk = process
+                .exchange(
+                    &input,
+                    PtySize::default(),
+                    Duration::from_millis(50),
+                    64 * 1024,
+                )
+                .unwrap();
+            input.drain(..chunk.input_accepted);
+            output.extend_from_slice(&chunk.output);
+            let text = String::from_utf8_lossy(&output).into_owned();
+            if chunk.status.is_some() || done(&text) || start.elapsed() > deadline {
+                return (text, chunk.status);
+            }
+        }
+    }
+
+    #[test]
+    fn f12_a_second_pty_job_cannot_reach_the_first_jobs_master() {
+        let temporary = TempDir::new().unwrap();
+        let mut first = RemotePtyProcess::spawn(
+            "printf 'ready\\n'; read value; printf 'got:%s\\n' \"$value\"",
+            temporary.path(),
+            PtySize::default(),
+            None,
+        )
+        .unwrap();
+        let (ready, _) = drain_until(&mut first, Vec::new(), Duration::from_secs(10), |text| {
+            text.contains("ready")
+        });
+        assert!(
+            ready.contains("ready"),
+            "first job did not start: {ready:?}"
+        );
+        let first_master = first.master.as_raw_fd();
+
+        // The second job looks for the first job's master by number, reports
+        // any terminal above stdio, and tries the attack from the finding:
+        // typing into every descriptor it holds. It runs under /bin/sh so
+        // the descriptors a login shell keeps for itself do not count.
+        let script = temporary.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "if [ -e /dev/fd/{first_master} ]; then echo leak:{first_master}; fi\n\
+                 for f in /dev/fd/*; do\n\
+                 n=${{f##*/}}\n\
+                 [ \"$n\" -gt 2 ] || continue\n\
+                 if [ -t \"$n\" ]; then echo tty:$n; fi\n\
+                 {{ echo INJECTED >\"$f\"; }} 2>/dev/null\n\
+                 done\n\
+                 echo swept\n"
+            ),
+        )
+        .unwrap();
+        let probe = format!("exec /bin/sh {}", script.display());
+        let mut second =
+            RemotePtyProcess::spawn(&probe, temporary.path(), PtySize::default(), None).unwrap();
+        let (second_output, status) =
+            drain_until(&mut second, Vec::new(), Duration::from_secs(10), |_| false);
+
+        // The first job reads its next line from its own terminal; it must
+        // be the one we send, not the second job's injection. Drain it to
+        // exit before asserting, so a failure does not leave a job blocked
+        // flushing undrained output while its process is reaped.
+        let (first_output, _) = drain_until(
+            &mut first,
+            b"genuine\n".to_vec(),
+            Duration::from_secs(10),
+            |_| false,
+        );
+        drop(first);
+        drop(second);
+        assert_eq!(status.as_deref(), Some("exit status: 0"), "{second_output}");
+        assert!(second_output.contains("swept"), "{second_output}");
+        assert!(!second_output.contains("leak:"), "{second_output}");
+        assert!(!second_output.contains("tty:"), "{second_output}");
+        assert!(first_output.contains("got:genuine"), "{first_output}");
+        assert!(!first_output.contains("INJECTED"), "{first_output}");
     }
 
     #[test]

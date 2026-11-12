@@ -2197,6 +2197,7 @@ dependencies = [
  "libc",
  "nix",
  "tempfile",
+ "xshell-platform",
 ]
 
 [[package]]
