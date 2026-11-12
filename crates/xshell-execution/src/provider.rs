@@ -30,6 +30,9 @@ pub const MAX_PROVIDED_TOOLS: usize = 64;
 const MAX_NAME_BYTES: usize = 64;
 /// Longest tool description. Descriptions are sent on every request.
 const MAX_DESCRIPTION_BYTES: usize = 4096;
+/// Longest parameter schema, as compact JSON. Schemas are sent on every
+/// request too, so they are bounded like descriptions.
+const MAX_SCHEMA_BYTES: usize = 16 * 1024;
 
 /// Whether a tool can change anything. Read-only tools are offered to
 /// `read_only` subagents; read-write tools only to agents given `inherit`.
@@ -304,6 +307,14 @@ fn validate_tool(provider: &str, tool: &ProvidedTool) -> Result<()> {
     if !is_object_schema {
         bail!("provider {provider:?}: tool {name:?} parameters must be an object schema");
     }
+    let schema_bytes =
+        serde_json::to_vec(&tool.definition.parameters).map_or(usize::MAX, |encoded| encoded.len());
+    if schema_bytes > MAX_SCHEMA_BYTES {
+        bail!(
+            "provider {provider:?}: tool {name:?} has a parameter schema larger than \
+{MAX_SCHEMA_BYTES} bytes"
+        );
+    }
     Ok(())
 }
 
@@ -520,9 +531,15 @@ pub(crate) mod tests {
         bad_schema.definition.parameters = json!({"type": "string"});
         let mut no_description = tool("b", ToolAccess::ReadOnly, ToolApproval::NotRequired);
         no_description.definition.description = "  ".into();
+        let mut huge_schema = tool("c", ToolAccess::ReadOnly, ToolApproval::NotRequired);
+        huge_schema.definition.parameters = json!({
+            "type": "object",
+            "description": "x".repeat(MAX_SCHEMA_BYTES),
+        });
         for (bad, message) in [
             (bad_schema, "object schema"),
             (no_description, "no description"),
+            (huge_schema, "parameter schema larger than"),
         ] {
             let error = ToolRegistry::builder()
                 .provider(Arc::new(Fixed {

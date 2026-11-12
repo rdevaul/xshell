@@ -81,7 +81,9 @@ first rule that matches:
 
 - **Default:** the behaviour without a policy. Read-only calls on
   non-sensitive paths run; shell commands and sensitive reads are denied,
-  prompted, or run by mode.
+  prompted, or run by mode. In `off`, a call that can change anything is
+  always denied, including a read-write tool from a
+  [tool provider](tool-providers.md) that needs no approval.
 - **Denied wins:** a `denied` entry overrides an `always_allowed` or `allowed`
   entry it covers, and xshelld reports each override when it starts.
 - **Compound commands:** allow patterns never match a command with a

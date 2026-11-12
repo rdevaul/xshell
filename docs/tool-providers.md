@@ -93,7 +93,8 @@ returns an `Arc<ToolRegistry>`:
 - A name may not repeat a built-in tool or another provided tool, and a
   provider may not be registered twice.
 - A description must be non-empty and at most 4 KiB. The parameter schema
-  must be an object schema.
+  must be an object schema of at most 16 KiB as compact JSON: both are sent
+  with every provider request.
 - A registry holds at most 64 tools (`MAX_PROVIDED_TOOLS`). Every offered
   tool's definition is sent on every provider request, so this bounds that
   standing cost.
@@ -133,7 +134,10 @@ built-in call:
    `GateReason::ToolDeclared`, which is treated exactly like `run_shell`'s
    gate: prompted in `ask` mode, run in `auto`, denied in `off`. The new
    reason is a wire change, so this change moves to session protocol 19.
-   `NotRequired` tools are ungated, like the read-only built-in tools.
+   `NotRequired` tools are ungated, like the read-only built-in tools,
+   with one exception: **`off` denies every `ReadWrite` tool**, gated or
+   not, so `off` keeps meaning the agent changes nothing. A `ReadOnly`
+   tool that needs no approval runs in every mode.
 4. **Policy:** the existing tool-name rules apply unchanged.
    `always_allowed = ["memory_get"]`, `allowed = ["memory_put"]` (which
    prompts in `ask` mode) and `denied = ["memory_purge"]` all behave as they
@@ -171,6 +175,10 @@ subagent's scope in `ToolContext::agent`.
   before the provider is called.
 - Every executed provided call counts as tool activity, so a failed turn
   does not roll back history over effects a provider may have had.
+- A call stopped by the time limit or by cancellation may already have had
+  effects, and the model may try it again. Make writes idempotent where
+  you can, for example by keying them on `ToolContext::call_id` or on a
+  key in the arguments.
 
 ### 4.7 Audit
 

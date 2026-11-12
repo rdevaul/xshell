@@ -5,8 +5,8 @@ use crate::provider::{CallScope, execute_provided};
 use crate::tools::{Preparation, ToolRef, execute_prepared, gate, prepare_call, truncate};
 use crate::{
     ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
-    GateReason, PolicyDecision, SensitivePaths, Tool, ToolApproval, ToolSet, default_decision,
-    drop_tool_payloads, estimate_history_tokens, history_bytes,
+    GateReason, PolicyDecision, SensitivePaths, Tool, ToolAccess, ToolApproval, ToolSet,
+    default_decision, drop_tool_payloads, estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -928,6 +928,10 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 path: preparation.path(),
                 gated: gate_reason.is_some(),
                 sensitive: gate_reason == Some(GateReason::SensitivePath),
+                writes: match tool {
+                    ToolRef::Provided(provided) => provided.access() == ToolAccess::ReadWrite,
+                    ToolRef::Builtin(builtin) => builtin == Tool::RunShell,
+                },
             };
             let ruled = policy.rules.decide_with_basis(&facts, approval);
             let policy_decision = ruled.decision;
@@ -4523,6 +4527,43 @@ mod tests {
             basis: Some(DecisionBasis::ModeDefault),
             approval: None,
         }));
+    }
+
+    #[tokio::test]
+    async fn off_mode_denies_read_write_provided_tools_that_need_no_approval() {
+        let temporary = TempDir::new().unwrap();
+        let (policy, calls) = provided_policy(ApprovalPolicy::Off);
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls_response(vec![
+                    provided_call("r", "memory_get"),
+                    provided_call("w", "memory_put"),
+                ]),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "hello".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tool_results(&observer.events),
+            [
+                ("r", "memory_get ran"),
+                ("w", "tool denied: the approval mode is off")
+            ]
+        );
+        assert!(approval_reasons(&observer.events).is_empty());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the write never reached the provider");
     }
 
     #[tokio::test]
