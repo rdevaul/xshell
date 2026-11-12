@@ -186,6 +186,11 @@ The value travels with the session's model binding, so `//model` switches and
 remote daemons apply the budget of the model actually in use. A profile may
 set `0` to disable compaction for that model.
 
+A profile marks a model that takes images with `vision = true`. Images in
+the conversation are then sent to it with the request; without the flag
+they are sent as short text placeholders. See the
+[agentic CAD plan](agentic-cad-plan.md#31-design) for the layout.
+
 A profile can also declare the model's window with `context_tokens` (and
 `reserve_output_tokens`, default 1024). When it does, the enforced budget is
 additionally capped by what that window can hold — `(context_tokens − reserve −

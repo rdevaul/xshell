@@ -102,6 +102,10 @@ max_history_bytes = 32768
 # Tokens held back for the model's own reply when context_tokens is set.
 # Default 1024.
 # reserve_output_tokens = 1024
+# Whether the model takes images (a vision model such as qwen2.5vl or
+# gemma3). Without it, images in the conversation are sent as short text
+# placeholders naming them.
+# vision = true
 
 [models.openrouter-free]
 provider = "openai"

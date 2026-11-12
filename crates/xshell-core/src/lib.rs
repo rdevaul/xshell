@@ -380,6 +380,31 @@ impl From<ImageRef> for ImageRefFields {
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
+    /// The bytes of images the messages refer to, by SHA-256. An image
+    /// with no entry here is sent as a text placeholder, never dropped
+    /// silently.
+    pub images: ImageBytes,
+}
+
+impl ChatRequest {
+    /// A request with no image bytes.
+    pub fn new(messages: Vec<ChatMessage>, tools: Vec<ToolDefinition>) -> Self {
+        Self {
+            messages,
+            tools,
+            images: ImageBytes::new(),
+        }
+    }
+}
+
+/// Image bytes by the SHA-256 of their stored encoding.
+pub type ImageBytes = std::collections::BTreeMap<String, std::sync::Arc<Vec<u8>>>;
+
+/// Where an engine reads the bytes of the images a conversation refers to,
+/// such as a session's image store.
+pub trait ImageSource: Send + Sync {
+    /// The verified bytes of `image`, or why they cannot be read.
+    fn image_bytes(&self, image: &ImageRef) -> Result<Vec<u8>, String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

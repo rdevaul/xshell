@@ -581,8 +581,9 @@ impl ExecutionCoordinator {
                         model: model.model.clone(),
                         base_url: model.base_url.clone(),
                         api_key_env: model.api_key_env.clone(),
+                        vision: model.vision,
                     })?;
-                    let policy = TurnPolicy::new(approval)
+                    let mut policy = TurnPolicy::new(approval)
                         .with_tools(self.toolset(&snapshot.descriptor.tools))
                         .with_session_id(session_id.clone())
                         .with_limits(limits)
@@ -597,6 +598,17 @@ impl ExecutionCoordinator {
                             context_tokens: model.context_tokens,
                             reserve_output_tokens: model.reserve_output_tokens,
                         }));
+                    // The session's own store: a turn can only show its model
+                    // images stored for this session.
+                    if model.vision {
+                        match self.inner.registry.lock_recover().image_store(&session_id) {
+                            Ok(store) => policy = policy.with_images(Arc::new(store)),
+                            Err(error) => eprintln!(
+                                "xshelld warning: session {session_id}: cannot open its image \
+store, so images are sent as placeholders: {error:#}"
+                            ),
+                        }
+                    }
                     let outcome = run_agent_turn_with_budget(
                         agent.as_mut(),
                         &mut snapshot.history,

@@ -1,3 +1,4 @@
+mod images;
 mod ollama;
 mod openai;
 
@@ -33,23 +34,6 @@ const SEND_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TOOL_CALLS: usize = 256;
 pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
-
-/// Refuse a request that carries images. Neither adapter encodes images yet
-/// (workstream A3), and sending only the text would silently drop content the
-/// user or a tool meant the model to see.
-pub(crate) fn refuse_images(request: &ChatRequest) -> Result<(), AdapterError> {
-    match request
-        .messages
-        .iter()
-        .map(|message| message.images.len())
-        .sum::<usize>()
-    {
-        0 => Ok(()),
-        count => Err(AdapterError::Unsupported(format!(
-            "the request carries {count} image(s), and this adapter cannot send images yet"
-        ))),
-    }
-}
 
 /// Build the HTTP client shared by all adapters. Every provider request goes
 /// through this so the timeout policy is defined in exactly one place.
@@ -141,6 +125,12 @@ fn describe_transport_error(error: &reqwest::Error) -> String {
 #[async_trait]
 pub trait AgentAdapter: Send {
     fn descriptor(&self) -> AgentDescriptor;
+
+    /// Whether this adapter sends images to its model. When it does not, the
+    /// engine need not read image bytes: images become text placeholders.
+    fn accepts_images(&self) -> bool {
+        false
+    }
 
     async fn chat_stream(
         &mut self,
@@ -517,10 +507,7 @@ mod transport_tests {
     use xshell_core::ChatMessage;
 
     fn request() -> ChatRequest {
-        ChatRequest {
-            messages: vec![ChatMessage::user("hello")],
-            tools: Vec::new(),
-        }
+        ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new())
     }
 
     #[tokio::test]

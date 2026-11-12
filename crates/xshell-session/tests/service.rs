@@ -37,6 +37,7 @@ fn model(name: &str) -> ModelBinding {
         max_history_bytes: None,
         context_tokens: None,
         reserve_output_tokens: None,
+        vision: false,
     }
 }
 
@@ -1319,6 +1320,7 @@ fn f3_sigterm_cancels_agent_tool_process_group_before_exit() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Durable,
@@ -1494,6 +1496,135 @@ fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
 }
 
 #[test]
+fn a_vision_model_is_shown_the_sessions_stored_images() {
+    let (base_url, model_server, bodies) =
+        common::serve_sse_recording(vec![sse_text("a bracket"), sse_text("still a bracket")]);
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut client = connect_when_ready(&socket);
+    let binding = |vision| ModelBinding {
+        profile_name: Some("fake".into()),
+        provider: "openai".into(),
+        model: "fake-model".into(),
+        base_url: base_url.clone(),
+        api_key_env: None,
+        max_history_bytes: None,
+        context_tokens: None,
+        reserve_output_tokens: None,
+        vision,
+    };
+    let session = client
+        .create(SessionCreation {
+            name: "vision".into(),
+            model: binding(true),
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
+        })
+        .unwrap();
+    let session_id = session.descriptor.id.clone();
+    // Until uploads exist (A4), store the image the way the daemon will:
+    // in the session's own store under the state directory.
+    let store = xshell_execution::ImageStore::open(
+        &state.join("images"),
+        &session_id,
+        xshell_execution::ImageStoreLimits::default(),
+    )
+    .unwrap();
+    let image = store
+        .put(
+            b"png bytes",
+            xshell_core::ImageMediaType::Png,
+            8,
+            6,
+            "renders/bracket.png",
+        )
+        .unwrap();
+    let history = vec![
+        ChatMessage::system("test"),
+        ChatMessage::user("here is the render").with_images([image]),
+        ChatMessage::assistant("noted"),
+    ];
+    client
+        .update(
+            session_id.clone(),
+            binding(true),
+            temporary.path().into(),
+            history,
+        )
+        .unwrap();
+
+    let run_turn = |client: &mut SessionClient| {
+        client
+            .submit(
+                session_id.clone(),
+                TurnInput::Agent {
+                    message: "what is it?".into(),
+                },
+                ApprovalPolicy::Ask,
+            )
+            .unwrap();
+        let mut after = 0;
+        for _ in 0..100 {
+            let batch = client.events(session_id.clone(), after, 500).unwrap();
+            for record in batch.events {
+                after = record.sequence;
+                match record.event {
+                    SessionEventKind::TurnCompleted => return,
+                    SessionEventKind::TurnFailed { message, .. } => {
+                        panic!("turn failed: {message}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        panic!("the turn did not complete");
+    };
+    run_turn(&mut client);
+    // The same session switched to a model without vision gets a placeholder.
+    let history = client.snapshot(session_id.clone()).unwrap().history;
+    client
+        .update(
+            session_id.clone(),
+            binding(false),
+            temporary.path().into(),
+            history,
+        )
+        .unwrap();
+    run_turn(&mut client);
+    model_server.join().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    let request: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let parts = &request["messages"][1]["content"];
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(
+        parts[0]["text"],
+        "here is the render\n[image: renders/bracket.png, 8x6]"
+    );
+    assert_eq!(
+        parts[1]["image_url"]["url"],
+        "data:image/png;base64,cG5nIGJ5dGVz"
+    );
+    let blind: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let text = blind["messages"][1]["content"].as_str().unwrap();
+    assert!(text.contains("not configured for images"), "{text}");
+    assert!(!bodies[1].contains("base64"));
+}
+
+#[test]
 fn agent_turn_waits_for_remote_approval_then_continues() {
     let tool_response = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
@@ -1533,6 +1664,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -1689,6 +1821,7 @@ fn f9_tool_call_from_an_unfinished_stream_never_runs() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -1789,6 +1922,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -1928,6 +2062,7 @@ fn f1_failed_agent_effect_survives_durable_session_reload() {
                     max_history_bytes: None,
                     context_tokens: None,
                     reserve_output_tokens: None,
+                    vision: false,
                 },
                 cwd: temporary.path().into(),
                 persistence: PersistenceMode::Durable,
@@ -2342,6 +2477,7 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -2564,6 +2700,7 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -3271,6 +3408,7 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,

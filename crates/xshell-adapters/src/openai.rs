@@ -1,3 +1,4 @@
+use crate::images::{Laid, lay_out};
 use crate::{AgentAdapter, stream_lines};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -5,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use xshell_core::{
-    AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatMessage, ChatRequest,
-    ToolCall, ToolDefinition,
+    AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatRequest, ToolCall,
+    ToolDefinition,
 };
 
 pub struct OpenAiCompatibleAdapter {
@@ -14,6 +15,7 @@ pub struct OpenAiCompatibleAdapter {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    vision: bool,
 }
 
 impl OpenAiCompatibleAdapter {
@@ -27,7 +29,15 @@ impl OpenAiCompatibleAdapter {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             api_key,
+            vision: false,
         }
+    }
+
+    /// Send images to the model as image parts. Without this, images are
+    /// replaced by text placeholders.
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -47,7 +57,7 @@ struct OpenAiRequest<'a> {
 #[derive(Serialize)]
 struct OpenAiMessage<'a> {
     role: String,
-    content: &'a str,
+    content: OpenAiContent<'a>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<OpenAiToolCallRef<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,11 +70,54 @@ struct OpenAiMessage<'a> {
     reasoning_content: Option<&'a str>,
 }
 
-impl<'a> From<&'a ChatMessage> for OpenAiMessage<'a> {
-    fn from(message: &'a ChatMessage) -> Self {
+/// A message's content: plain text, or text and image parts when it carries
+/// images.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OpenAiContent<'a> {
+    Text(&'a str),
+    Parts(Vec<OpenAiPart>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAiPart {
+    Text { text: String },
+    ImageUrl { image_url: OpenAiImageUrl },
+}
+
+#[derive(Serialize)]
+struct OpenAiImageUrl {
+    url: String,
+}
+
+impl<'a> From<&'a Laid<'a>> for OpenAiMessage<'a> {
+    fn from(laid: &'a Laid<'a>) -> Self {
+        let content = if laid.images.is_empty() {
+            OpenAiContent::Text(&laid.content)
+        } else {
+            let mut parts = vec![OpenAiPart::Text {
+                text: laid.content.to_string(),
+            }];
+            parts.extend(laid.images.iter().map(|image| OpenAiPart::ImageUrl {
+                image_url: OpenAiImageUrl {
+                    url: image.data_url(),
+                },
+            }));
+            OpenAiContent::Parts(parts)
+        };
+        let Some(message) = laid.source else {
+            return Self {
+                role: laid.role(),
+                content,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                reasoning_content: None,
+            };
+        };
         Self {
-            role: message.role.to_string(),
-            content: &message.content,
+            role: laid.role(),
+            content,
             tool_calls: message
                 .tool_calls
                 .iter()
@@ -165,8 +218,16 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
             id: "openai-compatible".into(),
             display_name: "OpenAI-compatible endpoint".into(),
             model: self.model.clone(),
-            capabilities: vec!["chat".into(), "streaming".into(), "tool_calls".into()],
+            capabilities: ["chat", "streaming", "tool_calls"]
+                .into_iter()
+                .chain(self.vision.then_some("vision"))
+                .map(String::from)
+                .collect(),
         }
+    }
+
+    fn accepts_images(&self) -> bool {
+        self.vision
     }
 
     async fn chat_stream(
@@ -174,8 +235,8 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         request: ChatRequest,
         events: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<AssistantResponse, AdapterError> {
-        crate::refuse_images(&request)?;
-        let messages = request.messages.iter().map(OpenAiMessage::from).collect();
+        let laid = lay_out(&request.messages, &request.images, self.vision);
+        let messages = laid.iter().map(OpenAiMessage::from).collect();
         let tools = request
             .tools
             .iter()
@@ -333,32 +394,46 @@ mod tests {
         assert_eq!(with.endpoint(), without.endpoint());
     }
 
-    #[tokio::test]
-    async fn requests_with_images_are_refused_before_sending() {
+    /// One message as the adapter would send it.
+    fn encoded(message: &ChatMessage, images: &xshell_core::ImageBytes, vision: bool) -> Value {
+        let messages = [message.clone()];
+        let laid = lay_out(&messages, images, vision);
+        serde_json::to_value(OpenAiMessage::from(&laid[0])).unwrap()
+    }
+
+    #[test]
+    fn images_are_sent_as_data_url_parts() {
         let image = xshell_core::ImageRef::new(
             "ab".repeat(32),
             xshell_core::ImageMediaType::Png,
             8,
             8,
-            64,
+            3,
             "plot.png",
         )
         .unwrap();
-        let request = ChatRequest {
-            messages: vec![ChatMessage::user("look").with_images([image])],
-            tools: Vec::new(),
-        };
-        // An unroutable endpoint: the refusal must come before any request.
-        let mut openai = OpenAiCompatibleAdapter::new("http://127.0.0.1:9", "model", None);
-        let error = openai
-            .chat_stream(request.clone(), &mut |_| {})
-            .await
-            .unwrap_err();
-        assert!(matches!(error, AdapterError::Unsupported(_)), "{error}");
-
-        let mut ollama = crate::OllamaAdapter::new("http://127.0.0.1:9", "model");
-        let error = ollama.chat_stream(request, &mut |_| {}).await.unwrap_err();
-        assert!(matches!(error, AdapterError::Unsupported(_)), "{error}");
+        let bytes: xshell_core::ImageBytes = [(
+            image.sha256().to_owned(),
+            std::sync::Arc::new(b"png".to_vec()),
+        )]
+        .into();
+        let message = ChatMessage::user("look").with_images([image]);
+        let sent = encoded(&message, &bytes, true);
+        assert_eq!(
+            sent["content"],
+            json!([
+                {"type": "text", "text": "look\n[image: plot.png, 8x8]"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}},
+            ])
+        );
+        // A model without vision gets text only.
+        let blind = encoded(&message, &bytes, false);
+        assert!(
+            blind["content"]
+                .as_str()
+                .unwrap()
+                .contains("not configured for images")
+        );
     }
 
     #[tokio::test]
@@ -376,10 +451,7 @@ mod tests {
         let mut deltas = String::new();
         let response = adapter
             .chat_stream(
-                ChatRequest {
-                    messages: vec![ChatMessage::user("hello")],
-                    tools: Vec::new(),
-                },
+                ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new()),
                 &mut |event| match event {
                     AgentEvent::TextDelta(delta) => deltas.push_str(&delta),
                 },
@@ -407,10 +479,7 @@ mod tests {
         let mut adapter = OpenAiCompatibleAdapter::new(base_url, "test-model", None);
         let result = adapter
             .chat_stream(
-                ChatRequest {
-                    messages: vec![ChatMessage::user("hello")],
-                    tools: Vec::new(),
-                },
+                ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new()),
                 &mut |_| {},
             )
             .await;
@@ -546,10 +615,7 @@ mod tests {
         let mut deltas = String::new();
         let response = adapter
             .chat_stream(
-                ChatRequest {
-                    messages: vec![ChatMessage::user("hello")],
-                    tools: Vec::new(),
-                },
+                ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new()),
                 &mut |event| match event {
                     AgentEvent::TextDelta(delta) => deltas.push_str(&delta),
                 },
@@ -568,11 +634,10 @@ mod tests {
     fn replays_assistant_reasoning_as_reasoning_content() {
         let message =
             ChatMessage::assistant("done").with_reasoning(Some("checked the file".into()));
-        let encoded = serde_json::to_value(OpenAiMessage::from(&message)).unwrap();
+        let encoded = encoded(&message, &Default::default(), false);
         assert_eq!(encoded["reasoning_content"], "checked the file");
 
-        let plain =
-            serde_json::to_value(OpenAiMessage::from(&ChatMessage::assistant("x"))).unwrap();
+        let plain = super::tests::encoded(&ChatMessage::assistant("x"), &Default::default(), false);
         assert!(plain.get("reasoning_content").is_none());
     }
 
@@ -584,7 +649,7 @@ mod tests {
             arguments: json!({"path": "README.md"}),
         };
         let message = ChatMessage::tool_result(&call, "contents");
-        let encoded = serde_json::to_value(OpenAiMessage::from(&message)).unwrap();
+        let encoded = encoded(&message, &Default::default(), false);
         assert_eq!(encoded["role"], "tool");
         assert_eq!(encoded["tool_call_id"], "call_123");
         assert!(encoded.get("tool_name").is_none());

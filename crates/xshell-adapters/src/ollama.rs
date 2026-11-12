@@ -1,17 +1,19 @@
+use crate::images::{Laid, lay_out};
 use crate::{AgentAdapter, stream_lines};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use xshell_core::{
-    AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatMessage, ChatRequest,
-    ToolCall, ToolDefinition,
+    AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatRequest, ToolCall,
+    ToolDefinition,
 };
 
 pub struct OllamaAdapter {
     client: Client,
     base_url: String,
     model: String,
+    vision: bool,
 }
 
 impl OllamaAdapter {
@@ -20,7 +22,15 @@ impl OllamaAdapter {
             client: crate::http_client(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
+            vision: false,
         }
+    }
+
+    /// Send images to the model in each message's `images` array. Without
+    /// this, images are replaced by text placeholders.
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
     }
 }
 
@@ -36,17 +46,35 @@ struct OllamaRequest<'a> {
 struct OllamaMessage<'a> {
     role: String,
     content: &'a str,
+    /// Base64 image data, without a `data:` prefix.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<OllamaToolCallRef<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_name: Option<&'a str>,
 }
 
-impl<'a> From<&'a ChatMessage> for OllamaMessage<'a> {
-    fn from(message: &'a ChatMessage) -> Self {
+impl<'a> From<&'a Laid<'a>> for OllamaMessage<'a> {
+    fn from(laid: &'a Laid<'a>) -> Self {
+        let images = laid
+            .images
+            .iter()
+            .map(|image| image.base64.as_str())
+            .collect();
+        let Some(message) = laid.source else {
+            return Self {
+                role: laid.role(),
+                content: &laid.content,
+                images,
+                tool_calls: Vec::new(),
+                tool_name: None,
+            };
+        };
         Self {
-            role: message.role.to_string(),
-            content: &message.content,
+            role: laid.role(),
+            content: &laid.content,
+            images,
             tool_calls: message
                 .tool_calls
                 .iter()
@@ -124,8 +152,16 @@ impl AgentAdapter for OllamaAdapter {
             id: "ollama".into(),
             display_name: "Ollama".into(),
             model: self.model.clone(),
-            capabilities: vec!["chat".into(), "streaming".into(), "tool_calls".into()],
+            capabilities: ["chat", "streaming", "tool_calls"]
+                .into_iter()
+                .chain(self.vision.then_some("vision"))
+                .map(String::from)
+                .collect(),
         }
+    }
+
+    fn accepts_images(&self) -> bool {
+        self.vision
     }
 
     async fn chat_stream(
@@ -133,8 +169,8 @@ impl AgentAdapter for OllamaAdapter {
         request: ChatRequest,
         events: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<AssistantResponse, AdapterError> {
-        crate::refuse_images(&request)?;
-        let messages = request.messages.iter().map(OllamaMessage::from).collect();
+        let laid = lay_out(&request.messages, &request.images, self.vision);
+        let messages = laid.iter().map(OllamaMessage::from).collect();
         let tools = request
             .tools
             .iter()
@@ -226,6 +262,44 @@ mod tests {
     use serde_json::json;
     use xshell_core::{ChatMessage, ChatRequest, ToolCall};
 
+    #[test]
+    fn images_are_sent_as_base64_and_tool_images_follow_the_tool_block() {
+        let image = xshell_core::ImageRef::new(
+            "cd".repeat(32),
+            xshell_core::ImageMediaType::Png,
+            4,
+            4,
+            3,
+            "render.png",
+        )
+        .unwrap();
+        let bytes: xshell_core::ImageBytes = [(
+            image.sha256().to_owned(),
+            std::sync::Arc::new(b"png".to_vec()),
+        )]
+        .into();
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "run_shell".into(),
+            arguments: json!({}),
+        };
+        let messages = vec![
+            ChatMessage::assistant_with_tools("", vec![call.clone()]),
+            ChatMessage::tool_result(&call, "rendered").with_images([image]),
+        ];
+        let laid = lay_out(&messages, &bytes, true);
+        let sent: Vec<Value> = laid
+            .iter()
+            .map(|laid| serde_json::to_value(OllamaMessage::from(laid)).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[1]["role"], "tool");
+        assert!(sent[1].get("images").is_none());
+        assert_eq!(sent[2]["role"], "user");
+        assert_eq!(sent[2]["images"], json!(["cG5n"]));
+        assert_eq!(sent[2]["content"], "Images from the run_shell call call_1:");
+    }
+
     const OLLAMA_CALL: &str = concat!(
         "{\"message\":{\"role\":\"assistant\",\"content\":\"\",",
         "\"tool_calls\":[{\"function\":{\"name\":\"read_file\",",
@@ -237,10 +311,7 @@ mod tests {
         let mut adapter = OllamaAdapter::new(base_url, "test-model");
         let result = adapter
             .chat_stream(
-                ChatRequest {
-                    messages: vec![ChatMessage::user("hello")],
-                    tools: Vec::new(),
-                },
+                ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new()),
                 &mut |_| {},
             )
             .await;
@@ -304,10 +375,7 @@ mod tests {
         let mut deltas = String::new();
         let response = adapter
             .chat_stream(
-                ChatRequest {
-                    messages: vec![ChatMessage::user("hello")],
-                    tools: Vec::new(),
-                },
+                ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new()),
                 &mut |event| match event {
                     AgentEvent::TextDelta(delta) => deltas.push_str(&delta),
                 },
@@ -331,10 +399,7 @@ mod tests {
         let mut adapter = OllamaAdapter::new(base_url, "test-model");
         let error = adapter
             .chat_stream(
-                ChatRequest {
-                    messages: vec![ChatMessage::user("hello")],
-                    tools: Vec::new(),
-                },
+                ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new()),
                 &mut |_| {},
             )
             .await
@@ -353,8 +418,9 @@ mod tests {
             name: "read_file".into(),
             arguments: json!({"path": "README.md"}),
         };
-        let message = ChatMessage::tool_result(&call, "contents");
-        let encoded = serde_json::to_value(OllamaMessage::from(&message)).unwrap();
+        let messages = [ChatMessage::tool_result(&call, "contents")];
+        let laid = lay_out(&messages, &Default::default(), false);
+        let encoded = serde_json::to_value(OllamaMessage::from(&laid[0])).unwrap();
         assert_eq!(encoded["role"], "tool");
         assert_eq!(encoded["tool_name"], "read_file");
         assert!(encoded.get("tool_call_id").is_none());
