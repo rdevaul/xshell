@@ -1,7 +1,10 @@
 use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::environment::remove_credentials;
-use crate::process::{LINGER_GRACE, ShellEnd, configure_process_group, supervise_shell};
+use crate::process::{
+    LINGER_GRACE, ShellEnd, configure_process_group, restrict_inherited_descriptors,
+    supervise_shell,
+};
 use crate::provider::{CallScope, execute_provided};
 use crate::tools::{
     Preparation, ToolRef, execute_prepared, execute_view_image, gate, prepare_call, truncate,
@@ -1606,6 +1609,7 @@ async fn run_direct_shell_with_grace(
     // The user typed this command, so it keeps the daemon's environment,
     // except for the provider credentials, which belong to xshell.
     remove_credentials(&mut process);
+    restrict_inherited_descriptors(&mut process);
     let child = process
         .spawn()
         .with_context(|| format!("could not launch shell {shell}"))?;
@@ -4464,6 +4468,20 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
             })
             .unwrap();
         assert!(result.contains("background processes"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn f12_a_direct_shell_command_cannot_see_a_live_pty_master() {
+        use crate::process::descriptor_leak::{leaky_pty_master, probe};
+        use std::os::fd::AsRawFd;
+        let temporary = TempDir::new().unwrap();
+        let master = leaky_pty_master();
+        let result = run_direct_shell(&probe(master.as_raw_fd()), temporary.path())
+            .await
+            .unwrap();
+        assert!(result.stdout.contains("swept"), "{result:?}");
+        assert!(!result.stdout.contains("leak:"), "{result:?}");
+        assert!(!result.stdout.contains("tty:"), "{result:?}");
     }
 
     #[tokio::test]

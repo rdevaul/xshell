@@ -47,6 +47,20 @@ payload length, and a bounded payload. Input is limited to 64 KiB per frame and
 output to slightly less than 256 KiB after its absolute offset. Stream close is
 an acknowledged detach operation; explicit `pty_close` terminates the job.
 
+## Descriptor hygiene
+
+The daemon holds every live job's PTY master, so no child may inherit one: a
+process holding another job's master can type into that terminal and read its
+output (finding F12, #128). Both PTY descriptors are created close-on-exec
+(`posix_openpt` and `open` with `O_CLOEXEC`); the slave still reaches the
+shell as descriptors 0 to 2, because `dup2` clears the flag on the copies.
+As a second layer, every PTY job, agent `run_shell` command, direct `$`
+command and SSH helper marks all descriptors above 2 close-on-exec in its
+`pre_exec` hook (`xshell_platform::descriptors::child_hook`), so a descriptor
+opened elsewhere without the flag cannot cross `exec` either. Children
+therefore start with only their stdio; nothing xshell starts is meant to
+inherit more.
+
 ## Escape router and unified session switching
 
 The interactive controller consumes a configurable prefix before input reaches

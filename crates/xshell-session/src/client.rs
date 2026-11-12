@@ -315,11 +315,13 @@ impl SessionClient {
 
     pub fn connect_ssh(destination: &str, client_version: &str) -> Result<Self> {
         validate_ssh_destination(destination)?;
-        let mut child = Command::new("ssh")
-            .args(["-T", "--", destination, "xshelld", "serve-stdio"])
+        let mut ssh = Command::new("ssh");
+        ssh.args(["-T", "--", destination, "xshelld", "serve-stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        xshell_platform::descriptors::restrict_inherited_descriptors(&mut ssh);
+        let mut child = ssh
             .spawn()
             .with_context(|| format!("cannot start ssh connection to {destination:?}"))?;
         let reader = child.stdout.take().context("cannot capture ssh stdout")?;
@@ -685,12 +687,14 @@ fn run_bounded_ssh(
     timeout: Duration,
     operation: &str,
 ) -> Result<(ExitStatus, Vec<u8>)> {
-    let mut child = Command::new("ssh")
-        .args(["-T", "--", destination])
+    let mut ssh = Command::new("ssh");
+    ssh.args(["-T", "--", destination])
         .args(remote_command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    xshell_platform::descriptors::restrict_inherited_descriptors(&mut ssh);
+    let mut child = ssh
         .spawn()
         .with_context(|| format!("cannot start SSH {operation} for {destination:?}"))?;
     let stdout = child

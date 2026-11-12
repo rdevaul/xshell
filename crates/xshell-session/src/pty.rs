@@ -863,7 +863,10 @@ mod tests {
         let claim = coordinator.claim(&ticket.ticket).unwrap();
         let mut cursor = claim.cursor;
         let mut initial_output = Vec::new();
-        for _ in 0..20 {
+        // Python under a login shell can take seconds to start on a loaded
+        // CI runner; wait on a deadline, not a fixed number of reads.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
             let result = coordinator.read_claimed(&claim, cursor, 100).unwrap();
             cursor = result.offset + result.output.len() as u64;
             initial_output.extend(result.output);
@@ -879,7 +882,10 @@ mod tests {
         let claim = coordinator.claim(&ticket.ticket).unwrap();
         let mut cursor = claim.cursor;
         let mut output = Vec::new();
-        for _ in 0..20 {
+        // Python under a login shell can take seconds to start on a loaded
+        // CI runner; wait on a deadline, not a fixed number of reads.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
             let result = coordinator.read_claimed(&claim, cursor, 100).unwrap();
             cursor = result.offset + result.output.len() as u64;
             output.extend(result.output);

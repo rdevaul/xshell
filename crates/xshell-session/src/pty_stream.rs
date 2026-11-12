@@ -88,11 +88,13 @@ impl PtyStreamClient {
         if destination.trim().is_empty() || destination.starts_with('-') {
             bail!("SSH destination must be non-empty and may not begin with '-'");
         }
-        let mut child = Command::new("ssh")
-            .args(["-T", "--", destination, "xshelld", "serve-pty-stdio"])
+        let mut ssh = Command::new("ssh");
+        ssh.args(["-T", "--", destination, "xshelld", "serve-pty-stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        xshell_platform::descriptors::restrict_inherited_descriptors(&mut ssh);
+        let mut child = ssh
             .spawn()
             .with_context(|| format!("cannot start PTY stream to {destination:?}"))?;
         let mut reader = child
