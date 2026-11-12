@@ -525,12 +525,18 @@ impl ExecutionCoordinator {
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                execution.conclude(
+                // `submit` has already recorded the turn's start, so an agent
+                // turn still gets its `turn_finished` record and summary.
+                finish_turn(
+                    &execution,
+                    &audit,
                     &turn_id,
                     SessionEventKind::TurnFailed {
                         message: error.to_string(),
                         reason: None,
                     },
+                    agent_turn.then(|| budget.usage()),
+                    first_record,
                 );
                 return;
             }
@@ -672,27 +678,14 @@ impl ExecutionCoordinator {
         } else {
             SessionEventKind::TurnCompleted
         };
-        if agent_turn {
-            let usage = budget.usage();
-            let audit_ref = record_turn_finished(&audit, &turn_id, &terminal, &usage).map(|last| {
-                TurnAuditRef {
-                    first_sequence: first_record
-                        .filter(|first| first.audit_session_id == last.audit_session_id)
-                        .map(|first| first.sequence),
-                    audit_session_id: last.audit_session_id,
-                    last_sequence: last.sequence,
-                    record_hash: last.record_hash,
-                }
-            });
-            execution.append(
-                &turn_id,
-                SessionEventKind::TurnSummary {
-                    usage: Some(usage),
-                    audit: audit_ref,
-                },
-            );
-        }
-        execution.conclude(&turn_id, terminal);
+        finish_turn(
+            &execution,
+            &audit,
+            &turn_id,
+            terminal,
+            agent_turn.then(|| budget.usage()),
+            first_record,
+        );
     }
 }
 
@@ -969,6 +962,39 @@ fn finish_locked(state: &mut ExecutionState, turn_id: &str) {
         .retain(|(pending_turn, _), _| pending_turn != turn_id);
 }
 
+/// End a turn: for an agent turn (`usage` is `Some`), append its
+/// `turn_finished` audit record and a `TurnSummary` event, then record the
+/// terminal event and release the turn. Every exit from `run_turn` comes
+/// through here so an agent turn never has a start record without an end.
+fn finish_turn(
+    execution: &SessionExecution,
+    audit: &SessionAuditHandle,
+    turn_id: &str,
+    terminal: SessionEventKind,
+    usage: Option<TurnUsage>,
+    first_record: Option<AuditReceipt>,
+) {
+    if let Some(usage) = usage {
+        let audit_ref =
+            record_turn_finished(audit, turn_id, &terminal, &usage).map(|last| TurnAuditRef {
+                first_sequence: first_record
+                    .filter(|first| first.audit_session_id == last.audit_session_id)
+                    .map(|first| first.sequence),
+                audit_session_id: last.audit_session_id,
+                last_sequence: last.sequence,
+                record_hash: last.record_hash,
+            });
+        execution.append(
+            turn_id,
+            SessionEventKind::TurnSummary {
+                usage: Some(usage),
+                audit: audit_ref,
+            },
+        );
+    }
+    execution.conclude(turn_id, terminal);
+}
+
 /// Append an agent turn's `turn_finished` audit record and return where it
 /// landed. The turn's effects have already happened, so a failure here does
 /// not change its outcome: the summary simply carries no audit reference,
@@ -1042,6 +1068,74 @@ mod tests {
             approver,
             detail: detail.map(str::to_owned),
         })
+    }
+
+    fn unaudited() -> SessionAuditHandle {
+        DaemonAudit::default().session(
+            "session",
+            SessionAuditDescriptor {
+                name: "session".into(),
+                host_id: "host".into(),
+                host_alias: "host".into(),
+                user: "user".into(),
+            },
+        )
+    }
+
+    fn turn_events(execution: &SessionExecution) -> Vec<SessionEventKind> {
+        execution
+            .events(0, Duration::ZERO)
+            .events
+            .into_iter()
+            .map(|event| event.event)
+            .collect()
+    }
+
+    fn runtime_failure() -> SessionEventKind {
+        SessionEventKind::TurnFailed {
+            message: "cannot build runtime".into(),
+            reason: None,
+        }
+    }
+
+    // The runtime-build failure in `run_turn` cannot be injected, so check
+    // the helper its early return now shares with the normal path.
+    #[test]
+    fn a_failed_agent_turn_still_ends_with_a_summary_before_its_terminal() {
+        let execution = SessionExecution::new();
+        let usage = TurnBudget::new(TurnLimits::default()).usage();
+        finish_turn(
+            &execution,
+            &unaudited(),
+            "turn",
+            runtime_failure(),
+            Some(usage),
+            None,
+        );
+        assert_eq!(
+            turn_events(&execution),
+            vec![
+                SessionEventKind::TurnSummary {
+                    usage: Some(usage),
+                    audit: None,
+                },
+                runtime_failure(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shell_turn_ends_without_a_summary() {
+        let execution = SessionExecution::new();
+        finish_turn(
+            &execution,
+            &unaudited(),
+            "turn",
+            runtime_failure(),
+            None,
+            None,
+        );
+        assert_eq!(turn_events(&execution), vec![runtime_failure()]);
     }
 
     #[test]
