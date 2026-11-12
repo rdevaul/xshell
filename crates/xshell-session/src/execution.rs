@@ -648,6 +648,11 @@ on its model profile to attach images"
         // ends, and nobody can wait on its turns afterwards, so its turns
         // get no durable record.
         let keep_record = snapshot.descriptor.persistence != crate::PersistenceMode::Ephemeral;
+        // The session's provider credential stays out of every shell, a
+        // direct `$` command included, even before its first agent turn.
+        if let Some(variable) = &snapshot.descriptor.model.api_key_env {
+            xshell_execution::protect_credential_variable(variable);
+        }
         let result = runtime.block_on(async {
             match input {
                 TurnInput::Agent { message, images } => {

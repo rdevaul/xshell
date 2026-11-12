@@ -1,5 +1,11 @@
+use crate::engine::CancellationFlag;
+use anyhow::{Context, Result};
+use std::process::ExitStatus;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 /// Extra group-wide `SIGKILL`s sent by [`ProcessGroupGuard::sweep`], and the
 /// pause before each. Together they cover the window in which a fork that
@@ -66,6 +72,168 @@ impl ProcessGroupGuard {
 
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
+    }
+}
+
+/// How long a shell's output is still drained after the shell itself exits.
+/// Past it, any process still holding the output pipes (typically a
+/// background job started with `&`) is killed with the rest of the group.
+pub(crate) const LINGER_GRACE: Duration = Duration::from_secs(2);
+/// After a group kill, how long output already written to the pipes is still
+/// collected before the readers are abandoned.
+const KILLED_DRAIN: Duration = Duration::from_millis(250);
+/// After a group kill, how long the shell leader is waited for. A `SIGKILL`ed
+/// leader is reaped at once; this only bounds a pathological kernel state.
+const KILLED_REAP: Duration = Duration::from_secs(2);
+
+/// Which pipe a chunk of shell output arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// How a supervised shell ended.
+#[derive(Debug)]
+pub(crate) enum ShellEnd {
+    /// The shell exited and its output pipes closed within [`LINGER_GRACE`].
+    Exited(ExitStatus),
+    /// The shell exited, but something still held its output pipes after
+    /// [`LINGER_GRACE`] (or at the deadline, if that came first). The process
+    /// group was killed; the output collected until then is kept.
+    ExitedLingering(ExitStatus),
+    /// Cancelled before the output was drained; the process group was killed.
+    Cancelled,
+    /// The deadline passed while the shell was running; the process group
+    /// was killed.
+    TimedOut,
+}
+
+/// Run a spawned shell (placed in its own group by
+/// [`configure_process_group`], with piped stdout and stderr) to completion,
+/// passing each chunk of output to `on_output`.
+///
+/// Every wait, including draining the pipes after the shell exits, sits
+/// inside one `select!` with cancellation and the deadline, so a background
+/// job that inherits the pipes cannot hold the caller past `timeout` plus a
+/// short, fixed kill-and-drain allowance (well under a few seconds). When the
+/// call ends by cancellation, timeout, or a lingering pipe holder, the whole
+/// group is killed and swept, and the reader tasks are aborted rather than
+/// awaited to EOF. The group stays armed until then, so dropping this future
+/// early also kills the group.
+///
+/// Limitation: a process that leaves the group (`setsid`, or `setpgid` to
+/// another group) cannot be reached by the group kill. It is never waited
+/// for (its readers are abandoned, so it gets `SIGPIPE` on its next write),
+/// but it can keep running. Containing it needs an OS-level sandbox.
+///
+/// A background job that redirects its output away from the pipes (for
+/// example `server > log 2>&1 &`) does not hold them, so after a normal exit
+/// it is left running, as in an ordinary shell.
+pub(crate) async fn supervise_shell(
+    mut child: Child,
+    cancellation: &CancellationFlag,
+    timeout: Duration,
+    mut on_output: impl FnMut(Stream, &[u8]) + Send,
+) -> Result<ShellEnd> {
+    let deadline = Instant::now() + timeout;
+    let mut group = ProcessGroupGuard::for_child(&child);
+    let stdout = child.stdout.take().context("cannot capture shell stdout")?;
+    let stderr = child.stderr.take().context("cannot capture shell stderr")?;
+    let (sender, mut receiver) = mpsc::channel::<(Stream, Vec<u8>)>(32);
+    let stdout_task = tokio::spawn(read_output(Stream::Stdout, stdout, sender.clone()));
+    let stderr_task = tokio::spawn(read_output(Stream::Stderr, stderr, sender));
+    let mut wait_task = tokio::spawn(async move { child.wait().await });
+
+    let mut status: Option<ExitStatus> = None;
+    let mut linger_until = deadline;
+    let mut pipes_open = true;
+    let stop = loop {
+        if !pipes_open && let Some(status) = status {
+            // Both readers have returned, so these joins complete at once.
+            stdout_task.await.context("shell stdout reader failed")??;
+            stderr_task.await.context("shell stderr reader failed")??;
+            // The leader is reaped and nothing holds the pipes. Members that
+            // redirected their output may remain; they are left alone.
+            group.disarm();
+            return Ok(ShellEnd::Exited(status));
+        }
+        tokio::select! {
+            item = receiver.recv(), if pipes_open => match item {
+                Some((stream, bytes)) => on_output(stream, &bytes),
+                None => pipes_open = false,
+            },
+            result = &mut wait_task, if status.is_none() => {
+                let exited = result
+                    .context("shell wait task failed")?
+                    .context("could not wait for shell")?;
+                status = Some(exited);
+                linger_until = deadline.min(Instant::now() + LINGER_GRACE);
+            }
+            () = cancellation.wait() => break ShellEnd::Cancelled,
+            () = tokio::time::sleep_until(linger_until) => {
+                break match status {
+                    Some(status) => ShellEnd::ExitedLingering(status),
+                    None => ShellEnd::TimedOut,
+                };
+            }
+        }
+    };
+
+    group.kill();
+    group.sweep().await;
+    if status.is_none() {
+        let _ = tokio::time::timeout(KILLED_REAP, &mut wait_task).await;
+    }
+    // Keep what the killed processes had already written, but do not wait for
+    // EOF: a process outside the group may hold the pipes indefinitely.
+    let drain_until = Instant::now() + KILLED_DRAIN;
+    while pipes_open {
+        tokio::select! {
+            item = receiver.recv() => match item {
+                Some((stream, bytes)) => on_output(stream, &bytes),
+                None => pipes_open = false,
+            },
+            () = tokio::time::sleep_until(drain_until) => break,
+        }
+    }
+    stdout_task.abort();
+    stderr_task.abort();
+    wait_task.abort();
+    // The sweep has run; never signal this group ID again.
+    group.disarm();
+    Ok(stop)
+}
+
+/// Forward a pipe to `sender` until EOF. Stops quietly if the receiver is
+/// gone, so an abandoned reader never blocks on a full channel.
+async fn read_output(
+    stream: Stream,
+    mut reader: impl AsyncRead + Unpin,
+    sender: mpsc::Sender<(Stream, Vec<u8>)>,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        if sender
+            .send((stream, buffer[..count].to_vec()))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
     }
 }
 

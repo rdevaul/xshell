@@ -1,6 +1,7 @@
 use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
-use crate::process::{ProcessGroupGuard, configure_process_group};
+use crate::environment::remove_credentials;
+use crate::process::{ShellEnd, configure_process_group, supervise_shell};
 use crate::provider::{CallScope, execute_provided};
 use crate::tools::{
     Preparation, ToolRef, execute_prepared, execute_view_image, gate, prepare_call, truncate,
@@ -22,9 +23,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
 use xshell_core::{
     AdapterError, AgentEvent, AssistantResponse, ChatMessage, ChatRequest, DEFAULT_SYSTEM_PROMPT,
@@ -355,6 +355,11 @@ pub trait TurnObserver: Send {
 }
 
 pub fn build_adapter(config: &AdapterConfig) -> Result<Box<dyn AgentAdapter>> {
+    // The credential is xshell's, never a shell command's: keep it out of
+    // every shell this process starts from now on.
+    if let Some(variable) = &config.api_key_env {
+        crate::protect_credential_variable(variable);
+    }
     let adapter: Box<dyn AgentAdapter> = match config.provider.as_str() {
         "ollama" => {
             Box::new(OllamaAdapter::new(&config.base_url, &config.model).with_vision(config.vision))
@@ -1546,81 +1551,45 @@ pub async fn run_direct_shell_streaming_cancellable(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_process_group(&mut process);
-    let mut child = process
+    // The user typed this command, so it keeps the daemon's environment,
+    // except for the provider credentials, which belong to xshell.
+    remove_credentials(&mut process);
+    let child = process
         .spawn()
         .with_context(|| format!("could not launch shell {shell}"))?;
-    let mut group = ProcessGroupGuard::for_child(&child);
-    let stdout = child.stdout.take().context("cannot capture shell stdout")?;
-    let stderr = child.stderr.take().context("cannot capture shell stderr")?;
-    let (sender, mut receiver) = mpsc::channel::<(&'static str, Vec<u8>)>(32);
-    let stdout_task = tokio::spawn(read_output("stdout", stdout, sender.clone()));
-    let stderr_task = tokio::spawn(read_output("stderr", stderr, sender.clone()));
-    drop(sender);
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
-    let mut wait_task = tokio::spawn(async move { child.wait().await });
-    let deadline = tokio::time::sleep(DIRECT_SHELL_TIMEOUT);
-    tokio::pin!(deadline);
-    let terminal = loop {
-        tokio::select! {
-            item = receiver.recv() => {
-                if let Some((stream, bytes)) = item {
-                    retain_shell_chunk(
-                        stream,
-                        &bytes,
-                        &mut stdout_bytes,
-                        &mut stderr_bytes,
-                        &mut emit,
-                    );
-                }
-            }
-            result = &mut wait_task => {
-                break Some(result.context("shell wait task failed")??);
-            }
-            () = cancellation.wait() => break None,
-            () = &mut deadline => break None,
+    let end = supervise_shell(
+        child,
+        &cancellation,
+        DIRECT_SHELL_TIMEOUT,
+        |stream, bytes| {
+            retain_shell_chunk(
+                stream.name(),
+                bytes,
+                &mut stdout_bytes,
+                &mut stderr_bytes,
+                &mut emit,
+            );
+        },
+    )
+    .await?;
+    let status = match end {
+        ShellEnd::Exited(status) => status.to_string(),
+        ShellEnd::ExitedLingering(status) => format!(
+            "{status}; background processes still holding the output after the shell \
+exited were killed"
+        ),
+        ShellEnd::Cancelled => {
+            bail!("shell command cancelled; the process group was killed and reaped")
+        }
+        ShellEnd::TimedOut => {
+            bail!("shell command timed out; the process group was killed and reaped")
         }
     };
-    let status = match terminal {
-        Some(status) => status,
-        None => {
-            let cancelled = cancellation.is_cancelled();
-            group.kill();
-            group.sweep().await;
-            let _ = wait_task.await;
-            group.disarm();
-            while let Some((stream, bytes)) = receiver.recv().await {
-                retain_shell_chunk(
-                    stream,
-                    &bytes,
-                    &mut stdout_bytes,
-                    &mut stderr_bytes,
-                    &mut emit,
-                );
-            }
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            if cancelled {
-                bail!("shell command cancelled; the process group was killed and reaped");
-            }
-            bail!("shell command timed out; the process group was killed and reaped");
-        }
-    };
-    group.disarm();
-    while let Some((stream, bytes)) = receiver.recv().await {
-        retain_shell_chunk(
-            stream,
-            &bytes,
-            &mut stdout_bytes,
-            &mut stderr_bytes,
-            &mut emit,
-        );
-    }
-    stdout_task.await.context("stdout reader failed")??;
-    stderr_task.await.context("stderr reader failed")??;
     Ok(DirectShellResult {
         cwd: cwd.to_owned(),
-        status: status.to_string(),
+        status,
         stdout: bounded_utf8(&stdout_bytes),
         stderr: bounded_utf8(&stderr_bytes),
     })
@@ -1639,30 +1608,6 @@ fn retain_shell_chunk(
         target.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
     }
     emit(stream, String::from_utf8_lossy(bytes).into_owned());
-}
-
-async fn read_output<R>(
-    stream: &'static str,
-    mut reader: R,
-    sender: mpsc::Sender<(&'static str, Vec<u8>)>,
-) -> Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buffer = vec![0_u8; 8 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(());
-        }
-        if sender
-            .send((stream, buffer[..count].to_vec()))
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-    }
 }
 
 fn bounded_utf8(bytes: &[u8]) -> String {
@@ -4192,6 +4137,106 @@ mod tests {
             !delayed.exists(),
             "F2 delayed captured-shell effect survived cancellation"
         );
+    }
+
+    /// F17 reopened F2: once the shell leader exited, the drain of its pipes
+    /// was not cancellable, so a background job kept the turn and survived.
+    #[tokio::test]
+    async fn f17_cancellation_kills_a_captured_shell_background_job_after_the_shell_exits() {
+        let temporary = TempDir::new().unwrap();
+        let started = temporary.path().join("started");
+        let delayed = temporary.path().join("delayed");
+        let command = format!(
+            "touch {}; (sleep 3; touch {}) & exit 0",
+            started.display(),
+            delayed.display()
+        );
+        let cancellation = CancellationFlag::default();
+        let cancel = cancellation.clone();
+        let started_for_task = started.clone();
+        let signal = tokio::spawn(async move {
+            while !started_for_task.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+        });
+        let error = run_direct_shell_streaming_cancellable(
+            &command,
+            temporary.path(),
+            cancellation,
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        signal.await.unwrap();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !delayed.exists(),
+            "F17 a cancelled captured-shell background job wrote its marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn f17_a_captured_shell_with_a_lingering_background_job_returns_promptly() {
+        let temporary = TempDir::new().unwrap();
+        let begun = std::time::Instant::now();
+        let result = run_direct_shell("sleep 1000000 & echo started", temporary.path())
+            .await
+            .unwrap();
+        assert!(
+            begun.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert!(result.stdout.contains("started"), "{result:?}");
+        assert!(result.status.contains("background processes"), "{result:?}");
+    }
+
+    /// An agent turn whose shell leaves a background job holding the pipes
+    /// finishes, rather than waiting on the job.
+    #[tokio::test]
+    async fn f17_an_agent_turn_is_not_held_by_a_background_job() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![shell_call("bg", "sleep 1000000 & echo started")],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = scripted_observer();
+        let begun = std::time::Instant::now();
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "go".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            begun.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            begun.elapsed()
+        );
+        let result = observer
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::ToolResult { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(result.contains("background processes"), "{result}");
     }
 
     #[tokio::test]
