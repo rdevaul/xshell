@@ -53,6 +53,11 @@ pub struct RunArgs {
     #[arg(long, conflicts_with = "session")]
     pub ephemeral: bool,
 
+    /// Attach an image file (PNG, JPEG, GIF or WebP) to the prompt. May be
+    /// given more than once. The model profile must have `vision = true`.
+    #[arg(long, value_name = "FILE")]
+    pub attach: Vec<PathBuf>,
+
     /// Start the turn and exit at once. Follow it later with `xshell wait`.
     #[arg(long, conflicts_with = "ephemeral")]
     pub detach: bool,
@@ -241,6 +246,20 @@ fn execute(
         .with_context(|| format!("cannot use working directory {}", shared.cwd.display()))
         .or_outcome(Outcome::Usage)?;
     let prompt = read_prompt(args).or_outcome(Outcome::Usage)?;
+    // Attachments are read before connecting, so a bad path is a usage
+    // error, and checked against the model profile here as the daemon will.
+    if !args.attach.is_empty() && !active_model.vision {
+        return Err(anyhow::anyhow!(
+            "--attach needs a model profile with `vision = true`"
+        ))
+        .or_outcome(Outcome::Usage);
+    }
+    let attachments = args
+        .attach
+        .iter()
+        .map(|path| crate::attach::read_attachment(path))
+        .collect::<Result<Vec<_>>>()
+        .or_outcome(Outcome::Usage)?;
     let overlay = match &shared.approval_policy {
         Some(path) => {
             let (config, _, warnings) =
@@ -288,6 +307,26 @@ fn execute(
         error,
     })?;
     let session_id = snapshot.descriptor.id.clone();
+    // A session this run created for a turn that never started is closed
+    // again, so refused runs do not use up the daemon's session budget. An
+    // ephemeral one goes when the client does.
+    let discard_session = |client: &mut SessionClient| {
+        if !existing && !args.ephemeral {
+            let _ = client.close(Some(session_id.clone()));
+        }
+    };
+
+    let mut images = Vec::with_capacity(attachments.len());
+    for (label, bytes) in attachments {
+        match client.upload_image(session_id.clone(), &bytes, label.clone()) {
+            Ok(image) => images.push(image),
+            Err(error) => {
+                discard_session(&mut client);
+                return Err(error.context(format!("cannot attach {label}")))
+                    .or_outcome(Outcome::Usage);
+            }
+        }
+    }
 
     // Follow events from after anything already in the journal.
     let after = client
@@ -298,18 +337,16 @@ fn execute(
     let turn_id = client
         .submit_with_limits(
             session_id.clone(),
-            TurnInput::Agent { message: prompt },
+            TurnInput::Agent {
+                message: prompt,
+                images,
+            },
             shared.approval,
             Some(limits),
             overlay,
         )
         .map_err(|error| {
-            // A session this run created for a turn that never started is
-            // closed again, so refused runs do not use up the daemon's
-            // session budget. An ephemeral one goes when the client does.
-            if !existing && !args.ephemeral {
-                let _ = client.close(Some(session_id.clone()));
-            }
+            discard_session(&mut client);
             RunError {
                 outcome: refusal_outcome(&error),
                 error,
@@ -998,12 +1035,14 @@ fn handle_execution(
             call_id,
             name,
             result,
+            images,
         } => {
             output.event(tagged(json!({
                 "event": "tool_result",
                 "call_id": call_id,
                 "name": name,
                 "result": result,
+                "images": (!images.is_empty()).then_some(images),
             })));
         }
         ExecutionEvent::TurnAborted => {

@@ -178,12 +178,13 @@ requested \"{requested}\" was not applied"
                             call_id,
                             name,
                             result,
+                            images,
                         } => {
                             audit.append_execution(AuditEvent::ToolResult {
                                 call_id,
                                 name,
                                 result: result.clone(),
-                                images: Vec::new(),
+                                images: images.iter().map(xshell_session::audit_image).collect(),
                             })?;
                             print!("{tag}");
                             print_tool_result(&result);
@@ -533,6 +534,7 @@ impl TurnObserver for LocalObserver<'_> {
                 call_id,
                 name,
                 result,
+                images,
             } => {
                 // Only for tools that are read-only: not run_shell, and not
                 // delegate_task, whose subagent made its own decisions.
@@ -549,7 +551,7 @@ impl TurnObserver for LocalObserver<'_> {
                     call_id,
                     name,
                     result: result.clone(),
-                    images: Vec::new(),
+                    images: images.iter().map(xshell_session::audit_image).collect(),
                 });
                 print!("{tag}");
                 print_tool_result(&result);

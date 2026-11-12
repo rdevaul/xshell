@@ -13,7 +13,7 @@ mod view;
 
 pub use audit::{
     DaemonAudit, SessionAuditDescriptor, SessionAuditHandle, TerminalStreamPolicy, audit_approval,
-    audit_decision_basis, audit_policy, audit_provided_tools, audit_tool_decision,
+    audit_decision_basis, audit_image, audit_policy, audit_provided_tools, audit_tool_decision,
     audit_turn_started,
 };
 pub use client::{
@@ -31,7 +31,7 @@ pub use model::{
     SessionSnapshot, SessionStatus, SessionTools, ShellCompletionCandidate, ShellCompletionResult,
     TurnAuditRef, TurnFailureReason, TurnInput, ViewResource, Visibility,
 };
-pub use protocol::{ClientRequest, ServerResponse};
+pub use protocol::{ClientRequest, MAX_UPLOAD_IMAGE_BYTES, ServerResponse};
 pub use pty::{PtyAudit, PtyClaim, PtyCoordinator, PtyReadResult};
 pub use pty_stream::{
     ClientPtyFrame, PtyStreamClient, ServerPtyFrame, read_client_frame, read_server_frame,

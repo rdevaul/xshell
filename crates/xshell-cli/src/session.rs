@@ -450,6 +450,12 @@ session's interactive process is running; stop it first"
         Ok(turn_id)
     }
 
+    /// Upload an image to the current session for the next agent message.
+    pub fn upload_image(&mut self, bytes: &[u8], label: String) -> Result<xshell_core::ImageRef> {
+        let session_id = self.active_session_id()?;
+        self.client_mut()?.upload_image(session_id, bytes, label)
+    }
+
     pub fn view_source(&mut self, path: PathBuf) -> Result<ViewResource> {
         let session_id = self.active_session_id()?;
         self.client_mut()?.view_source(session_id, path)

@@ -2,11 +2,13 @@ use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::process::{ProcessGroupGuard, configure_process_group};
 use crate::provider::{CallScope, execute_provided};
-use crate::tools::{Preparation, ToolRef, execute_prepared, gate, prepare_call, truncate};
+use crate::tools::{
+    Preparation, ToolRef, execute_prepared, execute_view_image, gate, prepare_call, truncate,
+};
 use crate::{
     ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
-    GateReason, PolicyDecision, SensitivePaths, Tool, ToolAccess, ToolApproval, ToolSet,
-    default_decision, drop_tool_payloads, estimate_history_tokens, history_bytes,
+    GateReason, PolicyDecision, SensitivePaths, SessionImages, Tool, ToolAccess, ToolApproval,
+    ToolSet, default_decision, drop_tool_payloads, estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -230,6 +232,9 @@ pub enum ExecutionEvent {
         call_id: String,
         name: String,
         result: String,
+        /// Images the tool produced, such as the file `view_image` showed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<xshell_core::ImageRef>,
     },
     TurnAborted,
     /// The conversation was shrunk to stay within the configured budget:
@@ -398,9 +403,14 @@ pub struct TurnPolicy {
     /// The daemon session the turn belongs to, passed to tool providers so
     /// they can keep per-session state. `None` outside a daemon.
     pub session_id: Option<String>,
-    /// Where the bytes of the conversation's images are read from, when the
-    /// model takes images. `None` sends every image as a placeholder.
-    pub images: Option<Arc<dyn ImageSource>>,
+    /// The session's images: where the bytes of the conversation's images
+    /// are read from, and where `view_image` stores what it shows. Set only
+    /// for models that take images; `None` sends every image as a
+    /// placeholder and leaves `view_image` out of the toolset.
+    pub images: Option<Arc<dyn SessionImages>>,
+    /// Images attached to the turn's user message, such as files the user
+    /// attached. The caller has checked they are in the session's store.
+    pub message_images: Vec<xshell_core::ImageRef>,
     /// Limits for a root turn. A child agent draws from its root turn's
     /// [`TurnBudget`] instead (see [`run_agent_turn_with_budget`]).
     pub limits: TurnLimits,
@@ -418,6 +428,7 @@ impl std::fmt::Debug for TurnPolicy {
             .field("agent_scope", &self.agent_scope)
             .field("session_id", &self.session_id)
             .field("images", &self.images.is_some())
+            .field("message_images", &self.message_images)
             .field("limits", &self.limits)
             .finish()
     }
@@ -435,6 +446,7 @@ impl Clone for TurnPolicy {
             agent_scope: self.agent_scope.clone(),
             session_id: self.session_id.clone(),
             images: self.images.clone(),
+            message_images: self.message_images.clone(),
             limits: self.limits,
         }
     }
@@ -452,8 +464,15 @@ impl TurnPolicy {
             agent_scope: None,
             session_id: None,
             images: None,
+            message_images: Vec::new(),
             limits: TurnLimits::default(),
         }
+    }
+
+    /// Attach `images` to the turn's user message.
+    pub fn with_message_images(mut self, images: Vec<xshell_core::ImageRef>) -> Self {
+        self.message_images = images;
+        self
     }
 
     pub fn with_tools(mut self, tools: ToolSet) -> Self {
@@ -461,8 +480,9 @@ impl TurnPolicy {
         self
     }
 
-    /// Read image bytes from `images` for models that take images.
-    pub fn with_images(mut self, images: Arc<dyn ImageSource>) -> Self {
+    /// Use `images` for a model that takes images: read the conversation's
+    /// images from it, and offer `view_image`, which stores into it.
+    pub fn with_images(mut self, images: Arc<dyn SessionImages>) -> Self {
         self.images = Some(images);
         self
     }
@@ -619,10 +639,22 @@ pub async fn run_agent_turn_with_budget(
     budget: &TurnBudget,
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
+    // `view_image` needs a session image store to put what it shows, and a
+    // model that takes images to see it; without them it is not offered,
+    // and a call to it is refused like any tool outside the set.
+    let without_images;
+    let policy = if policy.images.is_none() && policy.tools.contains(Tool::ViewImage) {
+        without_images = policy
+            .clone()
+            .with_tools(policy.tools.clone().without(Tool::ViewImage));
+        &without_images
+    } else {
+        policy
+    };
     let approval = policy.approval;
     // Keep the exact prior history for failed/cancelled-turn rollback.
     let mut rollback_history = history.clone();
-    history.push(ChatMessage::user(message));
+    history.push(ChatMessage::user(message).with_images(policy.message_images.iter().cloned()));
     let tools = policy.tools.definitions();
     let mut call_ids = CallIds::new(policy.agent_scope.as_deref());
     let mut delegations = 0;
@@ -666,7 +698,10 @@ pub async fn run_agent_turn_with_budget(
                 response = agent.chat_stream(
                     ChatRequest {
                         images: if agent.accepts_images() {
-                            read_images(policy.images.as_deref(), &request_messages)
+                            read_images(
+                                policy.images.as_deref().map(|images| images as &dyn ImageSource),
+                                &request_messages,
+                            )
                         } else {
                             ImageBytes::new()
                         },
@@ -1016,6 +1051,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
             }
 
             let mut subagent_aborted = false;
+            let mut result_images = Vec::new();
             let result = if denied_by_policy {
                 "tool denied by the approval policy".into()
             } else if decision != ApprovalDecision::Approve {
@@ -1061,6 +1097,18 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     },
                 )
                 .await
+            } else if tool.is(Tool::ViewImage) {
+                observed_tool_activity = true;
+                match &policy.images {
+                    Some(images) => {
+                        let (text, shown) =
+                            execute_view_image(call, preparation, Arc::clone(images)).await;
+                        result_images = shown;
+                        text
+                    }
+                    // Unreachable: the tool is only in the set with a store.
+                    None => "tool error: view_image is not available to this agent".into(),
+                }
             } else {
                 observed_tool_activity = true;
                 execute_prepared(
@@ -1076,9 +1124,10 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 call_id: scoped.id.clone(),
                 name: call.name.clone(),
                 result: result.clone(),
+                images: result_images.clone(),
             });
             budget.record_tool_output(result.len());
-            history.push(ChatMessage::tool_result(call, result));
+            history.push(ChatMessage::tool_result(call, result).with_images(result_images));
             // The user aborting a subagent's tool aborts the whole turn, as
             // it would for one of the parent's own tools.
             if subagent_aborted {
@@ -1199,10 +1248,13 @@ async fn run_delegation(
         Some(scope) => format!("{scope}/delegate-{number}"),
         None => format!("delegate-{number}"),
     };
+    // The subagent's task is text only: images attached to the parent's
+    // message stay with the parent.
     let child_policy = policy
         .clone()
         .with_tools(tools.clone())
-        .with_agent_scope(name.clone());
+        .with_agent_scope(name.clone())
+        .with_message_images(Vec::new());
     observer.emit(ExecutionEvent::SubagentStarted {
         agent: name.clone(),
         task: task.clone(),
@@ -1355,6 +1407,7 @@ fn refuse_tool_call(
         call_id: scoped.id.clone(),
         name: call.name.clone(),
         result: result.clone(),
+        images: Vec::new(),
     });
     history.push(ChatMessage::tool_result(call, result));
 }
@@ -4509,6 +4562,148 @@ mod tests {
             format!("image-{byte}.png"),
         )
         .unwrap()
+    }
+
+    /// A turn whose model asks to view `path`, then answers, with a session
+    /// image store when `store` is given.
+    async fn view_image_turn(
+        temporary: &TempDir,
+        path: &str,
+        policy: TurnPolicy,
+        decisions: Vec<ApprovalDecision>,
+    ) -> (ScriptedAdapter, Vec<ChatMessage>, Vec<ExecutionEvent>) {
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![ToolCall {
+                    id: "v".into(),
+                    name: "view_image".into(),
+                    arguments: json!({"path": path}),
+                }]),
+                answer("seen"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer(decisions);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "look".into(),
+            temporary.path(),
+            &policy,
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        (adapter, history, observer.events)
+    }
+
+    fn image_store(temporary: &TempDir) -> Arc<crate::ImageStore> {
+        Arc::new(
+            crate::ImageStore::open(
+                &temporary.path().join("store"),
+                "11111111-1111-4111-8111-111111111111",
+                crate::ImageStoreLimits::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn view_image_shows_the_model_an_ingested_image() {
+        let temporary = TempDir::new().unwrap();
+        std::fs::write(
+            temporary.path().join("render.png"),
+            crate::ingest::tests::png(20, 10),
+        )
+        .unwrap();
+        let store = image_store(&temporary);
+        let policy = TurnPolicy::new(ApprovalPolicy::Ask).with_images(store.clone());
+        let (adapter, history, events) =
+            view_image_turn(&temporary, "render.png", policy, vec![]).await;
+
+        assert!(offered(&adapter.requests[0]).contains(&"view_image"));
+        let results = tool_results(&events);
+        assert_eq!(
+            results,
+            [("v", "Viewed render.png: 20x10 PNG, shown with this result.")]
+        );
+        let shown = history
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap();
+        assert_eq!(shown.images.len(), 1);
+        let image = &shown.images[0];
+        assert_eq!((image.width(), image.height()), (20, 10));
+        assert!(store.contains(image));
+        // The image travels with the tool result to the next request.
+        let next = &adapter.requests[1].messages;
+        assert!(next.iter().any(|message| message.images == shown.images));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::ToolResult { images, .. } if images == &shown.images
+        )));
+    }
+
+    #[tokio::test]
+    async fn view_image_is_gated_like_read_file() {
+        let temporary = TempDir::new().unwrap();
+        std::fs::write(
+            temporary.path().join("secret.png"),
+            crate::ingest::tests::png(4, 4),
+        )
+        .unwrap();
+        // A sensitive path prompts; here the user denies it.
+        let sensitive = TurnPolicy::new(ApprovalPolicy::Ask)
+            .with_images(image_store(&temporary))
+            .with_sensitive_paths(SensitivePaths::new(["secret.png".to_owned()]));
+        let (_, history, events) = view_image_turn(
+            &temporary,
+            "secret.png",
+            sensitive,
+            vec![ApprovalDecision::Deny],
+        )
+        .await;
+        assert_eq!(approval_reasons(&events), [Some(GateReason::SensitivePath)]);
+        assert!(history.iter().all(|message| message.images.is_empty()));
+
+        // A blocked path is refused before the policy, in every mode.
+        let blocked = TurnPolicy::new(ApprovalPolicy::Auto)
+            .with_images(image_store(&temporary))
+            .with_blocked_paths(SensitivePaths::new(["secret.png".to_owned()]));
+        let (_, history, events) = view_image_turn(&temporary, "secret.png", blocked, vec![]).await;
+        assert!(events.contains(&ExecutionEvent::ToolDecision {
+            call_id: "v".into(),
+            decision: ApprovalDecision::Deny,
+            basis: Some(DecisionBasis::BlockedPath),
+            approval: None,
+        }));
+        assert!(tool_results(&events)[0].1.contains("blocked"));
+        assert!(history.iter().all(|message| message.images.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn view_image_is_not_offered_without_an_image_store() {
+        let temporary = TempDir::new().unwrap();
+        std::fs::write(
+            temporary.path().join("render.png"),
+            crate::ingest::tests::png(4, 4),
+        )
+        .unwrap();
+        let (adapter, _, events) = view_image_turn(
+            &temporary,
+            "render.png",
+            TurnPolicy::new(ApprovalPolicy::Auto),
+            vec![],
+        )
+        .await;
+        assert!(!offered(&adapter.requests[0]).contains(&"view_image"));
+        assert!(events.contains(&ExecutionEvent::ToolDecision {
+            call_id: "v".into(),
+            decision: ApprovalDecision::Deny,
+            basis: Some(DecisionBasis::NotInToolset),
+            approval: None,
+        }));
     }
 
     #[test]

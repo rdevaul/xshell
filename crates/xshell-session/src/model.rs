@@ -18,8 +18,10 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `SessionEventKind::TurnSummary`. Version 22 adds `tools` on
 // `SessionCreation` and `SessionDescriptor`. Version 23 adds `vision` to
 // `ModelBinding`. Version 24 adds `ClientRequest::LocateTurn` and durable
-// turn records.
-pub const SESSION_PROTOCOL_VERSION: u32 = 24;
+// turn records. Version 25 adds `UploadImage`, `images` on
+// `TurnInput::Agent`, the `view_image` tool and `images` on
+// `ExecutionEvent::ToolResult`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 25;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -458,8 +460,26 @@ pub struct SessionCreation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnInput {
-    Agent { message: String },
-    Shell { command: String },
+    Agent {
+        message: String,
+        /// Images attached to the message, already stored in the session
+        /// (see `UploadImage`). Absent when there are none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<xshell_core::ImageRef>,
+    },
+    Shell {
+        command: String,
+    },
+}
+
+impl TurnInput {
+    /// An agent message without images.
+    pub fn agent(message: impl Into<String>) -> Self {
+        Self::Agent {
+            message: message.into(),
+            images: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

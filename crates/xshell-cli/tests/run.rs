@@ -567,6 +567,46 @@ fn daemon_budgets_refuse_extra_turns_and_sessions_with_exit_six() {
     );
 }
 
+/// A 1x1 RGBA PNG.
+const TINY_PNG: [u8; 70] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64, 0xf8, 0xcf, 0x50,
+    0x0f, 0x00, 0x03, 0x86, 0x01, 0x80, 0x5a, 0x34, 0x7d, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn attach_needs_a_vision_profile_and_sends_the_image() {
+    let fabric = Fabric::with_config(&serve(vec![sse_text("a pixel")]), true, true, "", "");
+    let image = fabric.directory.path().join("pixel.png");
+    std::fs::write(&image, TINY_PNG).unwrap();
+    // The default profile has no vision: a usage error, before connecting.
+    let blind = fabric.run(&["--ephemeral", "--attach", image.to_str().unwrap(), "what?"]);
+    assert_eq!(blind.status.code(), Some(2), "{blind:?}");
+    assert!(String::from_utf8_lossy(&blind.stdout).is_empty());
+
+    let config = std::fs::read_to_string(&fabric.config).unwrap();
+    let with_vision = config.replace(
+        "model = \"fake-model\"\n",
+        "model = \"fake-model\"\nvision = true\n",
+    );
+    assert_ne!(config, with_vision);
+    std::fs::write(&fabric.config, with_vision).unwrap();
+    let missing = fabric.run(&["--ephemeral", "--attach", "/nonexistent.png", "what?"]);
+    assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+    let seen = fabric.run(&[
+        "--ephemeral",
+        "--output",
+        "jsonl",
+        "--attach",
+        image.to_str().unwrap(),
+        "what is it?",
+    ]);
+    assert_eq!(seen.status.code(), Some(0), "{seen:?}");
+    assert_eq!(events(&seen).last().unwrap()["answer"], "a pixel");
+}
+
 #[test]
 fn a_finished_turn_is_reported_by_id_after_the_daemon_restarts() {
     let mut fabric = Fabric::new(&serve(vec![sse_text("kept for later")]), true, true);

@@ -121,7 +121,7 @@ fn render_events<'a>(
                 renderer.finish(&mut output)?;
                 renderer = AgentRenderer::new(render_options);
                 let text = match input {
-                    TurnInput::Agent { message } => sanitize_terminal_text(message),
+                    TurnInput::Agent { message, .. } => sanitize_terminal_text(message),
                     TurnInput::Shell { command } => {
                         format!("$ {}", sanitize_terminal_text(command))
                     }
@@ -319,6 +319,7 @@ mod tests {
             SessionEventKind::TurnStarted {
                 input: TurnInput::Agent {
                     message: message.to_owned(),
+                    images: Vec::new(),
                 },
                 approval: ApprovalPolicy::default(),
                 requested_approval: None,

@@ -796,6 +796,7 @@ fn reject_remote_request(
         } => Some(selector.as_str()),
         ClientRequest::CompleteShell { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::UploadImage { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyStart { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyAttach { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyClose { session_id } => Some(session_id.as_str()),
@@ -1200,6 +1201,40 @@ fn process_request(
             Ok(ServerResponse::ViewSource {
                 resource: load_view_resource_bounded(path, cwd)?,
             })
+        }
+        ClientRequest::UploadImage {
+            session_id,
+            data,
+            label,
+        } => {
+            require_current(attached_session, &session_id)?;
+            let model = registry
+                .lock_recover()
+                .snapshot(&session_id)?
+                .descriptor
+                .model;
+            if !model.vision {
+                bail!(
+                    "this session's model is not configured for images; set `vision = true` \
+on its model profile to attach images"
+                );
+            }
+            // Base64 is 4 bytes per 3; refuse an oversized upload before
+            // decoding it.
+            let encoded_limit = crate::MAX_UPLOAD_IMAGE_BYTES.div_ceil(3) * 4;
+            if data.len() as u64 > encoded_limit {
+                bail!(
+                    "the image is larger than the {}-byte limit",
+                    crate::MAX_UPLOAD_IMAGE_BYTES
+                );
+            }
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .context("the uploaded image is not valid base64")?;
+            let store = registry.lock_recover().image_store(&session_id)?;
+            let image = xshell_execution::ingest_into(&store, &bytes, &label)?;
+            Ok(ServerResponse::ImageStored { image })
         }
         ClientRequest::PtyStart {
             session_id,

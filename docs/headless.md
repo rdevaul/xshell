@@ -20,11 +20,18 @@ running in the daemon (an `--ephemeral` session ends with its client).
 ## Usage
 
 ```text
-xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral] [--prompt-file FILE] [PROMPT]
+xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral] [--prompt-file FILE] [--attach FILE]... [PROMPT]
 ```
 
 - **Prompt:** the positional argument, `--prompt-file FILE`, or stdin when
   neither is given and stdin is not a terminal.
+- **Images:** `--attach FILE` (repeatable) attaches a PNG, JPEG, GIF or WebP
+  file of at most 20 MiB to the prompt. The model profile needs
+  `vision = true`; otherwise, or for a file that cannot be read, the run
+  exits 2 before connecting. The daemon decodes each image, scales it to at
+  most 1568 px on its longest edge and re-encodes it as PNG; an image it
+  cannot decode also exits 2, and a session the run created for it is
+  closed again.
 - **Session:**
   - By default, each run creates its own session, named `run-<time>-<id>`, which
     stays in the daemon afterwards.

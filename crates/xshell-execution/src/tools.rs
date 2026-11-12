@@ -29,14 +29,18 @@ pub enum Tool {
     /// Starts a subagent. Dispatched by the engine rather than
     /// [`execute_tool`], because it runs a nested agent turn.
     DelegateTask,
+    /// Shows the model an image file. Dispatched by the engine, which holds
+    /// the session's image store; offered only to models that take images.
+    ViewImage,
 }
 
 impl Tool {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ReadFile,
         Self::ListDirectory,
         Self::RunShell,
         Self::DelegateTask,
+        Self::ViewImage,
     ];
 
     pub fn name(self) -> &'static str {
@@ -45,6 +49,7 @@ impl Tool {
             Self::ListDirectory => "list_directory",
             Self::RunShell => "run_shell",
             Self::DelegateTask => "delegate_task",
+            Self::ViewImage => "view_image",
         }
     }
 
@@ -56,7 +61,7 @@ impl Tool {
     /// still be gated by the sensitive-path policy.
     pub fn is_read_only(self) -> bool {
         match self {
-            Self::ReadFile | Self::ListDirectory => true,
+            Self::ReadFile | Self::ListDirectory | Self::ViewImage => true,
             Self::RunShell | Self::DelegateTask => false,
         }
     }
@@ -355,10 +360,26 @@ need to keep in your own context."
                     "tools": {
                         "type": "string",
                         "enum": ["read_only", "inherit"],
-                        "description": "read_only (default): read_file and list_directory only. inherit: your tools, including run_shell under the same approval policy"
+                        "description": "read_only (default): your read-only tools only (read_file, list_directory, and any others you have). inherit: your tools, including run_shell under the same approval policy"
                     }
                 },
                 "required": ["task"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "view_image".into(),
+            description: "Look at an image file (PNG, JPEG, GIF or WebP) inside the current xshell \
+working directory, such as a render or plot a command produced. The image is shown to you \
+with the result, scaled to at most 1568 pixels on its longest edge. Files that look like \
+credentials or keys require user approval."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the working directory"}
+                },
+                "required": ["path"],
                 "additionalProperties": false
             }),
         },
@@ -481,7 +502,7 @@ pub(crate) fn gate(call: &ToolCall, preparation: &Preparation) -> Option<GateRea
 /// other tool.
 fn read_request(call: &ToolCall) -> Option<Result<(String, ObjectKind)>> {
     match Tool::from_name(&call.name)? {
-        Tool::ReadFile => Some(
+        Tool::ReadFile | Tool::ViewImage => Some(
             required_string(&call.arguments, "path")
                 .map(|path| (path.to_owned(), ObjectKind::File)),
         ),
@@ -582,7 +603,7 @@ pub(crate) async fn execute_prepared(
             Some(Tool::DelegateTask) => Err(anyhow::anyhow!(
                 "delegate_task is dispatched by the agent engine"
             )),
-            Some(Tool::ReadFile | Tool::ListDirectory) => {
+            Some(Tool::ReadFile | Tool::ListDirectory | Tool::ViewImage) => {
                 Err(anyhow::anyhow!("{} was not prepared", call.name))
             }
             None => Err(anyhow::anyhow!("unknown tool {}", call.name)),
@@ -591,6 +612,52 @@ pub(crate) async fn execute_prepared(
     match output {
         Ok(output) => truncate(output),
         Err(error) => format!("tool error: {error:#}"),
+    }
+}
+
+/// Run a prepared `view_image` call: read the file it opened (at most the
+/// per-image limit), ingest it into the session's store, and return the
+/// result text with the image to attach to it.
+pub(crate) async fn execute_view_image(
+    call: &ToolCall,
+    preparation: Preparation,
+    images: Arc<dyn crate::SessionImages>,
+) -> (String, Vec<xshell_core::ImageRef>) {
+    let object = match preparation {
+        Preparation::Read(object) => object,
+        Preparation::Failed(message) | Preparation::Blocked(message) => {
+            return (message, Vec::new());
+        }
+        Preparation::Other => {
+            return ("tool error: view_image was not prepared".into(), Vec::new());
+        }
+    };
+    let label = call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("image")
+        .to_owned();
+    let result = run_blocking(move || {
+        let limit = crate::MAX_SOURCE_BYTES as usize;
+        let (bytes, truncated) = object.read(limit)?;
+        if truncated {
+            bail!("the file is larger than the {limit}-byte image limit");
+        }
+        images.ingest(&bytes, &label).map_err(anyhow::Error::msg)
+    })
+    .await;
+    match result {
+        Ok(image) => (
+            format!(
+                "Viewed {}: {}x{} PNG, shown with this result.",
+                image.label(),
+                image.width(),
+                image.height()
+            ),
+            vec![image],
+        ),
+        Err(error) => (format!("tool error: {error:#}"), Vec::new()),
     }
 }
 
@@ -819,7 +886,7 @@ mod tests {
                 .into_iter()
                 .map(|tool| tool.name)
                 .collect::<Vec<_>>(),
-            ["read_file", "list_directory"]
+            ["read_file", "list_directory", "view_image"]
         );
         assert_eq!(ToolSet::default(), ToolSet::all());
         assert_eq!(ToolSet::all().definitions(), definitions());
@@ -840,7 +907,7 @@ mod tests {
         );
         assert_eq!(
             format!("{read_only:?}"),
-            r#"{"read_file", "list_directory"}"#
+            r#"{"read_file", "list_directory", "view_image"}"#
         );
     }
 
@@ -883,6 +950,7 @@ mod tests {
                 "list_directory",
                 "run_shell",
                 "delegate_task",
+                "view_image",
                 "memory_get",
                 "memory_put",
                 "memory_purge"
@@ -937,7 +1005,7 @@ mod tests {
         let set = ToolSet::all().with_provided(Arc::clone(&registry));
         assert_eq!(
             set.read_only_subset().names(),
-            ["read_file", "list_directory", "memory_get"]
+            ["read_file", "list_directory", "view_image", "memory_get"]
         );
         let narrowed = set.intersect(&ToolSet::none().with_provided(Arc::clone(&registry)));
         assert_eq!(

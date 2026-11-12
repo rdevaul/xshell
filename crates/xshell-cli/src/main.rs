@@ -1,3 +1,4 @@
+mod attach;
 mod audit;
 mod backlog;
 mod completion;
@@ -218,6 +219,8 @@ async fn main() -> Result<()> {
     // An explicit profile choice outlives `//model` switches; without one, the
     // active model profile's choice (or `agent.limits`) applies.
     let mut explicit_limits = args.limits.clone();
+    // Images uploaded with //attach for the next agent message.
+    let mut attachments: Vec<xshell_core::ImageRef> = Vec::new();
     if let Some(name) = &explicit_limits {
         model_config.limit_profile(name)?;
     }
@@ -779,6 +782,12 @@ async fn main() -> Result<()> {
                     Err(error) => eprintln!("xshell: {error:#}"),
                 }
             }
+            InputRoute::Control(ControlCommand::Attach(path)) => {
+                match attach::handle_attach(&path, &mut sessions, &active_model, &mut attachments) {
+                    Ok(message) => println!("{message}"),
+                    Err(error) => eprintln!("xshell: {error:#}"),
+                }
+            }
             InputRoute::Control(ControlCommand::View(view_args)) => {
                 if let Err(error) = handle_view(
                     &view_args,
@@ -814,9 +823,12 @@ async fn main() -> Result<()> {
                     }
                 };
                 if sessions.enabled() {
+                    // Pending attachments go with this message, whether or
+                    // not the session host accepts it.
                     let result = sessions.submit(
                         TurnInput::Agent {
                             message: message.clone(),
+                            images: std::mem::take(&mut attachments),
                         },
                         args.approval,
                         limits,

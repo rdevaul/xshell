@@ -72,6 +72,8 @@ control commands:
   //model NAME      switch profiles and start a fresh conversation
   //limits          show the turn limits that apply and the known profiles
   //limits NAME     use the named limit profile for following turns
+  //attach PATH     attach an image to your next message (vision models)
+  //attach          list pending attachments; //attach --clear drops them
   //agent            show active agent capabilities
   //tools            show tools exposed to the active agent
   //view [OPTIONS] PATH
@@ -105,6 +107,7 @@ control commands:
         ControlCommand::Model(_) => unreachable!("model is handled by the REPL"),
         ControlCommand::Limits(_) => unreachable!("limits is handled by the REPL"),
         ControlCommand::View(_) => unreachable!("view is handled by the REPL"),
+        ControlCommand::Attach(_) => unreachable!("attach is handled by the REPL"),
         ControlCommand::Connect(_)
         | ControlCommand::Sessions
         | ControlCommand::Resume(_)

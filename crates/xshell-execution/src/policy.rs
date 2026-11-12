@@ -103,7 +103,7 @@ enum Rule {
 }
 
 /// The tools a path entry may name.
-const PATH_TOOLS: &[&str] = &["read_file", "list_directory"];
+const PATH_TOOLS: &[&str] = &["read_file", "list_directory", "view_image"];
 
 impl Rule {
     fn parse(entry: &str) -> Result<Self> {

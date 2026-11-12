@@ -258,6 +258,24 @@ impl ExecutionCoordinator {
         let (limits, lowered) = requested_limits.clamp_to(self.inner.policy.max_limits);
         let requested_limits = lowered.then_some(requested_limits);
         let snapshot = self.inner.registry.lock_recover().snapshot(session_id)?;
+        // Attached images must be this session's own, exactly as the daemon
+        // ingested them, and only a model that takes images can see them.
+        if let TurnInput::Agent { images, .. } = &input
+            && !images.is_empty()
+        {
+            if !snapshot.descriptor.model.vision {
+                bail!(
+                    "this session's model is not configured for images; set `vision = true` \
+on its model profile to attach images"
+                );
+            }
+            self.inner
+                .registry
+                .lock_recover()
+                .image_store(session_id)?
+                .require_all(images)
+                .context("the message attaches an image this session does not have")?;
+        }
         let execution = self.session(session_id);
         let turn_id = Uuid::new_v4().to_string();
         let cancellation = CancellationFlag::default();
@@ -289,14 +307,18 @@ impl ExecutionCoordinator {
         // merely an attempted duplicate submission. With required auditing, a
         // failure here releases the reservation and refuses the turn outright.
         let audit = self.audit_handle_for_snapshot(&snapshot);
-        let (route, text) = match &input {
-            TurnInput::Agent { message } => ("agent", message.clone()),
-            TurnInput::Shell { command } => ("shell", format!("${command}")),
+        let (route, text, images) = match &input {
+            TurnInput::Agent { message, images } => (
+                "agent",
+                message.clone(),
+                images.iter().map(crate::audit_image).collect(),
+            ),
+            TurnInput::Shell { command } => ("shell", format!("${command}"), Vec::new()),
         };
         let first_record = match audit.append_with_receipt(AuditEvent::Input {
             route: route.into(),
             text,
-            images: Vec::new(),
+            images,
         }) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -628,7 +650,7 @@ impl ExecutionCoordinator {
         let keep_record = snapshot.descriptor.persistence != crate::PersistenceMode::Ephemeral;
         let result = runtime.block_on(async {
             match input {
-                TurnInput::Agent { message } => {
+                TurnInput::Agent { message, images } => {
                     let model = &snapshot.descriptor.model;
                     let mut agent = build_adapter(&AdapterConfig {
                         provider: model.provider.clone(),
@@ -651,7 +673,8 @@ impl ExecutionCoordinator {
                             max_history_bytes: model.max_history_bytes,
                             context_tokens: model.context_tokens,
                             reserve_output_tokens: model.reserve_output_tokens,
-                        }));
+                        }))
+                        .with_message_images(images);
                     // The session's own store: a turn can only show its model
                     // images stored for this session.
                     if model.vision {
@@ -1043,11 +1066,12 @@ impl DaemonObserver {
                 call_id,
                 name,
                 result,
+                images,
             } => self.audit(AuditEvent::ToolResult {
                 call_id: call_id.clone(),
                 name: name.clone(),
                 result: result.clone(),
-                images: Vec::new(),
+                images: images.iter().map(crate::audit_image).collect(),
             }),
             ExecutionEvent::TurnAborted => {}
             ExecutionEvent::HistoryCompacted { report } => {

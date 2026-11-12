@@ -70,8 +70,34 @@ results, naming the call. Without vision, or when an image's bytes cannot be
 read, the model gets a placeholder such as `[image: renders/bracket.png,
 1568x1176, not shown: this model is not configured for images]`, so a
 session switched between models never fails on its history. Behaviour on
-specific servers (vLLM, TabbyAPI, Ollama) still needs checking per model;
-nothing produces images until A4.
+specific servers (vLLM, TabbyAPI, Ollama) still needs checking per model.
+
+A4 is implemented.
+
+- **Ingestion** (`ingest.rs`): every image is decoded with the `image`
+  crate (PNG, JPEG, GIF or WebP only; at most 20 MiB and 50 megapixels,
+  checked from the header before any pixels are decoded), scaled to a
+  1568 px maximum edge, normalised to 8-bit RGB or RGBA, and re-encoded as
+  PNG. PNG is lossless, which keeps line art and text in renders legible,
+  and one output format keeps provider handling simple; photos come out
+  larger than JPEG would make them, but well inside the 20 MiB limit.
+- **Trusted metadata:** the store writes a record of each image's media
+  type and dimensions beside it, and a client's history or attachment that
+  claims anything else for an image is refused.
+- **`//attach PATH`** in the interactive CLI and **`xshell run --attach
+  FILE`** upload the file through the new `UploadImage` request (session
+  protocol 25); the daemon ingests it and the reference goes on the next
+  agent message (`TurnInput::Agent.images`), checked and audited on the
+  `input` record. Standalone xshell refuses attachments, because the
+  session host stores and checks images.
+- **`view_image`** is a built-in read-only tool, offered only to vision
+  models with a session store. It reads like `read_file` (confinement,
+  sensitive-path prompts, blocked paths), ingests the file and attaches it
+  to the tool result, where A3's layout sends it; the audit `tool_result`
+  record carries the image reference.
+- **Freeing space:** a full store is freed when its session ends or the
+  daemon restarts, and the error now says so. Collecting images dropped
+  from history while the session runs is left for A5.
 
 A2's store is implemented: `ImageStore` in `xshell-execution`, one
 directory per session under `images/` in the daemon's state directory.

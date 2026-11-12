@@ -99,6 +99,7 @@ fn run_turn(
             session_id.to_owned(),
             TurnInput::Agent {
                 message: message.into(),
+                images: Vec::new(),
             },
             approval,
         )
