@@ -17,8 +17,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // provided tools that require approval. Version 21 adds
 // `SessionEventKind::TurnSummary`. Version 22 adds `tools` on
 // `SessionCreation` and `SessionDescriptor`. Version 23 adds `vision` to
-// `ModelBinding`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 23;
+// `ModelBinding`. Version 24 adds `ClientRequest::LocateTurn` and durable
+// turn records.
+pub const SESSION_PROTOCOL_VERSION: u32 = 24;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -772,6 +772,14 @@ fn reject_remote_request(
             message: "PTY tickets may only be claimed through serve-pty-stdio".into(),
         }));
     }
+    // A turn record holds the turn's answer whatever its session's
+    // visibility, and headless job commands run on the daemon's own host.
+    if matches!(request, ClientRequest::LocateTurn { .. }) {
+        return Ok(Some(ServerResponse::Error {
+            code: "local_only".into(),
+            message: "turns can only be looked up on the session host".into(),
+        }));
+    }
     if matches!(
         request,
         ClientRequest::Create { session }
@@ -1165,6 +1173,9 @@ fn process_request(
             execution.cancel(&session_id, &turn_id)?;
             Ok(ServerResponse::CancellationAccepted)
         }
+        ClientRequest::LocateTurn { turn_id } => Ok(ServerResponse::TurnLocated {
+            location: execution.locate_turn(&turn_id)?,
+        }),
         ClientRequest::CompleteShell {
             session_id,
             line,

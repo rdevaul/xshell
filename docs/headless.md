@@ -47,20 +47,41 @@ xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral] [--prompt-file F
 ## Long-running jobs
 
 A turn runs in the daemon whether or not a client follows it. These commands
-act on the session named by `--session`, so a job can outlive the script
-that started it, and a restarted script can pick it up:
+act on one turn, named by `--turn` (the `turn_id` of the `run_started` line),
+or on the latest turn of the session named by `--session`, so a job can
+outlive the script that started it, and a restarted script can pick it up:
 
 ```sh
-session=$(xshell run --detach --approval auto --limits relaxed "Render every part")
-xshell status --session "$session"     # idle, agent running, ...
-xshell wait --session "$session"       # follow to the end; exit code as for run
-xshell result --session "$session"     # the last outcome now, or exit 7 if still running
-xshell cancel --session "$session"     # cancel and report (exit 4)
+turn=$(xshell run --detach --output jsonl --approval auto --limits relaxed \
+         "Render every part" | jq -r 'select(.event == "run_started") | .turn_id')
+xshell status --turn "$turn"     # agent_running, ..., or finished
+xshell wait --turn "$turn"       # follow to the end; exit code as for run
+xshell result --turn "$turn"     # the outcome now, or exit 7 if still running
+xshell cancel --turn "$turn"     # cancel and report (exit 4)
 ```
 
-- **`wait`** follows the session's active turn to its end, replaying it from
-  its first event in the session's journal. With no turn active, it replays
-  the last finished turn. SIGINT or SIGTERM stops waiting, leaves the turn
+With text output, `run --detach` prints the session name, for
+`--session NAME`.
+
+- **Turns outlive the daemon.** When an agent turn ends, the daemon writes a
+  record of it (outcome, failure reason, final answer, usage, and audit
+  reference) under its state directory, before it reports the end. `result
+  --turn` and `wait --turn` report a finished turn from that record when the
+  daemon no longer has its events, for example after a restart, which also
+  ends sessions that are not `durable`. They then print a warning and the
+  `result` line, with the same exit code the turn had. The daemon keeps the
+  256 most recent records. Turns in an `--ephemeral` session get no record:
+  the session leaves nothing behind when it ends.
+- **`--session` follows the journal.** The session forms report the latest
+  turn the daemon's in-memory journal still holds, so after a restart they
+  have nothing to report; use `--turn`.
+- **`status --turn`** reports a finished turn as `finished`.
+- **Local only.** Turns are looked up on the session host; a remote
+  connection (`serve-stdio`) refuses the request.
+
+- **`wait`** follows the turn to its end, replaying it from its first event in
+  the session's journal. With `--session` and no turn active, it replays the
+  last finished turn. SIGINT or SIGTERM stops waiting, leaves the turn
   running, and exits 7.
 - **`result`** reports the last finished turn without waiting, or exits 7 if a
   turn is running.
@@ -78,8 +99,8 @@ xshell cancel --session "$session"     # cancel and report (exit 4)
   (see [daemon budgets](session-fabric.md#daemon-budgets)).
 - **Retention:** turns are replayed from the daemon's in-memory event
   journal, which keeps recent turns until its size bound evicts them and does
-  not survive a daemon restart. The session and its conversation persist as
-  its persistence mode allows.
+  not survive a daemon restart; a turn's outcome is kept as a record (above).
+  The session and its conversation persist as its persistence mode allows.
 
 ## Approvals
 
@@ -177,7 +198,7 @@ incompatible change increments `schema`.
 | `turn_aborted` | | The turn was aborted at an approval |
 | `cancel_requested` | | The client asked the daemon to cancel the turn |
 | `detached` | | `run --detach` left the turn running |
-| `status` | `schema`, `session`, `session_id`, `activity`, `turn_id`? | The output of `status`; `activity` is `idle`, `agent_running`, `agent_waiting_approval`, `agent_stopping`, or `interactive_process` |
+| `status` | `schema`, `session`, `session_id`, `activity`, `turn_id`? | The output of `status`; `activity` is `idle`, `agent_running`, `agent_waiting_approval`, `agent_stopping`, `interactive_process`, or, for `status --turn` on a finished turn, `finished` |
 | `warning` | `message` | Something worth knowing that did not end the run |
 | `turn_completed` | | The turn finished |
 | `turn_failed` | `message`, `reason`? | The turn failed; `reason` is `budget_exhausted` or `audit_unavailable` when known |

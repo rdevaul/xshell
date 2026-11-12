@@ -3,7 +3,7 @@ use crate::{
     AgentTurnPhase, ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind,
     SessionRegistry, SessionTools, TurnInput,
 };
-use crate::{TurnAuditRef, TurnFailureReason};
+use crate::{TurnAuditRef, TurnFailureReason, TurnLocation, TurnOutcome, TurnRecord, TurnStore};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -40,6 +40,9 @@ struct CoordinatorInner {
     /// Turns running across all sessions, against
     /// `DaemonPolicy::max_concurrent_turns`.
     running_turns: Arc<AtomicUsize>,
+    /// Durable records of finished agent turns (H5); `None` if the records
+    /// directory could not be opened.
+    turns: Option<TurnStore>,
     audit: DaemonAudit,
     policy: DaemonPolicy,
 }
@@ -134,6 +137,15 @@ impl ExecutionCoordinator {
         audit: DaemonAudit,
         policy: DaemonPolicy,
     ) -> Self {
+        let turns = match TurnStore::open(registry.lock_recover().state_directory()) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!(
+                    "xshelld warning: turn records are off; results will not survive a restart: {error:#}"
+                );
+                None
+            }
+        };
         Self {
             inner: Arc::new(CoordinatorInner {
                 registry,
@@ -141,6 +153,7 @@ impl ExecutionCoordinator {
                 admission: Mutex::new(true),
                 workers: Mutex::new(Vec::new()),
                 running_turns: Arc::new(AtomicUsize::new(0)),
+                turns,
                 audit,
                 policy,
             }),
@@ -490,6 +503,39 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Where `turn_id` is: the session running it, and its durable record
+    /// once it has finished. Fails for a turn this daemon does not know.
+    pub fn locate_turn(&self, turn_id: &str) -> Result<TurnLocation> {
+        let active_session_id = self
+            .inner
+            .sessions
+            .lock_recover()
+            .iter()
+            .find(|(_, execution)| {
+                execution
+                    .state
+                    .lock_recover()
+                    .active
+                    .as_ref()
+                    .is_some_and(|turn| turn.id == turn_id)
+            })
+            .map(|(session_id, _)| session_id.clone());
+        let record = match &self.inner.turns {
+            Some(turns) => turns.get(turn_id)?,
+            None => None,
+        };
+        if active_session_id.is_none() && record.is_none() {
+            bail!(
+                "unknown turn {turn_id:?}; its record may have been removed, or it never ran here"
+            );
+        }
+        Ok(TurnLocation {
+            turn_id: turn_id.to_owned(),
+            active_session_id,
+            record,
+        })
+    }
+
     pub fn active_turn(&self, session_id: &str) -> Option<String> {
         self.session(session_id)
             .state
@@ -571,7 +617,15 @@ impl ExecutionCoordinator {
             cancellation: cancellation.clone(),
             audit: audit.clone(),
             audit_failure: None,
+            answer: String::new(),
+            tool_calls: 0,
+            approvals_denied: 0,
         };
+        let session_name = snapshot.descriptor.name.clone();
+        // An ephemeral session promises to leave nothing behind when it
+        // ends, and nobody can wait on its turns afterwards, so its turns
+        // get no durable record.
+        let keep_record = snapshot.descriptor.persistence != crate::PersistenceMode::Ephemeral;
         let result = runtime.block_on(async {
             match input {
                 TurnInput::Agent { message } => {
@@ -724,6 +778,41 @@ store, so images are sent as placeholders: {error:#}"
                     record_hash: last.record_hash,
                 }
             });
+            // The durable record is written before the turn is released, so
+            // a client that sees the end can look the turn up at once.
+            if let Some(turns) = self.inner.turns.as_ref().filter(|_| keep_record) {
+                let (outcome, reason, message) = match &terminal {
+                    SessionEventKind::TurnCompleted => (TurnOutcome::Completed, None, None),
+                    SessionEventKind::TurnCancelled => (TurnOutcome::Cancelled, None, None),
+                    SessionEventKind::TurnFailed { message, reason } => {
+                        (TurnOutcome::Failed, *reason, Some(message.clone()))
+                    }
+                    _ => (TurnOutcome::Failed, None, None),
+                };
+                let record = TurnRecord {
+                    turn_id: turn_id.clone(),
+                    session_id: session_id.clone(),
+                    session_name,
+                    finished_at_unix_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |elapsed| {
+                            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                        }),
+                    outcome,
+                    reason,
+                    message,
+                    answer: std::mem::take(&mut observer.answer),
+                    tool_calls: observer.tool_calls,
+                    approvals_denied: observer.approvals_denied,
+                    usage: Some(usage),
+                    audit: audit_ref.clone(),
+                };
+                if let Err(error) = turns.record(&record) {
+                    eprintln!(
+                        "xshelld warning: turn {turn_id} will not be reported after a restart: {error:#}"
+                    );
+                }
+            }
             execution.append(
                 &turn_id,
                 SessionEventKind::TurnSummary {
@@ -815,9 +904,34 @@ struct DaemonObserver {
     cancellation: CancellationFlag,
     audit: SessionAuditHandle,
     audit_failure: Option<anyhow::Error>,
+    /// The main agent's last non-empty response, for the turn record.
+    answer: String,
+    /// Tool calls requested by any agent in the turn.
+    tool_calls: usize,
+    /// Prompted calls that were denied.
+    approvals_denied: usize,
 }
 
 impl DaemonObserver {
+    /// Keep what the turn record reports: the answer, and counts the client
+    /// would otherwise compute from the events.
+    fn tally(&mut self, event: &ExecutionEvent) {
+        if let ExecutionEvent::AgentResponse { content, .. } = event
+            && !content.trim().is_empty()
+        {
+            self.answer.clone_from(content);
+        }
+        match event.innermost() {
+            ExecutionEvent::ToolRequested { .. } => self.tool_calls += 1,
+            ExecutionEvent::ToolDecision {
+                decision,
+                approval: Some(_),
+                ..
+            } if *decision != ApprovalDecision::Approve => self.approvals_denied += 1,
+            _ => {}
+        }
+    }
+
     fn audit(&mut self, event: AuditEvent) {
         if self.audit_failure.is_some() {
             return;
@@ -835,6 +949,7 @@ impl DaemonObserver {
 impl TurnObserver for DaemonObserver {
     fn emit(&mut self, event: ExecutionEvent) {
         self.audit_execution(&event);
+        self.tally(&event);
         // A subagent's approval is registered under its scoped call id, the
         // same id the client replies with.
         if let ExecutionEvent::ApprovalRequested { call, .. } = event.innermost() {

@@ -21,7 +21,7 @@ use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 use xshell_session::{
     AgentTurnPhase, PersistenceMode, SessionActivity, SessionClient, SessionCreation,
-    SessionEventKind, TurnFailureReason, TurnInput, Visibility,
+    SessionEventKind, TurnFailureReason, TurnInput, TurnOutcome, TurnRecord, Visibility,
 };
 
 /// The version of the JSON Lines schema. Bumped on any incompatible change;
@@ -68,12 +68,18 @@ pub struct RunArgs {
 }
 
 /// Options for `wait`, `status`, `result`, and `cancel`, which act on the
-/// session named by `--session`.
+/// turn named by `--turn`, or on the latest turn of the session named by
+/// `--session`.
 #[derive(Debug, Args)]
 pub struct JobArgs {
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     pub output: OutputFormat,
+
+    /// Act on this turn (the `turn_id` of `run_started`). A finished turn's
+    /// outcome is kept by the daemon and survives a restart.
+    #[arg(long, value_name = "TURN_ID")]
+    pub turn: Option<String>,
 
     /// For `wait`: read approval decisions from this file descriptor, as for
     /// `run --approval-channel`.
@@ -385,6 +391,7 @@ pub fn job(
     let outcome = match execute_job(
         command,
         &shared,
+        args.turn.as_deref(),
         args.approval_channel,
         &interrupted,
         &mut output,
@@ -395,6 +402,7 @@ pub fn job(
                 outcome: Some(outcome),
                 message: Some(format!("{error:#}")),
                 session: shared.session.clone(),
+                turn_id: args.turn.clone(),
                 ..Summary::default()
             });
             outcome
@@ -407,14 +415,25 @@ pub fn job(
 fn execute_job(
     command: JobCommand,
     shared: &SharedOptions,
+    turn: Option<&str>,
     approval_channel: Option<i32>,
     interrupted: &AtomicBool,
     output: &mut Output,
 ) -> std::result::Result<Outcome, RunError> {
+    if let Some(turn_id) = turn {
+        return execute_turn_job(
+            command,
+            shared,
+            turn_id,
+            approval_channel,
+            interrupted,
+            output,
+        );
+    }
     let selector = shared
         .session
         .clone()
-        .context("name the session with --session (`xshell run --detach` prints it)")
+        .context("name the turn with --turn, or the session with --session (`xshell run --detach` prints it)")
         .or_outcome(Outcome::Usage)?;
     let config = load_config(shared)?;
     // Take the channel's descriptor before opening any of our own, so it
@@ -497,6 +516,179 @@ fn execute_job(
     summary.outcome = Some(outcome);
     output.result(&summary);
     Ok(outcome)
+}
+
+/// Run a job command on one turn, found by its ID. A running turn is
+/// followed in its session, as with `--session`. A finished turn is replayed
+/// from the journal if the daemon still has its events, and otherwise
+/// reported from the record the daemon kept, which survives a restart.
+fn execute_turn_job(
+    command: JobCommand,
+    shared: &SharedOptions,
+    turn_id: &str,
+    approval_channel: Option<i32>,
+    interrupted: &AtomicBool,
+    output: &mut Output,
+) -> std::result::Result<Outcome, RunError> {
+    let config = load_config(shared)?;
+    let mut responder = Responder::open(approval_channel).or_outcome(Outcome::Usage)?;
+    let mut client = connect(&config)?;
+    let location = client
+        .locate_turn(turn_id.to_owned())
+        .or_outcome(Outcome::Usage)?;
+    let sessions = client.list().or_outcome(Outcome::Unavailable)?;
+
+    if let Some(session_id) = &location.active_session_id {
+        let descriptor = sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .context("the turn's session is gone")
+            .or_outcome(Outcome::Failed)?;
+        let mut summary = Summary {
+            session: Some(descriptor.name.clone()),
+            session_id: Some(descriptor.id.clone()),
+            turn_id: Some(turn_id.to_owned()),
+            ..Summary::default()
+        };
+        let following = match command {
+            JobCommand::Status => {
+                let (activity, _) = describe_activity(&descriptor.activity);
+                output.status(&descriptor.name, &descriptor.id, activity, Some(turn_id));
+                return Ok(Outcome::Completed);
+            }
+            JobCommand::Result => {
+                summary.outcome = Some(Outcome::Running);
+                output.result(&summary);
+                return Ok(Outcome::Running);
+            }
+            JobCommand::Wait => Following::Waiter,
+            JobCommand::Cancel => Following::Observer,
+        };
+        client
+            .attach(descriptor.id.clone())
+            .or_outcome(Outcome::Failed)?;
+        let after = replay_start(&mut client, &descriptor.id, turn_id)?.unwrap_or(0);
+        if command == JobCommand::Cancel {
+            client
+                .cancel(descriptor.id.clone(), turn_id.to_owned())
+                .or_outcome(Outcome::Failed)?;
+            output.event(json!({"event": "cancel_requested"}));
+        }
+        let outcome = follow_turn(
+            &mut client,
+            &descriptor.id,
+            turn_id,
+            after,
+            &mut summary,
+            output,
+            interrupted,
+            following,
+            &mut responder,
+        )?;
+        summary.outcome = Some(outcome);
+        output.result(&summary);
+        return Ok(outcome);
+    }
+
+    let record = location
+        .record
+        .context("the daemon reported neither a running turn nor a record")
+        .or_outcome(Outcome::Failed)?;
+    match command {
+        JobCommand::Status => {
+            output.status(
+                &record.session_name,
+                &record.session_id,
+                "finished",
+                Some(turn_id),
+            );
+            return Ok(Outcome::Completed);
+        }
+        JobCommand::Cancel => {
+            return Err(anyhow::anyhow!("the turn has already finished"))
+                .or_outcome(Outcome::Failed);
+        }
+        JobCommand::Wait | JobCommand::Result => {}
+    }
+    // Replay the turn's events if its session and the journal still have
+    // them; the record then only confirms what they show.
+    if sessions
+        .iter()
+        .any(|session| session.id == record.session_id)
+    {
+        client
+            .attach(record.session_id.clone())
+            .or_outcome(Outcome::Failed)?;
+        if let Some(after) = replay_start(&mut client, &record.session_id, turn_id)? {
+            let mut summary = Summary {
+                session: Some(record.session_name.clone()),
+                session_id: Some(record.session_id.clone()),
+                turn_id: Some(turn_id.to_owned()),
+                ..Summary::default()
+            };
+            let outcome = follow_turn(
+                &mut client,
+                &record.session_id,
+                turn_id,
+                after,
+                &mut summary,
+                output,
+                interrupted,
+                Following::Observer,
+                &mut responder,
+            )?;
+            summary.outcome = Some(outcome);
+            output.result(&summary);
+            return Ok(outcome);
+        }
+    }
+    output.warning("the turn's events are no longer in the daemon's journal; reporting its record");
+    let outcome = record_outcome(&record);
+    output.result(&Summary {
+        outcome: Some(outcome),
+        message: record.message,
+        answer: record.answer,
+        session: Some(record.session_name),
+        session_id: Some(record.session_id),
+        turn_id: Some(record.turn_id),
+        tool_calls: record.tool_calls,
+        approvals_denied: record.approvals_denied,
+        usage: record.usage,
+        audit: record.audit,
+    });
+    Ok(outcome)
+}
+
+/// The sequence to replay `turn_id` from: just before its first event the
+/// journal holds, or `None` when the journal holds none of them.
+fn replay_start(
+    client: &mut SessionClient,
+    session_id: &str,
+    turn_id: &str,
+) -> std::result::Result<Option<u64>, RunError> {
+    let journal = client
+        .events(session_id.to_owned(), 0, 0)
+        .or_outcome(Outcome::Unavailable)?;
+    Ok(journal
+        .events
+        .iter()
+        .find(|event| event.turn_id == turn_id)
+        .map(|event| event.sequence.saturating_sub(1)))
+}
+
+/// The run outcome a kept turn record stands for, with the same exit codes
+/// as following the turn live.
+fn record_outcome(record: &TurnRecord) -> Outcome {
+    match record.outcome {
+        TurnOutcome::Completed => Outcome::Completed,
+        TurnOutcome::Cancelled => Outcome::Cancelled,
+        TurnOutcome::Failed => match record.reason {
+            Some(TurnFailureReason::BudgetExhausted) => Outcome::BudgetExhausted,
+            Some(TurnFailureReason::AuditUnavailable) => Outcome::Unavailable,
+            None if record.approvals_denied > 0 => Outcome::ApprovalDenied,
+            None => Outcome::Failed,
+        },
+    }
 }
 
 /// A session's activity as a word, and the turn it concerns.

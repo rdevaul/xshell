@@ -197,6 +197,24 @@ enabled = {enabled}\nsocket = {socket:?}\nstate_directory = {state:?}\n{fabric_k
         let child = self.command(args).spawn().unwrap();
         wait_with_timeout(child, Duration::from_secs(30))
     }
+
+    /// Stop xshelld abruptly and start it again on the same state
+    /// directory, losing everything it held only in memory.
+    fn restart_daemon(&mut self) {
+        if let Some(mut daemon) = self.daemon.take() {
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+        }
+        let socket = self.directory.path().join("state").join("xshelld.sock");
+        let child = Command::new(xshelld_binary())
+            .args(["--config", self.config.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_socket(&socket);
+        self.daemon = Some(child);
+    }
 }
 
 impl Drop for Fabric {
@@ -547,6 +565,105 @@ fn daemon_budgets_refuse_extra_turns_and_sessions_with_exit_six() {
         result["message"].as_str().unwrap().contains("max_sessions"),
         "{result}"
     );
+}
+
+#[test]
+fn a_finished_turn_is_reported_by_id_after_the_daemon_restarts() {
+    let mut fabric = Fabric::new(&serve(vec![sse_text("kept for later")]), true, true);
+    let started = fabric.run(&[
+        "--detach",
+        "--output",
+        "jsonl",
+        "--approval",
+        "auto",
+        "--session",
+        "job",
+        "work",
+    ]);
+    assert_eq!(started.status.code(), Some(0), "{started:?}");
+    let turn = events(&started)[0]["turn_id"].as_str().unwrap().to_owned();
+
+    // While the daemon still holds the journal, `wait --turn` follows it.
+    let waited = fabric.job("wait", &["--turn", &turn, "--output", "jsonl"]);
+    assert_eq!(waited.status.code(), Some(0), "{waited:?}");
+    assert_eq!(events(&waited).last().unwrap()["answer"], "kept for later");
+
+    // After a restart the journal and the run's session are gone; the
+    // turn's record is not.
+    fabric.restart_daemon();
+    let result = fabric.job("result", &["--turn", &turn, "--output", "jsonl"]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    let reported = events(&result);
+    assert!(
+        reported.iter().any(|event| event["event"] == "warning"
+            && event["message"].as_str().unwrap().contains("no longer in")),
+        "{reported:?}"
+    );
+    let record = reported.last().unwrap();
+    assert_eq!(record["event"], "result");
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["answer"], "kept for later");
+    assert_eq!(record["session"], "job");
+    assert_eq!(record["turn_id"], turn);
+    assert_eq!(record["usage"]["model_rounds"]["used"], 1);
+
+    let text = fabric.job("wait", &["--turn", &turn]);
+    assert_eq!(text.status.code(), Some(0), "{text:?}");
+    assert_eq!(String::from_utf8_lossy(&text.stdout), "kept for later\n");
+
+    let status = fabric.job("status", &["--turn", &turn, "--output", "jsonl"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    assert_eq!(events(&status).pop().unwrap()["activity"], "finished");
+
+    let cancel = fabric.job("cancel", &["--turn", &turn]);
+    assert_eq!(cancel.status.code(), Some(1), "{cancel:?}");
+
+    let unknown = fabric.job(
+        "result",
+        &["--turn", "00000000-0000-4000-8000-000000000000"],
+    );
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+}
+
+#[test]
+fn an_ephemeral_runs_turn_leaves_no_record() {
+    let fabric = Fabric::new(&serve(vec![sse_text("gone")]), true, true);
+    let output = fabric.run(&["--output", "jsonl", "--ephemeral", "hi"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let turn = events(&output)[0]["turn_id"].as_str().unwrap().to_owned();
+    let lookup = fabric.job("result", &["--turn", &turn]);
+    assert_eq!(lookup.status.code(), Some(2), "{lookup:?}");
+    let records = fabric.directory.path().join("state").join("turns");
+    let kept = std::fs::read_dir(&records)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(kept, 0, "an ephemeral turn left a record");
+}
+
+#[test]
+fn a_running_turn_can_be_followed_and_cancelled_by_id() {
+    let fabric = Fabric::new(&serve(vec![HOLD.into()]), true, true);
+    let started = fabric.run(&[
+        "--detach",
+        "--output",
+        "jsonl",
+        "--approval",
+        "auto",
+        "--session",
+        "stuck",
+        "think",
+    ]);
+    assert_eq!(started.status.code(), Some(0), "{started:?}");
+    let turn = events(&started)[0]["turn_id"].as_str().unwrap().to_owned();
+    let early = fabric.job("result", &["--turn", &turn]);
+    assert_eq!(early.status.code(), Some(7), "{early:?}");
+    let status = fabric.job("status", &["--turn", &turn, "--output", "jsonl"]);
+    assert_eq!(events(&status).pop().unwrap()["activity"], "agent_running");
+    let cancelled = fabric.job("cancel", &["--turn", &turn, "--output", "jsonl"]);
+    assert_eq!(cancelled.status.code(), Some(4), "{cancelled:?}");
+    // The kept record agrees.
+    let result = fabric.job("result", &["--turn", &turn]);
+    assert_eq!(result.status.code(), Some(4), "{result:?}");
 }
 
 #[test]

@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use xshell_execution::{ImageStore, ImageStoreLimits, validate_working_directory};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SessionRecord {
     snapshot: SessionSnapshot,
     attachments: HashSet<String>,
@@ -29,6 +29,17 @@ pub struct SessionRegistry {
     image_limits: ImageStoreLimits,
     /// Most sessions kept at once; creating another is refused.
     max_sessions: usize,
+    /// Tests: make the next `persist` fail at this step.
+    #[cfg(test)]
+    fail_next_persist: std::cell::Cell<Option<PersistStep>>,
+}
+
+/// The steps of `persist` before which a test can inject a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistStep {
+    Write,
+    Sync,
+    Rename,
 }
 
 /// Directory under the state directory that holds each session's image
@@ -55,7 +66,7 @@ struct DurableState {
     in_flight: Vec<DurableInFlight>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DurableInFlight {
     session_id: String,
     operation_id: String,
@@ -154,6 +165,8 @@ impl SessionRegistry {
             in_flight: HashMap::new(),
             image_limits: ImageStoreLimits::default(),
             max_sessions: crate::DEFAULT_MAX_SESSIONS,
+            #[cfg(test)]
+            fail_next_persist: std::cell::Cell::new(None),
         };
         if recovered_in_flight {
             registry.persist()?;
@@ -166,6 +179,10 @@ impl SessionRegistry {
     /// it stay; only new ones are refused.
     pub fn set_max_sessions(&mut self, max_sessions: usize) {
         self.max_sessions = max_sessions;
+    }
+
+    pub fn state_directory(&self) -> &Path {
+        &self.state_directory
     }
 
     pub fn host_id(&self) -> &str {
@@ -246,14 +263,14 @@ close one to create another",
             descriptor,
             history: creation.history,
         };
-        self.sessions.insert(
-            id,
-            SessionRecord {
-                snapshot: snapshot.clone(),
-                attachments: HashSet::from([client_id.to_owned()]),
-            },
-        );
-        self.persist()?;
+        let record = SessionRecord {
+            snapshot: snapshot.clone(),
+            attachments: HashSet::from([client_id.to_owned()]),
+        };
+        self.commit(&id.clone(), |registry| {
+            registry.sessions.insert(id, record);
+            Ok(())
+        })?;
         Ok(snapshot)
     }
 
@@ -280,17 +297,26 @@ close one to create another",
     }
 
     pub fn detach(&mut self, client_id: &str, session_id: &str) -> Result<Option<String>> {
-        let Some(record) = self.sessions.get_mut(session_id) else {
+        if !self.sessions.contains_key(session_id) {
             return Ok(None);
-        };
-        record.attachments.remove(client_id);
-        let remove = record.attachments.is_empty()
-            && record.snapshot.descriptor.persistence == PersistenceMode::Ephemeral;
-        if remove {
-            self.sessions.remove(session_id);
+        }
+        let removed = self.commit(session_id, |registry| {
+            let record = registry
+                .sessions
+                .get_mut(session_id)
+                .expect("checked above");
+            record.attachments.remove(client_id);
+            let remove = record.attachments.is_empty()
+                && record.snapshot.descriptor.persistence == PersistenceMode::Ephemeral;
+            if remove {
+                registry.sessions.remove(session_id);
+            }
+            Ok(remove)
+        })?;
+        // Effects outside the registry follow only a committed change.
+        if removed {
             self.remove_images(session_id);
         }
-        self.persist()?;
         Ok(Some(session_id.to_owned()))
     }
 
@@ -305,7 +331,7 @@ close one to create another",
         let cwd = validate_working_directory(&cwd)?;
         let record = self
             .sessions
-            .get_mut(session_id)
+            .get(session_id)
             .with_context(|| format!("unknown session {session_id:?}"))?;
         if !record.attachments.contains(client_id) {
             bail!(
@@ -328,13 +354,18 @@ close one to create another",
             .require_all(images)
             .context("the history references an image this session does not have")?;
         }
-        record.snapshot.descriptor.model = model;
-        record.snapshot.descriptor.cwd = cwd;
-        record.snapshot.descriptor.last_active_at_unix_ms = timestamp_ms()?;
-        record.snapshot.history = history;
-        let descriptor = descriptor_with_status(record);
-        self.persist()?;
-        Ok(descriptor)
+        let now = timestamp_ms()?;
+        self.commit(session_id, |registry| {
+            let record = registry
+                .sessions
+                .get_mut(session_id)
+                .expect("checked above");
+            record.snapshot.descriptor.model = model;
+            record.snapshot.descriptor.cwd = cwd;
+            record.snapshot.descriptor.last_active_at_unix_ms = now;
+            record.snapshot.history = history;
+            Ok(descriptor_with_status(record))
+        })
     }
 
     pub fn begin_execution(
@@ -353,19 +384,17 @@ close one to create another",
         if self.in_flight.contains_key(session_id) {
             bail!("durable session already has an in-flight operation");
         }
-        self.in_flight.insert(
-            session_id.to_owned(),
-            DurableInFlight {
-                session_id: session_id.to_owned(),
-                operation_id: operation_id.to_owned(),
-                route: route.to_owned(),
-            },
-        );
-        if let Err(error) = self.persist() {
-            self.in_flight.remove(session_id);
-            return Err(error);
-        }
-        Ok(())
+        self.commit(session_id, |registry| {
+            registry.in_flight.insert(
+                session_id.to_owned(),
+                DurableInFlight {
+                    session_id: session_id.to_owned(),
+                    operation_id: operation_id.to_owned(),
+                    route: route.to_owned(),
+                },
+            );
+            Ok(())
+        })
     }
 
     pub fn finish_execution(&mut self, session_id: &str, operation_id: &str) -> Result<()> {
@@ -374,8 +403,10 @@ close one to create another",
             .get(session_id)
             .is_some_and(|operation| operation.operation_id == operation_id)
         {
-            self.in_flight.remove(session_id);
-            self.persist()?;
+            self.commit(session_id, |registry| {
+                registry.in_flight.remove(session_id);
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -387,17 +418,22 @@ close one to create another",
         history: Vec<xshell_core::ChatMessage>,
     ) -> Result<SessionDescriptor> {
         let cwd = validate_working_directory(&cwd)?;
-        let record = self
-            .sessions
-            .get_mut(session_id)
-            .with_context(|| format!("unknown session {session_id:?}"))?;
-        record.snapshot.descriptor.cwd = cwd;
-        record.snapshot.descriptor.last_active_at_unix_ms = timestamp_ms()?;
-        record.snapshot.history = history;
-        let descriptor = descriptor_with_status(record);
-        self.in_flight.remove(session_id);
-        self.persist()?;
-        Ok(descriptor)
+        if !self.sessions.contains_key(session_id) {
+            bail!("unknown session {session_id:?}");
+        }
+        let now = timestamp_ms()?;
+        self.commit(session_id, |registry| {
+            let record = registry
+                .sessions
+                .get_mut(session_id)
+                .expect("checked above");
+            record.snapshot.descriptor.cwd = cwd;
+            record.snapshot.descriptor.last_active_at_unix_ms = now;
+            record.snapshot.history = history;
+            let descriptor = descriptor_with_status(record);
+            registry.in_flight.remove(session_id);
+            Ok(descriptor)
+        })
     }
 
     pub fn close(&mut self, client_id: &str, selector: &str) -> Result<String> {
@@ -413,8 +449,10 @@ close one to create another",
                 record.snapshot.descriptor.name
             );
         }
-        self.sessions.remove(&id);
-        self.persist()?;
+        self.commit(&id, |registry| {
+            registry.sessions.remove(&id);
+            Ok(())
+        })?;
         self.remove_images(&id);
         Ok(id)
     }
@@ -511,6 +549,68 @@ close one to create another",
         }
     }
 
+    /// Apply `mutate`, which changes at most the session `session_id` and
+    /// its in-flight operation, and make the change durable. If `mutate` or
+    /// the write fails, the registry is put back as it was, so the caller's
+    /// error, the live registry, and the state a restart would load agree
+    /// (F7). Only the registry's own metadata is rolled back: effects an
+    /// operation already had outside it (a command that ran, images stored)
+    /// are not undone, which is why callers apply such effects only after a
+    /// successful commit, or record them as in-flight first.
+    ///
+    /// Sessions that are not durable are never written, so a change that
+    /// touches no durable state skips the write.
+    fn commit<T>(
+        &mut self,
+        session_id: &str,
+        mutate: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let record_before = self.sessions.get(session_id).cloned();
+        let in_flight_before = self.in_flight.get(session_id).cloned();
+        let value = match mutate(self) {
+            Ok(value) => value,
+            Err(error) => {
+                self.restore(session_id, record_before, in_flight_before);
+                return Err(error);
+            }
+        };
+        let is_durable = |record: Option<&SessionRecord>| {
+            record.is_some_and(|record| {
+                record.snapshot.descriptor.persistence == PersistenceMode::Durable
+            })
+        };
+        let touches_durable_state = is_durable(record_before.as_ref())
+            || is_durable(self.sessions.get(session_id))
+            || in_flight_before.as_ref() != self.in_flight.get(session_id);
+        if touches_durable_state && let Err(error) = self.persist() {
+            self.restore(session_id, record_before, in_flight_before);
+            return Err(error);
+        }
+        Ok(value)
+    }
+
+    fn restore(
+        &mut self,
+        session_id: &str,
+        record: Option<SessionRecord>,
+        in_flight: Option<DurableInFlight>,
+    ) {
+        match record {
+            Some(record) => self.sessions.insert(session_id.to_owned(), record),
+            None => self.sessions.remove(session_id),
+        };
+        match in_flight {
+            Some(operation) => self.in_flight.insert(session_id.to_owned(), operation),
+            None => self.in_flight.remove(session_id),
+        };
+    }
+
+    /// Write the durable state: a new file, synced, renamed over the old
+    /// one, then the directory synced. Until the rename the old state stands
+    /// and an error is returned. Once the rename has happened the new state
+    /// is what a restart loads, so a failure to sync the directory after it
+    /// is reported but does not fail the operation: failing it would roll
+    /// the live registry back to a state the disk no longer holds.
     fn persist(&self) -> Result<()> {
         let mut sessions = self
             .sessions
@@ -535,15 +635,51 @@ close one to create another",
         })?;
         let temporary = self.state_directory.join("sessions.json.new");
         let final_path = self.state_directory.join("sessions.json");
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true).mode(0o600);
-        let mut file = options.open(&temporary)?;
-        use std::io::Write;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        fs::rename(&temporary, &final_path)?;
+        let written = (|| -> Result<()> {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true).mode(0o600);
+            let mut file = options.open(&temporary)?;
+            use std::io::Write;
+            self.inject_failure(PersistStep::Write)?;
+            file.write_all(&encoded)?;
+            self.inject_failure(PersistStep::Sync)?;
+            file.sync_all()?;
+            self.inject_failure(PersistStep::Rename)?;
+            fs::rename(&temporary, &final_path)?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.context("cannot persist session state"));
+        }
+        if let Err(error) = sync_directory(&self.state_directory) {
+            eprintln!(
+                "xshelld warning: session state was written but {} could not be synced: {error}",
+                self.state_directory.display()
+            );
+        }
         Ok(())
     }
+
+    #[cfg(test)]
+    fn inject_failure(&self, step: PersistStep) -> Result<()> {
+        if self.fail_next_persist.get() == Some(step) {
+            self.fail_next_persist.set(None);
+            bail!("injected {step:?} failure");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn inject_failure(&self, _step: PersistStep) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Sync a directory, so a rename inside it survives a crash.
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
 }
 
 fn descriptor_with_status(record: &SessionRecord) -> SessionDescriptor {
@@ -707,6 +843,175 @@ mod tests {
 
     fn load(path: &Path) -> Result<SessionRegistry> {
         SessionRegistry::load(path.into(), "host".into(), "local".into(), "rich".into())
+    }
+
+    const STEPS: [PersistStep; 3] = [PersistStep::Write, PersistStep::Sync, PersistStep::Rename];
+
+    fn history_of(registry: &SessionRegistry, name: &str) -> Vec<ChatMessage> {
+        registry.snapshot(name).unwrap().history
+    }
+
+    #[test]
+    fn f7_a_failed_create_leaves_no_session_in_memory_or_on_disk() {
+        for step in STEPS {
+            let temp = TempDir::new().unwrap();
+            let mut registry = load(temp.path()).unwrap();
+            registry.fail_next_persist.set(Some(step));
+            let error = registry
+                .create(
+                    "client",
+                    creation(
+                        "ornithopter",
+                        temp.path(),
+                        PersistenceMode::Durable,
+                        Visibility::Fabric,
+                        Vec::new(),
+                    ),
+                )
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("injected"),
+                "{step:?}: {error:#}"
+            );
+            assert!(
+                registry.list().is_empty(),
+                "{step:?}: live registry kept it"
+            );
+            assert!(
+                load(temp.path()).unwrap().list().is_empty(),
+                "{step:?}: disk kept it"
+            );
+            assert!(
+                !temp.path().join("sessions.json.new").exists(),
+                "{step:?}: the partial file was left behind"
+            );
+            // The name is free again.
+            registry
+                .create(
+                    "client",
+                    creation(
+                        "ornithopter",
+                        temp.path(),
+                        PersistenceMode::Durable,
+                        Visibility::Fabric,
+                        Vec::new(),
+                    ),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn f7_a_failed_update_keeps_the_previous_history_everywhere() {
+        for step in STEPS {
+            let temp = TempDir::new().unwrap();
+            create_durable(temp.path(), vec![ChatMessage::user("before")]);
+            let mut registry = load(temp.path()).unwrap();
+            let id = registry.snapshot("ornithopter").unwrap().descriptor.id;
+            registry
+                .attach("client", &id, AttachmentRole::Owner)
+                .unwrap();
+            registry.fail_next_persist.set(Some(step));
+            assert!(
+                registry
+                    .update(
+                        "client",
+                        &id,
+                        model(),
+                        temp.path().into(),
+                        vec![ChatMessage::user("after")],
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                history_of(&registry, "ornithopter"),
+                vec![ChatMessage::user("before")],
+                "{step:?}"
+            );
+            assert_eq!(
+                history_of(&load(temp.path()).unwrap(), "ornithopter"),
+                vec![ChatMessage::user("before")],
+                "{step:?}"
+            );
+            // The same update succeeds once the disk does.
+            registry
+                .update(
+                    "client",
+                    &id,
+                    model(),
+                    temp.path().into(),
+                    vec![ChatMessage::user("after")],
+                )
+                .unwrap();
+            assert_eq!(
+                history_of(&load(temp.path()).unwrap(), "ornithopter"),
+                vec![ChatMessage::user("after")]
+            );
+        }
+    }
+
+    #[test]
+    fn f7_a_failed_close_keeps_the_session_everywhere() {
+        for step in STEPS {
+            let temp = TempDir::new().unwrap();
+            create_durable(temp.path(), vec![ChatMessage::user("keep")]);
+            let mut registry = load(temp.path()).unwrap();
+            registry.fail_next_persist.set(Some(step));
+            assert!(registry.close("client", "ornithopter").is_err(), "{step:?}");
+            assert_eq!(registry.list().len(), 1, "{step:?}");
+            assert_eq!(load(temp.path()).unwrap().list().len(), 1, "{step:?}");
+        }
+    }
+
+    #[test]
+    fn f7_a_failed_execution_state_update_keeps_the_in_flight_marker() {
+        let temp = TempDir::new().unwrap();
+        create_durable(temp.path(), vec![ChatMessage::user("before")]);
+        let mut registry = load(temp.path()).unwrap();
+        let id = registry.snapshot("ornithopter").unwrap().descriptor.id;
+        registry.begin_execution(&id, "turn-1", "agent").unwrap();
+        registry.fail_next_persist.set(Some(PersistStep::Rename));
+        assert!(
+            registry
+                .update_execution_state(&id, temp.path().into(), vec![ChatMessage::user("x")])
+                .is_err()
+        );
+        assert!(registry.in_flight.contains_key(&id));
+        assert_eq!(
+            history_of(&registry, "ornithopter"),
+            vec![ChatMessage::user("before")]
+        );
+        // A restart sees the interrupted operation, as the live registry does.
+        let restored = load(temp.path()).unwrap();
+        assert!(
+            history_of(&restored, "ornithopter")
+                .last()
+                .unwrap()
+                .content
+                .contains("outcome_unknown")
+        );
+    }
+
+    #[test]
+    fn f7_changes_to_sessions_that_are_not_durable_write_nothing() {
+        let temp = TempDir::new().unwrap();
+        let mut registry = load(temp.path()).unwrap();
+        // A failure would be injected into a write, but none happens.
+        registry.fail_next_persist.set(Some(PersistStep::Write));
+        let session = registry
+            .create(
+                "client",
+                creation(
+                    "scratch",
+                    temp.path(),
+                    PersistenceMode::Daemon,
+                    Visibility::Fabric,
+                    Vec::new(),
+                ),
+            )
+            .unwrap();
+        registry.detach("client", &session.descriptor.id).unwrap();
+        assert_eq!(registry.fail_next_persist.get(), Some(PersistStep::Write));
     }
 
     #[test]
