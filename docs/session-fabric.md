@@ -263,6 +263,47 @@ with an execution record. The tool output limit (`tool_output_bytes`, in
 bytes) counts each tool result as it is returned; the result that crosses it
 is kept, and the turn stops at its next provider request or tool call.
 
+## Shell commands: lifetime and environment
+
+`run_shell` (model-authored) and captured `$` commands (user-typed, outside
+a PTY) run in their own process group, and every wait, including reading
+their output after the shell exits, is bounded by the same deadline and
+cancellation:
+
+- **Timeout or cancellation** kills the whole group, background jobs
+  included, and reports the timeout or cancellation. Output already in the
+  pipes is kept for a further 250 ms at most; the call does not wait for the
+  pipes to close.
+- **A background job that keeps the output pipes open** after the shell
+  exits (`sleep 100 &`, or a build that leaves a daemon attached to its
+  output) gets a 2-second grace, bounded by the remaining timeout, and is
+  then killed with the group. The call returns the shell's exit status, the
+  output collected so far, and a note that background processes were
+  killed. To leave a job running, redirect its output away from the pipes
+  (`server > log 2>&1 &`); such a job is not killed after a normal exit.
+- **Limitation:** a process that leaves the group (`setsid`) is out of reach
+  of the group kill. The call does not wait for it, but it can keep running;
+  containing it needs an operating-system sandbox.
+
+A running tool is therefore bounded by its timeout plus a short fixed
+kill-and-drain allowance, so the turn's wall-time limit is overrun by at most
+about that much.
+
+`run_shell` commands do **not** inherit the daemon's environment. They get
+only these variables, when the daemon has them: `PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `COLORTERM`,
+`TMPDIR`, and `TZ`. Every configured provider credential variable
+(`api_key_env` of the session's model, and of every model profile in the
+loaded configuration) is removed even if its name is on that list. The
+command's shell can still set variables from its own startup files (zsh reads
+`~/.zshenv` even for `-c`). The list is a constant
+(`AGENT_ENVIRONMENT_ALLOWLIST` in `xshell-execution`); making it configurable
+is a follow-up.
+
+Captured `$` commands are typed by the user, so they keep the daemon's
+environment and run as a login shell, except that the provider credential
+variables are removed from them too: the key is xshell's, not the command's.
+
 ## Daemon budgets
 
 Two limits apply across the whole daemon, whatever clients ask for:

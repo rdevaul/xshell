@@ -1,7 +1,8 @@
 use crate::SensitivePaths;
 use crate::engine::CancellationFlag;
+use crate::environment::apply_agent_environment;
 use crate::prepared::{self, ObjectKind, PreparedObject};
-use crate::process::{ProcessGroupGuard, configure_process_group};
+use crate::process::{LINGER_GRACE, ShellEnd, Stream, configure_process_group, supervise_shell};
 use crate::provider::{RegisteredTool, ToolAccess, ToolRegistry};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,6 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use xshell_core::{ToolCall, ToolDefinition};
 
@@ -719,16 +719,34 @@ async fn run_shell(
     cancellation: CancellationFlag,
     timeout: Duration,
 ) -> Result<String> {
+    run_shell_with_grace(arguments, root, cancellation, timeout, LINGER_GRACE).await
+}
+
+/// [`run_shell`] with an explicit linger grace, so tests can make
+/// cancellation or the timeout the only way a call can end.
+async fn run_shell_with_grace(
+    arguments: &Value,
+    root: &Path,
+    cancellation: CancellationFlag,
+    timeout: Duration,
+    linger_grace: Duration,
+) -> Result<String> {
     let command = required_string(arguments, "command")?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let mut process = Command::new(&shell);
-    // Agent-requested commands run as a plain non-login shell. Sourcing the
-    // user's login profile on every tool call is slow, replays profile side
-    // effects, and exposes profile-exported credentials to model-authored
-    // commands. Direct `$` input, which the user types, keeps `-l`.
+    // Agent-requested commands run as a plain non-login shell: sourcing the
+    // user's login profile on every tool call is slow and replays profile
+    // side effects. Direct `$` input, which the user types, keeps `-l`.
     //
-    // The child is placed in its own process group so that a timeout kills
-    // the whole pipeline rather than only the shell leader.
+    // The command does not inherit the daemon's environment, which holds the
+    // provider API key and whatever tokens the daemon was started with. It
+    // gets only the allowlist in `crate::environment`, minus every registered
+    // credential variable. The shell's own startup files (for zsh,
+    // `~/.zshenv`, read even under `-c`) can still export variables.
+    //
+    // The child is placed in its own process group so that a timeout or a
+    // cancellation kills the whole pipeline, background jobs included,
+    // rather than only the shell leader.
     process
         .arg("-c")
         .arg(command)
@@ -736,85 +754,71 @@ async fn run_shell(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_agent_environment(&mut process);
     configure_process_group(&mut process);
-    let mut child = process
+    let child = process
         .spawn()
         .with_context(|| format!("could not launch shell {shell}"))?;
-    let mut group = ProcessGroupGuard::for_child(&child);
-    let stdout = child.stdout.take().context("cannot capture shell stdout")?;
-    let stderr = child.stderr.take().context("cannot capture shell stderr")?;
-    let stdout_task = tokio::spawn(read_bounded_output(stdout));
-    let stderr_task = tokio::spawn(read_bounded_output(stderr));
-    let wait = tokio::select! {
-        status = child.wait() => Some(status.context("could not wait for shell tool")),
-        () = cancellation.wait() => None,
-        () = tokio::time::sleep(timeout) => None,
-    };
-    let status = match wait {
-        Some(status) => status?,
-        None => {
-            let cancelled = cancellation.is_cancelled();
-            group.kill();
-            group.sweep().await;
-            let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            group.disarm();
-            if cancelled {
-                bail!("shell tool cancelled; the process group was killed and reaped");
-            }
-            bail!(
-                "shell tool timed out after {} seconds; the process group was killed and reaped",
-                timeout.as_secs()
-            );
+    let mut stdout = BoundedOutput::default();
+    let mut stderr = BoundedOutput::default();
+    let end = supervise_shell(
+        child,
+        &cancellation,
+        timeout,
+        linger_grace,
+        |stream, bytes| match stream {
+            Stream::Stdout => stdout.push(bytes),
+            Stream::Stderr => stderr.push(bytes),
+        },
+    )
+    .await?;
+    let (status, note) = match end {
+        ShellEnd::Exited(status) => (status, ""),
+        ShellEnd::ExitedLingering(status) => (
+            status,
+            "\nnote: the shell exited, but background processes still held its output; \
+they were killed and the output collected until then is shown",
+        ),
+        ShellEnd::Cancelled => {
+            bail!("shell tool cancelled; the process group was killed and reaped")
         }
+        ShellEnd::TimedOut => bail!(
+            "shell tool timed out after {} seconds; the process group was killed and reaped",
+            timeout.as_secs()
+        ),
     };
-    group.disarm();
-    let stdout = stdout_task
-        .await
-        .context("shell stdout reader task failed")??;
-    let stderr = stderr_task
-        .await
-        .context("shell stderr reader task failed")??;
     Ok(format!(
-        "exit status: {}\nstdout:\n{}\nstderr:\n{}",
+        "exit status: {}{note}\nstdout:\n{}\nstderr:\n{}",
         status,
         stdout.render(),
         stderr.render()
     ))
 }
 
+/// One stream of shell output, of which only a bounded prefix is kept.
+/// Output past the limit is still read and discarded: stopping at the limit
+/// would block the child on a full pipe and turn a memory bound into a
+/// deadlock.
+#[derive(Default)]
 struct BoundedOutput {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
 impl BoundedOutput {
+    fn push(&mut self, chunk: &[u8]) {
+        let remaining = MAX_TOOL_OUTPUT_BYTES.saturating_sub(self.bytes.len());
+        let retained = chunk.len().min(remaining);
+        self.bytes.extend_from_slice(&chunk[..retained]);
+        self.truncated |= retained < chunk.len();
+    }
+
     fn render(&self) -> String {
         let mut output = String::from_utf8_lossy(&self.bytes).into_owned();
         if self.truncated {
             output.push_str("\n[stream output truncated]");
         }
         output
-    }
-}
-
-/// Drain a pipe to EOF while retaining only a bounded prefix. Continuing to
-/// drain is important: stopping at the limit would block the child on a full
-/// pipe and turn a memory bound into a deadlock.
-async fn read_bounded_output(mut reader: impl AsyncRead + Unpin) -> std::io::Result<BoundedOutput> {
-    let mut bytes = Vec::with_capacity(MAX_TOOL_OUTPUT_BYTES);
-    let mut truncated = false;
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(BoundedOutput { bytes, truncated });
-        }
-        let remaining = MAX_TOOL_OUTPUT_BYTES.saturating_sub(bytes.len());
-        let retained = count.min(remaining);
-        bytes.extend_from_slice(&buffer[..retained]);
-        truncated |= retained < count;
     }
 }
 
@@ -841,6 +845,7 @@ pub(crate) fn truncate(mut output: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::ProcessGroupGuard;
     use std::path::PathBuf;
     use tokio::time::timeout;
 
@@ -1047,8 +1052,10 @@ mod tests {
 
     #[tokio::test]
     async fn shell_stream_collection_drains_but_retains_only_the_limit() {
-        let input = vec![b'x'; MAX_TOOL_OUTPUT_BYTES * 3];
-        let output = read_bounded_output(input.as_slice()).await.unwrap();
+        let mut output = BoundedOutput::default();
+        for _ in 0..3 {
+            output.push(&vec![b'x'; MAX_TOOL_OUTPUT_BYTES]);
+        }
         assert_eq!(output.bytes.len(), MAX_TOOL_OUTPUT_BYTES);
         assert!(output.truncated);
     }
@@ -1185,6 +1192,200 @@ mod tests {
             !alive,
             "grandchild {grandchild} survived process-group kill"
         );
+    }
+
+    /// Wait (generously) for a pid written to `path` by a shell command.
+    async fn recorded_pid(path: &Path) -> i32 {
+        for _ in 0..1000 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no pid was recorded in {}", path.display());
+    }
+
+    /// Whether `pid` still exists after giving the kernel up to five seconds
+    /// to finish killing and reaping it.
+    async fn still_alive_after_grace(pid: i32) -> bool {
+        for _ in 0..500 {
+            // SAFETY: kill with signal 0 only checks for existence.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// The issue's reproduction: the shell exits at once, but a background
+    /// job keeps its stdout open. The call must return promptly (after the
+    /// short linger grace, not the 60 s timeout), say what happened, and
+    /// leave no background job behind.
+    #[tokio::test]
+    async fn f17_a_lingering_background_job_after_a_normal_exit_returns_promptly() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let pid_file = temporary.path().join("pid");
+        let started = std::time::Instant::now();
+        let output = run_shell(
+            &json!({"command": format!(
+                "sleep 1000000 & echo $! > {}; echo started",
+                pid_file.display()
+            )}),
+            temporary.path(),
+            CancellationFlag::default(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
+        assert!(
+            output.starts_with("exit status: exit status: 0\n"),
+            "{output}"
+        );
+        assert!(output.contains("background processes still held its output"));
+        assert!(output.contains("stdout:\nstarted"), "{output}");
+        let pid = recorded_pid(&pid_file).await;
+        assert!(
+            !still_alive_after_grace(pid).await,
+            "F17 background job {pid} survived"
+        );
+    }
+
+    /// A job still holding the pipe after the timeout must not hold the
+    /// call: here the holder has even left the process group with `setsid`,
+    /// so the group kill cannot reach it, and the readers are abandoned.
+    #[tokio::test]
+    async fn f17_the_timeout_holds_even_when_a_pipe_holder_escapes_the_group() {
+        if std::process::Command::new("perl")
+            .arg("-e1")
+            .status()
+            .map_or(true, |status| !status.success())
+        {
+            eprintln!("skipping: perl is not available to call setsid");
+            return;
+        }
+        let temporary = tempfile::TempDir::new().unwrap();
+        let pid_file = temporary.path().join("pid");
+        let command = format!(
+            "perl -MPOSIX -e 'POSIX::setsid(); open(my $f, \">\", \"{}\"); \
+print $f $$; close $f; sleep 1000000' & sleep 1000000",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let error = run_shell(
+            &json!({ "command": command }),
+            temporary.path(),
+            CancellationFlag::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        let escapee = recorded_pid(&pid_file).await;
+        // SAFETY: the escapee is our own test process; clean it up.
+        unsafe { libc::kill(escapee, libc::SIGKILL) };
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+        assert!(
+            error.to_string().contains("timed out after 1 seconds"),
+            "{error}"
+        );
+    }
+
+    /// Cancelled after the shell has exited but while its background job
+    /// still holds the pipe: the job is killed, its delayed effect never
+    /// happens, and the call reports the cancellation.
+    #[tokio::test]
+    async fn f17_cancellation_kills_a_background_job_after_the_shell_exits() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let started_file = temporary.path().join("started");
+        let marker = temporary.path().join("marker");
+        let command = format!(
+            "touch {}; (sleep 3; touch {}) & exit 0",
+            started_file.display(),
+            marker.display()
+        );
+        let cancellation = CancellationFlag::default();
+        let cancel = cancellation.clone();
+        let started_for_task = started_file.clone();
+        let signal = tokio::spawn(async move {
+            while !started_for_task.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+        });
+        let started = std::time::Instant::now();
+        // The grace and timeout are far longer than the test, so only the
+        // cancellation can end the call.
+        let error = run_shell_with_grace(
+            &json!({ "command": command }),
+            temporary.path(),
+            cancellation,
+            Duration::from_secs(120),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        signal.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !marker.exists(),
+            "F17 a cancelled background job still wrote its marker"
+        );
+    }
+
+    /// The probe from the issue, run in a child copy of this test binary so
+    /// the environment can be set without mutating this process's own.
+    #[tokio::test]
+    async fn f18_run_shell_omits_the_provider_key_and_daemon_variables() {
+        const CHILD: &str = "XSHELL_F18_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Registered as the provider credential, and named to fall under
+            // the `LC_*` allowlist, so only the credential removal hides it.
+            crate::protect_credential_variable("LC_XSHELL_F18_PROVIDER_KEY");
+            let output = run_shell(
+                &json!({"command": "env"}),
+                &manifest_dir(),
+                CancellationFlag::default(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+            assert!(!output.contains("provider-secret-f18"), "{output}");
+            assert!(!output.contains("daemon-secret-f18"), "{output}");
+            assert!(output.contains("PATH="), "{output}");
+            // A user-typed command keeps the daemon's environment but never
+            // the provider credential.
+            let direct = crate::run_direct_shell("env", &manifest_dir())
+                .await
+                .unwrap();
+            assert!(!direct.stdout.contains("provider-secret-f18"));
+            assert!(direct.stdout.contains("daemon-secret-f18"));
+            std::fs::write(std::env::var_os(CHILD).unwrap(), "ran").unwrap();
+            return;
+        }
+        let temporary = tempfile::TempDir::new().unwrap();
+        let ran = temporary.path().join("ran");
+        let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::tests::f18_run_shell_omits_the_provider_key_and_daemon_variables",
+                "--nocapture",
+            ])
+            .env(CHILD, &ran)
+            .env("LC_XSHELL_F18_PROVIDER_KEY", "provider-secret-f18")
+            .env("XSHELL_F18_DAEMON_VARIABLE", "daemon-secret-f18")
+            .stdin(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "the F18 probe failed: {status}");
+        assert!(ran.exists(), "the F18 probe did not run");
     }
 
     #[test]

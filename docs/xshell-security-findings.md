@@ -10,7 +10,7 @@ historical review.
 | ID | Tracking | Priority | Package | State | Required regression evidence |
 |---|---|---|---|---|---|
 | F1 | [#51](https://github.com/rdevaul/xshell/issues/51) | P1 | M1.1 effects and recovery | Corrected | Completed tool effect and terminal failure survive reload and appear in the next request |
-| F2 | [#52](https://github.com/rdevaul/xshell/issues/52) | P1 | M1.2 cancellation and shutdown | Corrected | Agent and captured-shell pipelines/grandchildren cannot write delayed markers after cancellation |
+| F2 | [#52](https://github.com/rdevaul/xshell/issues/52) | P1 | M1.2 cancellation and shutdown | Corrected (reopened by F17, corrected again) | Agent and captured-shell pipelines/grandchildren cannot write delayed markers after cancellation |
 | F3 | [#53](https://github.com/rdevaul/xshell/issues/53) | P1 | M1.2 cancellation and shutdown | Corrected | SIGTERM drains agent, shell, and PTY work before audit closure; forced interruption is recovered as uncertain |
 | F4 | [#54](https://github.com/rdevaul/xshell/issues/54) | P1 | M1.3 prepared file access | Corrected | Sensitivity is stable across cwd changes, nesting, aliases, and sensitive ancestors |
 | F5 | [#55](https://github.com/rdevaul/xshell/issues/55) | P1 | M1.3 prepared file access | Corrected | Replacement hooks cannot substitute sensitive or outside-root bytes after authorization |
@@ -20,6 +20,8 @@ historical review.
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Corrected | Incomplete/error/refusal streams cannot produce executable tool calls |
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn and daemon-wide budgets landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
+| F17 | [#133](https://github.com/rdevaul/xshell/issues/133) | P0 | M1.2 cancellation and shutdown | Corrected (processes that `setsid` away are not contained) | A background job holding the pipes is killed at the timeout, at cancellation (its marker never appears), and after a short grace following a normal exit; the call returns promptly |
+| F18 | [#134](https://github.com/rdevaul/xshell/issues/134) | P0 | M1.4 credential bounds | Corrected (allowlist is a constant; configurability is follow-up) | The provider key variable and an arbitrary daemon variable are absent from `run_shell` output |
 | F13 | [#129](https://github.com/rdevaul/xshell/issues/129) | P0 | M1.3 prepared file access | Corrected | Case variants (`.ENV`, `.SSH/ID_ED25519`, `server.PEM`, `.GIT/config`) are sensitive, blocked and denied exactly like their stored names on a case-insensitive volume |
 | F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 
@@ -58,6 +60,36 @@ could miss a process whose fork overlapped the signal on macOS, which does not
 abort such a fork as Linux does; the F2 captured-shell test caught it on macOS
 CI. Cancellation now re-kills the group until it is empty, with a bounded
 number of rounds.
+
+F2 was reopened by F17 (#133) and is corrected again. Cancellation and the
+timeout raced only the shell leader's exit; once the leader exited, the group
+was disarmed and its output pipes were read to EOF with no deadline, so a
+background job (`sleep 1000000 &`) held the turn indefinitely, ignored both
+timeout and cancellation, and was reported as success, and a cancelled
+`(sleep 3; touch marker) & exit 0` still wrote its marker. Both shell paths
+(`run_shell` and captured `$` commands) now share one supervisor in
+`xshell-execution/src/process.rs` that keeps the group armed until the pipes
+close and puts the drain inside the same deadline-and-cancellation `select!`.
+On timeout or cancellation it kills and sweeps the group and abandons the
+readers instead of awaiting EOF. After a normal exit, a job still holding the
+pipes gets a 2-second grace (bounded by the remaining timeout) and is then
+killed; the result keeps the exit status and output and says background
+processes were killed. A process that leaves the group with `setsid` cannot be
+killed by the group kill; it is no longer waited for, but it can keep
+running. Evidence: the `f17_*` tests in `tools.rs` and `engine.rs`, including
+a `setsid` pipe holder that no longer extends the timeout.
+
+F18 (#134) is corrected. `run_shell` commands no longer inherit the daemon's
+environment, which held the provider key named by `api_key_env`. They get an
+allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`,
+`LC_*`, `TERM`, `COLORTERM`, `TMPDIR`, `TZ`), and every registered credential
+variable is removed even if allowlisted: the session model's `api_key_env`,
+every model profile's in the loaded configuration, and any key an adapter is
+built with. User-typed `$` commands keep the daemon's environment but lose the
+credential variables too. A shell's own startup files (zsh's `~/.zshenv`) can
+still export variables. Evidence:
+`f18_run_shell_omits_the_provider_key_and_daemon_variables`. The exact
+environment is documented in [session fabric](session-fabric.md#shell-commands-lifetime-and-environment).
 
 F9 is corrected. Both adapters hand tool calls to the engine only from a
 response the provider finished normally: the OpenAI-compatible adapter needs

@@ -2,6 +2,7 @@ mod budget;
 mod call_id;
 mod compaction;
 mod engine;
+mod environment;
 mod images;
 mod ingest;
 mod policy;
@@ -26,6 +27,7 @@ pub use engine::{
     captured_cd_destination, run_agent_turn, run_agent_turn_with_budget, run_direct_shell,
     run_direct_shell_streaming, run_direct_shell_streaming_cancellable, validate_working_directory,
 };
+pub use environment::{AGENT_ENVIRONMENT_ALLOWLIST, protect_credential_variable};
 pub use images::{
     CollectionReport, ImageStore, ImageStoreError, ImageStoreLimits, OrphanReport, SessionImages,
     StoreUsage, remove_orphan_stores,

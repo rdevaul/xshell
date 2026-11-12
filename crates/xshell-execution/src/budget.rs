@@ -26,8 +26,11 @@ pub struct TurnLimits {
     /// refused without evaluation.
     pub tool_calls_per_response: usize,
     /// Elapsed time, checked before every provider request and tool call and
-    /// enforced during provider requests. A running tool is bounded by its
-    /// own timeout, so a turn can overrun by at most one tool's timeout.
+    /// enforced during provider requests. It is not checked while a tool
+    /// runs; a running `run_shell` call is bounded by `shell_timeout` plus a
+    /// fixed kill-and-drain allowance of a few seconds (background jobs
+    /// included, see F17), so a turn overruns by at most about one shell
+    /// timeout. Other tools carry their own bounds.
     #[serde(with = "seconds")]
     pub wall_time: Duration,
     /// How long one `run_shell` tool call may run before its process group

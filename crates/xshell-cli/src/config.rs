@@ -172,6 +172,13 @@ impl XshellConfig {
         config
             .validate_limits()
             .with_context(|| format!("invalid configuration file {}", path.display()))?;
+        // Every configured provider credential is kept out of the shells
+        // this process starts, whichever profile ends up active.
+        for profile in config.models.values() {
+            if let Some(variable) = &profile.api_key_env {
+                xshell_execution::protect_credential_variable(variable);
+            }
+        }
         Ok((config, path))
     }
 
