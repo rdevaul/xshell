@@ -163,6 +163,11 @@ impl ExecutionCoordinator {
         self.inner.running_turns.load(Ordering::Acquire)
     }
 
+    /// The tools providers add to every agent turn.
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.inner.policy.tools
+    }
+
     pub fn audit(&self) -> &DaemonAudit {
         &self.inner.audit
     }

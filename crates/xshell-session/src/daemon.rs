@@ -1,0 +1,1600 @@
+//! The session daemon, `xshelld`, as a library.
+//!
+//! The `xshelld` binary is [`Daemon::new().main()`](Daemon::main). A program
+//! that compiles in its own tool providers builds the same daemon with
+//! [`Daemon::with_tools`] and gets every `xshelld` command (serving, `probe`,
+//! `serve-stdio`, `serve-pty-stdio`, `service`) unchanged; see
+//! `docs/tool-providers.md`.
+
+use crate::{
+    ClientPtyFrame, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonAudit, DaemonPolicy,
+    DaemonProbeReport, DaemonProbeStatus, ExecutionCoordinator, PersistenceMode, PtyAudit,
+    PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
+    SessionActivity, SessionConfig, SessionHandshake, SessionRegistry, complete_shell,
+    load_view_resource, read_client_frame, write_server_frame,
+};
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use serde::Deserialize;
+use std::ffi::CStr;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+use xshell_execution::ToolRegistry;
+use xshell_platform::LockExt;
+use xshell_platform::service::{ServiceDefinition, ServiceManager, ServiceState, ServiceVerb};
+
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+const VIEW_TIMEOUT: Duration = Duration::from_secs(3);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded wait for a service manager to finish starting or stopping a unit.
+const SERVICE_SETTLE_ATTEMPTS: usize = 20;
+const SERVICE_SETTLE_INTERVAL: Duration = Duration::from_millis(100);
+/// Bounded wait for a started daemon to begin accepting connections.
+const DAEMON_READY_ATTEMPTS: usize = 30;
+
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "Local session execution and persistence service for xshell"
+)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<DaemonCommand>,
+
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Ignore XSHELL_CONFIG and ~/.config/xshell/config.toml; use only
+    /// command-line flags and built-in defaults. Intended for tests and
+    /// hermetic deployments.
+    #[arg(long, global = true, conflicts_with = "config")]
+    no_user_config: bool,
+
+    #[arg(long, global = true)]
+    state_directory: Option<PathBuf>,
+
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
+
+    #[arg(long, global = true)]
+    host_alias: Option<String>,
+
+    #[arg(long, global = true)]
+    user: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Report binary and running-daemon compatibility as one JSON object.
+    Probe,
+    /// Proxy the session protocol between stdin/stdout and the local daemon.
+    ServeStdio,
+    /// Claim a PTY ticket and proxy its framed binary stream over stdin/stdout.
+    ServePtyStdio,
+    /// Manage this user's xshelld service (launchd or systemd --user).
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Write the per-user unit and start the daemon.
+    Install,
+    /// Stop the daemon and remove the per-user unit.
+    Uninstall,
+    /// Start an installed service.
+    Start,
+    /// Stop a running service without removing its unit.
+    Stop,
+    /// Restart the daemon, draining its work before the replacement starts.
+    Restart,
+    /// Report the installed service's state.
+    Status,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    session_fabric: SessionConfig,
+    #[serde(default)]
+    audit: xshell_audit::AuditConfig,
+}
+
+/// The session daemon, configured by its command line and configuration file
+/// and, for programs that embed it, by the tools they compile in.
+#[derive(Debug, Clone)]
+pub struct Daemon {
+    tools: Arc<ToolRegistry>,
+}
+
+impl Default for Daemon {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Daemon {
+    /// The daemon `xshelld` runs: no provided tools.
+    pub fn new() -> Self {
+        Self {
+            tools: ToolRegistry::empty(),
+        }
+    }
+
+    /// Offer `tools` to every agent turn, in addition to the built-in tools.
+    /// The registry is fixed for the daemon's lifetime.
+    pub fn with_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Parse the process's command line and run, exactly as `xshelld` does.
+    /// `--help` and argument errors exit the process, as for any CLI.
+    pub fn main(self) -> Result<()> {
+        run(Args::parse(), self.tools)
+    }
+
+    /// Run with an explicit command line (`args[0]` is the program name), for
+    /// programs that build it themselves. `--help` and argument errors exit
+    /// the process, as in [`main`](Self::main).
+    pub fn run_with_args<I, T>(self, args: I) -> Result<()>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        run(Args::parse_from(args), self.tools)
+    }
+}
+
+fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
+    let config_path = if args.no_user_config {
+        None
+    } else {
+        resolve_config_path(args.config)?
+    };
+    let (config, audit_config) = load_config(config_path.as_deref())?;
+    // Service management must stay usable on a host whose state directory does
+    // not exist yet — installing the service is what creates it — so this runs
+    // before the directory is required, with a best-effort socket path used
+    // only to confirm the daemon came up.
+    if let Some(DaemonCommand::Service(command)) = &args.command {
+        let socket = args.socket.clone().or_else(|| config.resolved_socket());
+        return run_service_command(command, config_path.as_deref(), socket.as_deref());
+    }
+    let state_directory = args
+        .state_directory
+        .or_else(|| config.resolved_state_directory())
+        .context("session state directory is required")?;
+    let socket = args
+        .socket
+        .or(config.socket.clone())
+        .unwrap_or_else(|| state_directory.join("xshelld.sock"));
+    if matches!(args.command, Some(DaemonCommand::Probe)) {
+        return print_probe(&socket);
+    }
+    if matches!(args.command, Some(DaemonCommand::ServeStdio)) {
+        return serve_stdio(&socket);
+    }
+    if matches!(args.command, Some(DaemonCommand::ServePtyStdio)) {
+        return serve_pty_stdio(&socket);
+    }
+    let host_alias = validate_host_alias(
+        args.host_alias
+            .or_else(|| config.host_alias.clone())
+            .unwrap_or_else(system_hostname),
+    )?;
+    let user = args.user.unwrap_or_else(system_user);
+    let host_id = load_or_create_host_id(&state_directory)?;
+    config.validate_budgets()?;
+    let mut registry = SessionRegistry::load(state_directory.clone(), host_id, host_alias, user)?;
+    registry.set_max_sessions(config.max_sessions);
+    let registry = Arc::new(Mutex::new(registry));
+    let audit = DaemonAudit::from_config(&audit_config)?;
+    let (rules, warnings) = config.approval_policy()?;
+    for warning in warnings {
+        eprintln!("xshelld: approval policy: {warning}");
+    }
+    let execution = ExecutionCoordinator::with_policy(
+        Arc::clone(&registry),
+        audit,
+        daemon_policy(&config, rules, tools)?,
+    );
+    let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
+
+    prepare_socket(&socket)?;
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("cannot bind session socket {}", socket.display()))?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let identity = registry.lock_recover();
+    println!("xshelld listening on {}", socket.display());
+    println!(
+        "host: {} ({}) user: {}",
+        identity.host_alias(),
+        identity.host_id(),
+        identity.user()
+    );
+    drop(identity);
+    println!("max approval: {}", execution.max_approval());
+    println!("provided tools: {}", describe_tools(execution.tools()));
+    println!("max limits: {}", execution.max_limits().summary());
+    println!(
+        "budgets: {} sessions, {} concurrent turns",
+        config.max_sessions,
+        execution.max_concurrent_turns()
+    );
+    println!(
+        "audit: {}",
+        match (execution.audit().enabled(), execution.audit().required()) {
+            (false, _) => "disabled".to_owned(),
+            (true, true) => "required (execution-boundary)".to_owned(),
+            (true, false) => "best-effort (execution-boundary)".to_owned(),
+        }
+    );
+    println!(
+        "terminal stream capture: {}",
+        match execution.audit().terminal_stream() {
+            None => "off (lifecycle only)".to_owned(),
+            Some(policy) => match policy.max_bytes {
+                None => "on (unbounded)".to_owned(),
+                Some(bytes) => format!("on ({bytes} bytes per job)"),
+            },
+        }
+    );
+
+    let shutdown = install_shutdown_handler()?;
+    listener.set_nonblocking(true)?;
+
+    loop {
+        if shutdown.try_recv().is_ok() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _address)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("xshelld: cannot configure accepted client socket: {error}");
+                    continue;
+                }
+                // The daemon runs commands as the invoking user. Socket mode
+                // is not a sufficient control on every platform, so verify
+                // the peer explicitly before reading a single request byte.
+                if let Err(error) = xshell_platform::require_same_user(&stream, "session") {
+                    eprintln!("xshelld: {error:#}");
+                    continue;
+                }
+                let registry = Arc::clone(&registry);
+                let execution = execution.clone();
+                let ptys = ptys.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_client(stream, registry, execution, ptys) {
+                        eprintln!("xshelld client error: {error:#}");
+                    }
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => eprintln!("xshelld accept error: {error}"),
+        }
+    }
+    execution.stop_accepting_and_cancel();
+    let shutdown_started = Instant::now();
+    let ptys_drained = ptys.shutdown_all(SHUTDOWN_TIMEOUT);
+    let remaining = SHUTDOWN_TIMEOUT.saturating_sub(shutdown_started.elapsed());
+    let execution_drained = execution.wait_for_shutdown(remaining);
+    let drained = ptys_drained && execution_drained;
+    if !drained {
+        eprintln!(
+            "xshelld: shutdown deadline elapsed; active outcomes require recovery reconciliation"
+        );
+    }
+    execution.audit().close_all(if drained {
+        "xshelld shutdown"
+    } else {
+        "xshelld forced shutdown with unresolved outcomes"
+    });
+    Ok(())
+}
+
+/// What the operator's configuration and the compiled-in tools decide for
+/// every turn.
+fn daemon_policy(
+    config: &SessionConfig,
+    rules: xshell_execution::Policy,
+    tools: Arc<ToolRegistry>,
+) -> Result<DaemonPolicy> {
+    Ok(DaemonPolicy {
+        max_approval: config.max_approval,
+        max_limits: config.limit_ceiling()?,
+        sensitive_paths: config.sensitive_paths(),
+        blocked_paths: config.blocked_paths(),
+        rules,
+        compaction: config.compaction.clone(),
+        tools,
+        max_concurrent_turns: config.max_concurrent_turns,
+    })
+}
+
+/// The startup line naming the provided tools, so an operator can see which
+/// tools this build adds and match the identity against audit records.
+fn describe_tools(tools: &ToolRegistry) -> String {
+    match tools.identity() {
+        None => "none".to_owned(),
+        Some(identity) => {
+            let names: Vec<_> = tools.tools().iter().map(|tool| tool.name()).collect();
+            format!("{} ({})", names.join(", "), &identity[..12])
+        }
+    }
+}
+
+fn print_probe(socket: &Path) -> Result<()> {
+    let daemon = match crate::SessionClient::probe(socket, env!("CARGO_PKG_VERSION")) {
+        Ok(SessionHandshake::Opened {
+            protocol_version,
+            host_id,
+            host_alias,
+            user,
+        }) => DaemonProbeStatus::Ready {
+            protocol_version,
+            host_id,
+            host_alias,
+            user,
+        },
+        Ok(SessionHandshake::Rejected { code, message }) if code == "protocol_version" => {
+            DaemonProbeStatus::Incompatible { code, message }
+        }
+        Ok(SessionHandshake::Rejected { code, message }) => {
+            DaemonProbeStatus::Rejected { code, message }
+        }
+        Err(error) => DaemonProbeStatus::Unavailable {
+            message: format!("{error:#}"),
+        },
+    };
+    let report = DaemonProbeReport {
+        schema_version: DAEMON_PROBE_SCHEMA_VERSION,
+        binary_version: env!("CARGO_PKG_VERSION").into(),
+        supported_protocol_version: SESSION_PROTOCOL_VERSION,
+        daemon,
+    };
+    serde_json::to_writer(std::io::stdout().lock(), &report)?;
+    println!();
+    Ok(())
+}
+
+/// Convert SIGINT/SIGTERM into an ordinary main-loop shutdown request. The main
+/// thread owns admission stop, worker cleanup, persistence, and audit closure.
+fn install_shutdown_handler() -> Result<mpsc::Receiver<()>> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])
+    .context("cannot install xshelld shutdown signals")?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("xshelld-shutdown".into())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                let _ = sender.send(());
+            }
+        })
+        .context("cannot spawn xshelld shutdown handler")?;
+    Ok(receiver)
+}
+
+fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    if let Some(path) = std::env::var_os("XSHELL_CONFIG") {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(home).join(".config/xshell/config.toml");
+    Ok(path.exists().then_some(path))
+}
+
+/// Build the service definition describing how this binary should be run.
+///
+/// The program path is this executable rather than whatever happens to be on
+/// `PATH`, so installing from a freshly bootstrapped binary registers that
+/// binary. The configuration path is pinned because a launchd agent or systemd
+/// user unit does not inherit the shell environment that normally supplies
+/// `XSHELL_CONFIG`.
+fn service_definition(config_path: Option<&Path>) -> Result<(ServiceDefinition, PathBuf)> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is required to locate this user's service directory")?;
+    let program = std::env::current_exe().context("cannot determine the running xshelld path")?;
+    let program = program.canonicalize().unwrap_or(program);
+    let log_directory = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/xshell")
+    } else {
+        home.join(".local/state/xshell")
+    };
+    Ok((
+        ServiceDefinition {
+            program,
+            config: config_path.map(Path::to_path_buf),
+            log_directory,
+        },
+        home,
+    ))
+}
+
+fn run_service_command(
+    command: &ServiceCommand,
+    config_path: Option<&Path>,
+    socket: Option<&Path>,
+) -> Result<()> {
+    let manager = ServiceManager::detect()?;
+    let (definition, home) = service_definition(config_path)?;
+    let uid = xshell_platform::effective_uid();
+    let unit_path = manager.unit_path(&home);
+
+    match command {
+        ServiceCommand::Install => {
+            let plan = manager.install_plan(&home, uid, &definition);
+            if let Some(parent) = plan.unit_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("cannot create unit directory {}", parent.display())
+                })?;
+            }
+            fs::create_dir_all(&definition.log_directory).with_context(|| {
+                format!(
+                    "cannot create log directory {}",
+                    definition.log_directory.display()
+                )
+            })?;
+            fs::write(&plan.unit_path, &plan.unit_contents)
+                .with_context(|| format!("cannot write {}", plan.unit_path.display()))?;
+            fs::set_permissions(&plan.unit_path, fs::Permissions::from_mode(0o600))?;
+            println!("wrote {}", plan.unit_path.display());
+            println!("runs: {}", definition.program_arguments().join(" "));
+            if definition.config.is_none() {
+                println!(
+                    "note: no configuration file was found, so the service runs with built-in \
+                     defaults; create ~/.config/xshell/config.toml and reinstall to pin one"
+                );
+            }
+            for spec in &plan.activate {
+                ServiceManager::run(spec)?;
+            }
+            report_service_state(manager, uid, &unit_path, Expect::Running)?;
+            report_daemon_readiness(socket);
+            report_persistence_caveat(manager);
+            Ok(())
+        }
+        ServiceCommand::Uninstall => {
+            let (teardown, reload) = manager.uninstall_commands(uid);
+            for spec in &teardown {
+                ServiceManager::run(spec)?;
+            }
+            match fs::remove_file(&unit_path) {
+                Ok(()) => println!("removed {}", unit_path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("no unit at {}", unit_path.display());
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot remove {}", unit_path.display()));
+                }
+            }
+            for spec in &reload {
+                ServiceManager::run(spec)?;
+            }
+            Ok(())
+        }
+        ServiceCommand::Status => {
+            let state = report_service_state(manager, uid, &unit_path, Expect::Settled)?;
+            if matches!(state, ServiceState::Running { .. }) {
+                report_daemon_readiness(socket);
+            }
+            Ok(())
+        }
+        ServiceCommand::Start | ServiceCommand::Stop | ServiceCommand::Restart => {
+            let (verb, expect) = match command {
+                ServiceCommand::Start => (ServiceVerb::Start, Expect::Running),
+                ServiceCommand::Stop => (ServiceVerb::Stop, Expect::NotRunning),
+                _ => (ServiceVerb::Restart, Expect::Running),
+            };
+            if !unit_path.exists() {
+                bail!(
+                    "no {} unit at {}; run `xshelld service install` first",
+                    manager.name(),
+                    unit_path.display()
+                );
+            }
+            for spec in &manager.verb_commands(verb, uid, &unit_path) {
+                ServiceManager::run(spec)?;
+            }
+            report_service_state(manager, uid, &unit_path, expect)?;
+            if expect == Expect::Running {
+                report_daemon_readiness(socket);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// What a caller is waiting for the service manager to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// Any state that is not a transition.
+    Settled,
+    Running,
+    NotRunning,
+}
+
+impl Expect {
+    fn satisfied_by(self, state: &ServiceState) -> bool {
+        match self {
+            Self::Settled => !state.is_settling(),
+            Self::Running => matches!(state, ServiceState::Running { .. }),
+            Self::NotRunning => matches!(
+                state,
+                ServiceState::Stopped | ServiceState::Installed | ServiceState::NotInstalled
+            ),
+        }
+    }
+}
+
+/// Poll until the service manager reports what the verb asked for.
+///
+/// Both service managers return before they have finished acting: `launchctl
+/// kickstart` reports success while the process is still being spawned through
+/// `xpcproxy`, and `launchctl bootout` returns while the old service is still
+/// listed. Reading status once therefore reports the previous state as if it
+/// were the result. Bounded, so a unit that never reaches the expected state
+/// still answers with whatever it actually is.
+fn service_state(
+    manager: ServiceManager,
+    uid: u32,
+    unit_path: &Path,
+    expect: Expect,
+) -> Result<ServiceState> {
+    let spec = manager.status_command(uid);
+    let mut state = ServiceState::NotInstalled;
+    for attempt in 0..SERVICE_SETTLE_ATTEMPTS {
+        let (success, output) = ServiceManager::run(&spec)?;
+        state = manager.parse_state(unit_path.exists(), success, &output);
+        if expect.satisfied_by(&state) {
+            return Ok(state);
+        }
+        if attempt + 1 < SERVICE_SETTLE_ATTEMPTS {
+            thread::sleep(SERVICE_SETTLE_INTERVAL);
+        }
+    }
+    Ok(state)
+}
+
+fn report_service_state(
+    manager: ServiceManager,
+    uid: u32,
+    unit_path: &Path,
+    expect: Expect,
+) -> Result<ServiceState> {
+    let state = service_state(manager, uid, unit_path, expect)?;
+    println!("service: {} ({})", state, manager.name());
+    Ok(state)
+}
+
+/// Report whether the started daemon is actually accepting connections.
+///
+/// A running process is not a serving daemon: `xshelld` binds its socket after
+/// launch, so a caller that connects the moment the service manager reports
+/// success gets a connection refused. Anything driving this remotely needs to
+/// know the difference between "the service manager started something" and
+/// "the session fabric is reachable".
+fn report_daemon_readiness(socket: Option<&Path>) {
+    let Some(socket) = socket else {
+        println!("daemon: socket path unknown; run `xshelld probe` to confirm readiness");
+        return;
+    };
+    for attempt in 0..DAEMON_READY_ATTEMPTS {
+        if let Ok(SessionHandshake::Opened {
+            protocol_version, ..
+        }) = crate::SessionClient::probe(socket, env!("CARGO_PKG_VERSION"))
+        {
+            println!(
+                "daemon: ready on {} (protocol {protocol_version})",
+                socket.display()
+            );
+            return;
+        }
+        if attempt + 1 < DAEMON_READY_ATTEMPTS {
+            thread::sleep(SERVICE_SETTLE_INTERVAL);
+        }
+    }
+    println!(
+        "daemon: not accepting connections on {} yet; check `xshelld probe` and the service log",
+        socket.display()
+    );
+}
+
+/// Report the one thing that stops a per-user service from surviving logout.
+///
+/// This matters most for the case the service exists to serve: a daemon
+/// installed over SSH is useless if it dies with the installing session.
+fn report_persistence_caveat(manager: ServiceManager) {
+    match manager {
+        ServiceManager::Systemd => {
+            let user = system_user();
+            let Ok((_, output)) = ServiceManager::run(&ServiceManager::linger_command(&user))
+            else {
+                return;
+            };
+            if ServiceManager::parse_linger(&output) == Some(false) {
+                println!(
+                    "note: lingering is off for {user}, so this service stops when your last \
+                     session ends; run `loginctl enable-linger {user}` to keep it running for \
+                     remote connections"
+                );
+            }
+        }
+        ServiceManager::Launchd => {
+            println!(
+                "note: launchd user agents run only while this user has an active login session; \
+                 a Mac with nobody logged in will not keep xshelld running"
+            );
+        }
+    }
+}
+
+fn serve_stdio(socket: &Path) -> Result<()> {
+    let stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "cannot connect stdio transport to xshell session service at {}",
+            socket.display()
+        )
+    })?;
+    let mut daemon_reader = BufReader::new(stream.try_clone()?);
+    let mut daemon_writer = stream;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut client_reader = BufReader::new(stdin.lock());
+    let mut client_writer = stdout.lock();
+
+    while let Some(line) = read_request_line(&mut client_reader)? {
+        let request: ClientRequest =
+            serde_json::from_str(&line).context("invalid stdio request")?;
+        if let Some(response) =
+            reject_remote_request(&request, &mut daemon_reader, &mut daemon_writer)?
+        {
+            send(&mut client_writer, &response)?;
+            continue;
+        }
+
+        serde_json::to_writer(&mut daemon_writer, &request)?;
+        daemon_writer.write_all(b"\n")?;
+        daemon_writer.flush()?;
+        let response_line = read_request_line(&mut daemon_reader)?
+            .context("local session daemon closed the stdio proxy connection")?;
+        let mut response: ServerResponse =
+            serde_json::from_str(&response_line).context("invalid local daemon response")?;
+        if let ServerResponse::Catalog { sessions } = &mut response {
+            sessions.retain(|session| session.visibility == crate::Visibility::Fabric);
+        }
+        send(&mut client_writer, &response)?;
+    }
+    Ok(())
+}
+
+fn serve_pty_stdio(socket: &Path) -> Result<()> {
+    let stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "cannot connect PTY transport to xshell session service at {}",
+            socket.display()
+        )
+    })?;
+    let mut daemon_reader = BufReader::new(stream.try_clone()?);
+    let mut daemon_writer = stream;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut client_reader = BufReader::new(stdin);
+    let mut client_writer = stdout.lock();
+
+    let mut ticket = String::new();
+    client_reader
+        .read_line(&mut ticket)
+        .context("cannot read PTY stream ticket")?;
+    let ticket = ticket.trim_end_matches(['\r', '\n']);
+    if ticket.is_empty() || ticket.len() > 128 {
+        bail!("invalid PTY stream ticket");
+    }
+    send_request(
+        &mut daemon_writer,
+        &ClientRequest::open(env!("CARGO_PKG_VERSION")),
+    )?;
+    match receive_response(&mut daemon_reader)? {
+        ServerResponse::Opened { .. } => {}
+        response => bail!("PTY proxy could not open daemon connection: {response:?}"),
+    }
+    send_request(
+        &mut daemon_writer,
+        &ClientRequest::PtyClaim {
+            ticket: ticket.to_owned(),
+        },
+    )?;
+    match receive_response(&mut daemon_reader)? {
+        ServerResponse::PtyClaimed => {
+            write_server_frame(&mut client_writer, &ServerPtyFrame::Ready)?;
+        }
+        ServerResponse::Error { message, .. } => {
+            write_server_frame(&mut client_writer, &ServerPtyFrame::Error(message))?;
+            return Ok(());
+        }
+        response => bail!("unexpected PTY claim response: {response:?}"),
+    }
+
+    let upload = thread::spawn(move || std::io::copy(&mut client_reader, &mut daemon_writer));
+    copy_and_flush(&mut daemon_reader, &mut client_writer)?;
+    drop(client_writer);
+    let _ = upload.join();
+    Ok(())
+}
+
+fn copy_and_flush(reader: &mut impl Read, writer: &mut impl Write) -> Result<()> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buffer[..count])?;
+        writer.flush()?;
+    }
+}
+
+fn receive_response(reader: &mut impl BufRead) -> Result<ServerResponse> {
+    let line = read_request_line(reader)?.context("session daemon closed the connection")?;
+    serde_json::from_str(&line).context("invalid session daemon response")
+}
+
+fn reject_remote_request(
+    request: &ClientRequest,
+    daemon_reader: &mut BufReader<UnixStream>,
+    daemon_writer: &mut UnixStream,
+) -> Result<Option<ServerResponse>> {
+    if matches!(request, ClientRequest::PtyClaim { .. }) {
+        return Ok(Some(ServerResponse::Error {
+            code: "dedicated_pty_connection_required".into(),
+            message: "PTY tickets may only be claimed through serve-pty-stdio".into(),
+        }));
+    }
+    if matches!(
+        request,
+        ClientRequest::Create { session }
+            if session.visibility == crate::Visibility::HostOnly
+    ) {
+        return Ok(Some(remote_visibility_error()));
+    }
+    let selector = match request {
+        ClientRequest::Attach { selector, .. } | ClientRequest::Switch { selector, .. } => {
+            Some(selector.as_str())
+        }
+        ClientRequest::Close {
+            selector: Some(selector),
+        } => Some(selector.as_str()),
+        ClientRequest::CompleteShell { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::PtyStart { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::PtyAttach { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::PtyClose { session_id } => Some(session_id.as_str()),
+        _ => None,
+    };
+    let Some(selector) = selector else {
+        return Ok(None);
+    };
+
+    serde_json::to_writer(&mut *daemon_writer, &ClientRequest::List)?;
+    daemon_writer.write_all(b"\n")?;
+    daemon_writer.flush()?;
+    let line = read_request_line(daemon_reader)?
+        .context("local session daemon closed during visibility check")?;
+    let response: ServerResponse = serde_json::from_str(&line)?;
+    let visible = matches!(
+        response,
+        ServerResponse::Catalog { sessions }
+            if sessions.iter().any(|session| {
+                session.visibility == crate::Visibility::Fabric
+                    && (session.id == selector || session.name == selector)
+            })
+    );
+    Ok((!visible).then(remote_visibility_error))
+}
+
+fn remote_visibility_error() -> ServerResponse {
+    ServerResponse::Error {
+        code: "remote_session_not_visible".into(),
+        message: "session is unavailable through the remote transport".into(),
+    }
+}
+
+fn load_config(path: Option<&Path>) -> Result<(SessionConfig, xshell_audit::AuditConfig)> {
+    let Some(path) = path else {
+        return Ok((
+            SessionConfig::default(),
+            xshell_audit::AuditConfig::default(),
+        ));
+    };
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("cannot read configuration file {}", path.display()))?;
+    let config: ConfigFile = toml::from_str(&source)
+        .with_context(|| format!("invalid configuration file {}", path.display()))?;
+    Ok((config.session_fabric, config.audit))
+}
+
+fn handle_client(
+    stream: UnixStream,
+    registry: Arc<Mutex<SessionRegistry>>,
+    execution: ExecutionCoordinator,
+    ptys: PtyCoordinator,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+    let Some(line) = read_request_line(&mut reader)? else {
+        return Ok(());
+    };
+    let request: ClientRequest = serde_json::from_str(&line).context("invalid open request")?;
+    let ClientRequest::Open {
+        protocol_version,
+        client_version: _,
+    } = request
+    else {
+        send_error(
+            &mut writer,
+            "protocol",
+            "first request must open a connection",
+        )?;
+        return Ok(());
+    };
+    if protocol_version != SESSION_PROTOCOL_VERSION {
+        send_error(
+            &mut writer,
+            "protocol_version",
+            &format!(
+                "client speaks session protocol {protocol_version} but this xshelld requires \
+                 {SESSION_PROTOCOL_VERSION}; xshell and xshelld are different builds — \
+                 upgrade the client or restart xshelld from the same build"
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let client_id = Uuid::new_v4().to_string();
+    {
+        let registry = registry.lock_recover();
+        send(
+            &mut writer,
+            &ServerResponse::Opened {
+                protocol_version: SESSION_PROTOCOL_VERSION,
+                client_id: client_id.clone(),
+                host_id: registry.host_id().to_owned(),
+                host_alias: registry.host_alias().to_owned(),
+                user: registry.user().to_owned(),
+            },
+        )?;
+    }
+
+    let mut attached_session: Option<String> = None;
+    let result = loop {
+        let line = match read_request_line(&mut reader) {
+            Ok(line) => line,
+            Err(error) => break Err(error),
+        };
+        let Some(line) = line else {
+            break Ok(());
+        };
+        let request: ClientRequest = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Err(error) = send_error(&mut writer, "invalid_request", &error.to_string()) {
+                    break Err(error);
+                }
+                continue;
+            }
+        };
+        if let ClientRequest::PtyClaim { ticket } = request {
+            let claim = match ptys.claim(&ticket) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    if let Err(error) =
+                        send_error(&mut writer, "pty_claim_failed", &format!("{error:#}"))
+                    {
+                        break Err(error);
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) = send(&mut writer, &ServerResponse::PtyClaimed) {
+                ptys.release_claim(&claim);
+                break Err(error);
+            }
+            let served = serve_claimed_pty(&mut reader, &mut writer, &ptys, &claim);
+            ptys.release_claim(&claim);
+            break served;
+        }
+        let response = process_request(
+            request,
+            &registry,
+            &execution,
+            &ptys,
+            &client_id,
+            &mut attached_session,
+        );
+        let sent = match response {
+            Ok(response) => send(&mut writer, &response),
+            Err(error) => {
+                // A spent daemon-wide budget has its own code, so a client
+                // can tell "try later" from a failure.
+                let code = if error
+                    .chain()
+                    .any(|cause| cause.is::<crate::CapacityExhausted>())
+                {
+                    "capacity"
+                } else {
+                    "request_failed"
+                };
+                send_error(&mut writer, code, &format!("{error:#}"))
+            }
+        };
+        if let Err(error) = sent {
+            break Err(error);
+        }
+    };
+    detach_on_disconnect(
+        &registry,
+        &execution,
+        &ptys,
+        &client_id,
+        attached_session.as_deref(),
+    );
+    result
+}
+
+fn serve_claimed_pty(
+    reader: &mut BufReader<UnixStream>,
+    writer: &mut UnixStream,
+    ptys: &PtyCoordinator,
+    claim: &PtyClaim,
+) -> Result<()> {
+    let mut cursor = claim.cursor;
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` is one initialized `pollfd`, matching the count of 1.
+        let polled = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if polled < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error).context("PTY stream poll failed");
+            }
+        } else if !reader.buffer().is_empty() || descriptor.revents & libc::POLLIN != 0 {
+            match read_client_frame(reader)? {
+                ClientPtyFrame::Input(bytes) => {
+                    ptys.write_claimed(claim, bytes)?;
+                }
+                ClientPtyFrame::Resize(updated) => ptys.resize_claimed(claim, updated)?,
+                ClientPtyFrame::Close => {
+                    ptys.release_claim(claim);
+                    write_server_frame(writer, &ServerPtyFrame::Detached)?;
+                    return Ok(());
+                }
+            }
+        } else if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Ok(());
+        }
+
+        let result = match ptys.read_claimed(claim, cursor, 40) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = format!("{error:#}");
+                let _ = write_server_frame(writer, &ServerPtyFrame::Error(message));
+                return Ok(());
+            }
+        };
+        cursor = result.offset.saturating_add(result.output.len() as u64);
+        if !result.output.is_empty() {
+            write_server_frame(
+                writer,
+                &ServerPtyFrame::Output {
+                    offset: result.offset,
+                    bytes: result.output,
+                },
+            )?;
+        }
+        if let Some(status) = result.status {
+            write_server_frame(writer, &ServerPtyFrame::Exit(status))?;
+            return Ok(());
+        }
+    }
+}
+
+fn process_request(
+    request: ClientRequest,
+    registry: &Arc<Mutex<SessionRegistry>>,
+    execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
+    client_id: &str,
+    attached_session: &mut Option<String>,
+) -> Result<ServerResponse> {
+    match request {
+        ClientRequest::List => {
+            let mut sessions = registry.lock_recover().list();
+            for session in &mut sessions {
+                session.activity = session_activity(execution, ptys, &session.id);
+            }
+            Ok(ServerResponse::Catalog { sessions })
+        }
+        ClientRequest::Create {
+            session: mut creation,
+        } => {
+            if creation.cwd == Path::new("~") {
+                let home = std::env::var_os("HOME").context("HOME is not set on session host")?;
+                creation.cwd = PathBuf::from(home)
+                    .canonicalize()
+                    .context("cannot resolve session host home directory")?;
+            }
+            let session = registry.lock_recover().create(client_id, creation)?;
+            if let Some(previous) = attached_session.take() {
+                detach_session(registry, execution, ptys, client_id, &previous)?;
+            }
+            *attached_session = Some(session.descriptor.id.clone());
+            Ok(ServerResponse::Created {
+                session: with_activity(session, execution, ptys),
+            })
+        }
+        ClientRequest::Attach { selector, role } => {
+            if attached_session.is_some() {
+                bail!("detach the current session before attaching another one");
+            }
+            let session = registry.lock_recover().attach(client_id, &selector, role)?;
+            *attached_session = Some(session.descriptor.id.clone());
+            Ok(ServerResponse::Attached {
+                session: with_activity(session, execution, ptys),
+                role,
+            })
+        }
+        ClientRequest::Switch { selector, role } => {
+            let session = registry.lock_recover().attach(client_id, &selector, role)?;
+            if let Some(previous) = attached_session.take()
+                && previous != session.descriptor.id
+            {
+                detach_session(registry, execution, ptys, client_id, &previous)?;
+            }
+            *attached_session = Some(session.descriptor.id.clone());
+            Ok(ServerResponse::Attached {
+                session: with_activity(session, execution, ptys),
+                role,
+            })
+        }
+        ClientRequest::Update {
+            session_id,
+            model,
+            cwd,
+            history,
+        } => {
+            if attached_session.as_deref() != Some(session_id.as_str()) {
+                bail!("the requested session is not this connection's current session");
+            }
+            if execution.active_turn(&session_id).is_some() {
+                bail!("cannot replace session state while a turn is active");
+            }
+            if ptys.has_session(&session_id) {
+                let cwd = xshell_execution::validate_working_directory(&cwd)?;
+                let snapshot = registry.lock_recover().snapshot(&session_id)?;
+                if snapshot.descriptor.model == model
+                    && snapshot.descriptor.cwd == cwd
+                    && snapshot.history == history
+                {
+                    return Ok(ServerResponse::Updated {
+                        session: descriptor_with_activity(snapshot.descriptor, execution, ptys),
+                    });
+                }
+                bail!("cannot replace session state while a PTY is active");
+            }
+            let session =
+                registry
+                    .lock_recover()
+                    .update(client_id, &session_id, model, cwd, history)?;
+            Ok(ServerResponse::Updated {
+                session: descriptor_with_activity(session, execution, ptys),
+            })
+        }
+        ClientRequest::Snapshot { session_id } => {
+            require_current(attached_session, &session_id)?;
+            let session = registry.lock_recover().snapshot(&session_id)?;
+            Ok(ServerResponse::Snapshot {
+                session: with_activity(session, execution, ptys),
+            })
+        }
+        ClientRequest::Submit {
+            session_id,
+            input,
+            approval,
+            limits,
+            policy,
+        } => {
+            require_current(attached_session, &session_id)?;
+            if ptys.has_session(&session_id) {
+                bail!("cannot start a turn while a PTY is active");
+            }
+            let overlay = policy
+                .map(|config| xshell_execution::Policy::parse(&config))
+                .transpose()
+                .context("invalid client approval policy")?
+                .map(|(overlay, _warnings)| overlay);
+            let turn_id = execution.submit(&session_id, input, approval, limits, overlay)?;
+            Ok(ServerResponse::Accepted { turn_id })
+        }
+        ClientRequest::Events {
+            session_id,
+            after_sequence,
+            wait_ms,
+        } => {
+            require_current(attached_session, &session_id)?;
+            Ok(ServerResponse::Events {
+                batch: execution.events(&session_id, after_sequence, wait_ms),
+            })
+        }
+        ClientRequest::Approve { session_id, reply } => {
+            require_current(attached_session, &session_id)?;
+            execution.approve(&session_id, reply)?;
+            Ok(ServerResponse::ApprovalAccepted)
+        }
+        ClientRequest::Cancel {
+            session_id,
+            turn_id,
+        } => {
+            require_current(attached_session, &session_id)?;
+            execution.cancel(&session_id, &turn_id)?;
+            Ok(ServerResponse::CancellationAccepted)
+        }
+        ClientRequest::CompleteShell {
+            session_id,
+            line,
+            cursor,
+        } => {
+            let cwd = registry
+                .lock_recover()
+                .snapshot(&session_id)?
+                .descriptor
+                .cwd;
+            Ok(ServerResponse::ShellCompletions {
+                result: complete_shell_bounded(line, cursor, cwd)?,
+            })
+        }
+        ClientRequest::ViewSource { session_id, path } => {
+            require_current(attached_session, &session_id)?;
+            let cwd = registry
+                .lock_recover()
+                .snapshot(&session_id)?
+                .descriptor
+                .cwd;
+            Ok(ServerResponse::ViewSource {
+                resource: load_view_resource_bounded(path, cwd)?,
+            })
+        }
+        ClientRequest::PtyStart {
+            session_id,
+            command,
+            size,
+            terminal_type,
+        } => {
+            require_current(attached_session, &session_id)?;
+            if execution.active_turn(&session_id).is_some() {
+                bail!("cannot start a PTY while a turn is active");
+            }
+            let cwd = registry
+                .lock_recover()
+                .snapshot(&session_id)?
+                .descriptor
+                .cwd;
+            let audit = PtyAudit {
+                handle: execution.audit_handle(&session_id)?,
+                stream: execution.audit().terminal_stream(),
+            };
+            let ticket =
+                ptys.start_audited(&session_id, command, &cwd, size, terminal_type, audit)?;
+            Ok(ServerResponse::PtyStarted { ticket })
+        }
+        ClientRequest::PtyAttach {
+            session_id,
+            after_offset,
+        } => {
+            require_current(attached_session, &session_id)?;
+            Ok(ServerResponse::PtyAttached {
+                ticket: ptys.attach(&session_id, after_offset)?,
+            })
+        }
+        ClientRequest::PtyClose { session_id } => {
+            require_current(attached_session, &session_id)?;
+            if !ptys.terminate_session(&session_id) {
+                bail!("session has no interactive process");
+            }
+            Ok(ServerResponse::PtyClosed)
+        }
+        ClientRequest::PtyClaim { .. } => bail!("PTY claims require a dedicated connection"),
+        ClientRequest::Detach => {
+            let detached = match attached_session.take() {
+                Some(session_id) => {
+                    detach_session(registry, execution, ptys, client_id, &session_id)?
+                }
+                None => None,
+            };
+            Ok(ServerResponse::Detached {
+                session_id: detached,
+            })
+        }
+        ClientRequest::Close { selector } => {
+            let selector = selector
+                .or_else(|| attached_session.clone())
+                .context("close requires a session selector when detached")?;
+            let session_id = registry.lock_recover().close(client_id, &selector)?;
+            // Session removal performs the controller-ownership check. Do not
+            // terminate work until that authorization has succeeded: another
+            // client may legitimately own the requested session.
+            ptys.terminate_session(&session_id);
+            execution.cancel_and_remove(&session_id);
+            execution
+                .audit()
+                .close_session(&session_id, "session closed");
+            if attached_session.as_deref() == Some(session_id.as_str()) {
+                *attached_session = None;
+            }
+            Ok(ServerResponse::Closed { session_id })
+        }
+        ClientRequest::Open { .. } => bail!("connection is already open"),
+    }
+}
+
+fn complete_shell_bounded(
+    line: String,
+    cursor: usize,
+    cwd: PathBuf,
+) -> Result<crate::ShellCompletionResult> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("xshelld-completion".into())
+        .spawn(move || {
+            let _ = sender.send(complete_shell(&line, cursor, &cwd));
+        })
+        .context("cannot start shell completion worker")?;
+    receiver
+        .recv_timeout(COMPLETION_TIMEOUT)
+        .context("shell completion timed out")?
+}
+
+fn load_view_resource_bounded(path: PathBuf, cwd: PathBuf) -> Result<crate::ViewResource> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("xshelld-view-source".into())
+        .spawn(move || {
+            let _ = sender.send(load_view_resource(&path, &cwd));
+        })
+        .context("cannot start view-source worker")?;
+    receiver
+        .recv_timeout(VIEW_TIMEOUT)
+        .context("view-source acquisition timed out")?
+}
+
+fn require_current(attached_session: &Option<String>, session_id: &str) -> Result<()> {
+    if attached_session.as_deref() != Some(session_id) {
+        bail!("the requested session is not this connection's current session");
+    }
+    Ok(())
+}
+
+fn with_activity(
+    mut snapshot: crate::SessionSnapshot,
+    execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
+) -> crate::SessionSnapshot {
+    snapshot.descriptor.activity = session_activity(execution, ptys, &snapshot.descriptor.id);
+    snapshot
+}
+
+fn descriptor_with_activity(
+    mut descriptor: crate::SessionDescriptor,
+    execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
+) -> crate::SessionDescriptor {
+    descriptor.activity = session_activity(execution, ptys, &descriptor.id);
+    descriptor
+}
+
+fn session_activity(
+    execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
+    session_id: &str,
+) -> SessionActivity {
+    ptys.session_activity(session_id)
+        .unwrap_or_else(|| execution.activity(session_id))
+}
+
+fn detach_on_disconnect(
+    registry: &Arc<Mutex<SessionRegistry>>,
+    execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
+    client_id: &str,
+    session_id: Option<&str>,
+) {
+    if let Some(session_id) = session_id
+        && let Err(error) = detach_session(registry, execution, ptys, client_id, session_id)
+    {
+        eprintln!("xshelld detach error: {error:#}");
+    }
+}
+
+fn detach_session(
+    registry: &Arc<Mutex<SessionRegistry>>,
+    execution: &ExecutionCoordinator,
+    ptys: &PtyCoordinator,
+    client_id: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let persistence = registry
+        .lock_recover()
+        .snapshot(session_id)?
+        .descriptor
+        .persistence;
+    if persistence == PersistenceMode::Ephemeral {
+        execution.cancel_and_remove(session_id);
+        ptys.terminate_session(session_id);
+    }
+    registry.lock_recover().detach(client_id, session_id)
+}
+
+fn read_request_line(reader: &mut impl BufRead) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let count = reader
+        .by_ref()
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_REQUEST_BYTES || bytes.last() != Some(&b'\n') {
+        bail!("session request exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    Ok(Some(
+        String::from_utf8(bytes).context("session request is not UTF-8")?,
+    ))
+}
+
+fn send(writer: &mut impl Write, response: &ServerResponse) -> Result<()> {
+    serde_json::to_writer(&mut *writer, response)?;
+    writer.write_all(b"\n")?;
+    writer.flush().context("cannot flush session response")
+}
+
+fn send_request(writer: &mut impl Write, request: &ClientRequest) -> Result<()> {
+    serde_json::to_writer(&mut *writer, request)?;
+    writer.write_all(b"\n")?;
+    writer.flush().context("cannot flush session request")
+}
+
+fn send_error(writer: &mut UnixStream, code: &str, message: &str) -> Result<()> {
+    send(
+        writer,
+        &ServerResponse::Error {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        },
+    )
+}
+
+fn prepare_socket(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("session socket must have a parent directory")?;
+    // The socket's parent must be ours and private; otherwise another local
+    // user could pre-create the directory (for example under /tmp) and
+    // replace or redirect the socket.
+    xshell_platform::ensure_secure_directory(parent, "session socket")?;
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket() {
+            bail!("refusing to replace non-socket path {}", path.display());
+        }
+        fs::remove_file(path)
+            .with_context(|| format!("cannot remove stale session socket {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn load_or_create_host_id(state_directory: &Path) -> Result<String> {
+    xshell_platform::ensure_secure_directory(state_directory, "session state")?;
+    let path = state_directory.join("host-id");
+    if path.exists() {
+        let value = fs::read_to_string(&path)?;
+        let value = value.trim();
+        Uuid::parse_str(value).context("invalid host ID")?;
+        return Ok(value.to_owned());
+    }
+    let value = Uuid::new_v4().to_string();
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(&path)?;
+    writeln!(file, "{value}")?;
+    file.sync_all()?;
+    Ok(value)
+}
+
+fn system_hostname() -> String {
+    // `c_char` is `i8` on x86_64 but `u8` on aarch64 Linux; spell the element
+    // type through libc so this compiles on every supported target.
+    let mut buffer = [0 as libc::c_char; 256];
+    // SAFETY: `buffer` is writable for the length passed, one byte short of its size, so the
+    // zeroed last byte always terminates the name.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } == 0 {
+        // SAFETY: gethostname succeeded, and the buffer's last byte is still NUL, so `buffer`
+        // holds a NUL-terminated string that lives for this borrow.
+        let hostname = unsafe { CStr::from_ptr(buffer.as_ptr()) };
+        if let Ok(hostname) = hostname.to_str() {
+            return hostname.to_owned();
+        }
+    }
+    "localhost".to_owned()
+}
+
+fn validate_host_alias(alias: String) -> Result<String> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        bail!("host alias must not be empty");
+    }
+    if alias
+        .chars()
+        .any(|character| character.is_control() || matches!(character, ':' | '/' | '#'))
+    {
+        bail!("host alias must not contain control characters, ':', '/', or '#'");
+    }
+    Ok(alias.to_owned())
+}
+
+fn system_user() -> String {
+    // SAFETY: geteuid(2) takes no arguments and cannot fail.
+    std::env::var("USER").unwrap_or_else(|_| unsafe { libc::geteuid() }.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both service managers return before they have finished acting, so a verb
+    /// has to wait for the state it asked for rather than for any settled
+    /// state. Observed on macOS 15: `launchctl bootout` returns while
+    /// `launchctl print` still reports the old service as running, which made
+    /// `service stop` print "running" immediately after stopping it.
+    #[test]
+    fn stop_waits_for_the_service_to_stop_not_merely_to_settle() {
+        let running = ServiceState::Running { pid: Some(42) };
+
+        assert!(
+            !Expect::NotRunning.satisfied_by(&running),
+            "a still-running service must not satisfy a stop"
+        );
+        // `Running` is a settled state, so a settle-only wait would have
+        // returned it and reported the stop as a no-op.
+        assert!(Expect::Settled.satisfied_by(&running));
+
+        for stopped in [
+            ServiceState::Stopped,
+            ServiceState::Installed,
+            ServiceState::NotInstalled,
+        ] {
+            assert!(Expect::NotRunning.satisfied_by(&stopped), "{stopped}");
+        }
+    }
+
+    #[test]
+    fn start_waits_for_running_and_ignores_the_spawn_transition() {
+        let spawning = ServiceState::Starting {
+            detail: "xpcproxy".to_owned(),
+        };
+        assert!(!Expect::Running.satisfied_by(&spawning));
+        assert!(!Expect::Settled.satisfied_by(&spawning));
+        assert!(Expect::Running.satisfied_by(&ServiceState::Running { pid: Some(1) }));
+        // A failed unit is settled; the caller reports it rather than spinning.
+        assert!(Expect::Settled.satisfied_by(&ServiceState::Failed {
+            detail: "boom".to_owned()
+        }));
+    }
+
+    /// The unit must run the binary that installed it and pin the configuration
+    /// the daemon would otherwise read from an environment a service does not
+    /// inherit.
+    #[test]
+    fn service_definition_pins_this_binary_and_the_resolved_config() {
+        let config = PathBuf::from("/etc/xshell/config.toml");
+        let (definition, home) = service_definition(Some(&config)).unwrap();
+
+        assert_eq!(definition.config.as_deref(), Some(config.as_path()));
+        assert_eq!(definition.program, std::env::current_exe().unwrap());
+        assert!(definition.program.is_absolute());
+        assert!(definition.log_directory.starts_with(&home));
+
+        let arguments = definition.program_arguments();
+        assert_eq!(arguments[arguments.len() - 2], "--config");
+        assert_eq!(arguments[arguments.len() - 1], config.display().to_string());
+
+        let (bare, _) = service_definition(None).unwrap();
+        assert_eq!(bare.program_arguments().len(), 1);
+    }
+
+    struct Named;
+
+    #[async_trait::async_trait]
+    impl xshell_execution::ToolProvider for Named {
+        fn name(&self) -> &str {
+            "memory"
+        }
+
+        fn tools(&self) -> Vec<xshell_execution::ProvidedTool> {
+            ["memory_get", "memory_put"]
+                .into_iter()
+                .map(|name| xshell_execution::ProvidedTool {
+                    definition: xshell_core::ToolDefinition {
+                        name: name.into(),
+                        description: "A memory tool.".into(),
+                        parameters: serde_json::json!({"type": "object"}),
+                    },
+                    access: xshell_execution::ToolAccess::ReadOnly,
+                    approval: xshell_execution::ToolApproval::NotRequired,
+                })
+                .collect()
+        }
+
+        async fn call(
+            &self,
+            _tool: &str,
+            _context: xshell_execution::ToolContext,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn startup_names_the_provided_tools_and_their_identity() {
+        assert_eq!(describe_tools(&ToolRegistry::empty()), "none");
+        let registry = ToolRegistry::builder()
+            .provider(Arc::new(Named))
+            .build()
+            .unwrap();
+        let identity = registry.identity().unwrap();
+        assert_eq!(
+            describe_tools(&registry),
+            format!("memory_get, memory_put ({})", &identity[..12])
+        );
+    }
+
+    #[test]
+    fn the_daemon_policy_carries_the_compiled_in_tools() {
+        let registry = ToolRegistry::builder()
+            .provider(Arc::new(Named))
+            .build()
+            .unwrap();
+        let policy = daemon_policy(
+            &SessionConfig::default(),
+            xshell_execution::Policy::default(),
+            Arc::clone(&registry),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&policy.tools, &registry));
+        assert!(Daemon::new().tools.is_empty());
+    }
+}

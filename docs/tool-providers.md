@@ -1,7 +1,7 @@
 # Tool providers: design
 
-**Status:** proposed; stage 1 implemented (`crates/xshell-execution/src/provider.rs`).
-**Updated:** 11 November 2026
+**Status:** proposed; stages S1 and S2 implemented (`crates/xshell-execution/src/provider.rs`, `crates/xshell-session/src/daemon.rs`).
+**Updated:** 12 November 2026
 
 ## 1. Summary
 
@@ -219,17 +219,58 @@ turn's session id, and passes the registry to the audit record. The stock
 `xshelld` registers no providers (`ToolRegistry::empty()`), so nothing
 changes for existing deployments. The standalone CLI likewise has none.
 
-Today a program can use providers by building `ExecutionCoordinator` with
-its own `DaemonPolicy`, or by calling `run_agent_turn` directly. A
-downstream binary that wants the whole daemon with its own providers needs
-stage S2.
+### 5.1 Building a daemon with providers
+
+The daemon is a library, `xshell_session::daemon`, and the `xshelld` binary
+is `Daemon::new().main()`. A program that compiles in providers builds the
+same daemon:
+
+```rust
+use std::sync::Arc;
+use xshell_execution::ToolRegistry;
+use xshell_session::daemon::Daemon;
+
+fn main() -> anyhow::Result<()> {
+    let tools = ToolRegistry::builder()
+        .provider(Arc::new(my_memory::Provider::new()))
+        .build()?;
+    Daemon::new().with_tools(tools).main()
+}
+```
+
+The result accepts the same command line and configuration file as `xshelld`
+and has every command: serving, `probe`, `serve-stdio`, `serve-pty-stdio`
+and `service`. It speaks the same session protocol, so `xshell` clients
+connect to it unchanged. `Daemon::run_with_args` takes an explicit command
+line, for programs that build one themselves. At startup the daemon prints
+the provided tools and the first 12 characters of the registry identity, so
+an operator can match a running build against its audit records.
+
+Things to know when replacing `xshelld` with your own build:
+
+- **Service unit.** `service install` writes the same per-user unit as
+  `xshelld` (`com.xshell.xshelld` on macOS, `xshelld.service` on Linux),
+  pointing at the binary that ran the command. Installing your build
+  replaces a stock `xshelld` service, and the reverse. One daemon per user
+  is the intended state.
+- **Remote connections.** `//connect` runs `xshelld probe` and
+  `xshelld serve-stdio` by name on the remote host. Those commands only
+  proxy to the daemon's socket, so a stock `xshelld` of the same version on
+  the remote `PATH` can serve your build there. Otherwise, install your
+  binary under the name `xshelld`.
+- **Versions.** Your build and its clients must use the same session
+  protocol version, as for `xshelld`.
+
+Programs that do not want the whole daemon can still build an
+`ExecutionCoordinator` with their own `DaemonPolicy`, or call
+`run_agent_turn` directly.
 
 ## 6. Staged plan
 
 | Stage | Content | Status |
 |---|---|---|
-| S1 | Provider trait, registry, toolset, engine dispatch, gate reason, delegation, `DaemonPolicy.tools`, session id, audit field | This change |
-| S2 | **Embeddable daemon.** Move `xshelld`'s serve loop from `src/bin/xshelld.rs` into the library (for example `xshell_session::daemon::run(options, registry)`) so a downstream binary can register providers and otherwise behave exactly like `xshelld` | Next. A mechanical move. |
+| S1 | Provider trait, registry, toolset, engine dispatch, gate reason, delegation, `DaemonPolicy.tools`, session id, audit field | Done (#121) |
+| S2 | **Embeddable daemon.** `xshelld` moved into the library as `xshell_session::daemon::Daemon`, with `with_tools` (§5.1) | Done |
 | S3 | **Argument-scoped policy.** An optional `ToolProvider::policy_subject(tool, arguments) -> Option<String>` returning the string an argument pattern matches, so rules such as `memory_put: shared/*` work | When a provider needs it |
 | S4 | **Per-session toolsets.** A session's creation names which provided tools it gets (always within the registry and within the daemon's policy), so one daemon can give its users different tool sets | Needed for multi-user gateways |
 | S5 | **Model-facing errors and output.** Optional structured results (images through the content-addressed image store, A1–A4) | After A4 |

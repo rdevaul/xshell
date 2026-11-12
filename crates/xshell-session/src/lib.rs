@@ -1,6 +1,7 @@
 mod audit;
 mod client;
 mod completion;
+pub mod daemon;
 mod execution;
 mod model;
 mod protocol;
