@@ -246,6 +246,11 @@ line, for programs that build one themselves. At startup the daemon prints
 the provided tools and the first 12 characters of the registry identity, so
 an operator can match a running build against its audit records.
 
+`main` and `run_with_args` run the daemon as the whole process: they install
+the SIGTERM and SIGINT handlers that stop it, print to stdout, and exit the
+process on `--help` or an argument error. Call them from a program that is
+the daemon, not from a thread inside a larger one.
+
 Things to know when replacing `xshelld` with your own build:
 
 - **Service unit.** `service install` writes the same per-user unit as

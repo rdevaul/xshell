@@ -147,7 +147,8 @@ fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].call_id, "call_1");
-        assert_eq!(calls[0].cwd, temporary.path());
+        // The daemon canonicalizes the cwd (macOS temp dirs sit behind a symlink).
+        assert_eq!(calls[0].cwd, temporary.path().canonicalize().unwrap());
         assert_eq!(calls[0].agent, None);
     }
     let history = client.snapshot(session_id).unwrap().history;
