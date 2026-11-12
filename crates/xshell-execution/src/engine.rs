@@ -1,7 +1,7 @@
 use crate::budget::{BudgetExhausted, TurnBudget, TurnLimits};
 use crate::call_id::CallIds;
 use crate::environment::remove_credentials;
-use crate::process::{ShellEnd, configure_process_group, supervise_shell};
+use crate::process::{LINGER_GRACE, ShellEnd, configure_process_group, supervise_shell};
 use crate::provider::{CallScope, execute_provided};
 use crate::tools::{
     Preparation, ToolRef, execute_prepared, execute_view_image, gate, prepare_call, truncate,
@@ -1522,6 +1522,18 @@ pub async fn run_direct_shell_streaming_cancellable(
     command: &str,
     cwd: &Path,
     cancellation: CancellationFlag,
+    emit: impl FnMut(&str, String) + Send,
+) -> Result<DirectShellResult> {
+    run_direct_shell_with_grace(command, cwd, cancellation, LINGER_GRACE, emit).await
+}
+
+/// [`run_direct_shell_streaming_cancellable`] with an explicit linger grace,
+/// so tests can make cancellation the only way a command can end.
+async fn run_direct_shell_with_grace(
+    command: &str,
+    cwd: &Path,
+    cancellation: CancellationFlag,
+    linger_grace: Duration,
     mut emit: impl FnMut(&str, String) + Send,
 ) -> Result<DirectShellResult> {
     if command.trim().is_empty() {
@@ -1563,6 +1575,7 @@ pub async fn run_direct_shell_streaming_cancellable(
         child,
         &cancellation,
         DIRECT_SHELL_TIMEOUT,
+        linger_grace,
         |stream, bytes| {
             retain_shell_chunk(
                 stream.name(),
@@ -4160,10 +4173,13 @@ mod tests {
             }
             cancel.cancel();
         });
-        let error = run_direct_shell_streaming_cancellable(
+        // A grace far longer than the test, so only the cancellation can end
+        // the command.
+        let error = run_direct_shell_with_grace(
             &command,
             temporary.path(),
             cancellation,
+            Duration::from_secs(60),
             |_, _| {},
         )
         .await

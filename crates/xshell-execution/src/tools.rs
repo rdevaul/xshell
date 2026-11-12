@@ -2,7 +2,7 @@ use crate::SensitivePaths;
 use crate::engine::CancellationFlag;
 use crate::environment::apply_agent_environment;
 use crate::prepared::{self, ObjectKind, PreparedObject};
-use crate::process::{ShellEnd, Stream, configure_process_group, supervise_shell};
+use crate::process::{LINGER_GRACE, ShellEnd, Stream, configure_process_group, supervise_shell};
 use crate::provider::{RegisteredTool, ToolAccess, ToolRegistry};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -719,6 +719,18 @@ async fn run_shell(
     cancellation: CancellationFlag,
     timeout: Duration,
 ) -> Result<String> {
+    run_shell_with_grace(arguments, root, cancellation, timeout, LINGER_GRACE).await
+}
+
+/// [`run_shell`] with an explicit linger grace, so tests can make
+/// cancellation or the timeout the only way a call can end.
+async fn run_shell_with_grace(
+    arguments: &Value,
+    root: &Path,
+    cancellation: CancellationFlag,
+    timeout: Duration,
+    linger_grace: Duration,
+) -> Result<String> {
     let command = required_string(arguments, "command")?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let mut process = Command::new(&shell);
@@ -753,6 +765,7 @@ async fn run_shell(
         child,
         &cancellation,
         timeout,
+        linger_grace,
         |stream, bytes| match stream {
             Stream::Stdout => stdout.push(bytes),
             Stream::Stderr => stderr.push(bytes),
@@ -1305,10 +1318,13 @@ print $f $$; close $f; sleep 1000000' & sleep 1000000",
             cancel.cancel();
         });
         let started = std::time::Instant::now();
-        let error = run_shell(
+        // The grace and timeout are far longer than the test, so only the
+        // cancellation can end the call.
+        let error = run_shell_with_grace(
             &json!({ "command": command }),
             temporary.path(),
             cancellation,
+            Duration::from_secs(120),
             Duration::from_secs(60),
         )
         .await

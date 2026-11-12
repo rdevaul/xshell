@@ -75,9 +75,10 @@ impl ProcessGroupGuard {
     }
 }
 
-/// How long a shell's output is still drained after the shell itself exits.
-/// Past it, any process still holding the output pipes (typically a
-/// background job started with `&`) is killed with the rest of the group.
+/// The default for how long a shell's output is still drained after the
+/// shell itself exits (see [`supervise_shell`]'s `linger_grace`). Past it,
+/// any process still holding the output pipes (typically a background job
+/// started with `&`) is killed with the rest of the group.
 pub(crate) const LINGER_GRACE: Duration = Duration::from_secs(2);
 /// After a group kill, how long output already written to the pipes is still
 /// collected before the readers are abandoned.
@@ -105,10 +106,10 @@ impl Stream {
 /// How a supervised shell ended.
 #[derive(Debug)]
 pub(crate) enum ShellEnd {
-    /// The shell exited and its output pipes closed within [`LINGER_GRACE`].
+    /// The shell exited and its output pipes closed within the linger grace.
     Exited(ExitStatus),
     /// The shell exited, but something still held its output pipes after
-    /// [`LINGER_GRACE`] (or at the deadline, if that came first). The process
+    /// the linger grace (or at the deadline, if that came first). The process
     /// group was killed; the output collected until then is kept.
     ExitedLingering(ExitStatus),
     /// Cancelled before the output was drained; the process group was killed.
@@ -139,10 +140,14 @@ pub(crate) enum ShellEnd {
 /// A background job that redirects its output away from the pipes (for
 /// example `server > log 2>&1 &`) does not hold them, so after a normal exit
 /// it is left running, as in an ordinary shell.
+///
+/// `linger_grace` is how long the pipes may stay open after the shell exits
+/// ([`LINGER_GRACE`] in production); it is capped by the remaining timeout.
 pub(crate) async fn supervise_shell(
     mut child: Child,
     cancellation: &CancellationFlag,
     timeout: Duration,
+    linger_grace: Duration,
     mut on_output: impl FnMut(Stream, &[u8]) + Send,
 ) -> Result<ShellEnd> {
     let deadline = Instant::now() + timeout;
@@ -177,7 +182,7 @@ pub(crate) async fn supervise_shell(
                     .context("shell wait task failed")?
                     .context("could not wait for shell")?;
                 status = Some(exited);
-                linger_until = deadline.min(Instant::now() + LINGER_GRACE);
+                linger_until = deadline.min(Instant::now() + linger_grace);
             }
             () = cancellation.wait() => break ShellEnd::Cancelled,
             () = tokio::time::sleep_until(linger_until) => {
