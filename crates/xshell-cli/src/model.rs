@@ -24,6 +24,7 @@ pub(crate) fn build_adapter(
         api_key_env: include_credentials
             .then(|| active.api_key_env.clone())
             .flatten(),
+        vision: active.vision,
     })
 }
 

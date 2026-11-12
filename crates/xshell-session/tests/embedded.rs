@@ -97,6 +97,7 @@ fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,

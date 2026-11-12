@@ -521,6 +521,7 @@ mod tests {
                 max_history_bytes: None,
                 context_tokens: None,
                 reserve_output_tokens: None,
+                vision: false,
             },
             cwd: PathBuf::from("/tmp"),
             persistence: PersistenceMode::Daemon,

@@ -15,8 +15,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `tool_output_bytes` to the turn limits. Version 20 adds the
 // `tool_declared` gate reason on `ExecutionEvent::ApprovalRequested`, sent for
 // provided tools that require approval. Version 21 adds
-// `SessionEventKind::TurnSummary`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 21;
+// `SessionEventKind::TurnSummary`. Version 22 adds `vision` to
+// `ModelBinding`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 22;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -379,6 +380,10 @@ pub struct ModelBinding {
     /// Tokens held back for the model's reply when `context_tokens` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserve_output_tokens: Option<usize>,
+    /// Whether the model takes images; without it they are sent as text
+    /// placeholders. Absent in sessions saved before images.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vision: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

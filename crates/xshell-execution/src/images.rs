@@ -317,6 +317,12 @@ impl ImageStore {
     }
 }
 
+impl xshell_core::ImageSource for ImageStore {
+    fn image_bytes(&self, image: &ImageRef) -> std::result::Result<Vec<u8>, String> {
+        self.get(image).map_err(|error| format!("{error:#}"))
+    }
+}
+
 /// Remove the stores under `root` that belong to no session in `live`:
 /// ephemeral sessions that ended while the daemon was down, or sessions
 /// whose removal failed part-way.
