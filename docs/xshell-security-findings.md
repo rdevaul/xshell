@@ -20,10 +20,11 @@ historical review.
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Corrected | Incomplete/error/refusal streams cannot produce executable tool calls |
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn and daemon-wide budgets landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
+| F13 | [#129](https://github.com/rdevaul/xshell/issues/129) | P0 | M1.3 prepared file access | Corrected | Case variants (`.ENV`, `.SSH/ID_ED25519`, `server.PEM`, `.GIT/config`) are sensitive, blocked and denied exactly like their stored names on a case-insensitive volume |
+| F14 | [#130](https://github.com/rdevaul/xshell/issues/130) | P0 | Audit integrity | Corrected (records after the last checkpoint stay unsigned; per-record signing is #131) | A forged tail after a final checkpoint, duplicate keys and unknown fields fail; a non-round-tripping float verifies; a swapped session file and a rolled-back log (via the index) fail; real format 1, 2 and 9 logs verify |
+| F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 | F17 | [#133](https://github.com/rdevaul/xshell/issues/133) | P0 | M1.2 cancellation and shutdown | Corrected (processes that `setsid` away are not contained) | A background job holding the pipes is killed at the timeout, at cancellation (its marker never appears), and after a short grace following a normal exit; the call returns promptly |
 | F18 | [#134](https://github.com/rdevaul/xshell/issues/134) | P0 | M1.4 credential bounds | Corrected (allowlist is a constant; configurability is follow-up) | The provider key variable and an arbitrary daemon variable are absent from `run_shell` output |
-| F13 | [#129](https://github.com/rdevaul/xshell/issues/129) | P0 | M1.3 prepared file access | Corrected | Case variants (`.ENV`, `.SSH/ID_ED25519`, `server.PEM`, `.GIT/config`) are sensitive, blocked and denied exactly like their stored names on a case-insensitive volume |
-| F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 
 ## Evidence rules
 
@@ -213,6 +214,28 @@ error body, a mid-stream error message, or a tool name the model chose. The
 full error still reaches the user and the audit log. Records saved before the
 fix lose their quoted detail when merged. Tests: `f16_*` in
 `xshell-execution/src/engine.rs` and `xshell-core/src/lib.rs`.
+
+F14 is corrected (#130). Audit format 10 (protocol 11) hashes and signs the
+bytes a log stores: the daemon serializes each record and checkpoint body once,
+hashes those bytes, and writes them unchanged, and the verifier hashes the
+stored body before parsing it. A float that `serde_json` does not reparse
+exactly, a different key order, or a different escape can no longer break a
+genuine log or hide a change. Every line is parsed strictly, so a repeated key
+at any depth (`"command":"ls","command":"rm -rf ~"`) or an unknown field fails.
+Any entry after a final checkpoint fails, and the report counts the records
+after the last checkpoint, which only the unkeyed chain covers. The verifier
+binds a log to its session through the file name or `--session-id`, and
+`--index checkpoints.jsonl` detects a log rolled back or replaced behind the
+index's latest checkpoint. Formats 1 to 9 are still verified by re-encoding
+and reported as `legacy-reencoded`; formats 1 and 2 are re-encoded without
+`logical_session_attached.terminal_stream`, which they never wrote, so they
+verify again, and float parsing is now exact (`float_roundtrip`), so a format 9
+log with such a float verifies too. The verifier still exits non-zero for a
+log without a final checkpoint unless `--allow-open` is given. Deleting a
+whole session file is visible only by comparing the index with the sessions
+directory, and signing each record is tracked in #131. Evidence: the `f14_*`
+tests in `xshell-audit/src/verify.rs` and `xshell-audit/tests/verify_cli.rs`,
+including fixtures written by the format 1, 2 and 9 writers.
 
 The [development roadmap](xshell-development-roadmap.md) remains the
 cross-product sequencing authority.
