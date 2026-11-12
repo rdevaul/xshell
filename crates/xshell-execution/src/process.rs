@@ -17,6 +17,16 @@ pub(crate) fn configure_process_group(command: &mut Command) {
     command.process_group(0).kill_on_drop(true);
 }
 
+/// Keep every descriptor above 2 from crossing `exec` into a shell child:
+/// PTY masters of other jobs, daemon sockets, an approval channel (F12).
+pub(crate) fn restrict_inherited_descriptors(command: &mut Command) {
+    // SAFETY: the hook makes only async-signal-safe system calls on memory
+    // allocated before the fork; see `DescriptorSweep::run`.
+    unsafe {
+        command.pre_exec(xshell_platform::descriptors::child_hook());
+    }
+}
+
 pub(crate) struct ProcessGroupGuard {
     process_group: Option<i32>,
     armed: bool,
@@ -245,6 +255,33 @@ async fn read_output(
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+/// Helpers for the F12 regression tests of the shell paths.
+#[cfg(test)]
+pub(crate) mod descriptor_leak {
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+
+    /// A PTY master opened the way `openpty(3)` opened them before F12:
+    /// without close-on-exec, as a live job's master in the daemon was.
+    pub(crate) fn leaky_pty_master() -> OwnedFd {
+        // SAFETY: posix_openpt(3) takes only flags; the descriptor is owned below.
+        let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: posix_openpt succeeded, so `fd` is a new descriptor nothing else owns.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// A shell command that prints `leak:N` if descriptor `master` reached
+    /// it, `tty:N` for any terminal above stdio, then `swept`. It runs under
+    /// `/bin/sh` so descriptors a user's shell keeps for itself do not count.
+    pub(crate) fn probe(master: RawFd) -> String {
+        format!(
+            "exec /bin/sh -c 'if [ -e /dev/fd/{master} ]; then echo leak:{master}; fi; \
+             for f in /dev/fd/*; do n=${{f##*/}}; [ \"$n\" -gt 2 ] || continue; \
+             if [ -t \"$n\" ]; then echo tty:$n; fi; done; echo swept'"
+        )
     }
 }
 

@@ -20,6 +20,7 @@ historical review.
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Corrected | Incomplete/error/refusal streams cannot produce executable tool calls |
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn and daemon-wide budgets landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
 | F11 | [#61](https://github.com/rdevaul/xshell/issues/61) | P2 | M1.5 directory consistency | Corrected | Files cannot become cwd; invalid updates preserve the previous cwd in every mode |
+| F12 | [#128](https://github.com/rdevaul/xshell/issues/128) | P0 | PTY descriptor hygiene | Corrected | A second PTY job, an agent `run_shell` child, and a direct `$` command see no other job's PTY master and cannot type into it |
 | F13 | [#129](https://github.com/rdevaul/xshell/issues/129) | P0 | M1.3 prepared file access | Corrected | Case variants (`.ENV`, `.SSH/ID_ED25519`, `server.PEM`, `.GIT/config`) are sensitive, blocked and denied exactly like their stored names on a case-insensitive volume |
 | F14 | [#130](https://github.com/rdevaul/xshell/issues/130) | P0 | Audit integrity | Corrected (records after the last checkpoint stay unsigned; per-record signing is #131) | A forged tail after a final checkpoint, duplicate keys and unknown fields fail; a non-round-tripping float verifies; a swapped session file and a rolled-back log (via the index) fail; real format 1, 2 and 9 logs verify |
 | F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
@@ -125,6 +126,44 @@ deterministic limit. The daemon also bounds turns running at once
 turn bounds the bytes of tool output it returns to the model
 (`tool_output_bytes`). A session's budget across turns and a bound on retained
 history without compaction remain, so F10 stays open.
+
+F12 is corrected (#128). It was found in the 12 November 2026 security
+review of `03dae9a`, not the original review, so its acceptance condition is
+the one in the issue. `openpty(3)` set close-on-exec on neither PTY
+descriptor, and `xshelld` keeps every interactive job's master open, so every
+later child (other sessions' PTY jobs, `run_shell`, `$` turns) inherited every
+live master and could type into, or read, another session's terminal. Two
+layers now keep descriptors out of children:
+
+- **Close-on-exec at allocation.** `xshell-pty` opens the master with
+  `posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)` and the slave with
+  `open(O_CLOEXEC)`, so neither is ever inheritable, even by a fork on another
+  thread. Both macOS and Linux honour the flag; a libc that rejected it would
+  get the flag set by `fcntl` straight after, a window the second layer covers.
+  The slave still becomes the child's stdio, because `dup2` clears
+  close-on-exec on descriptors 0 to 2.
+- **A sweep in every shell child.** PTY jobs, `run_shell`, direct `$`
+  commands, and the SSH helpers run
+  `xshell_platform::descriptors::child_hook` between `fork` and `exec`. It
+  marks every descriptor above 2 close-on-exec: `close_range(2)` with
+  `CLOSE_RANGE_CLOEXEC` on Linux 5.11 and later, the `proc_pidinfo` listing
+  into a buffer allocated before the fork on macOS, and otherwise an `fcntl`
+  probe of every number below the soft descriptor limit. It marks rather
+  than closes so the standard library's exec-error pipe keeps working. This
+  also keeps the headless `--approval-channel` descriptor out of agent
+  commands. No xshell child is meant to inherit a descriptor above 2.
+
+Evidence: `f12_a_second_pty_job_cannot_reach_the_first_jobs_master` runs two
+PTY jobs; the second looks for the first's master by number, lists any
+terminal above its stdio, and writes into every descriptor it holds, and the
+first job then reads only the line the test sends. Without the correction it
+finds the master and the first job reads `INJECTED`.
+`f12_a_run_shell_child_cannot_see_a_live_pty_master` and
+`f12_a_direct_shell_command_cannot_see_a_live_pty_master` hold a master opened
+without close-on-exec, as before the fix, and show the sweep keeps it out of
+both captured-shell paths. Unit tests in `xshell-platform` cover the sweep and
+its fallback, and `f12_pty_master_and_slave_are_close_on_exec` checks the
+allocation.
 
 F4, F5, and F8 are corrected together by M1.3, a single prepared-operation
 boundary in `xshell-execution` (`prepared.rs`), because they shared one cause:

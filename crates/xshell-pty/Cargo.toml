@@ -10,6 +10,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 nix.workspace = true
+xshell-platform = { path = "../xshell-platform" }
 
 [dev-dependencies]
 tempfile = "3.21"
