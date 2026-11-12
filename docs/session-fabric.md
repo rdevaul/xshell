@@ -191,6 +191,16 @@ the conversation are then sent to it with the request; without the flag
 they are sent as short text placeholders. See the
 [agentic CAD plan](agentic-cad-plan.md#31-design) for the layout.
 
+With a vision model, `//attach PATH` attaches an image file to your next
+message (`//attach` lists pending attachments; `//attach --clear` drops
+them), and the agent gets a `view_image` tool for looking at image files in
+the working directory, such as renders its own commands produced.
+`view_image` is read-only and is gated, confined and blocked like
+`read_file`; policy entries name it like the other path tools
+(`view_image: renders/*`). Images are decoded, scaled to at most 1568 px on
+the longest edge and re-encoded as PNG by the session host before they are
+stored or sent.
+
 A profile can also declare the model's window with `context_tokens` (and
 `reserve_output_tokens`, default 1024). When it does, the enforced budget is
 additionally capped by what that window can hold — `(context_tokens − reserve −

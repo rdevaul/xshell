@@ -1197,7 +1197,11 @@ fn process_request(
             label,
         } => {
             require_current(attached_session, &session_id)?;
-            let model = registry.lock_recover().snapshot(&session_id)?.descriptor.model;
+            let model = registry
+                .lock_recover()
+                .snapshot(&session_id)?
+                .descriptor
+                .model;
             if !model.vision {
                 bail!(
                     "this session's model is not configured for images; set `vision = true` \

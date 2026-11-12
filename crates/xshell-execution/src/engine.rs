@@ -7,8 +7,8 @@ use crate::tools::{
 };
 use crate::{
     ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
-    GateReason, PolicyDecision, SensitivePaths, Tool, ToolAccess, ToolApproval, ToolSet,
-    SessionImages, default_decision, drop_tool_payloads, estimate_history_tokens, history_bytes,
+    GateReason, PolicyDecision, SensitivePaths, SessionImages, Tool, ToolAccess, ToolApproval,
+    ToolSet, default_decision, drop_tool_payloads, estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -4664,18 +4664,14 @@ mod tests {
             vec![ApprovalDecision::Deny],
         )
         .await;
-        assert_eq!(
-            approval_reasons(&events),
-            [Some(GateReason::SensitivePath)]
-        );
+        assert_eq!(approval_reasons(&events), [Some(GateReason::SensitivePath)]);
         assert!(history.iter().all(|message| message.images.is_empty()));
 
         // A blocked path is refused before the policy, in every mode.
         let blocked = TurnPolicy::new(ApprovalPolicy::Auto)
             .with_images(image_store(&temporary))
             .with_blocked_paths(SensitivePaths::new(["secret.png".to_owned()]));
-        let (_, history, events) =
-            view_image_turn(&temporary, "secret.png", blocked, vec![]).await;
+        let (_, history, events) = view_image_turn(&temporary, "secret.png", blocked, vec![]).await;
         assert!(events.contains(&ExecutionEvent::ToolDecision {
             call_id: "v".into(),
             decision: ApprovalDecision::Deny,

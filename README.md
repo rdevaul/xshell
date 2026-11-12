@@ -406,7 +406,7 @@ attachments are next-stage work. See the
 xshell is agentic infrastructure, not a sandbox. Its controls make authority
 visible and bounded:
 
-- `read_file` and `list_directory` are confined to the session cwd: the path
+- `read_file`, `list_directory` and `view_image` are confined to the session cwd: the path
   is walked one component at a time without following symlinks implicitly,
   and the read uses the object that walk opened, so it cannot be swapped
   between the approval decision and the read. Reads and listings are bounded

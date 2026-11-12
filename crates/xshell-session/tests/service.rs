@@ -1496,6 +1496,194 @@ fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
     }));
 }
 
+/// A PNG of `width` x `height` pixels.
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::RgbImage::from_pixel(width, height, image::Rgb([30, 90, 160]))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
+/// The dimensions of the PNG in an `image_url` data-URL part.
+fn sent_png_dimensions(part: &serde_json::Value) -> (u32, u32) {
+    use base64::Engine as _;
+    let url = part["image_url"]["url"].as_str().unwrap();
+    let data = url.strip_prefix("data:image/png;base64,").unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap();
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
+    (decoded.width(), decoded.height())
+}
+
+/// Run one agent turn to completion, failing the test if it fails.
+fn complete_turn(client: &mut SessionClient, session_id: &str, input: TurnInput) {
+    client
+        .submit(session_id.to_owned(), input, ApprovalPolicy::Ask)
+        .unwrap();
+    let mut after = 0;
+    for _ in 0..100 {
+        let batch = client.events(session_id.to_owned(), after, 500).unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::TurnCompleted => return,
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+    }
+    panic!("the turn did not complete");
+}
+
+#[test]
+fn attached_and_viewed_images_reach_the_model_re_encoded_and_bounded() {
+    let (base_url, model_server, bodies) = common::serve_sse_recording(vec![
+        sse_text("a wide part"),
+        sse_tool_call(
+            "call_view",
+            "view_image",
+            serde_json::json!({"path": "render.png"}),
+        ),
+        sse_text("seen it"),
+    ]);
+    let temporary = TempDir::new().unwrap();
+    std::fs::write(temporary.path().join("render.png"), png(30, 20)).unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .arg("--no-user-config")
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _daemon = Daemon(child);
+    let mut client = connect_when_ready(&socket);
+    let binding = |vision| ModelBinding {
+        profile_name: Some("fake".into()),
+        provider: "openai".into(),
+        model: "fake-model".into(),
+        base_url: base_url.clone(),
+        api_key_env: None,
+        max_history_bytes: None,
+        context_tokens: None,
+        reserve_output_tokens: None,
+        vision,
+    };
+    let creation = |name: &str, vision| SessionCreation {
+        name: name.into(),
+        model: binding(vision),
+        cwd: temporary.path().into(),
+        persistence: PersistenceMode::Daemon,
+        visibility: Visibility::Fabric,
+        history: vec![ChatMessage::system("test")],
+        tools: Default::default(),
+    };
+
+    // A session whose model has no vision refuses uploads.
+    let blind = client.create(creation("blind", false)).unwrap();
+    let refused = client
+        .upload_image(blind.descriptor.id.clone(), &png(4, 4), "x.png".into())
+        .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("not configured for images"),
+        "{refused:#}"
+    );
+
+    let session = client.create(creation("vision", true)).unwrap();
+    let session_id = session.descriptor.id.clone();
+    // Garbage is refused by the daemon's decoder.
+    assert!(
+        client
+            .upload_image(session_id.clone(), b"not an image", "bad.png".into())
+            .is_err()
+    );
+    // A large image is scaled down by the daemon, which reports its own
+    // dimensions.
+    let image = client
+        .upload_image(session_id.clone(), &png(3136, 1000), "wide.png".into())
+        .unwrap();
+    assert_eq!((image.width(), image.height()), (1568, 500));
+    // A reference claiming other dimensions is refused.
+    let forged = xshell_core::ImageRef::new(
+        image.sha256(),
+        image.media_type(),
+        3136,
+        1000,
+        image.byte_len(),
+        "wide.png",
+    )
+    .unwrap();
+    assert!(
+        client
+            .submit(
+                session_id.clone(),
+                TurnInput::Agent {
+                    message: "look".into(),
+                    images: vec![forged],
+                },
+                ApprovalPolicy::Ask,
+            )
+            .is_err()
+    );
+
+    complete_turn(
+        &mut client,
+        &session_id,
+        TurnInput::Agent {
+            message: "what is this?".into(),
+            images: vec![image],
+        },
+    );
+    complete_turn(
+        &mut client,
+        &session_id,
+        TurnInput::agent("view render.png"),
+    );
+    model_server.join().unwrap();
+
+    let bodies = bodies.lock().unwrap();
+    let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let attached = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    assert_eq!(sent_png_dimensions(&attached["content"][1]), (1568, 500));
+    assert!(
+        first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "view_image")
+    );
+    // After the view_image call, the next request carries the file as an
+    // image in a user message after the tool result.
+    let after_view: serde_json::Value = serde_json::from_str(&bodies[2]).unwrap();
+    let messages = after_view["messages"].as_array().unwrap();
+    let tool_index = messages
+        .iter()
+        .position(|message| message["role"] == "tool")
+        .unwrap();
+    assert!(
+        messages[tool_index]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Viewed render.png: 30x20 PNG")
+    );
+    let carrier = &messages[tool_index + 1];
+    assert_eq!(carrier["role"], "user");
+    assert_eq!(sent_png_dimensions(&carrier["content"][1]), (30, 20));
+}
+
 #[test]
 fn a_vision_model_is_shown_the_sessions_stored_images() {
     let (base_url, model_server, bodies) =

@@ -2224,6 +2224,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "clap",
+ "image",
  "libc",
  "serde",
  "serde_json",

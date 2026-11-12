@@ -31,6 +31,7 @@ xshell-pty = { path = "../xshell-pty" }
 
 [dev-dependencies]
 base64.workspace = true
+image.workspace = true
 tempfile = "3.21"
 xshell-audit = { path = "../xshell-audit", features = [] }
 

@@ -628,7 +628,9 @@ pub(crate) async fn execute_view_image(
         Preparation::Failed(message) | Preparation::Blocked(message) => {
             return (message, Vec::new());
         }
-        Preparation::Other => return ("tool error: view_image was not prepared".into(), Vec::new()),
+        Preparation::Other => {
+            return ("tool error: view_image was not prepared".into(), Vec::new());
+        }
     };
     let label = call
         .arguments

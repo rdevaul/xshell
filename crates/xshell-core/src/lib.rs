@@ -38,7 +38,10 @@ pub enum ControlCommand {
     Detach,
     Close(Vec<String>),
     Quit,
-    Unknown { name: String, args: Vec<String> },
+    Unknown {
+        name: String,
+        args: Vec<String>,
+    },
 }
 
 pub fn classify_input(input: &str) -> InputRoute {

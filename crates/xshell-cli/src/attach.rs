@@ -18,11 +18,15 @@ pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>)> {
         .read_to_end(&mut bytes)
         .with_context(|| format!("cannot read {}", path.display()))?;
     if bytes.len() as u64 > limit {
-        bail!("{} is larger than the {limit}-byte image limit", path.display());
+        bail!(
+            "{} is larger than the {limit}-byte image limit",
+            path.display()
+        );
     }
-    let label = path
-        .file_name()
-        .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
+    let label = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     Ok((label, bytes))
 }
 
