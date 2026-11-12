@@ -15,7 +15,7 @@ historical review.
 | F4 | [#54](https://github.com/rdevaul/xshell/issues/54) | P1 | M1.3 prepared file access | Corrected | Sensitivity is stable across cwd changes, nesting, aliases, and sensitive ancestors |
 | F5 | [#55](https://github.com/rdevaul/xshell/issues/55) | P1 | M1.3 prepared file access | Corrected | Replacement hooks cannot substitute sensitive or outside-root bytes after authorization |
 | F6 | [#56](https://github.com/rdevaul/xshell/issues/56) | P1 | M1.4 service bounds | Corrected | A non-acknowledging audit peer cannot freeze unrelated sessions, control, or shutdown |
-| F7 | [#57](https://github.com/rdevaul/xshell/issues/57) | P2 | M1.1 effects and recovery | Open | Injected write/sync/rename failures leave response, memory, and restarted state consistent |
+| F7 | [#57](https://github.com/rdevaul/xshell/issues/57) | P2 | M1.1 effects and recovery | Corrected (incremental writes remain) | Injected write/sync/rename failures leave response, memory, and restarted state consistent |
 | F8 | [#58](https://github.com/rdevaul/xshell/issues/58) | P2 | M1.3 prepared file access | Corrected | File and directory acquisition remain bounded before allocation and control stays responsive |
 | F9 | [#59](https://github.com/rdevaul/xshell/issues/59) | P2 | M1.4 provider bounds | Corrected | Incomplete/error/refusal streams cannot produce executable tool calls |
 | F10 | [#60](https://github.com/rdevaul/xshell/issues/60) | P2 | M1.4 resource bounds | Open (per-turn and daemon-wide budgets landed) | Maximal repeated batches stop at deterministic request, tool, byte, time, and worker budgets |
@@ -43,6 +43,7 @@ historical review.
 4. Correct audit/provider/resource bounds for F6, F9, and F10. (F6 and F9
    done; F10 partly done.)
 5. Complete F7 transactional persistence and crash-durability injection.
+   (Done; per-session incremental writes remain.)
 
 F3 has graceful SIGTERM coverage for agent tools, captured shell commands, and
 PTYs, including descendant-process cleanup and audit-close ordering. A durable
@@ -66,6 +67,19 @@ unparseable arguments. Adapter tests cover each case, and a daemon test shows
 a complete-looking `run_shell` call from a stream that ends early never runs.
 Text-only responses are not held to this rule because they cannot cause
 effects.
+
+F7 is corrected for the session registry. Every mutating operation applies
+its change, writes `sessions.json`, and puts the registry back as it was if
+the write fails, so the caller's error, the live registry, and a restarted
+daemon agree. The write is a synced temporary file, an atomic rename, and an
+`fsync` of the directory; a failure to sync the directory after the rename is
+reported but does not undo the change, because the disk already holds it.
+Changes to sessions that are not durable write nothing. Tests inject write,
+sync, and rename failures into create, update, close, and the end of an
+execution. Only metadata is rolled back: effects outside the registry are
+applied after a successful commit (image removal) or covered by the
+in-flight marker (turns). Every persistence pass still writes all durable
+sessions; per-session incremental writes remain.
 
 F10 is partly corrected (#84): every agent turn, including its subagents,
 draws from one budget of provider requests, tool calls, tool calls per

@@ -8,6 +8,7 @@ mod protocol;
 mod pty;
 mod pty_stream;
 mod registry;
+mod turns;
 mod view;
 
 pub use audit::{
@@ -37,4 +38,7 @@ pub use pty_stream::{
     write_client_frame, write_server_frame,
 };
 pub use registry::SessionRegistry;
+pub use turns::{
+    MAX_RECORDED_ANSWER_BYTES, MAX_TURN_RECORDS, TurnLocation, TurnOutcome, TurnRecord, TurnStore,
+};
 pub use view::load_view_resource;

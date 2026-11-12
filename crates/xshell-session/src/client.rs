@@ -556,6 +556,16 @@ impl SessionClient {
         }
     }
 
+    /// Where `turn_id` is: the session running it, and its durable record
+    /// once it has finished. Fails for a turn the daemon does not know.
+    pub fn locate_turn(&mut self, turn_id: String) -> Result<crate::TurnLocation> {
+        self.send(&ClientRequest::LocateTurn { turn_id })?;
+        match self.receive()? {
+            ServerResponse::TurnLocated { location } => Ok(location),
+            response => response_error("turn lookup", response),
+        }
+    }
+
     pub fn cancel(&mut self, session_id: String, turn_id: String) -> Result<()> {
         self.send(&ClientRequest::Cancel {
             session_id,

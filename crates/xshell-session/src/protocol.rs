@@ -61,6 +61,11 @@ pub enum ClientRequest {
         session_id: String,
         turn_id: String,
     },
+    /// Where a turn is: the session running it, and its durable record once
+    /// it has finished. Served to local clients only.
+    LocateTurn {
+        turn_id: String,
+    },
     CompleteShell {
         session_id: String,
         line: String,
@@ -149,6 +154,9 @@ pub enum ServerResponse {
     },
     ApprovalAccepted,
     CancellationAccepted,
+    TurnLocated {
+        location: crate::TurnLocation,
+    },
     ShellCompletions {
         result: ShellCompletionResult,
     },

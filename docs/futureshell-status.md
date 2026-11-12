@@ -99,7 +99,7 @@ replace FS2–FS4.
 | Turn limits and the `relaxed` profile | Autonomy budget: model rounds and tool dispatches (§9.4) | Usage and assurance labels in the result (H4) |
 | Approval channel (`--approval-channel FD`) | Gateway human-decision events; `on_exhausted request_approval` | Decisions should carry an authorization identity (H3) |
 | Sensitivity `block` class | Read-capability denial | Covers agent read tools only, not `run_shell` (H6) |
-| In-memory event journal | Durable task evidence | Results are lost on daemon restart (H5) |
+| In-memory event journal | Durable task evidence | Each turn's outcome is kept as a durable record addressed by turn ID (H5); the events themselves are not |
 
 ### Harmonization commitments
 
@@ -177,10 +177,14 @@ replace FS2–FS4.
   dispatches with an assurance label (`enforced`; tokens `unavailable`),
   and the audit session, sequence range and record hash of the turn's
   records.
-- **Plan drift (open, H5).** The CAD plan specifies job commands on a turn
-  ID and `wait` reading from the session snapshot. The implementation uses
-  the session and the in-memory journal. Either update the plan or close the
-  gap.
+- **Job identity (H5, closed).** Job commands accept `--turn TURN_ID`.
+  Each finished agent turn leaves a durable record (outcome, reason, answer,
+  usage, audit reference) written before the turn is released, so `result
+  --turn` and `wait --turn` report it after a daemon restart, with the same
+  exit codes. The events themselves still live only in the in-memory
+  journal; the record and the audit log are what survive. Registry
+  persistence is transactional (F7): a failed write leaves the response, the
+  live registry, and restarted state in agreement.
 
 ## Traceability
 
@@ -201,10 +205,11 @@ replace FS2–FS4.
 
 1. ~~Record policy identity, the client overlay, and each decision's source
    in the audit trail (H3)~~ (done, except binding approvals to prepared
-   operations), and resolve the job-identity drift (H5).
+   operations), and ~~resolve the job-identity drift (H5)~~ (done).
 2. ~~Global F10 budgets~~ (concurrent turns, sessions, and per-turn tool
-   output bytes landed); a session's cumulative budget waits on goals. Next,
-   F7 transactional persistence, which H5 also needs.
+   output bytes landed); a session's cumulative budget waits on goals.
+   ~~F7 transactional persistence~~ (done for the registry; per-session
+   incremental writes remain).
 3. Establish the M2 authorization/provider boundary, starting from the
    approval policy's decision function. Grants bind to the prepared
    operations produced by M1.3.
