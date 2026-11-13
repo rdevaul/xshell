@@ -1048,6 +1048,18 @@ mod tests {
             "cp /bin/rm ~/bin/x; x -rf build",
             "cat /bin/rm > rr && ./rr -rf build",
             "rm -rf \"build;\"",
+            // Quoting and escaping the command word.
+            "r''m -rf build",
+            "\\rm -rf build",
+            "'rm' -rf build",
+            "\"rm\" -rf build",
+            "r\\m -rf build",
+            // Wrapper flags the parser does not see through.
+            "env -S 'rm -rf build'",
+            "command -p rm -rf build",
+            "exec -a x rm -rf build",
+            "nohup -- rm -rf build",
+            "time -- rm -rf build",
         ] {
             let decided = base(&rules, &shell(command));
             assert!(
