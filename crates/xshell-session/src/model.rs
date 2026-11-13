@@ -154,9 +154,54 @@ impl SessionConfig {
         )
     }
 
-    /// Paths agent read tools may never read.
+    /// Paths agent read tools may never read: the configured `block`
+    /// classes. Daemons and clients use [`Self::protected_paths`], which
+    /// adds xshell's own files.
     pub fn blocked_paths(&self) -> xshell_execution::SensitivePaths {
         xshell_execution::SensitivePaths::new(self.class_patterns(SensitivityAction::Block))
+    }
+
+    /// The `block` classes plus xshell's own state, which agent read tools
+    /// may never read whatever the configuration says (finding F24): the
+    /// session state directory (every durable session's history, the image
+    /// store, turn records), the audit log directory, and the configuration
+    /// file. Without this, a session whose working directory is the home
+    /// directory could read back, without approval, a secret it was once
+    /// approved to see, or another session's conversation.
+    ///
+    /// Each is anchored to its resolved absolute path. The configuration
+    /// file's whole directory is blocked only when it is xshell's own
+    /// (named `xshell`), so `--config ./xshell.toml` in a project does not
+    /// block the project.
+    /// `state_directory` is the one in use, when a command line chose it;
+    /// otherwise the configured or default one.
+    pub fn protected_paths(
+        &self,
+        state_directory: Option<&std::path::Path>,
+        config_file: Option<&std::path::Path>,
+        audit_directory: Option<&std::path::Path>,
+    ) -> xshell_execution::SensitivePaths {
+        let mut patterns: Vec<String> = self.class_patterns(SensitivityAction::Block).collect();
+        let mut directories: Vec<PathBuf> = Vec::new();
+        directories.extend(
+            state_directory
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| self.resolved_state_directory()),
+        );
+        directories.extend(audit_directory.map(std::path::Path::to_path_buf));
+        if let Some(parent) = config_file
+            .and_then(std::path::Path::parent)
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "xshell"))
+        {
+            directories.push(parent.to_path_buf());
+        }
+        for directory in directories {
+            patterns.push(format!("{}/**", anchored(&directory)));
+        }
+        if let Some(file) = config_file {
+            patterns.push(anchored(file));
+        }
+        xshell_execution::SensitivePaths::new(patterns)
     }
 
     fn class_patterns(&self, action: SensitivityAction) -> impl Iterator<Item = String> + '_ {
@@ -228,6 +273,22 @@ impl SessionConfig {
             self.resolved_state_directory()
                 .map(|directory| directory.join("xshelld.sock"))
         })
+    }
+}
+
+/// `path` as an anchored pattern: canonical where it exists (matching is on
+/// canonical paths), absolute otherwise, without a trailing `/`.
+fn anchored(path: &std::path::Path) -> String {
+    let resolved = path
+        .canonicalize()
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy().replace('\\', "/");
+    let trimmed = text.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
     }
 }
 
@@ -627,6 +688,46 @@ pub struct PtyTicket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f24_xshells_own_state_config_and_audit_are_always_blocked() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let state = root.join("state");
+        let audit = root.join("audit");
+        let config_dir = root.join("home/.config/xshell");
+        for directory in [&state, &audit, &config_dir] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let config_file = config_dir.join("config.toml");
+        std::fs::write(&config_file, "").unwrap();
+        let config = SessionConfig::default();
+        let blocked = config.protected_paths(Some(&state), Some(&config_file), Some(&audit));
+        for path in [
+            state.join("sessions.json"),
+            state.join("images/abc/def"),
+            state.clone(),
+            audit.join("sessions/one.jsonl"),
+            config_file.clone(),
+            config_dir.join("other.toml"),
+        ] {
+            assert!(blocked.matches(&path), "{} was not blocked", path.display());
+        }
+        // Case variants are blocked too (F13 folding).
+        let upper = state.join("SESSIONS.JSON");
+        assert!(blocked.matches(&upper));
+        // A project beside them is not.
+        assert!(!blocked.matches(&root.join("project/src/main.rs")));
+
+        // A config file outside an `xshell` directory blocks only itself.
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let local_config = project.join("xshell.toml");
+        std::fs::write(&local_config, "").unwrap();
+        let blocked = config.protected_paths(Some(&state), Some(&local_config), None);
+        assert!(blocked.matches(&local_config));
+        assert!(!blocked.matches(&project.join("README.md")));
+    }
 
     #[test]
     fn daemon_budgets_default_and_must_allow_one() {
