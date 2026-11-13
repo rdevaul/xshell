@@ -97,13 +97,33 @@ impl SessionRegistry {
             }
             for mut snapshot in state.sessions {
                 validate_name(&snapshot.descriptor.name)?;
-                snapshot.descriptor.cwd = validate_working_directory(&snapshot.descriptor.cwd)
-                    .with_context(|| {
-                        format!(
-                            "invalid working directory for durable session {:?}",
-                            snapshot.descriptor.name
-                        )
-                    })?;
+                // A durable session whose directory has gone (a deleted
+                // project, an ejected volume) must not keep the daemon from
+                // starting (F21): it moves to a fallback directory, and its
+                // history says so.
+                match validate_working_directory(&snapshot.descriptor.cwd) {
+                    Ok(cwd) => snapshot.descriptor.cwd = cwd,
+                    Err(error) => {
+                        let fallback = fallback_working_directory();
+                        eprintln!(
+                            "xshelld warning: durable session {:?}: its working directory {} is \
+unavailable ({error:#}); using {}",
+                            snapshot.descriptor.name,
+                            snapshot.descriptor.cwd.display(),
+                            fallback.display()
+                        );
+                        snapshot
+                            .history
+                            .push(xshell_core::ChatMessage::system(format!(
+                                "[xshell recovery] the working directory {} was unavailable when \
+the session host started; the session now runs in {}",
+                                snapshot.descriptor.cwd.display(),
+                                fallback.display()
+                            )));
+                        snapshot.descriptor.cwd = fallback;
+                        recovered_in_flight = true;
+                    }
+                }
                 if snapshot.descriptor.persistence != PersistenceMode::Durable {
                     bail!("non-durable session found in durable state");
                 }
@@ -130,12 +150,18 @@ impl SessionRegistry {
                 }
             }
             for operation in state.in_flight {
-                let record = sessions.get_mut(&operation.session_id).with_context(|| {
-                    format!(
-                        "in-flight operation {:?} references an unknown durable session",
-                        operation.operation_id
-                    )
-                })?;
+                // A marker whose session is gone (closed while its turn ran,
+                // under an older daemon) has nothing left to recover; it
+                // must not keep the daemon from starting (F21).
+                let Some(record) = sessions.get_mut(&operation.session_id) else {
+                    eprintln!(
+                        "xshelld warning: dropping in-flight {} operation {} of a session that no \
+longer exists",
+                        operation.route, operation.operation_id
+                    );
+                    recovered_in_flight = true;
+                    continue;
+                };
                 let recovery = format!(
                     "[xshell recovery] outcome_unknown: {route} operation {operation_id} was interrupted before a terminal outcome was persisted; inspect external effects before retrying",
                     route = operation.route,
@@ -419,6 +445,14 @@ close one to create another",
     ) -> Result<SessionDescriptor> {
         let cwd = validate_working_directory(&cwd)?;
         if !self.sessions.contains_key(session_id) {
+            // The session was closed while the turn ran. Its in-flight
+            // marker goes with it, so no stale marker is persisted (F21).
+            if self.in_flight.contains_key(session_id) {
+                self.commit(session_id, |registry| {
+                    registry.in_flight.remove(session_id);
+                    Ok(())
+                })?;
+            }
             bail!("unknown session {session_id:?}");
         }
         let now = timestamp_ms()?;
@@ -449,8 +483,12 @@ close one to create another",
                 record.snapshot.descriptor.name
             );
         }
+        // A turn still running in the closed session cannot finish its
+        // operation any more, so its marker is removed with the session
+        // rather than left to block the next start (F21).
         self.commit(&id, |registry| {
             registry.sessions.remove(&id);
+            registry.in_flight.remove(&id);
             Ok(())
         })?;
         self.remove_images(&id);
@@ -710,6 +748,15 @@ fn validate_name(name: &str) -> Result<()> {
         bail!("session names may contain only ASCII letters, digits, '-' and '_'");
     }
     Ok(())
+}
+
+/// Where a durable session whose directory has gone runs instead: the
+/// user's home directory, or `/` without one.
+fn fallback_working_directory() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| validate_working_directory(&home).ok())
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn ensure_state_directory(path: &Path) -> Result<()> {
@@ -1052,6 +1099,92 @@ mod tests {
         // before selections existed reads back as every tool.
         let saved = std::fs::read_to_string(temp.path().join("sessions.json")).unwrap();
         assert_eq!(saved.matches("\"tools\"").count(), 1, "{saved}");
+    }
+
+    #[test]
+    fn f21_closing_a_session_during_a_turn_leaves_no_marker_to_block_startup() {
+        let temp = TempDir::new().unwrap();
+        create_durable(temp.path(), Vec::new());
+        let mut registry = load(temp.path()).unwrap();
+        let id = registry.snapshot("ornithopter").unwrap().descriptor.id;
+        registry
+            .attach("client", &id, AttachmentRole::Owner)
+            .unwrap();
+        registry.begin_execution(&id, "turn-1", "agent").unwrap();
+        registry.close("client", &id).unwrap();
+        // The turn ends after the close, as a running turn does.
+        assert!(
+            registry
+                .update_execution_state(&id, temp.path().into(), Vec::new())
+                .is_err()
+        );
+        drop(registry);
+        let restored = load(temp.path()).unwrap();
+        assert!(restored.list().is_empty());
+        let saved = std::fs::read_to_string(temp.path().join("sessions.json")).unwrap();
+        assert!(!saved.contains("turn-1"), "{saved}");
+    }
+
+    #[test]
+    fn f21_an_orphaned_marker_from_an_older_daemon_is_dropped_at_startup() {
+        let temp = TempDir::new().unwrap();
+        create_durable(temp.path(), Vec::new());
+        let state_path = temp.path().join("sessions.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        state["in_flight"] = serde_json::json!([{
+            "session_id": "33333333-3333-4333-8333-333333333333",
+            "operation_id": "turn-orphan",
+            "route": "agent",
+        }]);
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let restored = load(temp.path()).unwrap();
+        assert!(restored.snapshot("ornithopter").is_ok());
+        let saved = std::fs::read_to_string(&state_path).unwrap();
+        assert!(
+            !saved.contains("turn-orphan"),
+            "the marker was kept: {saved}"
+        );
+    }
+
+    #[test]
+    fn f21_a_session_whose_directory_is_gone_moves_instead_of_blocking_startup() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut registry = load(temp.path()).unwrap();
+        let created = registry
+            .create(
+                "client",
+                creation(
+                    "project",
+                    &project,
+                    PersistenceMode::Durable,
+                    Visibility::Fabric,
+                    vec![ChatMessage::user("hello")],
+                ),
+            )
+            .unwrap();
+        registry.detach("client", &created.descriptor.id).unwrap();
+        drop(registry);
+        std::fs::remove_dir(&project).unwrap();
+
+        let restored = load(temp.path()).unwrap();
+        let snapshot = restored.snapshot("project").unwrap();
+        assert_ne!(snapshot.descriptor.cwd, project);
+        assert!(snapshot.descriptor.cwd.is_dir());
+        let note = &snapshot.history.last().unwrap().content;
+        assert!(note.contains("was unavailable"), "{note}");
+        // The move is saved, so the next start loads cleanly too.
+        assert_eq!(
+            load(temp.path())
+                .unwrap()
+                .snapshot("project")
+                .unwrap()
+                .history,
+            snapshot.history
+        );
     }
 
     fn create_durable(path: &Path, history: Vec<ChatMessage>) {

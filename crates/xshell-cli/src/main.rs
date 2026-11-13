@@ -195,7 +195,13 @@ async fn main() -> Result<()> {
     };
     let base_policy = TurnPolicy::new(args.approval)
         .with_sensitive_paths(model_config.session_fabric.sensitive_paths())
-        .with_blocked_paths(model_config.session_fabric.blocked_paths())
+        // The block classes plus xshell's own state, config and audit
+        // directories, which standalone turns may not read either (F24).
+        .with_blocked_paths(model_config.session_fabric.protected_paths(
+            None,
+            Some(&config_path),
+            model_config.audit.directory.as_deref(),
+        ))
         .with_rules(xshell_execution::ApprovalRules {
             base: {
                 let (policy, warnings) = model_config.session_fabric.approval_policy()?;
