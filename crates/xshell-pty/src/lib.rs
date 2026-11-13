@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use nix::pty::Winsize;
-use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
+use nix::sys::termios::{FlushArg, SetArg, Termios, cfmakeraw, tcflush, tcgetattr, tcsetattr};
 use std::env;
 use std::ffi::CStr;
 use std::fs::File;
@@ -227,10 +227,29 @@ impl ControllerInput {
         ))
     }
 
+    /// Drop every byte the terminal has received but xshell has not read,
+    /// including a half-typed escape sequence. Called before and just after an
+    /// approval prompt so keys typed while the agent was working cannot answer
+    /// it (F20).
+    pub fn discard_pending(&mut self) -> Result<()> {
+        self.prefix_pending = false;
+        discard_terminal_input(self.descriptor)
+    }
+
     /// Restore cooked input before displaying a picker or line editor.
     pub fn restore(&mut self) -> Result<()> {
         self.guard.restore()
     }
+}
+
+/// Discard input queued on a terminal that nothing has read yet
+/// (`tcflush(TCIFLUSH)`), in raw or canonical mode. A partial canonical line is
+/// dropped too, although its echo stays on the screen.
+pub fn discard_terminal_input(descriptor: RawFd) -> Result<()> {
+    // SAFETY: callers pass a descriptor they hold open (the process's stdin or
+    // a controller's terminal) for the duration of this call.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(descriptor) };
+    tcflush(borrowed, FlushArg::TCIFLUSH).context("cannot discard pending terminal input")
 }
 
 /// An exchange-driven PTY process. The caller supplies bounded input and drains
@@ -1202,6 +1221,72 @@ mod tests {
         assert_eq!(restored.output_flags, original.output_flags);
         assert!(restored.local_flags.contains(LocalFlags::ICANON));
         assert!(restored.local_flags.contains(LocalFlags::ECHO));
+    }
+
+    /// F20: bytes typed before an approval prompt is drawn are thrown away,
+    /// and keys typed afterwards still arrive.
+    #[test]
+    fn f20_typeahead_before_a_prompt_is_discarded() {
+        let OpenptyResult { master, slave } = openpty(None, None).unwrap();
+        let original = tcgetattr(slave.as_fd()).unwrap();
+        let guard = TerminalGuard::enter_input_raw(slave.as_raw_fd(), original).unwrap();
+        let mut controller = ControllerInput {
+            descriptor: slave.as_raw_fd(),
+            guard,
+            escape_prefix: 0x1d,
+            prefix_pending: false,
+        };
+        let mut keyboard = File::from(master);
+
+        // Typed while the agent works, including a dangling escape prefix.
+        keyboard.write_all(b"why y\r\x1d").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut readable = libc::pollfd {
+            fd: slave.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd, matching the count of 1.
+        while unsafe { libc::poll(&mut readable, 1, 10) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "typeahead never arrived"
+            );
+        }
+        controller.discard_pending().unwrap();
+        assert_eq!(
+            controller.read(Duration::from_millis(50)).unwrap(),
+            (Vec::new(), None),
+            "typeahead survived the flush"
+        );
+        assert!(!controller.prefix_pending);
+
+        keyboard.write_all(b"n").unwrap();
+        let mut answer = Vec::new();
+        while answer.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "answer never arrived");
+            answer = controller.read(Duration::from_millis(50)).unwrap().0;
+        }
+        assert_eq!(answer, b"n");
+    }
+
+    /// F20: the line-mode prompt discards a whole typed-ahead line.
+    #[test]
+    fn f20_discard_drops_a_typed_ahead_canonical_line() {
+        let OpenptyResult { master, slave } = openpty(None, None).unwrap();
+        let mut keyboard = File::from(master);
+        keyboard.write_all(b"y\n").unwrap();
+        let mut readable = libc::pollfd {
+            fd: slave.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd, matching the count of 1.
+        assert_eq!(unsafe { libc::poll(&mut readable, 1, 2000) }, 1);
+        discard_terminal_input(slave.as_raw_fd()).unwrap();
+        readable.revents = 0;
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::poll(&mut readable, 1, 50) }, 0);
     }
 
     #[test]
