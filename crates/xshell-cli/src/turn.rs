@@ -1,5 +1,6 @@
 //! Agent turns: the local `TurnObserver`, daemon event following, approval prompts, and tool-result display.
 
+use crate::approval_keys::{APPROVAL_SETTLE, ApprovalKeys, KeyOutcome};
 use crate::audit::AuditRuntime;
 use crate::completion::XshellHelper;
 use crate::config::ActiveModel;
@@ -318,43 +319,80 @@ fn confirm_daemon_tool(
         GateReason::Policy => " (the approval policy requires approval)".to_owned(),
         GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),
     };
-    print!(
-        "Approve `{}`{why}? [y/N/q] ",
+    let prompt = format!(
+        "Approve `{}`{why}? [y+Enter/N/q] ",
         escape_for_prompt(&tools::summary(call))
     );
-    io::stdout().flush()?;
+    // F20: keys typed while the agent worked, or in flight when the prompt
+    // appeared, must not answer it. See `approval_keys` for the rules.
+    let mut keys = ApprovalKeys::default();
     loop {
-        let (bytes, action) = controller.read(Duration::from_millis(100))?;
-        if let Some(action) = action {
-            match action {
-                xshell_pty::ControllerAction::Help => print_controller_help()?,
-                xshell_pty::ControllerAction::Terminate => {
-                    println!("q");
-                    return Ok(ApprovalPromptOutcome::Decision(ApprovalDecision::AbortTurn));
-                }
-                action => {
-                    println!();
-                    return Ok(ApprovalPromptOutcome::Focus(action));
+        controller.discard_pending()?;
+        print!("{prompt}");
+        io::stdout().flush()?;
+        let settled = std::time::Instant::now() + APPROVAL_SETTLE;
+        let mut discarded = false;
+        while let Some(wait) = settled.checked_duration_since(std::time::Instant::now()) {
+            let (bytes, action) = controller.read(wait)?;
+            discarded |= !bytes.is_empty() || action.is_some();
+        }
+        controller.discard_pending()?;
+        if discarded {
+            print!("\x07");
+            io::stdout().flush()?;
+        }
+        keys.clear();
+        let outcome = loop {
+            let (bytes, action) = controller.read(Duration::from_millis(100))?;
+            if let Some(action) = action {
+                match action {
+                    xshell_pty::ControllerAction::Help => print_controller_help()?,
+                    xshell_pty::ControllerAction::Terminate => {
+                        println!("q");
+                        return Ok(ApprovalPromptOutcome::Decision(ApprovalDecision::AbortTurn));
+                    }
+                    action => {
+                        println!();
+                        return Ok(ApprovalPromptOutcome::Focus(action));
+                    }
                 }
             }
-        }
-        for byte in bytes {
-            let decision = match byte.to_ascii_lowercase() {
-                b'y' => Some(ApprovalDecision::Approve),
-                b'n' | b'\r' | b'\n' => Some(ApprovalDecision::Deny),
-                b'q' => Some(ApprovalDecision::AbortTurn),
-                _ => None,
-            };
-            if let Some(decision) = decision {
+            if bytes.is_empty() {
+                continue;
+            }
+            let shown = keys.typed().len();
+            let outcome = keys.feed(&bytes);
+            if outcome == KeyOutcome::Pending {
+                // Echo the partial `yes`, honouring backspace.
+                let typed = keys.typed();
+                for _ in typed.len()..shown {
+                    print!("\x08 \x08");
+                }
+                if typed.len() > shown {
+                    print!("{}", String::from_utf8_lossy(&typed[shown..]));
+                }
+                io::stdout().flush()?;
+                continue;
+            }
+            break outcome;
+        };
+        match outcome {
+            KeyOutcome::Decided(decision) => {
                 println!(
-                    "{}",
+                    "\r\n{}",
                     match decision {
-                        ApprovalDecision::Approve => "y",
-                        ApprovalDecision::Deny => "n",
-                        ApprovalDecision::AbortTurn => "q",
+                        ApprovalDecision::Approve => "approved",
+                        ApprovalDecision::Deny => "denied",
+                        ApprovalDecision::AbortTurn => "turn aborted",
                     }
                 );
                 return Ok(ApprovalPromptOutcome::Decision(decision));
+            }
+            KeyOutcome::Reprompt | KeyOutcome::Pending => {
+                println!(
+                    "\r\nNot an answer; pending input discarded. Type y then Enter to approve, \
+                     n or Enter to deny, q to abort the turn."
+                );
             }
         }
     }
@@ -765,6 +803,9 @@ pub(crate) fn confirm_tool(call: &ToolCall, reason: GateReason) -> Result<Approv
             GateReason::Policy => " (the approval policy requires approval)".to_owned(),
             GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),
         };
+        // F20: a line typed ahead of the prompt, or while it was being drawn,
+        // is discarded rather than taken as the answer.
+        crate::approval_keys::discard_line_typeahead()?;
         print!(
             "Approve `{}`{why}? [y/N/q] ",
             escape_for_prompt(&tools::summary(call))
@@ -772,6 +813,7 @@ pub(crate) fn confirm_tool(call: &ToolCall, reason: GateReason) -> Result<Approv
         io::stdout()
             .flush()
             .context("could not flush approval prompt")?;
+        crate::approval_keys::settle_line_prompt()?;
         let mut answer = String::new();
         let bytes_read = io::stdin()
             .read_line(&mut answer)

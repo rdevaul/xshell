@@ -194,7 +194,7 @@ likely. Priority 2 covers journeys every release should keep working.
 | Detach from a running turn with `ctrl-] d`, then run `//sessions` (#100) | The CLI keeps running, the listing shows the turn running, and the daemon's conversation is untouched |
 | A turn finishes while detached | The next prompt reports it, the CLI adopts the daemon's conversation, and the next sync does not overwrite it |
 | `//resume` a detached turn | Output produced while detached is redrawn, and the turn's completion is followed |
-| Approval prompt: `y`, `n`, `q` | Each decision reaches the daemon; `q` aborts the turn; a denied command never runs (marker file) |
+| Approval prompt: `y` Enter, `n`, `q` | Each decision reaches the daemon; `q` aborts the turn; a denied command never runs (marker file); typeahead and a word containing `y` do not approve (F20) |
 | `ctrl-] q` during a turn | The turn is cancelled, and the prompt and daemon both return to idle |
 | An interactive `$` command, then `ctrl-] d` and `//resume` | The terminal is restored after detaching, and resuming reattaches with recent output |
 | CLI exit and restart | Sessions survive. Restarting reattaches the default session with its history, including a turn still running when the CLI exited |
