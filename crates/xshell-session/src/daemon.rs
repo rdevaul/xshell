@@ -11,7 +11,7 @@ use crate::{
     DaemonAudit, DaemonPolicy, DaemonProbeReport, DaemonProbeStatus, ExecutionCoordinator,
     PersistenceMode, PtyAudit, PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame,
     ServerResponse, SessionActivity, SessionConfig, SessionHandshake, SessionRegistry,
-    complete_shell, load_view_resource, read_client_frame, write_server_frame,
+    complete_shell, load_view_resource, read_client_frame, tokens_match, write_server_frame,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -223,16 +223,27 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
             credential_routes,
             // The block classes plus this daemon's own state, config and
             // audit directories (F24).
-            config.protected_paths(
-                Some(&state_directory),
-                config_path.as_deref(),
-                audit_config.directory.as_deref(),
+            // The control token beside the socket is blocked too, in case
+            // the socket lives outside the state directory (F27).
+            with_blocked_file(
+                config.protected_paths(
+                    Some(&state_directory),
+                    config_path.as_deref(),
+                    audit_config.directory.as_deref(),
+                ),
+                &crate::control_token_path(&socket),
             ),
         )?,
     );
     let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
 
+    // Orphaned descendants are re-parented to the daemon, so a child that
+    // double-forks is still recognised as one (F27).
+    xshell_platform::become_child_subreaper();
     prepare_socket(&socket)?;
+    // A fresh token for this run, written before the socket accepts anyone
+    // (F27). Clients read it from beside the socket.
+    let control_token = Arc::new(crate::write_new_token(&crate::control_token_path(&socket))?);
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("cannot bind session socket {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -295,8 +306,11 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
                 let registry = Arc::clone(&registry);
                 let execution = execution.clone();
                 let ptys = ptys.clone();
+                let control_token = Arc::clone(&control_token);
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, registry, execution, ptys) {
+                    if let Err(error) =
+                        handle_client(stream, registry, execution, ptys, &control_token)
+                    {
                         eprintln!("xshelld client error: {error:#}");
                     }
                 });
@@ -695,9 +709,15 @@ fn serve_stdio(socket: &Path) -> Result<()> {
     let mut client_reader = BufReader::new(stdin.lock());
     let mut client_writer = stdout.lock();
 
+    // The remote client is authenticated by SSH as this user; the proxy
+    // presents this host's control token for it, whatever the client sent.
+    let local_token = crate::read_token(&crate::control_token_path(socket))?;
     while let Some(line) = read_request_line(&mut client_reader)? {
-        let request: ClientRequest =
+        let mut request: ClientRequest =
             serde_json::from_str(&line).context("invalid stdio request")?;
+        if let ClientRequest::Open { token, .. } = &mut request {
+            *token = Some(local_token.clone());
+        }
         if let Some(response) =
             reject_remote_request(&request, &mut daemon_reader, &mut daemon_writer)?
         {
@@ -742,9 +762,11 @@ fn serve_pty_stdio(socket: &Path) -> Result<()> {
     if ticket.is_empty() || ticket.len() > 128 {
         bail!("invalid PTY stream ticket");
     }
+    // A PTY stream is claimed on an authenticated connection only (F27).
+    let local_token = crate::read_token(&crate::control_token_path(socket))?;
     send_request(
         &mut daemon_writer,
-        &ClientRequest::open(env!("CARGO_PKG_VERSION")),
+        &ClientRequest::open_with_token(env!("CARGO_PKG_VERSION"), local_token),
     )?;
     match receive_response(&mut daemon_reader)? {
         ServerResponse::Opened { .. } => {}
@@ -875,7 +897,18 @@ fn handle_client(
     registry: Arc<Mutex<SessionRegistry>>,
     execution: ExecutionCoordinator,
     ptys: PtyCoordinator,
+    control_token: &str,
 ) -> Result<()> {
+    // A process the daemon started (an agent `run_shell` child, a `$`
+    // command, a terminal job, or anything they spawned) may never control
+    // the daemon, whatever it presents (F27). The daemon's own in-process
+    // connections are allowed.
+    let own_pid = std::process::id();
+    // Fail closed: a peer whose process cannot be identified is treated as
+    // one of the daemon's own descendants (F27).
+    let peer_is_descendant = xshell_platform::peer_pid(&stream).map_or(true, |pid| {
+        pid != own_pid && xshell_platform::is_descendant_of(pid, own_pid)
+    });
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let Some(line) = read_request_line(&mut reader)? else {
@@ -885,6 +918,7 @@ fn handle_client(
     let ClientRequest::Open {
         protocol_version,
         client_version: _,
+        token,
     } = request
     else {
         send_error(
@@ -906,6 +940,28 @@ fn handle_client(
         )?;
         return Ok(());
     }
+    if peer_is_descendant {
+        send_error(
+            &mut writer,
+            "forbidden_descendant",
+            "processes started by this session host may not control it",
+        )?;
+        return Ok(());
+    }
+    // Without a token the connection may learn only what a probe learns;
+    // a wrong token is refused outright (F27).
+    let authenticated = match &token {
+        Some(token) if tokens_match(token, control_token) => true,
+        Some(_) => {
+            send_error(
+                &mut writer,
+                "unauthorized",
+                "the control token is not this session host's",
+            )?;
+            return Ok(());
+        }
+        None => false,
+    };
 
     let client_id = Uuid::new_v4().to_string();
     {
@@ -940,6 +996,16 @@ fn handle_client(
                 continue;
             }
         };
+        if !authenticated {
+            if let Err(error) = send_error(
+                &mut writer,
+                "unauthorized",
+                "this connection did not present the session host's control token",
+            ) {
+                break Err(error);
+            }
+            continue;
+        }
         if let ClientRequest::PtyClaim { ticket } = request {
             let claim = match ptys.claim(&ticket) {
                 Ok(claim) => claim,
@@ -1516,6 +1582,25 @@ fn prepare_socket(path: &Path) -> Result<()> {
             .with_context(|| format!("cannot remove stale session socket {}", path.display()))?;
     }
     Ok(())
+}
+
+/// `blocked` plus one more file, matched at its resolved absolute path.
+fn with_blocked_file(
+    blocked: xshell_execution::SensitivePaths,
+    file: &Path,
+) -> xshell_execution::SensitivePaths {
+    let anchored = file
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(file.file_name())
+        .map_or_else(|| file.to_path_buf(), |(parent, name)| parent.join(name));
+    xshell_execution::SensitivePaths::new(
+        blocked
+            .patterns()
+            .iter()
+            .cloned()
+            .chain(std::iter::once(anchored.to_string_lossy().into_owned())),
+    )
 }
 
 /// Take an exclusive lock on the state directory, so a second daemon cannot
