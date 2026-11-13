@@ -27,6 +27,7 @@ historical review.
 | F17 | [#133](https://github.com/rdevaul/xshell/issues/133) | P0 | M1.2 cancellation and shutdown | Corrected (processes that `setsid` away are not contained) | A background job holding the pipes is killed at the timeout, at cancellation (its marker never appears), and after a short grace following a normal exit; the call returns promptly |
 | F18 | [#134](https://github.com/rdevaul/xshell/issues/134) | P0 | M1.4 credential bounds | Corrected (allowlist is a constant; configurability is follow-up) | The provider key variable and an arbitrary daemon variable are absent from `run_shell` output |
 | F20 | [#136](https://github.com/rdevaul/xshell/issues/136) | P1 | Approval integrity | Corrected | Typeahead before the prompt is discarded on a PTY; "why", "okay" and a `y` with input behind its Enter re-prompt instead of approving; only `y`/`yes` + Enter approves; Enter alone denies |
+| F23 | [#139](https://github.com/rdevaul/xshell/issues/139) | P1 | M1.4 credential bounds | Corrected (a keyless binding may still name any endpoint) | A client binding that names an arbitrary variable, or a configured variable with another endpoint, is refused at create, update, and turn start, and nothing reaches its endpoint; a binding one host supplied is never sent to another; a key over plain http to a non-loopback host is refused while loopback http works; a provider redirect is not followed |
 
 ## Evidence rules
 
@@ -111,6 +112,28 @@ already required a whole `y`/`yes` line; they gain the flushes. Piped stdin
 is not a terminal and is read as before. Evidence: the `f20_*` tests in
 `xshell-cli/src/approval_keys.rs` and `xshell-pty/src/lib.rs`, the latter on a
 real PTY.
+
+F23 (#139) is corrected. A session's model binding comes from a client, and
+the daemon read whatever variable its `api_key_env` named and sent it as a
+bearer token to its `base_url`, so any attached client could send
+`GITHUB_TOKEN` to its own server. The daemon now reads the `[models.NAME]`
+profiles of its own configuration and accepts a binding that names a
+credential only when a profile has the same provider, `base_url` (the
+provider default when omitted; trailing `/` ignored), and `api_key_env`.
+`OPENAI_API_KEY` to `https://api.openai.com` is built in, matching the
+client's default for `--provider openai`. The check runs when a session is
+created, when an update changes the binding, and when an agent turn starts,
+so a saved session whose profile was removed cannot use the key. A binding
+with no credential may still name any endpoint. The client marks a binding
+it adopts from a session with that session's host and never sends it to
+another host: `//connect` and `//new` use the local profile of the same name
+instead, or the model the client started with. The OpenAI-compatible adapter
+refuses to attach a key over plain `http` except to `localhost`,
+`127.0.0.0/8`, or `::1` (the Ollama adapter sends no key), and neither
+adapter follows redirects. Evidence: the `f23_*` tests in
+`xshell-session/src/credentials.rs`, `xshell-session/tests/service.rs`,
+`xshell-adapters/src/lib.rs`, and the CLI's `config.rs`, `session.rs`, and
+`sessions_ui.rs`.
 
 F9 is corrected. Both adapters hand tool calls to the engine only from a
 response the provider finished normally: the OpenAI-compatible adapter needs

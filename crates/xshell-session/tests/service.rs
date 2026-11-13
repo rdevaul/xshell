@@ -3685,3 +3685,150 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
 fn interactive() -> xshell_execution::ApprovalSource {
     xshell_execution::ApprovalSource::new(xshell_execution::Approver::Interactive)
 }
+
+/// Start xshelld with `config` as its configuration and `F23_ROUTED_KEY` and
+/// `F23_UNROUTED_SECRET` in its environment.
+fn f23_daemon(temporary: &TempDir, config: &str) -> (Daemon, PathBuf) {
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let config_path = temporary.path().join("config.toml");
+    std::fs::write(&config_path, config).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--config", config_path.to_str().unwrap()])
+        .args(["--state-directory", state.to_str().unwrap()])
+        .args(["--socket", socket.to_str().unwrap()])
+        .env("F23_ROUTED_KEY", "routed-key-value")
+        .env("F23_UNROUTED_SECRET", "unrouted-secret-value")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    (Daemon(child), socket)
+}
+
+fn f23_binding(base_url: &str, api_key_env: Option<&str>) -> ModelBinding {
+    ModelBinding {
+        profile_name: Some("router".into()),
+        provider: "openai".into(),
+        model: "fake-model".into(),
+        base_url: base_url.into(),
+        api_key_env: api_key_env.map(str::to_owned),
+        max_history_bytes: None,
+        context_tokens: None,
+        reserve_output_tokens: None,
+        vision: false,
+    }
+}
+
+#[test]
+fn f23_a_client_cannot_route_an_unconfigured_credential() {
+    // A listener standing in for the attacker's endpoint. Nothing may
+    // connect to it: every binding below that names it carries a credential
+    // the daemon's configuration does not send there.
+    let attacker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let attacker_url = format!("http://{}/v1", attacker.local_addr().unwrap());
+    let temporary = TempDir::new().unwrap();
+    let configured_url = "http://127.0.0.1:9/v1";
+    let config = format!(
+        "[models.router]\nprovider = \"openai\"\nmodel = \"fake-model\"\n\
+base_url = \"{configured_url}\"\napi_key_env = \"F23_ROUTED_KEY\"\n"
+    );
+    let (daemon, socket) = f23_daemon(&temporary, &config);
+    let mut client = connect_when_ready(&socket);
+    let creation = |name: &str, model: ModelBinding| SessionCreation {
+        name: name.into(),
+        model,
+        cwd: temporary.path().into(),
+        persistence: PersistenceMode::Durable,
+        visibility: Visibility::Fabric,
+        history: vec![ChatMessage::system("test")],
+        tools: Default::default(),
+    };
+
+    // Creating a session that names an arbitrary variable is refused, and
+    // so is a configured variable aimed at another endpoint.
+    for binding in [
+        f23_binding(&attacker_url, Some("F23_UNROUTED_SECRET")),
+        f23_binding(&attacker_url, Some("F23_ROUTED_KEY")),
+        f23_binding(configured_url, Some("F23_UNROUTED_SECRET")),
+    ] {
+        let error = client
+            .create(creation("refused", binding))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no model profile"), "{error}");
+        assert!(!error.contains("value"), "{error}");
+    }
+
+    // The same holds for updating an existing session.
+    let session = client
+        .create(creation("keyless", f23_binding(&attacker_url, None)))
+        .unwrap();
+    let session_id = session.descriptor.id.clone();
+    let error = client
+        .update(
+            session_id.clone(),
+            f23_binding(&attacker_url, Some("F23_UNROUTED_SECRET")),
+            temporary.path().into(),
+            vec![ChatMessage::system("test")],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no model profile"), "{error}");
+
+    // The configured route is accepted.
+    client
+        .update(
+            session_id.clone(),
+            f23_binding(configured_url, Some("F23_ROUTED_KEY")),
+            temporary.path().into(),
+            vec![ChatMessage::system("test")],
+        )
+        .unwrap();
+    drop(client);
+    drop(daemon);
+
+    // Restarted without that profile, the daemon still holds the saved
+    // session's binding, and refuses to run a turn with it rather than
+    // read and send the credential.
+    let (_daemon, socket) = f23_daemon(&temporary, "");
+    let mut client = connect_when_ready(&socket);
+    client.attach(session_id.clone()).unwrap();
+    client
+        .submit(
+            session_id.clone(),
+            TurnInput::Agent {
+                message: "hello".into(),
+                images: Vec::new(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    let mut after = 0;
+    let mut failure = None;
+    for _ in 0..100 {
+        let batch = client.events(session_id.clone(), after, 500).unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::TurnFailed { message, .. } => failure = Some(message),
+                SessionEventKind::TurnCompleted => panic!("the turn must not run"),
+                _ => {}
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+    let failure = failure.expect("the turn failed");
+    assert!(failure.contains("no model profile"), "{failure}");
+
+    attacker.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(
+            attacker.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "no request may reach an endpoint the daemon did not configure"
+    );
+}

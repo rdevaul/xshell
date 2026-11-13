@@ -36,13 +36,58 @@ pub(crate) const MAX_TOOL_CALLS: usize = 256;
 pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 /// Build the HTTP client shared by all adapters. Every provider request goes
-/// through this so the timeout policy is defined in exactly one place.
+/// through this so the timeout and redirect policy is defined in exactly one
+/// place.
+///
+/// Redirects are never followed. A followed redirect would replay the
+/// request, credential and conversation included, to wherever the endpoint
+/// pointed, including a plain-http URL; a provider API has no reason to
+/// redirect, so the redirect is reported as the endpoint's error instead.
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(STREAM_IDLE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("static reqwest client configuration is valid")
+}
+
+/// Refuse to send a credential to `base_url` unless the connection protects
+/// it: `https`, or plain `http` only to a loopback host (`localhost`,
+/// `127.0.0.0/8`, `::1`), where the key never crosses a network.
+///
+/// The error names the scheme and host but never the credential.
+pub fn check_credential_endpoint(base_url: &str) -> Result<(), AdapterError> {
+    let url = reqwest::Url::parse(base_url).map_err(|error| {
+        AdapterError::Unsupported(format!("the endpoint URL is not valid: {error}"))
+    })?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&url) => Ok(()),
+        "http" => Err(AdapterError::Unsupported(format!(
+            "refusing to send an API key over plain http to {}; use https, or http only to a \
+loopback address",
+            url.host_str().unwrap_or("(no host)")
+        ))),
+        scheme => Err(AdapterError::Unsupported(format!(
+            "refusing to send an API key over the {scheme:?} scheme; use https"
+        ))),
+    }
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // An IPv6 host keeps its brackets in `host_str`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// Send a provider request, retrying once if it failed before any response
@@ -549,6 +594,140 @@ mod transport_tests {
             "missing the underlying cause: {error}"
         );
         assert!(error.contains("retried once"), "missing the retry: {error}");
+    }
+
+    /// Answer the first request with a redirect to `location`.
+    fn serve_redirect(location: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn f23_provider_redirects_are_not_followed() {
+        // The redirect target is another loopback listener; following the
+        // redirect would replay the request, bearer token included, to it.
+        // It answers anything it receives, so a followed redirect fails the
+        // assertions below instead of hanging the test.
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target.local_addr().unwrap();
+        let contacted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let contacted = std::sync::Arc::clone(&contacted);
+            std::thread::spawn(move || {
+                use std::io::Write;
+                for mut socket in target.incoming().flatten() {
+                    contacted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n",
+                    );
+                }
+            });
+        }
+        let location = format!("http://{target_address}/v1/chat/completions");
+
+        let (base_url, server) = serve_redirect(location.clone());
+        let mut adapter =
+            OpenAiCompatibleAdapter::new(base_url, "test-model", Some("secret-key".into()));
+        let error = adapter
+            .chat_stream(request(), &mut |_| {})
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(error, AdapterError::Http { status: 302, .. }),
+            "a redirect must surface as the endpoint's error: {error}"
+        );
+
+        let (base_url, server) = serve_redirect(location);
+        let mut adapter = OllamaAdapter::new(base_url, "test-model");
+        let error = adapter
+            .chat_stream(request(), &mut |_| {})
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(error, AdapterError::Http { status: 302, .. }),
+            "a redirect must surface as the endpoint's error: {error}"
+        );
+
+        assert!(
+            !contacted.load(std::sync::atomic::Ordering::SeqCst),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn f23_api_key_is_refused_over_plain_http_to_a_remote_host() {
+        // 192.0.2.0/24 is TEST-NET-1: nothing answers there, so the request
+        // must be refused before any connection is attempted.
+        let mut adapter = OpenAiCompatibleAdapter::new(
+            "http://192.0.2.1:8080/v1",
+            "test-model",
+            Some("secret-key".into()),
+        );
+        let error = adapter
+            .chat_stream(request(), &mut |_| {})
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(matches!(error, AdapterError::Unsupported(_)), "{text}");
+        assert!(text.contains("plain http"), "{text}");
+        assert!(!text.contains("secret-key"), "the key must not be echoed");
+    }
+
+    #[tokio::test]
+    async fn f23_api_key_is_sent_over_plain_http_to_loopback() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, server) = super::test_support::serve_once("text/event-stream", body.into());
+        let mut adapter =
+            OpenAiCompatibleAdapter::new(base_url, "test-model", Some("local-key".into()));
+        let response = adapter.chat_stream(request(), &mut |_| {}).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(response.content, "ok");
+    }
+
+    #[test]
+    fn f23_credential_endpoints_need_https_or_loopback() {
+        for allowed in [
+            "https://api.openai.com",
+            "https://openrouter.ai/api/v1",
+            "http://localhost:8080/v1",
+            "http://LOCALHOST",
+            "http://127.0.0.1:11434",
+            "http://127.1.2.3",
+            "http://[::1]:8080",
+        ] {
+            assert!(check_credential_endpoint(allowed).is_ok(), "{allowed}");
+        }
+        for refused in [
+            "http://api.openai.com",
+            "http://192.168.1.10:8080/v1",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "http://[::ffff:203.0.113.1]",
+            "ftp://127.0.0.1",
+            "not a url",
+        ] {
+            assert!(check_credential_endpoint(refused).is_err(), "{refused}");
+        }
     }
 }
 

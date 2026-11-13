@@ -1,7 +1,7 @@
 use crate::audit::{AuditReceipt, DaemonAudit, SessionAuditDescriptor, SessionAuditHandle};
 use crate::{
-    AgentTurnPhase, ApprovalReply, EventBatch, SessionActivity, SessionEvent, SessionEventKind,
-    SessionRegistry, SessionTools, TurnInput,
+    AgentTurnPhase, ApprovalReply, CredentialRoutes, EventBatch, ModelBinding, SessionActivity,
+    SessionEvent, SessionEventKind, SessionRegistry, SessionTools, TurnInput,
 };
 use crate::{TurnAuditRef, TurnFailureReason, TurnLocation, TurnOutcome, TurnRecord, TurnStore};
 use anyhow::{Context, Result, bail};
@@ -60,6 +60,9 @@ pub struct DaemonPolicy {
     pub tools: Arc<ToolRegistry>,
     /// Most turns running at once across all sessions.
     pub max_concurrent_turns: usize,
+    /// The endpoints each provider credential may be sent to, from the
+    /// daemon's own model profiles. A client's binding is held to these.
+    pub credential_routes: CredentialRoutes,
 }
 
 impl Default for DaemonPolicy {
@@ -73,6 +76,7 @@ impl Default for DaemonPolicy {
             compaction: CompactionConfig::default(),
             tools: ToolRegistry::empty(),
             max_concurrent_turns: crate::DEFAULT_MAX_CONCURRENT_TURNS,
+            credential_routes: CredentialRoutes::default(),
         }
     }
 }
@@ -185,6 +189,14 @@ impl ExecutionCoordinator {
     /// Refuse a session tool selection that names a tool this daemon does
     /// not offer, or names one twice, so a typo fails when the session is
     /// created instead of silently leaving the agent without the tool.
+    /// Refuse a model binding that would send one of this daemon's
+    /// credentials somewhere its configuration does not send it. The binding
+    /// is the client's; the credential and the decision where it may go are
+    /// the daemon's.
+    pub fn check_model_binding(&self, model: &ModelBinding) -> Result<()> {
+        self.inner.policy.credential_routes.check(model)
+    }
+
     pub fn check_session_tools(&self, tools: &SessionTools) -> Result<()> {
         let SessionTools::Only(names) = tools else {
             return Ok(());
@@ -657,6 +669,10 @@ on its model profile to attach images"
             match input {
                 TurnInput::Agent { message, images } => {
                     let model = &snapshot.descriptor.model;
+                    // Checked again here, not only on create and update: a
+                    // session restored from disk carries the binding it was
+                    // saved with, and the configuration may have changed.
+                    self.check_model_binding(model)?;
                     let mut agent = build_adapter(&AdapterConfig {
                         provider: model.provider.clone(),
                         model: model.model.clone(),

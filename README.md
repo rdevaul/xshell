@@ -181,7 +181,14 @@ Within xshell, `//model list` shows configured profiles and `//model NAME`
 switches the active session to a fresh conversation. Clearing history on a
 model switch prevents context supplied to one provider from silently crossing
 into another. In daemon-backed sessions, the credential variable is resolved
-in the `xshelld` environment on the machine doing the work.
+in the `xshelld` environment on the machine doing the work, and that daemon
+sends a credential only where its **own** configuration says to: a profile
+that names `api_key_env` must also exist, with the same `provider`,
+`base_url`, and `api_key_env`, in the configuration `xshelld` loads on that
+machine (by default the same `~/.config/xshell/config.toml`). A remote host
+needs such a profile in its own configuration. Models without a key, such as
+a local Ollama, need none. Keys are sent only over `https`, or plain `http`
+to a loopback address, and provider redirects are not followed.
 
 ## Persistent local sessions
 

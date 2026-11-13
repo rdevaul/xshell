@@ -13,6 +13,20 @@ use xshell_session::{
 };
 use xshell_view::sanitize_terminal_text;
 
+/// Refuse to send `model` to `host_id` when another host supplied it. The
+/// caller replaces such a binding with one from this client's configuration
+/// (`XshellConfig::model_for_host`); this check keeps a missed case from
+/// carrying one host's binding to another.
+fn ensure_binding_for_host(model: &ActiveModel, host_id: &str) -> Result<()> {
+    match model.origin_host_id.as_deref() {
+        Some(origin) if origin != host_id => bail!(
+            "refusing to use a model binding supplied by another host; choose a model profile \
+with //model first"
+        ),
+        _ => Ok(()),
+    }
+}
+
 struct HostConnection {
     client: SessionClient,
     endpoint: ConnectionEndpoint,
@@ -109,6 +123,14 @@ impl SessionRuntime {
 
     pub fn active(&self) -> Option<&SessionDescriptor> {
         self.active.as_ref()
+    }
+
+    /// The host of the active connection, which [`Self::create`] and
+    /// [`Self::sync`] send bindings to.
+    pub fn connected_host_id(&self) -> Option<&str> {
+        self.connection
+            .as_ref()
+            .map(|connection| connection.client.host_id())
     }
 
     pub fn display_host_alias<'a>(&'a self, session: &'a SessionDescriptor) -> &'a str {
@@ -230,6 +252,7 @@ impl SessionRuntime {
             ));
         }
 
+        ensure_binding_for_host(model, &host_id)?;
         let session_name = requested_session.unwrap_or(default_session);
         let exists = client
             .list()?
@@ -278,6 +301,7 @@ impl SessionRuntime {
         else {
             return Ok(());
         };
+        ensure_binding_for_host(model, self.client_mut()?.host_id())?;
         let model = model.to_session_binding();
         if agent_turn {
             // A turn this client detached from (or never followed) owns the
@@ -377,6 +401,7 @@ session's interactive process is running; stop it first"
         visibility: Visibility,
     ) -> Result<SessionSnapshot> {
         let previous = self.active.as_ref().map(|session| session.id.clone());
+        ensure_binding_for_host(model, self.client_mut()?.host_id())?;
         let snapshot = self.client_mut()?.create(SessionCreation {
             name,
             model: model.to_session_binding(),
@@ -1040,6 +1065,7 @@ mod tests {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                origin_host_id: None,
             }
         }
 
@@ -1159,6 +1185,38 @@ mod tests {
                 ChatMessage::user("start the job"),
                 ChatMessage::assistant("job finished"),
             ]
+        }
+
+        #[test]
+        fn f23_a_binding_another_host_supplied_is_never_sent_to_this_one() {
+            let service = FakeService::start(snapshot(SessionActivity::Idle, before_turn()));
+            let mut runtime = service.detached_runtime();
+            runtime.active.as_mut().unwrap().activity = SessionActivity::Idle;
+            let mut foreign = model();
+            foreign.origin_host_id = Some("other-host".into());
+
+            let error = runtime
+                .sync(&foreign, Path::new("/"), &before_turn())
+                .unwrap_err();
+            assert!(error.to_string().contains("another host"), "{error:#}");
+            let error = runtime
+                .create(
+                    "copy".into(),
+                    &foreign,
+                    Path::new("/"),
+                    before_turn(),
+                    PersistenceMode::Daemon,
+                    Visibility::Fabric,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("another host"), "{error:#}");
+            assert!(service.updates.lock().unwrap().is_empty());
+
+            // The host's own binding goes back to it.
+            let mut own = model();
+            own.origin_host_id = Some("host".into());
+            runtime.sync(&own, Path::new("/"), &before_turn()).unwrap();
+            assert_eq!(service.updates.lock().unwrap().len(), 1);
         }
 
         #[test]

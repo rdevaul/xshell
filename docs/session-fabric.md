@@ -635,6 +635,35 @@ large histories.
 Execution credentials are resolved only in the daemon environment. Protocol
 model bindings contain an environment-variable name, never its value.
 
+A binding is the client's, but the credential is the daemon's, so the daemon
+decides where it may go. It reads the `[models.NAME]` profiles of its own
+configuration (only `provider`, `base_url`, and `api_key_env`) and accepts a
+binding that names a credential only when one profile has the same provider,
+`base_url` (the provider's default when the profile omits it; a trailing `/`
+is ignored), and `api_key_env`. `OPENAI_API_KEY` with
+`https://api.openai.com` is accepted without a profile, matching the client's
+default for `--provider openai`. Any other binding with a credential is
+refused when a session is created, when an update changes its binding, and
+when an agent turn starts; the error names no variable. A binding without a
+credential may name any endpoint. Consequences:
+
+- A remote host must list each keyed profile used on it in its own
+  configuration; the controller's profiles do not authorize anything there.
+- `--base-url` and `--api-key-env` on the command line work with a daemon
+  only when they match one of its profiles.
+- A session saved with a keyed binding fails its next agent turn if the
+  daemon no longer has a matching profile; `//model PROFILE` rebinds it.
+
+The client never carries a binding from one host to another. A binding it
+adopts from a session (on attach, switch, or turn completion) is marked with
+that session's host. `//connect` and `//new` on a different host use the
+client's own profile of the same name instead, or the model the client
+started with when it has no such profile.
+
+The OpenAI-compatible adapter sends a key only over `https`, or plain `http`
+to `localhost`, `127.0.0.0/8`, or `::1`; the Ollama adapter sends none. No
+adapter follows HTTP redirects: a redirect fails the request with its status.
+
 ## Reserved evolution
 
 Further federation work will add signed bootstrap installation, connection
