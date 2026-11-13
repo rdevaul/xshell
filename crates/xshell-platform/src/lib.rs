@@ -150,12 +150,47 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
             size,
         )
     };
-    (written == size).then_some(info.pbi_ppid)
+    if written == size {
+        return Some(info.pbi_ppid);
+    }
+    // proc_pidinfo can refuse another user's process (an ancestor such as
+    // `login`); sysctl's process table, which `ps` reads, does not.
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        libc::c_int::try_from(pid).ok()?,
+    ];
+    // SAFETY: `kinfo_proc` is plain-old-data that sysctl fills.
+    let mut process: libc::kinfo_proc = unsafe { zeroed() };
+    let mut length = size_of::<libc::kinfo_proc>();
+    // SAFETY: `mib` names one process, and `process` is a writable buffer of
+    // `length` bytes; sysctl writes at most that many.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&mut process as *mut libc::kinfo_proc).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // A pid with no process gives success with nothing written.
+    if result != 0 || length == 0 {
+        return None;
+    }
+    u32::try_from(process.kp_eproc.e_ppid).ok()
 }
 
-/// Whether process `pid` is `ancestor` itself or one of its descendants,
-/// walking parent links at most a bounded number of steps. A process whose
-/// ancestry cannot be read is treated as not a descendant.
+/// Whether process `pid` may be `ancestor` itself or one of its
+/// descendants, walking parent links at most a bounded number of steps.
+///
+/// This fails closed: it answers `false` only when the walk reaches the
+/// root (pid 1) without meeting `ancestor`. A process whose ancestry cannot
+/// be read counts as a descendant. Otherwise a descendant could connect,
+/// hand the connection to a child and exit before the check, so the walk
+/// would find no process and wave the connection through.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
     const MAX_DEPTH: usize = 256;
@@ -164,12 +199,17 @@ pub fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
         if current == ancestor {
             return true;
         }
+        if current <= 1 {
+            return false;
+        }
         match parent_pid(current) {
-            Some(parent) if parent != current && current > 1 => current = parent,
-            _ => return false,
+            Some(parent) if parent != current => current = parent,
+            // Unreadable (exited, or the platform would not say), or a
+            // loop: not known to be outside the daemon's tree.
+            _ => return true,
         }
     }
-    false
+    true
 }
 
 /// Make this process the reaper of its orphaned descendants (Linux), so a
@@ -350,8 +390,13 @@ mod tests {
         if let Some(parent) = parent_pid(me) {
             assert!(!is_descendant_of(parent, me));
         }
+        let gone = child.id();
         let _ = child.kill();
         let _ = child.wait();
+        // A process that has exited cannot be placed outside the tree, so it
+        // counts as a descendant: a descendant must not escape the check by
+        // handing its connection on and exiting first (F27).
+        assert!(is_descendant_of(gone, u32::MAX - 1));
     }
 
     #[test]

@@ -228,7 +228,10 @@ checks two things on every connection:
   (`forbidden_descendant`). That covers a shell command that reads the token
   file with `cat`. On Linux the daemon is its descendants' subreaper, so a
   process that double-forks to leave the tree is re-parented to the daemon
-  and is still refused.
+  and is still refused. The check fails closed: a connecting process the
+  daemon cannot identify, or whose ancestry it cannot trace back to the root
+  (because it has already exited, say), is refused too, so a descendant
+  cannot hand its connection to a child and exit before the check.
 
 Remote clients over SSH are unaffected: `xshelld serve-stdio` and
 `serve-pty-stdio` run on the remote host as the user, read that host's token

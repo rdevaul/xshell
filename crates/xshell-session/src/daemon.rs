@@ -904,8 +904,11 @@ fn handle_client(
     // the daemon, whatever it presents (F27). The daemon's own in-process
     // connections are allowed.
     let own_pid = std::process::id();
-    let peer_is_descendant = xshell_platform::peer_pid(&stream)
-        .is_ok_and(|pid| pid != own_pid && xshell_platform::is_descendant_of(pid, own_pid));
+    // Fail closed: a peer whose process cannot be identified is treated as
+    // one of the daemon's own descendants (F27).
+    let peer_is_descendant = xshell_platform::peer_pid(&stream).map_or(true, |pid| {
+        pid != own_pid && xshell_platform::is_descendant_of(pid, own_pid)
+    });
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let Some(line) = read_request_line(&mut reader)? else {
