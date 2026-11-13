@@ -119,6 +119,7 @@ impl ActiveModel {
             context_tokens: binding.context_tokens,
             reserve_output_tokens: binding.reserve_output_tokens,
             vision: binding.vision,
+            origin_host_id: None,
         })
     }
 }
@@ -142,6 +143,12 @@ pub struct ActiveModel {
     pub context_tokens: Option<usize>,
     pub reserve_output_tokens: Option<usize>,
     pub vision: bool,
+    /// The host whose session supplied this binding, or `None` when it came
+    /// from this client's own configuration and command line. A binding a
+    /// host supplied is that host's to use: it is never sent to another
+    /// host, which could otherwise be made to send its credential, or its
+    /// conversation, to an endpoint the first host chose.
+    pub origin_host_id: Option<String>,
 }
 
 impl XshellConfig {
@@ -226,6 +233,7 @@ impl XshellConfig {
             context_tokens: selected.and_then(|profile| profile.context_tokens),
             reserve_output_tokens: selected.and_then(|profile| profile.reserve_output_tokens),
             vision: selected.is_some_and(|profile| profile.vision),
+            origin_host_id: None,
         })
     }
 
@@ -248,7 +256,37 @@ impl XshellConfig {
             context_tokens: profile.context_tokens,
             reserve_output_tokens: profile.reserve_output_tokens,
             vision: profile.vision,
+            origin_host_id: None,
         })
+    }
+
+    /// The model to bind a session on `host_id` to, starting from `model`.
+    ///
+    /// A model from this client's own configuration, or one `host_id`
+    /// itself supplied, is used as it is. One another host supplied is
+    /// replaced by this configuration's profile of the same name, or by
+    /// `fallback` (the model this client started with) when there is none.
+    /// `host_id` is `None` for a host not connected yet, which cannot have
+    /// supplied anything.
+    pub fn model_for_host(
+        &self,
+        model: &ActiveModel,
+        host_id: Option<&str>,
+        fallback: &ActiveModel,
+    ) -> Result<ActiveModel> {
+        match model.origin_host_id.as_deref() {
+            None => return Ok(model.clone()),
+            Some(origin) if Some(origin) == host_id => return Ok(model.clone()),
+            Some(_) => {}
+        }
+        if let Some(name) = model.profile_name.as_deref()
+            && self.models.contains_key(name)
+        {
+            return self.resolve_profile(name);
+        }
+        let mut fallback = fallback.clone();
+        fallback.origin_host_id = None;
+        Ok(fallback)
     }
 
     /// The limits of the named profile.
@@ -756,6 +794,64 @@ model = "m"
                 .session_fabric
                 .blocked_paths()
                 .matches(Path::new("/home/user/keys/server.pem"))
+        );
+    }
+
+    /// A binding host A supplied, aimed at A's endpoint with B's variable.
+    fn supplied_by(host: &str, profile_name: Option<&str>) -> ActiveModel {
+        ActiveModel {
+            profile_name: profile_name.map(str::to_owned),
+            provider: Provider::Openai,
+            model: "exfiltrate".into(),
+            base_url: "https://host-a.example/v1".into(),
+            api_key_env: Some("GITHUB_TOKEN".into()),
+            max_history_bytes: None,
+            context_tokens: None,
+            reserve_output_tokens: None,
+            vision: false,
+            origin_host_id: Some(host.into()),
+        }
+    }
+
+    #[test]
+    fn f23_a_binding_from_one_host_is_not_carried_to_another() {
+        let config = sample();
+        let startup = config.resolve_profile("local").unwrap();
+
+        // To another host, or to a host not connected yet: replaced by the
+        // local profile of the same name...
+        for target in [Some("host-b"), None] {
+            let model = config
+                .model_for_host(&supplied_by("host-a", Some("router")), target, &startup)
+                .unwrap();
+            assert_eq!(model, config.resolve_profile("router").unwrap());
+            assert_eq!(model.base_url, "https://openrouter.ai/api/v1");
+            assert_eq!(model.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+            assert_eq!(model.origin_host_id, None);
+        }
+        // ...or, when this client has no such profile, by the startup model.
+        for name in [Some("not-configured-here"), None] {
+            let model = config
+                .model_for_host(&supplied_by("host-a", name), Some("host-b"), &startup)
+                .unwrap();
+            assert_eq!(model, startup);
+        }
+
+        // Back to the host that supplied it, the binding is that host's own.
+        let own = supplied_by("host-a", Some("router"));
+        assert_eq!(
+            config
+                .model_for_host(&own, Some("host-a"), &startup)
+                .unwrap(),
+            own
+        );
+        // This client's own choice goes anywhere.
+        let router = config.resolve_profile("router").unwrap();
+        assert_eq!(
+            config
+                .model_for_host(&router, Some("host-b"), &startup)
+                .unwrap(),
+            router
         );
     }
 }

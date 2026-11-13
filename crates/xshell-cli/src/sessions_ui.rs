@@ -63,7 +63,10 @@ pub(crate) fn restore_session_state(
     history: &mut Vec<ChatMessage>,
     default_system_prompt: &str,
 ) -> Result<()> {
-    let restored_model = ActiveModel::from_session_binding(snapshot.descriptor.model)?;
+    let mut restored_model = ActiveModel::from_session_binding(snapshot.descriptor.model)?;
+    // The binding is the session host's: it may be sent back to that host,
+    // never to another (see `XshellConfig::model_for_host`).
+    restored_model.origin_host_id = Some(snapshot.descriptor.host_id);
     *active_model = restored_model;
     // The active working directory may be on another host. Its daemon validates
     // the path; a controller must not try to resolve it against its local filesystem.
@@ -182,12 +185,13 @@ pub(crate) fn create_session(
     history: &mut Vec<ChatMessage>,
     system_prompt: &str,
     editor: &mut Editor<XshellHelper, DefaultHistory>,
+    startup_model: &ActiveModel,
 ) -> Result<()> {
     let options = parse_new_session_options(&args)?;
     sessions.sync(active_model, cwd, history)?;
     let new_model = match options.profile.as_deref() {
         Some(profile) => config.resolve_profile(profile)?,
-        None => active_model.clone(),
+        None => config.model_for_host(active_model, sessions.connected_host_id(), startup_model)?,
     };
     let new_history = vec![ChatMessage::system(system_prompt)];
     let snapshot = sessions.create(
@@ -313,6 +317,46 @@ mod tests {
         assert_eq!(options.profile.as_deref(), Some("local-qwen"));
         assert_eq!(options.persistence, PersistenceMode::Durable);
         assert_eq!(options.visibility, Visibility::HostOnly);
+    }
+
+    #[test]
+    fn f23_a_restored_binding_remembers_the_host_that_supplied_it() {
+        let config: XshellConfig =
+            toml::from_str("[models.local]\nprovider = \"ollama\"\nmodel = \"qwen3:8b\"\n")
+                .unwrap();
+        let local = config.resolve_profile("local").unwrap();
+        let mut binding = local.to_session_binding();
+        binding.base_url = "https://host-a.example".into();
+        let snapshot = SessionSnapshot {
+            descriptor: xshell_session::SessionDescriptor {
+                id: "s1".into(),
+                name: "work".into(),
+                host_id: "host-a".into(),
+                host_alias: "a".into(),
+                user: "user".into(),
+                model: binding,
+                cwd: PathBuf::from("/"),
+                persistence: PersistenceMode::Daemon,
+                visibility: Visibility::Fabric,
+                access_mode: xshell_session::AccessMode::SingleUser,
+                status: xshell_session::SessionStatus::Attached,
+                activity: Default::default(),
+                attached_clients: 1,
+                created_at_unix_ms: 0,
+                last_active_at_unix_ms: 0,
+                tools: Default::default(),
+            },
+            history: Vec::new(),
+        };
+        let mut active = local.clone();
+        let (mut cwd, mut history) = (PathBuf::new(), Vec::new());
+        restore_session_state(snapshot, &mut active, &mut cwd, &mut history, "system").unwrap();
+        assert_eq!(active.origin_host_id.as_deref(), Some("host-a"));
+        // //connect and //new to another host start from the local profile.
+        let carried = config
+            .model_for_host(&active, Some("host-b"), &local)
+            .unwrap();
+        assert_eq!(carried, local);
     }
 
     #[test]

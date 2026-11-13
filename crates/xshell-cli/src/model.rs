@@ -77,7 +77,8 @@ pub(crate) fn switch_model_profile(
     daemon_owned: bool,
 ) -> Result<()> {
     let next = config.resolve_profile(name)?;
-    if next == *active {
+    // Compared as bindings: where the active one came from does not matter.
+    if next.to_session_binding() == active.to_session_binding() {
         println!("model profile {name:?} is already active");
         return Ok(());
     }

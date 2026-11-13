@@ -367,10 +367,21 @@ pub fn build_adapter(config: &AdapterConfig) -> Result<Box<dyn AgentAdapter>> {
         "ollama" => {
             Box::new(OllamaAdapter::new(&config.base_url, &config.model).with_vision(config.vision))
         }
-        "openai" => Box::new(
-            OpenAiCompatibleAdapter::new(&config.base_url, &config.model, resolve_api_key(config)?)
+        "openai" => {
+            // Refuse before the credential is even read; the adapter checks
+            // again before every request that carries it.
+            if config.api_key_env.is_some() {
+                xshell_adapters::check_credential_endpoint(&config.base_url)?;
+            }
+            Box::new(
+                OpenAiCompatibleAdapter::new(
+                    &config.base_url,
+                    &config.model,
+                    resolve_api_key(config)?,
+                )
                 .with_vision(config.vision),
-        ),
+            )
+        }
         provider => bail!("unsupported agent provider {provider:?}"),
     };
     Ok(adapter)

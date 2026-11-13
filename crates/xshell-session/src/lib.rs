@@ -1,6 +1,7 @@
 mod audit;
 mod client;
 mod completion;
+mod credentials;
 pub mod daemon;
 mod execution;
 mod model;
@@ -21,6 +22,7 @@ pub use client::{
     SessionHandshake,
 };
 pub use completion::complete_shell;
+pub use credentials::{ConfiguredModel, CredentialRoutes, default_model_base_url};
 pub use execution::{DaemonPolicy, ExecutionCoordinator};
 pub use model::{
     AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, CapacityExhausted,

@@ -227,6 +227,11 @@ async fn main() -> Result<()> {
     let mut cwd = xshell_execution::validate_working_directory(&args.cwd)
         .with_context(|| format!("cannot use working directory {}", args.cwd.display()))?;
     let mut history = vec![ChatMessage::system(args.system_prompt.clone())];
+    // The model this client's own configuration and command line chose. A
+    // session on a newly connected host starts with it (or with the local
+    // profile of the active binding's name), never with a binding another
+    // host supplied.
+    let startup_model = active_model.clone();
     let (mut sessions, restored) = SessionRuntime::start(
         &model_config.session_fabric,
         args.session.as_deref(),
@@ -560,11 +565,19 @@ async fn main() -> Result<()> {
                     eprintln!("xshell: cannot synchronize current session: {error:#}");
                     continue;
                 }
+                let connect_model =
+                    match model_config.model_for_host(&active_model, None, &startup_model) {
+                        Ok(model) => model,
+                        Err(error) => {
+                            eprintln!("xshell: {error:#}");
+                            continue;
+                        }
+                    };
                 match sessions.connect_ssh(
                     &options.destination,
                     options.session.as_deref(),
                     &model_config.session_fabric.default_session,
-                    &active_model,
+                    &connect_model,
                     &args.system_prompt,
                 ) {
                     Ok(snapshot) => {
@@ -673,6 +686,7 @@ async fn main() -> Result<()> {
                     &mut history,
                     &args.system_prompt,
                     &mut editor,
+                    &startup_model,
                 ) {
                     Ok(()) => {
                         refresh_shell_completions(&sessions, &mut editor);

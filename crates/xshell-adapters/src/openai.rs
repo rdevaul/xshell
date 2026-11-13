@@ -252,6 +252,7 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
             stream: true,
         });
         if let Some(api_key) = &self.api_key {
+            crate::check_credential_endpoint(&self.base_url)?;
             builder = builder.bearer_auth(api_key);
         }
         let response = crate::send_with_retry(builder).await?;

@@ -7,11 +7,11 @@
 //! `docs/tool-providers.md`.
 
 use crate::{
-    ClientPtyFrame, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonAudit, DaemonPolicy,
-    DaemonProbeReport, DaemonProbeStatus, ExecutionCoordinator, PersistenceMode, PtyAudit,
-    PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
-    SessionActivity, SessionConfig, SessionHandshake, SessionRegistry, complete_shell,
-    load_view_resource, read_client_frame, write_server_frame,
+    ClientPtyFrame, ClientRequest, ConfiguredModel, CredentialRoutes, DAEMON_PROBE_SCHEMA_VERSION,
+    DaemonAudit, DaemonPolicy, DaemonProbeReport, DaemonProbeStatus, ExecutionCoordinator,
+    PersistenceMode, PtyAudit, PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame,
+    ServerResponse, SessionActivity, SessionConfig, SessionHandshake, SessionRegistry,
+    complete_shell, load_view_resource, read_client_frame, write_server_frame,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -107,6 +107,9 @@ struct ConfigFile {
     session_fabric: SessionConfig,
     #[serde(default)]
     audit: xshell_audit::AuditConfig,
+    /// The model profiles, read only for the credential routes they declare.
+    #[serde(default)]
+    models: std::collections::BTreeMap<String, ConfiguredModel>,
 }
 
 /// The session daemon, configured by its command line and configuration file
@@ -161,7 +164,12 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
     } else {
         resolve_config_path(args.config)?
     };
-    let (config, audit_config) = load_config(config_path.as_deref())?;
+    let ConfigFile {
+        session_fabric: config,
+        audit: audit_config,
+        models,
+    } = load_config(config_path.as_deref())?;
+    let credential_routes = CredentialRoutes::from_profiles(&models);
     // Service management must stay usable on a host whose state directory does
     // not exist yet — installing the service is what creates it — so this runs
     // before the directory is required, with a best-effort socket path used
@@ -206,7 +214,7 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
     let execution = ExecutionCoordinator::with_policy(
         Arc::clone(&registry),
         audit,
-        daemon_policy(&config, rules, tools)?,
+        daemon_policy(&config, rules, tools, credential_routes)?,
     );
     let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
 
@@ -311,7 +319,13 @@ fn daemon_policy(
     config: &SessionConfig,
     rules: xshell_execution::Policy,
     tools: Arc<ToolRegistry>,
+    credential_routes: CredentialRoutes,
 ) -> Result<DaemonPolicy> {
+    // Every credential a configured profile names stays out of the shells
+    // this daemon starts, whichever session ends up using it.
+    for variable in credential_routes.variables() {
+        xshell_execution::protect_credential_variable(variable);
+    }
     Ok(DaemonPolicy {
         max_approval: config.max_approval,
         max_limits: config.limit_ceiling()?,
@@ -321,6 +335,7 @@ fn daemon_policy(
         compaction: config.compaction.clone(),
         tools,
         max_concurrent_turns: config.max_concurrent_turns,
+        credential_routes,
     })
 }
 
@@ -830,18 +845,14 @@ fn remote_visibility_error() -> ServerResponse {
     }
 }
 
-fn load_config(path: Option<&Path>) -> Result<(SessionConfig, xshell_audit::AuditConfig)> {
+fn load_config(path: Option<&Path>) -> Result<ConfigFile> {
     let Some(path) = path else {
-        return Ok((
-            SessionConfig::default(),
-            xshell_audit::AuditConfig::default(),
-        ));
+        return Ok(ConfigFile::default());
     };
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read configuration file {}", path.display()))?;
-    let config: ConfigFile = toml::from_str(&source)
-        .with_context(|| format!("invalid configuration file {}", path.display()))?;
-    Ok((config.session_fabric, config.audit))
+    toml::from_str(&source)
+        .with_context(|| format!("invalid configuration file {}", path.display()))
 }
 
 fn handle_client(
@@ -1059,6 +1070,7 @@ fn process_request(
                     .context("cannot resolve session host home directory")?;
             }
             execution.check_session_tools(&creation.tools)?;
+            execution.check_model_binding(&creation.model)?;
             let session = registry.lock_recover().create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
                 detach_session(registry, execution, ptys, client_id, &previous)?;
@@ -1103,6 +1115,19 @@ fn process_request(
             }
             if execution.active_turn(&session_id).is_some() {
                 bail!("cannot replace session state while a turn is active");
+            }
+            // A binding the session already has is not new: a client echoing
+            // it back with a changed directory or conversation must not be
+            // refused because the configuration changed since. Its turns are
+            // still checked when they start.
+            if registry
+                .lock_recover()
+                .snapshot(&session_id)?
+                .descriptor
+                .model
+                != model
+            {
+                execution.check_model_binding(&model)?;
             }
             if ptys.has_session(&session_id) {
                 let cwd = xshell_execution::validate_working_directory(&cwd)?;
@@ -1639,6 +1664,7 @@ mod tests {
             &SessionConfig::default(),
             xshell_execution::Policy::default(),
             Arc::clone(&registry),
+            CredentialRoutes::default(),
         )
         .unwrap();
         assert!(Arc::ptr_eq(&policy.tools, &registry));
