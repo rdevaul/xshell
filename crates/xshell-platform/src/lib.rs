@@ -66,6 +66,128 @@ pub fn peer_uid(stream: &UnixStream) -> Result<u32> {
     Ok(uid)
 }
 
+/// Return the process ID of the process on the other end of a connected
+/// Unix socket, as recorded when it connected.
+#[cfg(target_os = "linux")]
+pub fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    use std::mem::{size_of, zeroed};
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `ucred` is plain-old-data, and getsockopt writes at most
+    // `length` bytes into it.
+    let mut credentials: libc::ucred = unsafe { zeroed() };
+    let mut length = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `credentials` is a writable `ucred` and `length` holds its
+    // size, so getsockopt writes within it.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot identify socket peer");
+    }
+    u32::try_from(credentials.pid).context("socket peer has no process ID")
+}
+
+/// Return the process ID of the process on the other end of a connected
+/// Unix socket, as recorded when it connected.
+#[cfg(target_os = "macos")]
+pub fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    use std::mem::size_of;
+    use std::os::fd::AsRawFd;
+
+    let mut pid: libc::pid_t = 0;
+    let mut length = size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` is a writable pid_t and `length` holds its size, so
+    // getsockopt writes within it.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot identify socket peer");
+    }
+    u32::try_from(pid).context("socket peer has no process ID")
+}
+
+/// The parent of process `pid`, or `None` when it cannot be read (the
+/// process has exited, or the platform does not say).
+#[cfg(target_os = "linux")]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    // The command name in parentheses may contain spaces or `)`, so parse
+    // from the last `)`: "pid (comm) state ppid ...".
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The parent of process `pid`, or `None` when it cannot be read (the
+/// process has exited, or the platform does not say).
+#[cfg(target_os = "macos")]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    use std::mem::{size_of, zeroed};
+
+    // SAFETY: `proc_bsdinfo` is plain-old-data that proc_pidinfo fills.
+    let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::c_int::try_from(pid).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info.pbi_ppid)
+}
+
+/// Whether process `pid` is `ancestor` itself or one of its descendants,
+/// walking parent links at most a bounded number of steps. A process whose
+/// ancestry cannot be read is treated as not a descendant.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
+    const MAX_DEPTH: usize = 256;
+    let mut current = pid;
+    for _ in 0..MAX_DEPTH {
+        if current == ancestor {
+            return true;
+        }
+        match parent_pid(current) {
+            Some(parent) if parent != current && current > 1 => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Make this process the reaper of its orphaned descendants (Linux), so a
+/// child that double-forks to leave the process tree is re-parented here
+/// and stays a descendant. Elsewhere this does nothing and returns `false`.
+pub fn become_child_subreaper() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl(PR_SET_CHILD_SUBREAPER) takes integer arguments and
+        // has no memory-safety preconditions.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Reject a connection whose peer is not the same user as this process.
 ///
 /// Socket file mode alone is not a complete control: a socket can be reached
@@ -207,6 +329,29 @@ mod tests {
         .join();
         assert!(shared.lock().is_err(), "mutex should be poisoned");
         assert_eq!(shared.lock_recover().len(), 3);
+    }
+
+    #[test]
+    fn peer_pid_names_this_process_over_a_socket_pair() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        assert_eq!(peer_pid(&client).unwrap(), std::process::id());
+    }
+
+    #[test]
+    fn a_child_is_a_descendant_and_the_parent_is_not() {
+        let me = std::process::id();
+        assert!(is_descendant_of(me, me));
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        assert!(is_descendant_of(child.id(), me));
+        assert!(!is_descendant_of(me, child.id()));
+        if let Some(parent) = parent_pid(me) {
+            assert!(!is_descendant_of(parent, me));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
