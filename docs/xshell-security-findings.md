@@ -26,6 +26,7 @@ historical review.
 | F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 | F17 | [#133](https://github.com/rdevaul/xshell/issues/133) | P0 | M1.2 cancellation and shutdown | Corrected (processes that `setsid` away are not contained) | A background job holding the pipes is killed at the timeout, at cancellation (its marker never appears), and after a short grace following a normal exit; the call returns promptly |
 | F18 | [#134](https://github.com/rdevaul/xshell/issues/134) | P0 | M1.4 credential bounds | Corrected (allowlist is a constant; configurability is follow-up) | The provider key variable and an arbitrary daemon variable are absent from `run_shell` output |
+| F20 | [#136](https://github.com/rdevaul/xshell/issues/136) | P1 | Approval integrity | Corrected | Typeahead before the prompt is discarded on a PTY; "why", "okay" and a `y` with input behind its Enter re-prompt instead of approving; only `y`/`yes` + Enter approves; Enter alone denies |
 
 ## Evidence rules
 
@@ -92,6 +93,24 @@ credential variables too. A shell's own startup files (zsh's `~/.zshenv`) can
 still export variables. Evidence:
 `f18_run_shell_omits_the_provider_key_and_daemon_variables`. The exact
 environment is documented in [session fabric](session-fabric.md#shell-commands-lifetime-and-environment).
+
+F20 (#136) is corrected. The interactive approval prompt read raw bytes and
+took the first `y`, `n`, `q` or Enter, skipping everything else, and never
+discarded pending input, so "why", "okay" or "sorry" typed while the agent
+worked approved the next call at its first `y`. Every prompt that authorizes
+an effect (the raw-mode tool approval, the line-mode tool approval used
+without a full terminal, and the `//connect` remote-repair prompt) now
+discards pending terminal input (`tcflush(TCIFLUSH)`) before it is drawn,
+waits 250 ms, and discards again, so keys in flight do not count. In raw mode
+approval needs `y` (or `yes`) followed by Enter as the last byte read; `n`,
+`q`, Ctrl-C, Ctrl-D and Enter alone answer at once, because they cannot
+authorize anything, and Enter alone keeps its documented default, deny. Any
+other byte, including `y` followed by anything but Enter, discards pending
+input and re-prompts. Backspace edits a partial `yes`. Line-mode prompts
+already required a whole `y`/`yes` line; they gain the flushes. Piped stdin
+is not a terminal and is read as before. Evidence: the `f20_*` tests in
+`xshell-cli/src/approval_keys.rs` and `xshell-pty/src/lib.rs`, the latter on a
+real PTY.
 
 F9 is corrected. Both adapters hand tool calls to the engine only from a
 response the provider finished normally: the OpenAI-compatible adapter needs

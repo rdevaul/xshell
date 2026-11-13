@@ -880,6 +880,8 @@ fn confirm_remote_repair(destination: &str, repair: RemoteRepair) -> Result<bool
         );
     }
     loop {
+        // F20: typed-ahead lines must not authorize a remote repair.
+        crate::approval_keys::discard_line_typeahead()?;
         print!(
             "Run `xshelld service {}` on {destination}? [y/N] ",
             repair.verb()
@@ -887,6 +889,7 @@ fn confirm_remote_repair(destination: &str, repair: RemoteRepair) -> Result<bool
         io::stdout()
             .flush()
             .context("could not flush repair prompt")?;
+        crate::approval_keys::settle_line_prompt()?;
         let mut answer = String::new();
         if io::stdin()
             .read_line(&mut answer)

@@ -61,6 +61,19 @@ opened elsewhere without the flag cannot cross `exec` either. Children
 therefore start with only their stdio; nothing xshell starts is meant to
 inherit more.
 
+## Approval prompt keys
+
+When a structured agent turn asks for approval, the prompt reads
+``Approve `...`? [y+Enter/N/q]``. Input typed before the prompt appears, or in
+the first 250 ms after, is discarded (the terminal bell rings if anything was
+thrown away). Type `y` (or `yes`) and press Enter to approve; Backspace
+corrects a partial answer. `n`, or Enter alone, denies at once; `q`, Ctrl-C or
+Ctrl-D aborts the turn. Any other key discards pending input and asks again,
+so a word that merely contains a `y` never approves. The escape prefix works
+at the prompt once it has settled. Without a full terminal the prompt reads a
+whole line (`y`/`yes`, `n`/`no` or empty, `q`/`quit`/`abort`) and discards
+typed-ahead lines the same way.
+
 ## Escape router and unified session switching
 
 The interactive controller consumes a configurable prefix before input reaches
