@@ -2,7 +2,7 @@ use crate::{AUDIT_PROTOCOL_VERSION, AuditCheckpoint, AuditEvent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "request", rename_all = "snake_case")]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientRequest {
     Open {
         protocol_version: u32,
@@ -24,7 +24,7 @@ impl ClientRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "response", rename_all = "snake_case")]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerResponse {
     Opened {
         protocol_version: u32,

@@ -97,11 +97,14 @@ journal.
 The daemon's audit session for an xshell session is finalized with a signed
 checkpoint when that session is closed with `//close`. A daemon that exits
 without closing its sessions leaves verifiable chains without final
-checkpoints, which the verifier reports.
+checkpoints, which the verifier reports (`--allow-open` verifies them without
+failing).
 
 ## Log format
 
-Each session is stored as `sessions/<session-id>.jsonl`. Record bodies contain:
+Each session is stored as `sessions/<session-id>.jsonl`, one JSON entry per
+line. A record line is `{"entry":"record","body":{...},"record_hash":"..."}`.
+Record bodies contain:
 
 - format and session identifiers;
 - a daemon-assigned sequence number and timestamp;
@@ -109,21 +112,55 @@ Each session is stored as `sessions/<session-id>.jsonl`. Record bodies contain:
 - the previous record hash;
 - a typed audit event.
 
-The record hash is SHA-256 over a domain separator and the serialized record
-body. Checkpoints contain the current sequence and chain head and are signed
-with Ed25519. Checkpoints have their own sequence and previous-checkpoint hash,
-so copied, removed, or reordered checkpoint entries are detectable as well. A
-final checkpoint distinguishes a cleanly closed log from a log whose tail may
-have been removed.
+The record hash is SHA-256 over a domain separator and the record body's
+bytes exactly as the line stores them: the daemon serializes the body once,
+hashes those bytes, and writes them unchanged. Checkpoints contain the current
+sequence and chain head and are signed with Ed25519; the signature, witness
+commitment, and checkpoint hash also cover the checkpoint body's stored bytes.
+Checkpoints have their own sequence and previous-checkpoint hash, so copied,
+removed, or reordered checkpoint entries are detectable as well. A final
+checkpoint distinguishes a cleanly closed log from a log whose tail may have
+been removed, and nothing may follow it.
 
 Every checkpoint also contains a blinded, domain-separated SHA-256 witness
 commitment. A future peer, RFC 3161, transparency-log, or OpenTimestamps backend
 can publish that commitment without changing the on-disk format or revealing
 the checkpoint itself.
 
-The daemon writes the latest signed checkpoints to `checkpoints.jsonl` as a
-local rollback reference. Strong rollback detection will require copying those
-commitments or receipts to an independent system.
+The daemon also appends every signed checkpoint, for every session, to
+`checkpoints.jsonl` in the audit directory (the same checkpoint without the
+`entry` tag). The verifier can cross-check a session log against it
+(`--index`). It is a local reference only: anyone able to rewrite the session
+logs can usually rewrite the index too, so strong rollback detection still
+requires copying those commitments or receipts to an independent system.
+
+### What is authenticated
+
+- **Signed:** every record up to the last checkpoint. The checkpoint signs the
+  chain head, and the chain links each record's stored bytes to the one before.
+- **Chained but not signed:** records after the last checkpoint. The record
+  hash is unkeyed, so anyone who can write the file can alter those records or
+  append new ones and recompute the chain. A live session, or one whose daemon
+  stopped without closing it, has such a tail; the verifier reports its length
+  as `unsigned records` and warns. A cleanly closed log ends with a final
+  checkpoint covering every record, so it has none.
+- **Not covered by the log itself:** which file a log is stored under, and
+  whether a whole log was removed or replaced by an older copy. The verifier
+  checks the file name against the session ID in the content, and `--index`
+  checks the log's last checkpoint against the index; neither helps against
+  someone who can rewrite the index as well.
+- **Parsing:** every line is parsed strictly. A repeated object key at any
+  depth (including inside free-form values such as tool arguments) or a field
+  the format does not define fails verification, so a line cannot read
+  differently to different parsers.
+
+Formats 1 to 9 hashed and signed a re-serialization of the parsed body rather
+than its stored bytes. The verifier still accepts them by encoding the parsed
+body again, and reports `hashing: legacy-reencoded`: such a log authenticates
+its parsed content, but not the exact encoding of its lines. Formats 1 and 2
+predate `logical_session_attached.terminal_stream` and are re-encoded without
+it. Format 10 logs report `hashing: stored-bytes`. A log must use one format
+throughout.
 
 ## Verification
 
@@ -138,12 +175,25 @@ Verify a session with:
 ```sh
 xshell-audit-verify \
   --public-key /path/to/trusted/xshell-audit.pub \
+  --index /var/lib/xshell-audit/checkpoints.jsonl \
   /var/lib/xshell-audit/sessions/SESSION-ID.jsonl
 ```
 
 Verification checks record hashes, sequence continuity, previous-hash links,
 checkpoint state, witness commitments, signing-key identity, Ed25519
-signatures, and the final-checkpoint marker.
+signatures, and the final-checkpoint marker, and rejects any entry after a
+final checkpoint. It then binds the log to a session: the session ID in the
+content must match the file name, or the ID given with `--session-id ID`. With
+`--index PATH`, the latest checkpoint the index holds for the session must be
+the log's last checkpoint; a log that was truncated, rolled back to an earlier
+checkpoint, or replaced fails.
+
+The report gives the format, the hashing scheme, the number of records and
+checkpoints, how many records the last checkpoint signs, and how many follow it
+unsigned. A log without a final checkpoint fails verification
+(`--require-final` states this default explicitly). `--allow-open` accepts such
+a log, for example one still being written, and still warns about its unsigned
+records.
 
 ## Captured events and current limitations
 
@@ -253,19 +303,31 @@ entered at prompts that disable echo are recorded on the input side. Treat
 the audit directory accordingly.
 
 An unclean client or daemon crash leaves a verifiable hash chain but no final
-checkpoint. The verifier reports this explicitly rather than claiming the log
-is complete.
+checkpoint. The verifier reports this explicitly, with the number of records
+after the last signed checkpoint, rather than claiming the log is complete.
 
-History-compaction events advanced the audit client/daemon protocol to version
-3 and the on-disk audit format to version 2; terminal-stream events advance
-them to protocol 4 and format 3; auto-continue events and the `reasoning` and
-`finish_reason` fields on agent responses advance them to protocol 5 and format
-4; `subagent_started` and `subagent_finished` events advance them to protocol 6
-and format 5; the `images` field on `input` and `tool_result` events advances
-them to protocol 7 and format 6. Image records hold the hash, media type,
-dimensions, byte length, and label, never the image bytes. `turn_started`
-and the `basis` and `approval` fields on `tool_decision` advance them to
-protocol 8 and format 7. Upgrade and restart `xshell-auditd` together
-with `xshelld` and the CLI — a version mismatch is reported at handshake with
-the expected and received versions. The verifier remains able to read every
+### Versions
+
+The audit client/daemon protocol and the on-disk format are versioned
+separately. Each protocol version from 3 on pairs with the format one below
+it:
+
+| Protocol | Format | Change |
+|---|---|---|
+| 1 | 1 | The original protocol and format |
+| 2 | 1 | `view_operation` events |
+| 3 | 2 | `history_compacted` events |
+| 4 | 3 | `terminal_stream` events and `logical_session_attached.terminal_stream` |
+| 5 | 4 | `auto_continued` events; `reasoning` and `finish_reason` on `agent_response` |
+| 6 | 5 | `subagent_started` and `subagent_finished` events |
+| 7 | 6 | `images` on `input` and `tool_result` |
+| 8 | 7 | `turn_started` events; `basis` and `approval` on `tool_decision` |
+| 9 | 8 | `turn_finished` events; `provided_tools` on `turn_started` |
+| 10 | 9 | `offered_tools` on `turn_started` |
+| 11 | 10 | Hashes and signatures cover stored bytes; requests, responses and log entries reject unknown fields (F14) |
+
+Image records hold the hash, media type, dimensions, byte length, and label,
+never the image bytes. Upgrade and restart `xshell-auditd` together with
+`xshelld` and the CLI — a version mismatch is reported at handshake with the
+expected and received versions. The verifier remains able to read every
 format from version 1 onward.

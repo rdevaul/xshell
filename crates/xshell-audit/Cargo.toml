@@ -22,7 +22,7 @@ hex.workspace = true
 libc.workspace = true
 rand_core.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip", "raw_value"] }
 sha2.workspace = true
 toml = "1.1"
 uuid.workspace = true

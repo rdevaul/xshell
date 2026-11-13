@@ -6,6 +6,8 @@ use std::path::PathBuf;
 /// versions down to `MIN_SUPPORTED_AUDIT_FORMAT_VERSION` so existing signed
 /// logs remain readable after upgrading.
 ///
+/// - 1: the original format, including `AuditEvent::LogicalSessionAttached`,
+///   `LogicalSessionDetached` and `ViewOperation`.
 /// - 2: adds `AuditEvent::HistoryCompacted`.
 /// - 3: adds `AuditEvent::TerminalStream` and the `terminal_stream` field on
 ///   `AuditEvent::LogicalSessionAttached`.
@@ -19,19 +21,35 @@ use std::path::PathBuf;
 /// - 8: adds `AuditEvent::TurnFinished` and the `provided_tools` field on
 ///   `AuditEvent::TurnStarted`.
 /// - 9: adds the `offered_tools` field on `AuditEvent::TurnStarted`.
-pub const AUDIT_FORMAT_VERSION: u32 = 9;
+/// - 10: record hashes, checkpoint signatures and checkpoint hashes cover the
+///   body bytes as stored in the line, not a re-serialization of the parsed
+///   body (F14). Formats 1 to 9 are verified by re-encoding.
+pub const AUDIT_FORMAT_VERSION: u32 = 10;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
-// Version 3 added `AuditEvent::HistoryCompacted`; version 4 adds
-// `AuditEvent::TerminalStream`; version 5 adds `AuditEvent::AutoContinued`;
-// version 6 adds `AuditEvent::SubagentStarted` and `SubagentFinished`;
-// version 7 adds `images` on `Input` and `ToolResult`; version 8 adds
-// `TurnStarted` and `basis` and `approval` on `ToolDecision`; version 9 adds
-// `TurnFinished` and `provided_tools` on `TurnStarted`; version 10 adds
-// `offered_tools` on `TurnStarted`.
-// Tagged enum variants are not forward-compatible in serde, so mixed-version
-// peers must fail at handshake. New fields are not either: an older service
-// would drop them and sign a record without them.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 10;
+/// The first format whose hashes and signatures cover the stored body bytes.
+pub const STORED_BYTES_AUDIT_FORMAT_VERSION: u32 = 10;
+/// Version of the client/daemon protocol. Each protocol version from 3 on
+/// pairs with the format one below it:
+///
+/// - 1: the original protocol (format 1).
+/// - 2: adds `AuditEvent::ViewOperation` (format 1).
+/// - 3: adds `AuditEvent::HistoryCompacted` (format 2).
+/// - 4: adds `AuditEvent::TerminalStream` (format 3).
+/// - 5: adds `AuditEvent::AutoContinued` and the agent-response fields
+///   (format 4).
+/// - 6: adds `SubagentStarted` and `SubagentFinished` (format 5).
+/// - 7: adds `images` on `Input` and `ToolResult` (format 6).
+/// - 8: adds `TurnStarted` and `basis` and `approval` on `ToolDecision`
+///   (format 7).
+/// - 9: adds `TurnFinished` and `provided_tools` on `TurnStarted` (format 8).
+/// - 10: adds `offered_tools` on `TurnStarted` (format 9).
+/// - 11: requests and responses reject unknown fields, and the daemon writes
+///   format 10 (F14).
+///
+/// Tagged enum variants are not forward-compatible in serde, so mixed-version
+/// peers must fail at handshake. New fields are not either: an older service
+/// would drop them and sign a record without them.
+pub const AUDIT_PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -167,7 +185,7 @@ pub struct AuditImage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuditEvent {
     SessionStarted {
         client_version: String,
@@ -191,6 +209,8 @@ pub enum AuditEvent {
         /// so a reader can distinguish "no terminal output" from "not
         /// captured". `None` when written by a component that does not run
         /// interactive processes (the CLI) or by a pre-format-3 writer.
+        /// Writers from format 3 on encode `None` as `null`; formats 1 and 2
+        /// never wrote the field, which the legacy verifier accounts for.
         #[serde(default)]
         terminal_stream: Option<bool>,
     },
@@ -371,6 +391,7 @@ pub enum AuditEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditRecordBody {
     pub format_version: u32,
     pub session_id: String,
@@ -382,12 +403,14 @@ pub struct AuditRecordBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditRecord {
     pub body: AuditRecordBody,
     pub record_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointBody {
     pub format_version: u32,
     pub session_id: String,
@@ -401,12 +424,14 @@ pub struct CheckpointBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WitnessCommitment {
     pub scheme: String,
     pub commitment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditCheckpoint {
     pub body: CheckpointBody,
     pub blinding_nonce: String,
@@ -416,7 +441,7 @@ pub struct AuditCheckpoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "entry", rename_all = "snake_case")]
+#[serde(tag = "entry", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuditLogEntry {
     Record(AuditRecord),
     Checkpoint(AuditCheckpoint),
