@@ -147,9 +147,28 @@ patterns = ["*.pem", "*.key", "*.p12", "id_rsa", "id_ed25519"]
 A `prompt` path stays gated even when the approval policy always allows its
 tool, unless the daemon's own policy names the path (`read_file:
 config/.env`); a client policy never can. A `block` path is refused to
-`read_file` and `list_directory` in every mode, whatever either policy says.
-Sensitivity governs the agent's read tools; a shell command that reads such a
-file is governed by the policy's `run_shell` rules.
+`read_file`, `list_directory` and `view_image` in every mode, whatever either
+policy says. Sensitivity governs the agent's read tools; a shell command that
+reads such a file is governed by the policy's `run_shell` rules.
+
+**xshell's own files are always blocked**, whatever the configuration:
+- the session state directory, which holds every durable session's history,
+  the image store and turn records;
+- the audit log directory (`audit.directory`);
+- the configuration file in use, and its whole directory when that is
+  xshell's own (`~/.config/xshell`).
+
+Each is matched at its resolved absolute path and ignoring case, so a session
+whose working directory is the home folder cannot read back another
+session's conversation, or a secret it was once approved to see, without
+approval.
+
+**One daemon per state directory.** `xshelld` locks its state directory at
+startup and refuses to replace a socket another daemon is still serving, so a
+second daemon cannot take over the first or overwrite its state. A durable
+session whose working directory has gone (a deleted project, an ejected
+volume) moves to the home directory with a note in its history, rather than
+keeping the daemon from starting.
 
 ## History compaction
 

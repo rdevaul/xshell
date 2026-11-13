@@ -954,6 +954,59 @@ fn a_blocked_path_is_never_read_whatever_the_mode() {
     assert_eq!(decision["basis"]["kind"], "blocked_path", "{decision}");
 }
 
+#[test]
+fn f24_the_daemons_own_state_and_config_are_never_read() {
+    // The session's cwd holds the daemon's state directory and the config
+    // file, as a home-directory session would.
+    let fabric = Fabric::with_config(
+        &serve(vec![
+            sse_tool_call(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "state/host-id"}),
+            ),
+            sse_tool_call(
+                "call_2",
+                "read_file",
+                serde_json::json!({"path": "config.toml"}),
+            ),
+            sse_text("could not read them"),
+        ]),
+        true,
+        true,
+        "max_approval = \"auto\"",
+        "",
+    );
+    let output = fabric.run(&[
+        "--output",
+        "jsonl",
+        "--ephemeral",
+        "--approval",
+        "auto",
+        "read the state",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let events = events(&output);
+    let decisions: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "tool_decision")
+        .collect();
+    assert_eq!(decisions.len(), 2, "{events:?}");
+    for decision in decisions {
+        assert_eq!(decision["decision"], "deny", "{decision}");
+        assert_eq!(decision["basis"]["kind"], "blocked_path", "{decision}");
+    }
+    let results: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "tool_result")
+        .map(|event| event["result"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(
+        results.iter().all(|result| result.contains("blocked")),
+        "{results:?}"
+    );
+}
+
 /// Spawn `xshell run` with a pipe on descriptor 3 for approval decisions.
 fn spawn_with_channel(fabric: &Fabric, args: &[&str]) -> (Child, std::fs::File) {
     use std::os::fd::FromRawFd;

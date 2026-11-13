@@ -203,6 +203,8 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
     let user = args.user.unwrap_or_else(system_user);
     let host_id = load_or_create_host_id(&state_directory)?;
     config.validate_budgets()?;
+    // One daemon per state directory: held until the process exits (F21).
+    let _state_lock = lock_state_directory(&state_directory)?;
     let mut registry = SessionRegistry::load(state_directory.clone(), host_id, host_alias, user)?;
     registry.set_max_sessions(config.max_sessions);
     let registry = Arc::new(Mutex::new(registry));
@@ -214,7 +216,19 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
     let execution = ExecutionCoordinator::with_policy(
         Arc::clone(&registry),
         audit,
-        daemon_policy(&config, rules, tools, credential_routes)?,
+        daemon_policy(
+            &config,
+            rules,
+            tools,
+            credential_routes,
+            // The block classes plus this daemon's own state, config and
+            // audit directories (F24).
+            config.protected_paths(
+                Some(&state_directory),
+                config_path.as_deref(),
+                audit_config.directory.as_deref(),
+            ),
+        )?,
     );
     let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
 
@@ -320,6 +334,7 @@ fn daemon_policy(
     rules: xshell_execution::Policy,
     tools: Arc<ToolRegistry>,
     credential_routes: CredentialRoutes,
+    blocked_paths: xshell_execution::SensitivePaths,
 ) -> Result<DaemonPolicy> {
     // Every credential a configured profile names stays out of the shells
     // this daemon starts, whichever session ends up using it.
@@ -330,7 +345,7 @@ fn daemon_policy(
         max_approval: config.max_approval,
         max_limits: config.limit_ceiling()?,
         sensitive_paths: config.sensitive_paths(),
-        blocked_paths: config.blocked_paths(),
+        blocked_paths,
         rules,
         compaction: config.compaction.clone(),
         tools,
@@ -1302,9 +1317,15 @@ on its model profile to attach images"
         }
         ClientRequest::PtyClaim { .. } => bail!("PTY claims require a dedicated connection"),
         ClientRequest::Detach => {
-            let detached = match attached_session.take() {
+            // Forget the attachment only once the registry has recorded the
+            // detach, so a failed save leaves the connection and the
+            // registry in agreement (F21).
+            let detached = match attached_session.clone() {
                 Some(session_id) => {
-                    detach_session(registry, execution, ptys, client_id, &session_id)?
+                    let detached =
+                        detach_session(registry, execution, ptys, client_id, &session_id)?;
+                    *attached_session = None;
+                    detached
                 }
                 None => None,
             };
@@ -1483,10 +1504,48 @@ fn prepare_socket(path: &Path) -> Result<()> {
         if !metadata.file_type().is_socket() {
             bail!("refusing to replace non-socket path {}", path.display());
         }
+        // Only a dead socket is stale. A live one belongs to a running
+        // daemon, which this one must not take over (F21).
+        if UnixStream::connect(path).is_ok() {
+            bail!(
+                "another xshelld is already serving {}; stop it first",
+                path.display()
+            );
+        }
         fs::remove_file(path)
             .with_context(|| format!("cannot remove stale session socket {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Take an exclusive lock on the state directory, so a second daemon cannot
+/// load and overwrite the same session state (F21). The lock is released
+/// when the returned file is dropped or the process exits, so a daemon that
+/// was killed leaves no stale lock behind.
+fn lock_state_directory(state_directory: &Path) -> Result<fs::File> {
+    let path = state_directory.join("xshelld.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    // SAFETY: flock(2) takes a descriptor this function owns and integer
+    // flags; it has no memory-safety preconditions.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            bail!(
+                "another xshelld is already using the state directory {}",
+                state_directory.display()
+            );
+        }
+        return Err(error).with_context(|| format!("cannot lock {}", path.display()));
+    }
+    Ok(file)
 }
 
 fn load_or_create_host_id(state_directory: &Path) -> Result<String> {
@@ -1665,6 +1724,7 @@ mod tests {
             xshell_execution::Policy::default(),
             Arc::clone(&registry),
             CredentialRoutes::default(),
+            SessionConfig::default().blocked_paths(),
         )
         .unwrap();
         assert!(Arc::ptr_eq(&policy.tools, &registry));

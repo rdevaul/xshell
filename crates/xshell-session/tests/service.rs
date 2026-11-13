@@ -1815,6 +1815,45 @@ fn a_vision_model_is_shown_the_sessions_stored_images() {
 }
 
 #[test]
+fn f21_a_second_daemon_does_not_take_over_a_running_one() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let spawn = |state: &std::path::Path, socket: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let _first = Daemon(spawn(&state, &socket));
+    let mut client = connect_when_ready(&socket);
+
+    // The same state directory, even on another socket: refused by the lock.
+    let second = spawn(&state, &temporary.path().join("other.sock"))
+        .wait_with_output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already using the state directory"),
+        "{second:?}"
+    );
+    // Another state directory on the live socket: refused, socket kept.
+    let other_state = temporary.path().join("other-state");
+    let third = spawn(&other_state, &socket).wait_with_output().unwrap();
+    assert!(!third.status.success());
+    assert!(
+        String::from_utf8_lossy(&third.stderr).contains("already serving"),
+        "{third:?}"
+    );
+    // The first daemon still answers on its socket.
+    assert!(client.list().is_ok());
+}
+
+#[test]
 fn agent_turn_waits_for_remote_approval_then_continues() {
     let tool_response = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
