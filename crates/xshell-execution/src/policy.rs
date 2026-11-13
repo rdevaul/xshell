@@ -27,20 +27,29 @@
 //! policy decides the call and the stricter decision wins, so an overlay can
 //! only restrict. An overlay is silent about calls it does not list.
 //!
-//! Allow patterns never match a compound shell command (pipelines, `;`, `&&`,
-//! substitutions, redirections, brace expansion) or one whose command word is
-//! not plain (`FOO=1 make`, `=make`); only a bare `run_shell` entry does.
-//! Deny patterns are also checked against each part of a compound command.
-//! When a policy has shell deny patterns and a command cannot be split into
-//! parts that are read as written (a substitution, a separator inside quotes,
-//! an expanding command word), the command is never run unattended: it is
-//! prompted in `ask` mode and denied otherwise. Chaining and quoting therefore
-//! cannot get around a denial. Patterns still match literal words, so wrappers
-//! such as `xargs rm` or `env rm` are not recognised as `rm`.
+//! Allow patterns match one simple command as written (no pipeline, `;`,
+//! `&&`, redirection, substitution or brace expansion; a plain command word
+//! compared literally). `*` inside an allow word does not match `/`, and an
+//! allow never matches an argument with a `..` component or an unquoted glob
+//! or tilde (F19). Only a bare `run_shell` entry matches compound commands.
+//!
+//! Deny patterns are checked against every program a command would run, as
+//! [`crate::shell_policy`] reads it: split with the shell's quoting rules,
+//! command words resolved through the working directory, `PATH` and
+//! symlinks, compared by folded name and by file identity, with transparent
+//! wrappers (`command`, `exec`, `nohup`, `time -p`, plain `env`) seen
+//! through. When a policy has shell deny patterns and a command cannot be
+//! fully checked (a substitution, a shell or inline interpreter, a wrapper
+//! such as `sudo` or `xargs`, a compound command that binds names or writes
+//! files before a later part runs), it is never run unattended: it is
+//! prompted in `ask` mode and denied otherwise. A deny list still cannot see
+//! what an allowed program does internally (H6).
 
+use crate::shell_policy::{self, Lookup, plain_command_word};
 use crate::{ApprovalPolicy, SensitivePaths};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::path::Path;
 
 /// A policy as written in configuration or sent by a client.
@@ -90,6 +99,12 @@ pub struct CallFacts<'a> {
     /// default, so `off` keeps meaning the agent changes nothing, even for
     /// a provided tool that needs no approval.
     pub writes: bool,
+    /// The working directory a `run_shell` command runs in, so a command
+    /// word with `/` can be resolved to the program it runs (F19).
+    pub cwd: Option<&'a Path>,
+    /// The `PATH` bare command words are looked up in. `None` uses the
+    /// process's own `PATH`, which agent shells inherit.
+    pub search_path: Option<&'a OsStr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,8 +168,7 @@ impl Rule {
             Self::Tool(_) => true,
             Self::Shell(pattern) => call
                 .command
-                .and_then(simple_command)
-                .is_some_and(|words| words_match(pattern, &words)),
+                .is_some_and(|command| allow_matches(pattern, command)),
             // Exact: an allow must not reach a differently cased object.
             Self::Path { pattern, .. } => call
                 .path
@@ -169,11 +183,9 @@ impl Rule {
             return false;
         }
         match self {
-            Self::Shell(pattern) => call.command.is_some_and(|command| {
-                command_parts(command)
-                    .iter()
-                    .any(|words| words_match(pattern, words))
-            }),
+            Self::Shell(pattern) => call
+                .command
+                .is_some_and(|command| deny_matches(pattern, command, &lookup(call))),
             // Case-folded: a denial must not be dodged by spelling (F13).
             Self::Path { pattern, .. } => call
                 .path
@@ -431,7 +443,7 @@ impl Policy {
                 .any(|rule| matches!(rule, Rule::Shell(_)))
             && call
                 .command
-                .is_none_or(|command| checked_parts(command).is_none())
+                .is_none_or(|command| shell_policy::analyze(command, &lookup(call)).is_none())
     }
 
     fn decide_by_rules(
@@ -538,109 +550,137 @@ impl ApprovalRules {
     }
 }
 
-/// Shell metacharacters that separate commands or redirect them. Checked on
-/// the raw text, quoted or not, so the test errs towards "compound".
-const SEPARATORS: &[char] = &['|', ';', '&', '<', '>', '\n', '\r'];
-
-/// Shell metacharacters that substitute or expand text, so the words the
-/// shell runs cannot be read from the command as written: command and
-/// parameter substitution, subshells, and brace expansion.
-const EXPANSIONS: &[char] = &['`', '$', '(', ')', '{', '}'];
-
-/// Whether `word` is a plain command name or path, which the shell runs as
-/// written. Rejects variable assignments (`FOO=1 rm`), globs (`r?`), tilde
-/// and zsh `=` expansion (`=rm`), and anything else that could make the
-/// shell run a command other than the one the word spells.
-fn plain_command_word(word: &str) -> bool {
-    !word.is_empty()
-        && word.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | ':' | '@' | ',')
-        })
-}
-
-/// The words of `command` if it is one simple command whose command word is
-/// plain.
-fn simple_command(command: &str) -> Option<Vec<String>> {
-    if command.contains(SEPARATORS) || command.contains(EXPANSIONS) {
-        return None;
+/// Where `call`'s command words are looked up.
+fn lookup<'a>(call: &CallFacts<'a>) -> Lookup<'a> {
+    Lookup {
+        cwd: call.cwd,
+        search_path: call.search_path,
     }
-    shell_words::split(command)
-        .ok()
-        .filter(|words| words.first().is_some_and(|word| plain_command_word(word)))
 }
 
-/// The words of each part of `command`, split at the metacharacters that
-/// separate commands. Parts that do not parse are skipped, so this is a
-/// best-effort reading: [`checked_parts`] says whether it can be trusted.
-fn command_parts(command: &str) -> Vec<Vec<String>> {
+/// Whether an allow pattern matches `command`: a single simple command, with
+/// no redirection, whose words match the pattern as written (F19).
+///
+/// - The command word must be plain and is compared literally: an allow is
+///   for the program it names, so `./make` or `MAKE` is not `make`.
+/// - `*` inside a pattern word does not match `/`; a pattern word that is
+///   exactly `*` matches any one word, and a final `*` any remaining words.
+/// - No match is made when any word holds a `..` path component or an
+///   unquoted glob or tilde the shell would expand: `cat docs/*` must not
+///   allow `cat docs/../../etc/passwd`, and `rm -rf build/*` must not allow
+///   `rm -rf build/../..`.
+fn allow_matches(pattern: &[String], command: &str) -> bool {
+    let Some(segments) = shell_policy::segments(command) else {
+        return false;
+    };
+    let [segment] = segments.as_slice() else {
+        return false;
+    };
+    if segment.writes_file
+        || segment
+            .words
+            .iter()
+            .any(|word| word.expands || has_parent_component(&word.text))
+    {
+        return false;
+    }
+    let words: Vec<String> = segment.words.iter().map(|word| word.text.clone()).collect();
+    let (Some(first), Some(pattern_first)) = (words.first(), pattern.first()) else {
+        return false;
+    };
+    plain_command_word(first)
+        && wildcard(pattern_first, first, true)
+        && arguments_match(&pattern[1..], &words[1..], true)
+}
+
+fn has_parent_component(word: &str) -> bool {
+    word.split('/').any(|component| component == "..")
+}
+
+/// Whether a deny pattern matches any program `command` would run.
+///
+/// The pattern's command word is compared with the program actually run, by
+/// folded file name and by file identity, after transparent wrappers are
+/// stripped (see [`shell_policy`]). Its other words are compared with the
+/// arguments as written; `*` matches anything, `/` included, so a denial is
+/// never narrower than it reads. When the command cannot be analysed, its
+/// parts are still checked as far as they can be read; the uncheckable rule
+/// in [`Policy::decide`] keeps such commands from running unattended anyway.
+fn deny_matches(pattern: &[String], command: &str, lookup: &Lookup) -> bool {
+    let Some(pattern_first) = pattern.first() else {
+        return false;
+    };
+    let (pattern_names, pattern_identity) = lookup.program(pattern_first);
+    let pattern_name = pattern_names.first().cloned().unwrap_or_default();
+    let matches = |argv: &[String], names: &[String], identity: Option<(u64, u64)>| {
+        let program = names
+            .iter()
+            .any(|name| wildcard(&pattern_name, name, false))
+            || (identity.is_some() && identity == pattern_identity);
+        program && arguments_match(&pattern[1..], &argv[1..], false)
+    };
+    match shell_policy::analyze(command, lookup) {
+        Some(invocations) => invocations
+            .iter()
+            .any(|invocation| matches(&invocation.argv, &invocation.names, invocation.identity)),
+        None => best_effort_parts(command).iter().any(|argv| {
+            let (names, identity) = lookup.program(&argv[0]);
+            matches(argv, &names, identity)
+        }),
+    }
+}
+
+/// The words of each part of a command that cannot be analysed, split at
+/// every metacharacter that separates or expands. Parts that do not parse
+/// are skipped.
+fn best_effort_parts(command: &str) -> Vec<Vec<String>> {
+    const BREAKS: &[char] = &[
+        '|', ';', '&', '<', '>', '\n', '\r', '`', '$', '(', ')', '{', '}',
+    ];
     command
-        .split(|c| SEPARATORS.contains(&c) || EXPANSIONS.contains(&c))
+        .split(BREAKS)
         .filter_map(|part| shell_words::split(part).ok())
         .filter(|words| !words.is_empty())
         .collect()
 }
 
-/// The words of each part of `command` if every part is a simple command
-/// that can be read as written: no substitution or expansion anywhere, every
-/// part parses (a separator inside quotes leaves an unbalanced part), and
-/// every command word is plain. `None` means a denial cannot be checked
-/// reliably against this command.
-fn checked_parts(command: &str) -> Option<Vec<Vec<String>>> {
-    if command.contains(EXPANSIONS) {
-        return None;
-    }
-    let mut parts = Vec::new();
-    for part in command.split(SEPARATORS) {
-        let words = shell_words::split(part).ok()?;
-        match words.first() {
-            None => {}
-            Some(word) if plain_command_word(word) => parts.push(words),
-            Some(_) => return None,
-        }
-    }
-    Some(parts)
-}
-
 /// Whether `words` match `pattern` word for word. A pattern word may contain
-/// `*` wildcards; a final pattern word of exactly `*` matches any number of
-/// remaining words, including none.
-fn words_match(pattern: &[String], words: &[String]) -> bool {
+/// `*` wildcards, and a pattern word that is exactly `*` matches any one
+/// word; a final pattern word of exactly `*` matches any number of remaining
+/// words, including none. `narrow` keeps `*` inside a word from matching
+/// `/`.
+fn arguments_match(pattern: &[String], words: &[String], narrow: bool) -> bool {
+    let word_matches =
+        |(pattern, word): (&String, &String)| pattern == "*" || wildcard(pattern, word, narrow);
     match pattern.split_last() {
         Some((last, init)) if last == "*" => {
-            words.len() >= init.len()
-                && init
-                    .iter()
-                    .zip(words)
-                    .all(|(pattern, word)| wildcard(pattern, word))
+            words.len() >= init.len() && init.iter().zip(words).all(word_matches)
         }
-        _ => {
-            pattern.len() == words.len()
-                && pattern
-                    .iter()
-                    .zip(words)
-                    .all(|(pattern, word)| wildcard(pattern, word))
-        }
+        _ => pattern.len() == words.len() && pattern.iter().zip(words).all(word_matches),
     }
 }
 
-/// `*` matches any run of characters, including none.
-fn wildcard(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == text;
-    }
-    let (first, rest) = parts.split_first().expect("split yields at least one part");
-    let Some(mut remaining) = text.strip_prefix(first) else {
-        return false;
-    };
-    let (last, middle) = rest.split_last().expect("a `*` yields two parts");
-    for part in middle {
-        match remaining.find(part) {
-            Some(index) => remaining = &remaining[index + part.len()..],
-            None => return false,
+/// `*` matches any run of characters, including none; with `narrow`, not
+/// `/`.
+fn wildcard(pattern: &str, text: &str, narrow: bool) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    // matched[j]: the pattern read so far matches text[..j].
+    let mut matched = vec![false; text.len() + 1];
+    matched[0] = true;
+    for p in pattern.chars() {
+        let mut next = vec![false; text.len() + 1];
+        if p == '*' {
+            for j in 0..=text.len() {
+                next[j] = matched[j] || (j > 0 && next[j - 1] && !(narrow && text[j - 1] == '/'));
+            }
+        } else {
+            for j in 1..=text.len() {
+                next[j] = matched[j - 1] && text[j - 1] == p;
+            }
         }
+        matched = next;
     }
-    remaining.len() >= last.len() && remaining.ends_with(last)
+    matched[text.len()]
 }
 
 /// Path patterns follow sensitive-path matching: a pattern with `/` matches at
@@ -682,6 +722,10 @@ mod tests {
         Policy::parse(&config).unwrap().0
     }
 
+    /// The `PATH` shell commands in these tests are resolved against, so
+    /// results do not depend on the test runner's own `PATH`.
+    const TEST_PATH: &str = "/usr/bin:/bin";
+
     fn shell(command: &str) -> CallFacts<'_> {
         CallFacts {
             tool: "run_shell",
@@ -690,6 +734,8 @@ mod tests {
             gated: true,
             sensitive: false,
             writes: true,
+            cwd: None,
+            search_path: Some(OsStr::new(TEST_PATH)),
         }
     }
 
@@ -702,6 +748,8 @@ mod tests {
             gated: false,
             sensitive: false,
             writes,
+            cwd: None,
+            search_path: None,
         }
     }
 
@@ -713,6 +761,8 @@ mod tests {
             gated: sensitive,
             sensitive,
             writes: false,
+            cwd: None,
+            search_path: None,
         }
     }
 
@@ -875,10 +925,20 @@ mod tests {
         assert_eq!(base(&rules, &shell("make all")), [Deny, Run, Run]);
         assert_eq!(base(&rules, &shell("ls | wc -l")), [Deny, Run, Run]);
         assert_eq!(base(&rules, &shell("rm -rf build")), [Deny, Deny, Deny]);
+        // Quoted separators are read as literal text, and a command word that
+        // still names `rm` is denied outright.
         for command in [
-            // A separator inside quotes leaves parts that do not parse.
             "rm -rf \"build;\"",
             "rm -rf 'a|b' build",
+            "~/bin/rm -rf build",
+        ] {
+            assert_eq!(
+                base(&rules, &shell(command)),
+                [Deny, Deny, Deny],
+                "{command}"
+            );
+        }
+        for command in [
             // Substitutions hide the command word.
             "$(echo rm) -rf build",
             "`echo rm` -rf build",
@@ -889,7 +949,6 @@ mod tests {
             "FOO=1 rm -rf build",
             "=rm -rf build",
             "r? -rf build",
-            "~/bin/rm -rf build",
         ] {
             assert_eq!(
                 base(&rules, &shell(command)),
@@ -927,28 +986,189 @@ mod tests {
     fn quoting_cannot_smuggle_a_second_command_past_a_pattern() {
         let rules = policy(&["run_shell: echo *"], Some(&[]), &[]);
         assert_eq!(base(&rules, &shell("echo hello world")), [Deny, Run, Run]);
-        assert_eq!(base(&rules, &shell("echo 'a;b'")), [Deny, Deny, Deny]);
+        // A quoted separator is one literal argument: still one `echo`.
+        assert_eq!(base(&rules, &shell("echo 'a;b'")), [Deny, Run, Run]);
+        assert_eq!(base(&rules, &shell("echo a;b")), [Deny, Deny, Deny]);
         assert_eq!(base(&rules, &shell("echo \"$(id)\"")), [Deny, Deny, Deny]);
     }
 
     #[test]
     fn word_patterns_match_exactly_or_with_wildcards() {
         let words = |text: &str| shell_words::split(text).unwrap();
-        assert!(words_match(&words("git status"), &words("git status")));
-        assert!(!words_match(&words("git status"), &words("git status -s")));
-        assert!(words_match(&words("git *"), &words("git")));
-        assert!(words_match(&words("git *"), &words("git log --oneline")));
-        assert!(words_match(
-            &words("yapcad export *.step"),
-            &words("yapcad export part.step")
-        ));
-        assert!(!words_match(
-            &words("yapcad export *.step"),
-            &words("yapcad export part.stl")
-        ));
-        assert!(wildcard("a*b*c", "aXXbYYc"));
-        assert!(!wildcard("a*b*c", "aXXc"));
-        assert!(wildcard("*", ""));
+        let allows = |pattern: &str, command: &str| allow_matches(&words(pattern), command);
+        assert!(allows("git status", "git status"));
+        assert!(!allows("git status", "git status -s"));
+        assert!(allows("git *", "git"));
+        assert!(allows("git *", "git log --oneline"));
+        assert!(allows("yapcad export *.step", "yapcad export part.step"));
+        assert!(!allows("yapcad export *.step", "yapcad export part.stl"));
+        assert!(wildcard("a*b*c", "aXXbYYc", false));
+        assert!(!wildcard("a*b*c", "aXXc", false));
+        assert!(wildcard("*", "", true));
+        assert!(wildcard("a*", "a/b", false));
+        assert!(!wildcard("a*", "a/b", true));
+    }
+
+    /// The configuration a shell denial must protect: everything but `rm`.
+    fn everything_but_rm() -> Policy {
+        policy(&["run_shell"], None, &["run_shell: rm *"])
+    }
+
+    #[test]
+    fn f19_the_reported_bypasses_never_run_unattended() {
+        let rules = everything_but_rm();
+        for command in [
+            "RM -rf build",
+            "hash x=/bin/rm; x -rf build",
+            "ln -s /bin/rm r && ./r -rf build",
+            "repeat 1 rm -rf build",
+            "time rm -rf build",
+            "coproc rm -rf build",
+            "exec rm -rf build",
+            "nohup rm -rf build",
+            "sh -c 'rm -rf build'",
+            "bash -c 'rm -rf build'",
+            "/bin/rm -rf build",
+            "/usr/bin/rm -rf build",
+            "find . -delete",
+            "find . -name '*.o' -exec rm {} +",
+            "command rm -rf build",
+            "env -i rm -rf build",
+            "builtin command rm -rf build",
+            "echo build | xargs rm -rf",
+            "sudo rm -rf build",
+            "python3 -c 'import shutil; shutil.rmtree(\"build\")'",
+            "perl -e 'system(\"rm -rf build\")'",
+            "echo 'rm -rf build' | sh",
+            "awk 'BEGIN{system(\"rm -rf build\")}'",
+            "sed 's/.*/rm -rf build/e' list",
+            "eval rm -rf build",
+            ". ./script",
+            "git -c alias.x='!rm -rf build' x",
+            "cp /bin/rm ~/bin/x; x -rf build",
+            "cat /bin/rm > rr && ./rr -rf build",
+            "rm -rf \"build;\"",
+        ] {
+            let decided = base(&rules, &shell(command));
+            assert!(
+                decided[1] != Run && decided[2] != Run,
+                "{command}: {decided:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f19_wrappers_and_spellings_of_a_denied_program_are_denied() {
+        let rules = everything_but_rm();
+        for command in [
+            "RM -rf build",
+            "/bin/rm -rf build",
+            "command rm -rf build",
+            "exec rm -rf build",
+            "nohup rm -rf build",
+            "time -p rm -rf build",
+            "env A=1 rm -rf build",
+            "ls && rm -rf build",
+            "rm -rf \"build;\"",
+        ] {
+            assert_eq!(
+                base(&rules, &shell(command)),
+                [Deny, Deny, Deny],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn f19_a_symlink_to_a_denied_program_is_denied() {
+        let rm = ["/bin/rm", "/usr/bin/rm"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+            .expect("rm is installed");
+        let temporary = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(rm, temporary.path().join("tidy")).unwrap();
+        std::fs::hard_link(
+            std::fs::canonicalize(rm).unwrap(),
+            temporary.path().join("sweep"),
+        )
+        .ok();
+        let path = format!("{}:{TEST_PATH}", temporary.path().display());
+        let rules = everything_but_rm();
+        for command in ["./tidy -rf build", "tidy -rf build"] {
+            let call = CallFacts {
+                cwd: Some(temporary.path()),
+                search_path: Some(OsStr::new(&path)),
+                ..shell(command)
+            };
+            assert_eq!(base(&rules, &call), [Deny, Deny, Deny], "{command}");
+        }
+        // A hard link has another name but the same file.
+        if temporary.path().join("sweep").exists() {
+            let call = CallFacts {
+                cwd: Some(temporary.path()),
+                search_path: Some(OsStr::new(&path)),
+                ..shell("sweep -rf build")
+            };
+            assert_eq!(base(&rules, &call), [Deny, Deny, Deny]);
+        }
+    }
+
+    #[test]
+    fn f19_ordinary_commands_still_run_under_a_denial() {
+        let rules = everything_but_rm();
+        for command in [
+            "git status",
+            "make test",
+            "yapcad export a.step",
+            "ls -la | wc -l",
+            "cargo build 2>&1 | tail -n 5",
+            "make > build.log 2>&1",
+            "grep -rn foo src && echo found",
+            "command -v rm",
+            "sed -n '/error/p' log",
+            "awk -f report.awk data",
+            "find . -name '*.rs'",
+        ] {
+            assert_eq!(base(&rules, &shell(command)), [Deny, Run, Run], "{command}");
+        }
+        // Under a denial, a command that is fully understood but runs a file
+        // an earlier part may have written is not.
+        for command in ["make && ./out/tool", "curl -o x http://h; ls"] {
+            assert_eq!(
+                base(&rules, &shell(command)),
+                [Deny, Prompt, Deny],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn f19_allow_patterns_do_not_cross_directories_or_expand() {
+        let rules = policy(
+            &["run_shell: rm -rf build/*", "run_shell: cat docs/*"],
+            None,
+            &[],
+        );
+        assert_eq!(base(&rules, &shell("rm -rf build/out")), [Deny, Run, Run]);
+        assert_eq!(base(&rules, &shell("cat docs/guide.md")), [Deny, Run, Run]);
+        for command in [
+            "rm -rf build/../..",
+            "rm -rf build/a/../../..",
+            "cat docs/../../../etc/passwd",
+            "cat docs/sub/file",
+            "cat docs/*",
+            "cat docs/~",
+            "rm -rf build/[a-z]",
+        ] {
+            assert_eq!(
+                base(&rules, &shell(command)),
+                [Deny, Prompt, Run],
+                "{command}"
+            );
+        }
+        // Quoted, the same characters are literal and the pattern applies.
+        assert_eq!(base(&rules, &shell("cat 'docs/*'")), [Deny, Run, Run]);
     }
 
     #[test]
