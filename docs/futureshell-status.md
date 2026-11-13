@@ -135,8 +135,9 @@ replace FS2–FS4.
   accept a turn ID, as the CAD plan originally specified, and the terminal
   result should be durable (F7), so that `wait` and `result` survive a daemon
   restart. Until then the connector cannot claim durable resume.
-- **H6 — Pattern policy is not isolation.** Shell patterns match literal
-  words and cannot see what an interpreter or script does. `run_shell` keeps
+- **H6 — Pattern policy is not isolation.** Shell patterns see the programs
+  a command starts (F19), not what an interpreter, script or allowed program
+  does once running. `run_shell` keeps
   ambient authority and must never be reported as `isolated`. The CAD plan's
   open question on sandboxing `run_shell` and FutureShell's `isolated`
   provider are one design problem, to be solved once.
@@ -155,8 +156,12 @@ replace FS2–FS4.
   parts, and substitutions, expansions and assignments hid the command word.
   The policy now fails closed: with `run_shell` denials, a command that
   cannot be split into parts read as written is prompted in `ask` mode and
-  denied otherwise. Wrappers such as `xargs rm` remain the documented
-  literal-word limit (H6).
+  denied otherwise. F19 (2026-11-12 review) closed the remaining spellings:
+  denials now resolve the program each part runs (`RM`, `/bin/rm`,
+  `command rm`, symlinks and hard links), and wrappers (`xargs`, `sudo`,
+  `coproc`), shells, inline interpreters, `find -exec`/`-delete` and
+  compound commands that bind names or write files before a later part are
+  uncheckable. What an allowed program does internally remains H6.
 - **Audit binding (H3, mostly closed).** Each agent turn's `turn_started`
   audit record holds the effective mode and limits and both policies with
   their identities, and every `tool_decision` records its basis (the policy

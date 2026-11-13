@@ -1529,6 +1529,8 @@ print $f $$; close $f; sleep 1000000' & sleep 1000000",
                 gated: false,
                 sensitive: false,
                 writes: false,
+                cwd: None,
+                search_path: None,
             };
             assert!(facts.path.is_some(), "{path} prepares");
             for mode in [

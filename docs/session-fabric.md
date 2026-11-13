@@ -87,20 +87,56 @@ first rule that matches:
   [tool provider](tool-providers.md) that needs no approval.
 - **Denied wins:** a `denied` entry overrides an `always_allowed` or `allowed`
   entry it covers, and xshelld reports each override when it starts.
-- **Compound commands:** allow patterns never match a command with a
-  pipeline, `;`, `&&`, a substitution, a redirection, or brace expansion, or
-  one whose command word is not a plain name or path (`FOO=1 make`, `=make`,
-  `ma?e`); only a bare `run_shell` entry does. Deny patterns are also checked
-  against each part of such a command. When a policy has `run_shell` deny
-  patterns and a command cannot be split into parts that are read as written
-  (a substitution, a separator inside quotes, an expanding command word), it
-  never runs unattended: it is prompted in `ask` mode and denied otherwise.
-  So neither chaining nor quoting gets around a denial. A pattern that allows
-  an interpreter or a script (`python *`, `./build.sh`) allows whatever that
-  program does.
-- **Literal words:** patterns match the command as written, so
-  `run_shell: rm *` does not match `/bin/rm` or `command rm`. Prefer an
-  `allowed` list, which denies everything unlisted, over a `denied` list
+- **Allow patterns** match one simple command as written: no pipeline, `;`,
+  `&&`, redirection, substitution or brace expansion, and a plain command
+  word compared literally (`./make` and `FOO=1 make` are not `make`). `*`
+  inside a pattern word does not match `/`; a pattern word that is exactly
+  `*` matches one word, and a final `*` any remaining words. An allow never
+  matches when an argument has a `..` component or an unquoted glob or
+  tilde, so `run_shell: cat docs/*` does not allow
+  `cat docs/../../etc/passwd`, and `run_shell: rm -rf build/*` does not
+  allow `rm -rf build/../..`. Only a bare `run_shell` entry matches compound
+  commands. A pattern that allows an interpreter or a script (`python *`,
+  `./build.sh`) allows whatever that program does.
+- **Deny patterns** are checked against every program a command would run
+  (F19). The command is split with the shell's quoting rules, so a quoted
+  `;` is text and a redirection target is not a command. Each command word
+  is resolved as the shell would resolve it: a path against the session's
+  working directory, a bare name through `PATH`, then through symlinks. It
+  matches a denied program by name, letter case ignored, or by being the
+  same file (a hard link). `command`, `exec`, `nohup`, `time -p` and `env`
+  with only assignments, `-i` or `-u` are seen through. So
+  `run_shell: rm *` denies `RM -rf x`, `/bin/rm -rf x`, `command rm -rf x`,
+  `exec rm -rf x` and `./tidy -rf x` when `tidy` links to `rm`.
+- **Fail closed:** when a policy has `run_shell` deny patterns, a command it
+  cannot fully check is never run unattended. It is prompted in `ask` mode
+  and denied otherwise, with the `uncheckable_command` basis. That covers:
+  - substitutions, parameter and brace expansion, here-documents, and
+    command words that are not plain (`FOO=1 rm`, `r?`, `=rm`, `~/bin/x`);
+  - shell grammar and wrappers that run a program the policy cannot see:
+    `sudo`, `xargs`, `coproc`, `repeat`, `eval`, `source`, `.`, `nice`,
+    `timeout`, `setsid`, `watch`, `flock`, `chroot`, `script` and similar;
+  - every shell (`sh -c '…'`, `echo … | sh`, `busybox`), and interpreters
+    given inline code or standard input (`python -c`, `perl -e`, `node -e`,
+    `awk` without `-f`, `sed` with its `e` command or `s///e`); an
+    interpreter given an existing script file is checked as that program;
+  - `find` with `-exec`, `-execdir`, `-ok`, `-okdir` or `-delete`, and `git
+    -c` (which can define an alias that runs a shell command);
+  - in a compound command, a part that could change what a later part runs:
+    an output redirection, or a name-binding or file-writing command
+    (`hash`, `alias`, `export`, `ln`, `cp`, `mv`, `curl`, `tee`, `chmod`,
+    ...) in any part but the last, and a command word with `/` in any part
+    but the first. So `ln -s /bin/rm r && ./r -rf x` and
+    `hash x=/bin/rm; x -rf x` never run unattended.
+- **What a denial cannot see.** The policy reads the command, not the
+  programs it runs: a script, a Makefile, or any allowed program can still
+  do internally what a denied program would, so a deny list is a guard
+  against the shell, not isolation (H6 in
+  [FutureShell status](futureshell-status.md)). Names are resolved with the
+  daemon's `PATH` when the call is decided; a shell startup file that
+  changes `PATH` or defines aliases or functions is not seen, and a copy
+  (not a link) of a denied program made by an earlier call is not
+  recognised. Prefer an `allowed` list, which denies everything unlisted,
   when the goal is to keep a command from running.
 - **Client policies:** a client may send its own policy with a turn
   (`xshell --approval-policy FILE`). Each policy decides the call and the

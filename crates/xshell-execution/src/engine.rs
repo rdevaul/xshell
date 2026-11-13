@@ -1009,6 +1009,8 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     ToolRef::Provided(provided) => provided.access() == ToolAccess::ReadWrite,
                     ToolRef::Builtin(builtin) => builtin == Tool::RunShell,
                 },
+                cwd: Some(cwd),
+                search_path: None,
             };
             let ruled = policy.rules.decide_with_basis(&facts, approval);
             let policy_decision = ruled.decision;

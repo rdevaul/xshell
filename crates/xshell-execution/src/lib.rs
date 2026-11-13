@@ -10,6 +10,7 @@ mod prepared;
 mod process;
 mod provider;
 mod sensitive;
+mod shell_policy;
 mod tools;
 
 pub use budget::{
