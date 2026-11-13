@@ -229,8 +229,9 @@ checks two things on every connection:
   file with `cat`. On Linux the daemon is its descendants' subreaper, so a
   process that double-forks to leave the tree is re-parented to the daemon
   and is still refused. The check fails closed: a connecting process the
-  daemon cannot identify, or whose ancestry it cannot trace back to the root
-  (because it has already exited, say), is refused too, so a descendant
+  daemon cannot identify, or whose ancestry it cannot trace to the root or to
+  another user's process (because it has already exited, say), is refused
+  too, so a descendant
   cannot hand its connection to a child and exit before the check.
 
 Remote clients over SSH are unaffected: `xshelld serve-stdio` and
