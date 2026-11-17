@@ -20,8 +20,9 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `ModelBinding`. Version 24 adds `ClientRequest::LocateTurn` and durable
 // turn records. Version 25 adds `UploadImage`, `images` on
 // `TurnInput::Agent`, the `view_image` tool and `images` on
-// `ExecutionEvent::ToolResult`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 25;
+// `ExecutionEvent::ToolResult`. Version 26 adds the control `token` on
+// `ClientRequest::Open` and refuses unauthenticated requests (F27).
+pub const SESSION_PROTOCOL_VERSION: u32 = 26;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

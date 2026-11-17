@@ -1105,6 +1105,10 @@ mod tests {
                 let directory = tempfile::TempDir::new().unwrap();
                 let socket = directory.path().join("xshelld.sock");
                 let listener = UnixListener::bind(&socket).unwrap();
+                // Clients read the daemon's control token from beside the
+                // socket (F27).
+                xshell_session::write_new_token(&xshell_session::control_token_path(&socket))
+                    .unwrap();
                 let session = Arc::new(Mutex::new(initial));
                 let updates = Arc::new(Mutex::new(Vec::new()));
                 let (state, received) = (Arc::clone(&session), Arc::clone(&updates));

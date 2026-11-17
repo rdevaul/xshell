@@ -206,6 +206,48 @@ session whose working directory has gone (a deleted project, an ejected
 volume) moves to the home directory with a note in its history, rather than
 keeping the daemon from starting.
 
+## Who may control the daemon
+
+The socket only admits the user who owns the daemon. That alone would let
+anything running as that user drive it, including the commands the daemon
+itself runs. An agent's `run_shell` command could then attach a detached
+session and approve its own next call, submit a `$` command no approval
+policy covers, or change a session's model or history. So `xshelld` also
+checks two things on every connection:
+
+- **A control token.** Each start writes a fresh random token beside the
+  socket, as `<socket>.token` (`xshelld.sock.token` in the state directory by
+  default), readable only by the user. Clients read it from there and present
+  it when they open a connection. Without it a connection learns only the
+  daemon's identity and protocol version, as `xshelld probe` needs; every
+  other request is refused (`unauthorized`), and a wrong token is refused
+  outright. Agent read tools can never read the token file: it is in the
+  state directory, which is always blocked, and its own path is blocked too.
+- **Not one of its own processes.** A connection from a process the daemon
+  started, or any of their descendants, is refused whatever it presents
+  (`forbidden_descendant`). That covers a shell command that reads the token
+  file with `cat`. On Linux the daemon is its descendants' subreaper, so a
+  process that double-forks to leave the tree is re-parented to the daemon
+  and is still refused. The check fails closed: a connecting process the
+  daemon cannot identify, or whose ancestry it cannot trace to the root or to
+  another user's process (because it has already exited, say), is refused
+  too, so a descendant
+  cannot hand its connection to a child and exit before the check.
+
+Remote clients over SSH are unaffected: `xshelld serve-stdio` and
+`serve-pty-stdio` run on the remote host as the user, read that host's token
+and present it for the client, so SSH remains the remote connection's
+authentication. Terminal streams are claimed on an authenticated connection,
+with the ticket the controlling client received.
+
+**What this does not cover.** A program the user runs outside xshell can
+still read the token and connect, as it could edit any of the user's files.
+On macOS, where there is no subreaper, a descendant that both double-forks
+to leave the daemon's process tree and reads the token file (with a shell
+command; agent read tools cannot) can still connect. Separating the agent's
+commands from the user's own authority needs operating-system sandboxing
+([H6](futureshell-status.md)).
+
 ## History compaction
 
 Every provider request carries the full conversation, so an unbounded history

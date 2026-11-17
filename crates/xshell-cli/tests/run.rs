@@ -912,6 +912,59 @@ fn an_invalid_client_policy_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
 }
 
+/// The token file and socket of a fabric's daemon.
+fn control_token(fabric: &Fabric) -> std::path::PathBuf {
+    fabric
+        .directory
+        .path()
+        .join("state")
+        .join("xshelld.sock.token")
+}
+
+#[test]
+fn f27_an_agents_own_commands_cannot_drive_the_daemon() {
+    // The agent's run_shell command runs the real xshell against its own
+    // daemon, with the daemon's config and control token readable on disk.
+    // It runs in the session's cwd, the fabric directory.
+    let command = format!(
+        "{} --config ./config.toml status --session f27; echo exit=$?",
+        env!("CARGO_BIN_EXE_xshell")
+    );
+    let fabric = Fabric::with_config(
+        &serve(vec![
+            sse_tool_call(
+                "call_1",
+                "run_shell",
+                serde_json::json!({ "command": command }),
+            ),
+            sse_text("done"),
+        ]),
+        true,
+        true,
+        "max_approval = \"auto\"",
+        "",
+    );
+    let output = fabric.run(&[
+        "--output",
+        "jsonl",
+        "--session",
+        "f27",
+        "--approval",
+        "auto",
+        "check the session",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(control_token(&fabric).exists());
+    let result = tool_result(&events(&output));
+    assert!(
+        result.contains("may not control it") && !result.contains("exit=0"),
+        "the agent's command reached the daemon: {result}"
+    );
+    // The user's own client, with the same token, still works.
+    let status = fabric.job("status", &["--session", "f27"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+}
+
 #[test]
 fn a_blocked_path_is_never_read_whatever_the_mode() {
     let fabric = Fabric::with_config(

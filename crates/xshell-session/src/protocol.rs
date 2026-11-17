@@ -14,6 +14,11 @@ pub enum ClientRequest {
     Open {
         protocol_version: u32,
         client_version: String,
+        /// The daemon's control token (F27). Without it the connection may
+        /// only learn the daemon's identity, as a probe does; every other
+        /// request is refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     List,
     Create {
@@ -112,10 +117,21 @@ pub enum ClientRequest {
 pub const MAX_UPLOAD_IMAGE_BYTES: u64 = xshell_execution::MAX_SOURCE_BYTES;
 
 impl ClientRequest {
+    /// An open request without a token: enough to probe the daemon.
     pub fn open(client_version: impl Into<String>) -> Self {
         Self::Open {
             protocol_version: SESSION_PROTOCOL_VERSION,
             client_version: client_version.into(),
+            token: None,
+        }
+    }
+
+    /// An open request carrying the daemon's control token.
+    pub fn open_with_token(client_version: impl Into<String>, token: String) -> Self {
+        Self::Open {
+            protocol_version: SESSION_PROTOCOL_VERSION,
+            client_version: client_version.into(),
+            token: Some(token),
         }
     }
 }

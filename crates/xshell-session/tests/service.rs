@@ -1815,6 +1815,61 @@ fn a_vision_model_is_shown_the_sessions_stored_images() {
 }
 
 #[test]
+fn f27_connections_without_the_control_token_control_nothing() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // The real client reads the token and works.
+    let mut client = connect_when_ready(&socket);
+    assert!(client.list().is_ok());
+
+    let exchange = |open: ClientRequest, then: Option<ClientRequest>| {
+        let stream = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut replies = Vec::new();
+        for request in std::iter::once(open).chain(then) {
+            serde_json::to_writer(&mut writer, &request).unwrap();
+            writer.write_all(b"\n").unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            replies.push(serde_json::from_str::<ServerResponse>(&line).unwrap());
+        }
+        replies
+    };
+    // No token: the identity a probe needs, and nothing else.
+    let replies = exchange(ClientRequest::open("test"), Some(ClientRequest::List));
+    assert!(matches!(replies[0], ServerResponse::Opened { .. }));
+    assert!(
+        matches!(&replies[1], ServerResponse::Error { code, .. } if code == "unauthorized"),
+        "{replies:?}"
+    );
+    // A wrong token is refused at open.
+    let replies = exchange(ClientRequest::open_with_token("test", "0".repeat(64)), None);
+    assert!(
+        matches!(&replies[0], ServerResponse::Error { code, .. } if code == "unauthorized"),
+        "{replies:?}"
+    );
+    // The token is private to the user and rotates with each start.
+    let token_path = xshell_session::control_token_path(&socket);
+    let mode = std::fs::metadata(&token_path).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn f21_a_second_daemon_does_not_take_over_a_running_one() {
     let temporary = TempDir::new().unwrap();
     let state = temporary.path().join("state");

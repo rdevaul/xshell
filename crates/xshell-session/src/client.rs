@@ -228,6 +228,8 @@ impl SessionClient {
         }
     }
 
+    /// Connect to the local daemon at `socket`, authenticating with the
+    /// control token it keeps beside the socket (F27).
     pub fn connect(socket: &Path, client_version: &str) -> Result<Self> {
         let stream = UnixStream::connect(socket).with_context(|| {
             format!(
@@ -235,6 +237,7 @@ impl SessionClient {
                 socket.display()
             )
         })?;
+        let token = crate::read_token(&crate::control_token_path(socket))?;
         set_close_on_exec(&stream)?;
         let writer = stream.try_clone().context("cannot clone session socket")?;
         set_close_on_exec(&writer)?;
@@ -243,6 +246,7 @@ impl SessionClient {
             Box::new(writer),
             TransportGuard::Local,
             client_version,
+            Some(token),
         )
     }
 
@@ -326,11 +330,14 @@ impl SessionClient {
             .with_context(|| format!("cannot start ssh connection to {destination:?}"))?;
         let reader = child.stdout.take().context("cannot capture ssh stdout")?;
         let writer = child.stdin.take().context("cannot open ssh stdin")?;
+        // The remote `serve-stdio` authenticates to its own daemon with that
+        // host's token; SSH is this connection's authentication.
         Self::open(
             Box::new(reader),
             Box::new(writer),
             TransportGuard::Ssh(child),
             client_version,
+            None,
         )
         .with_context(|| format!("cannot open xshell session service on {destination:?}"))
     }
@@ -340,6 +347,7 @@ impl SessionClient {
         writer: Box<dyn Write + Send>,
         transport: TransportGuard,
         client_version: &str,
+        token: Option<String>,
     ) -> Result<Self> {
         let mut client = Self {
             client_id: String::new(),
@@ -350,7 +358,10 @@ impl SessionClient {
             writer,
             _transport: transport,
         };
-        client.send(&ClientRequest::open(client_version))?;
+        client.send(&match token {
+            Some(token) => ClientRequest::open_with_token(client_version, token),
+            None => ClientRequest::open(client_version),
+        })?;
         match client.receive()? {
             ServerResponse::Opened {
                 protocol_version,
