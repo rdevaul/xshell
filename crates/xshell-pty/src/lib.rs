@@ -709,9 +709,11 @@ fn spawn_child(
     // Keep every descriptor above 2 (other jobs' PTY masters, daemon
     // sockets) from crossing exec (finding F12).
     xshell_platform::descriptors::restrict_inherited_descriptors(&mut process);
-    let child = process
-        .spawn()
-        .with_context(|| format!("could not launch PTY shell {shell}"))?;
+    // The job is waited on here, so the daemon's orphan reaper leaves it
+    // alone.
+    let child =
+        xshell_platform::children::spawn_waited(|| process.spawn(), |child| Some(child.id()))
+            .with_context(|| format!("could not launch PTY shell {shell}"))?;
     Ok((master, child))
 }
 

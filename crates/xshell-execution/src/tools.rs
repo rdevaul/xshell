@@ -760,9 +760,11 @@ async fn run_shell_with_grace(
     apply_agent_environment(&mut process);
     configure_process_group(&mut process);
     restrict_inherited_descriptors(&mut process);
-    let child = process
-        .spawn()
-        .with_context(|| format!("could not launch shell {shell}"))?;
+    // The child is waited on here, so the daemon's orphan reaper leaves it
+    // alone.
+    let child =
+        xshell_platform::children::spawn_waited(|| process.spawn(), tokio::process::Child::id)
+            .with_context(|| format!("could not launch shell {shell}"))?;
     let mut stdout = BoundedOutput::default();
     let mut stderr = BoundedOutput::default();
     let end = supervise_shell(

@@ -8,7 +8,9 @@
 //! and every connection that controls a session must present it. The file
 //! sits in the daemon's state directory by default, which agent read tools
 //! may never read (F24); the daemon also refuses connections from its own
-//! descendants outright, which covers a shell command that reads the file.
+//! descendants outright, which covers a shell command that reads the file
+//! but not one that escapes the daemon's process tree first (F27 is only
+//! partially corrected; see docs/session-fabric.md).
 
 use anyhow::{Context, Result, bail};
 use std::fs;
