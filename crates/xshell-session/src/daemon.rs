@@ -909,9 +909,10 @@ fn handle_client(
     // connections are allowed.
     let own_pid = std::process::id();
     // Fail closed: a peer whose process cannot be identified is treated as
-    // one of the daemon's own descendants (F27).
+    // one of the daemon's own descendants (F27). No process has pid 0; the
+    // kernel reports it for a peer it cannot name.
     let peer_is_descendant = xshell_platform::peer_pid(&stream).map_or(true, |pid| {
-        pid != own_pid && xshell_platform::is_descendant_of(pid, own_pid)
+        pid == 0 || (pid != own_pid && xshell_platform::is_descendant_of(pid, own_pid))
     });
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;

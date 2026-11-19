@@ -59,7 +59,12 @@ impl PtyStreamClient {
             )
         })?;
         let mut writer = reader.try_clone().context("cannot clone PTY socket")?;
-        send_json(&mut writer, &ClientRequest::open(env!("CARGO_PKG_VERSION")))?;
+        // A PTY stream is claimed on an authenticated connection only (F27).
+        let token = crate::read_token(&crate::control_token_path(socket))?;
+        send_json(
+            &mut writer,
+            &ClientRequest::open_with_token(env!("CARGO_PKG_VERSION"), token),
+        )?;
         match read_json_response(&mut &reader)? {
             ServerResponse::Opened {
                 protocol_version, ..
