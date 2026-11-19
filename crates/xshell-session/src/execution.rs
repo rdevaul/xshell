@@ -117,7 +117,7 @@ impl TurnSlot {
     /// Take a place, unless `limit` turns are already running.
     fn acquire(running: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         running
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < limit).then_some(count + 1)
             })
             .ok()
