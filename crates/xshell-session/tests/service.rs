@@ -13,8 +13,8 @@ mod common;
 use common::{connect_when_ready, serve_sse, sse_text, sse_tool_call};
 use xshell_session::{
     AttachmentRole, ClientPtyFrame, ClientRequest, ModelBinding, PersistenceMode, PtySize,
-    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionClient,
-    SessionCreation, SessionEventKind, TurnInput, Visibility, read_server_frame,
+    PtyStreamClient, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
+    SessionClient, SessionCreation, SessionEventKind, TurnInput, Visibility, read_server_frame,
     write_client_frame,
 };
 
@@ -491,6 +491,54 @@ fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
     assert!(text.contains("37 109"));
     drop(input);
     assert!(proxy.wait().unwrap().success());
+}
+
+#[test]
+fn f27_local_pty_stream_claims_its_ticket_with_the_control_token() {
+    let temporary = TempDir::new().unwrap();
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .args(["--host-alias", "test-host", "--user", "tester"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut owner = connect_when_ready(&socket);
+    let session = owner
+        .create(SessionCreation {
+            name: "local-pty".into(),
+            model: model("local"),
+            cwd: temporary.path().to_owned(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: Vec::new(),
+            tools: Default::default(),
+        })
+        .unwrap();
+    let ticket = owner
+        .pty_start(
+            session.descriptor.id.clone(),
+            "sleep 30".into(),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            None,
+        )
+        .unwrap();
+
+    // The interactive client's own path to a screen-mode program: a second
+    // local connection, which must authenticate like the first.
+    let stream = PtyStreamClient::connect_local(&socket, &ticket.ticket, ticket.replay_from);
+    assert!(stream.is_ok(), "{:#}", stream.err().unwrap());
+    drop(stream);
+    owner.pty_close(session.descriptor.id).unwrap();
 }
 
 fn send_request(writer: &mut impl Write, request: &ClientRequest) {
@@ -1850,6 +1898,17 @@ fn f27_connections_without_the_control_token_control_nothing() {
     // No token: the identity a probe needs, and nothing else.
     let replies = exchange(ClientRequest::open("test"), Some(ClientRequest::List));
     assert!(matches!(replies[0], ServerResponse::Opened { .. }));
+    assert!(
+        matches!(&replies[1], ServerResponse::Error { code, .. } if code == "unauthorized"),
+        "{replies:?}"
+    );
+    // Nor may it claim a PTY stream: refused before the ticket is looked at.
+    let replies = exchange(
+        ClientRequest::open("test"),
+        Some(ClientRequest::PtyClaim {
+            ticket: "0".repeat(32),
+        }),
+    );
     assert!(
         matches!(&replies[1], ServerResponse::Error { code, .. } if code == "unauthorized"),
         "{replies:?}"
