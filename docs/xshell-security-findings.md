@@ -1,6 +1,6 @@
 # xshell security finding ledger
 
-**Updated:** 12 November 2026
+**Updated:** 17 November 2026
 
 **Authority:** The evidence and acceptance conditions in the
 [design, security, and usability review](xshell-design-security-usability-review.md)
@@ -31,7 +31,8 @@ historical review.
 | F21 | [#137](https://github.com/rdevaul/xshell/issues/137) | P1 | Daemon startup and state | Corrected | Closing a session mid-turn, an orphaned in-flight marker, and a durable session whose cwd was deleted all leave a daemon that starts; a second daemon on the same state directory or live socket refuses to start and the first keeps serving; a failed detach keeps the connection attached |
 | F23 | [#139](https://github.com/rdevaul/xshell/issues/139) | P1 | M1.4 credential bounds | Corrected (a keyless binding may still name any endpoint) | A client binding that names an arbitrary variable, or a configured variable with another endpoint, is refused at create, update, and turn start, and nothing reaches its endpoint; a binding one host supplied is never sent to another; a key over plain http to a non-loopback host is refused while loopback http works; a provider redirect is not followed |
 | F24 | [#140](https://github.com/rdevaul/xshell/issues/140) | P1 | M1.3 prepared file access | Corrected | Agent reads of the daemon's state directory (sessions, images, turn records), the audit directory and the config file are refused with the `blocked_path` basis in `auto` mode, in daemon and standalone turns, case variants included |
-| F27 | [#143](https://github.com/rdevaul/xshell/issues/143) | P1 | Daemon control authentication | Corrected (a program outside xshell, or on macOS a descendant that double-forks away and reads the token file with a shell command, can still connect; full separation is H6) | A connection without the control token gets only the daemon's identity and every request is refused; a wrong token is refused at open; an agent `run_shell` command running the real `xshell` with the daemon's config and readable token is refused as a descendant, while the user's client keeps working |
+| F27 | [#143](https://github.com/rdevaul/xshell/issues/143) | P1 | Daemon control authentication | Partially corrected (descendants are refused, but on macOS a descendant that double-forks away still connects; on Linux so does anything started through a process outside the daemon's tree, such as `systemd-run --user`, `at`, an existing tmux server or `ssh localhost`; the token file is readable by every child, and running `xshell` reads it for them. The robust control is the per-turn approval key, R1 in #143) | A connection without the control token gets only the daemon's identity and every request is refused; a wrong token is refused at open; an agent `run_shell` command running the real `xshell` with the daemon's config and readable token is refused as a descendant, while the user's client keeps working |
+| F30 | [#156](https://github.com/rdevaul/xshell/issues/156) | P0 | Daemon control authentication | Corrected | The ancestry walk reads a setuid-root `login` and `launchd` on macOS, so the user's client under Terminal.app is not refused; a hidden ancestor counts as outside the daemon's tree and a vanished one as inside it; on Linux an orphan adopted by the daemon is reaped while `run_shell`, `$` and PTY exit statuses are still reported |
 
 ## Evidence rules
 
@@ -138,6 +139,45 @@ adapter follows redirects. Evidence: the `f23_*` tests in
 `xshell-session/src/credentials.rs`, `xshell-session/tests/service.rs`,
 `xshell-adapters/src/lib.rs`, and the CLI's `config.rs`, `session.rs`, and
 `sessions_ui.rs`.
+
+F27 (#143) is partially corrected. `xshelld` writes a fresh control token
+beside its socket and refuses every request on a connection that has not
+presented it, and it refuses any connection from one of its own descendants,
+whatever it presents. Refusing descendants is what stops an agent command
+from running `xshell`: the token file is readable by every child, and the
+real `xshell` reads it for them. The descendant check is not a boundary. On
+macOS, where there is no subreaper, a descendant that double-forks is
+re-parented to `launchd` and connects (reproduced in review with
+`sh -c '(sleep 1; xshell … status …) &'`). On Linux the daemon is its
+descendants' subreaper, but a process outside its tree that starts commands
+on request (`systemd-run --user`, `at`, an existing tmux server,
+`ssh localhost`) is a way out. The robust control is the per-turn approval
+key (R1 in the #143 design), which holds however a process reached the
+daemon.
+
+F30 (#156) is corrected. It was found in the 17 November 2026 review of
+`0a90991`, as a regression from F27. The ancestry walk read parents with
+`proc_pidinfo(PROC_PIDTBSDINFO)`, which fails with EPERM for the setuid-root
+`login` in every Terminal.app shell's ancestry (and for `launchd`), and then
+guessed from `kill(pid, 0)` whether another user owned it. `login`'s real uid
+is the user's, so the guess said "ours", the walk failed closed, and the
+user's own client was refused with `forbidden_descendant`. The walk now reads
+parents with `PROC_PIDT_SHORTBSDINFO`, which reads any process as `ps` does,
+and infers nothing from signal permission. A process that has gone still
+counts as a descendant, so a descendant cannot hand its connection on and
+exit first; one that exists but cannot be read (on Linux only under
+`hidepid`) counts as outside, because everything the daemon starts can be
+read. On Linux the daemon, as a subreaper, also adopted orphans and never
+reaped them. A reaper thread now collects zombie children every 500 ms, but
+only those the daemon did not spawn itself: `run_shell`, `$` and PTY children
+are spawned through `xshell_platform::children::spawn_waited`, which records
+their pids under a gate the reaper also takes, so no exit status the daemon
+waits for is stolen. Evidence: the walk's unit tests in
+`xshell-platform/src/ancestry.rs`, which run over a fake process tree and
+over this machine's own ancestry; `only_unrecorded_zombies_are_reaped` in
+`xshell-platform/src/children.rs`; `f30_adopted_orphans_are_reaped` in
+`xshell-session/tests/service.rs`; and the F27 test, which passes from a
+Terminal.app shell.
 
 F9 is corrected. Both adapters hand tool calls to the engine only from a
 response the provider finished normally: the OpenAI-compatible adapter needs

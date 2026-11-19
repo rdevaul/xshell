@@ -138,10 +138,15 @@ replace FS2–FS4.
 - **H6 — Pattern policy is not isolation.** Shell patterns see the programs
   a command starts (F19), not what an interpreter, script or allowed program
   does once running. `run_shell` keeps
-  ambient authority and must never be reported as `isolated`. Its commands
-  can no longer drive `xshelld` itself (F27: a control token, and refusal of
-  the daemon's descendants), but they still act with the user's authority
-  everywhere else. The CAD plan's
+  ambient authority and must never be reported as `isolated`. `xshelld`
+  refuses connections from its own descendants (F27, partially corrected),
+  so an agent command that simply runs `xshell` cannot drive it. That check
+  is not a boundary: on macOS a command that double-forks escapes it, and on
+  Linux so does one that asks a process outside the daemon's tree to run
+  something (`systemd-run --user`, `at`, an existing tmux server,
+  `ssh localhost`). The control token is readable by every child. The robust
+  control is the per-turn approval key (R1 in #143). Either way the commands
+  act with the user's authority everywhere else. The CAD plan's
   open question on sandboxing `run_shell` and FutureShell's `isolated`
   provider are one design problem, to be solved once.
 - **H7 — Gate CAD outputs with deterministic checks.** A supervisor that

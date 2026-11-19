@@ -10,8 +10,14 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+pub mod ancestry;
+pub mod children;
 pub mod descriptors;
 pub mod service;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use ancestry::{is_descendant_of, parent_pid};
+pub use children::become_child_subreaper;
 
 /// The effective user ID of this process.
 pub fn effective_uid() -> u32 {
@@ -118,102 +124,6 @@ pub fn peer_pid(stream: &UnixStream) -> Result<u32> {
         return Err(std::io::Error::last_os_error()).context("cannot identify socket peer");
     }
     u32::try_from(pid).context("socket peer has no process ID")
-}
-
-/// The parent of process `pid`, or `None` when it cannot be read (the
-/// process has exited, or the platform does not say).
-#[cfg(target_os = "linux")]
-pub fn parent_pid(pid: u32) -> Option<u32> {
-    // The command name in parentheses may contain spaces or `)`, so parse
-    // from the last `)`: "pid (comm) state ppid ...".
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// The parent of process `pid`, or `None` when it cannot be read (the
-/// process has exited, or the platform does not say).
-#[cfg(target_os = "macos")]
-pub fn parent_pid(pid: u32) -> Option<u32> {
-    use std::mem::{size_of, zeroed};
-
-    // SAFETY: `proc_bsdinfo` is plain-old-data that proc_pidinfo fills.
-    let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
-    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is a writable buffer of `size` bytes.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            libc::c_int::try_from(pid).ok()?,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        )
-    };
-    (written == size).then_some(info.pbi_ppid)
-}
-
-/// Whether process `pid` may be `ancestor` itself or one of its
-/// descendants, walking parent links at most a bounded number of steps.
-///
-/// This fails closed: it answers `false` only when the walk reaches the
-/// root (pid 1), or a process owned by another user, without meeting
-/// `ancestor`. Any other process whose ancestry cannot be read counts as a
-/// descendant. Otherwise a descendant could connect,
-/// hand the connection to a child and exit before the check, so the walk
-/// would find no process and wave the connection through.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
-    const MAX_DEPTH: usize = 256;
-    let mut current = pid;
-    for _ in 0..MAX_DEPTH {
-        if current == ancestor {
-            return true;
-        }
-        if current <= 1 {
-            return false;
-        }
-        match parent_pid(current) {
-            Some(parent) if parent != current => current = parent,
-            Some(_) => return true,
-            // Unreadable. A process that exists but belongs to another user
-            // (an ancestor such as `login`) is outside the daemon's tree:
-            // everything the daemon starts runs as the daemon's user. Any
-            // other failure (the process has exited, say) is not known to be
-            // outside it.
-            None => return !belongs_to_another_user(current),
-        }
-    }
-    true
-}
-
-/// Whether process `pid` exists but this process may not signal it, which
-/// means another user owns it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn belongs_to_another_user(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: kill(2) with signal 0 sends nothing; it only reports whether
-    // the process exists and may be signalled.
-    let result = unsafe { libc::kill(pid, 0) };
-    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Make this process the reaper of its orphaned descendants (Linux), so a
-/// child that double-forks to leave the process tree is re-parented here
-/// and stays a descendant. Elsewhere this does nothing and returns `false`.
-pub fn become_child_subreaper() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: prctl(PR_SET_CHILD_SUBREAPER) takes integer arguments and
-        // has no memory-safety preconditions.
-        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0 }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
 }
 
 /// Reject a connection whose peer is not the same user as this process.
@@ -363,28 +273,6 @@ mod tests {
     fn peer_pid_names_this_process_over_a_socket_pair() {
         let (client, _server) = UnixStream::pair().unwrap();
         assert_eq!(peer_pid(&client).unwrap(), std::process::id());
-    }
-
-    #[test]
-    fn a_child_is_a_descendant_and_the_parent_is_not() {
-        let me = std::process::id();
-        assert!(is_descendant_of(me, me));
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .unwrap();
-        assert!(is_descendant_of(child.id(), me));
-        assert!(!is_descendant_of(me, child.id()));
-        if let Some(parent) = parent_pid(me) {
-            assert!(!is_descendant_of(parent, me));
-        }
-        let gone = child.id();
-        let _ = child.kill();
-        let _ = child.wait();
-        // A process that has exited cannot be placed outside the tree, so it
-        // counts as a descendant: a descendant must not escape the check by
-        // handing its connection on and exiting first (F27).
-        assert!(is_descendant_of(gone, u32::MAX - 1));
     }
 
     #[test]

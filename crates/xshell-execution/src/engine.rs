@@ -1623,9 +1623,11 @@ async fn run_direct_shell_with_grace(
     // except for the provider credentials, which belong to xshell.
     remove_credentials(&mut process);
     restrict_inherited_descriptors(&mut process);
-    let child = process
-        .spawn()
-        .with_context(|| format!("could not launch shell {shell}"))?;
+    // The child is waited on here, so the daemon's orphan reaper leaves it
+    // alone.
+    let child =
+        xshell_platform::children::spawn_waited(|| process.spawn(), tokio::process::Child::id)
+            .with_context(|| format!("could not launch shell {shell}"))?;
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
     let end = supervise_shell(

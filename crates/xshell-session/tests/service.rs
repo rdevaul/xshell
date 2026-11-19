@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use xshell_core::ChatMessage;
 use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
@@ -120,7 +120,8 @@ fn daemon_rejects_the_previous_protocol_during_handshake() {
 }
 
 fn wait_for_audit_service(socket: &Path) {
-    for _ in 0..100 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
         if let Ok(mut client) = xshell_audit::AuditClient::connect(socket, "test") {
             client
                 .append(xshell_audit::AuditEvent::SessionEnded {
@@ -3925,4 +3926,192 @@ base_url = \"{configured_url}\"\napi_key_env = \"F23_ROUTED_KEY\"\n"
         ),
         "no request may reach an endpoint the daemon did not configure"
     );
+}
+
+/// Whether `pid` is still a child of `parent`, a zombie or not.
+#[cfg(target_os = "linux")]
+fn is_child_of(pid: i32, parent: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let rest = &stat[stat.rfind(')').unwrap() + 1..];
+    rest.split_whitespace().nth(1) == Some(parent.to_string().as_str())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn f30_adopted_orphans_are_reaped() {
+    // Each command leaves a short-lived background process behind and exits
+    // with a status of its own. The orphan is adopted by the daemon, its
+    // subreaper, and must be reaped; the command's status must still be
+    // reported, so the reaper took nothing the daemon waits for.
+    let temporary = TempDir::new().unwrap();
+    let orphan = |name: &str, code: u8| {
+        format!(
+            "sh -c 'sleep 0.2 </dev/null >/dev/null 2>&1 & echo $! > {}'; exit {code}",
+            temporary.path().join(name).display()
+        )
+    };
+    let (base_url, model_server) = serve_sse(vec![
+        sse_tool_call(
+            "call_1",
+            "run_shell",
+            serde_json::json!({ "command": orphan("agent", 5) }),
+        ),
+        sse_text("done"),
+    ]);
+    let state = temporary.path().join("state");
+    let socket = state.join("xshelld.sock");
+    let daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_xshelld"))
+            .arg("--no-user-config")
+            .args(["--state-directory", state.to_str().unwrap()])
+            .args(["--socket", socket.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let daemon_pid = daemon.0.id();
+    let mut client = connect_when_ready(&socket);
+    let session = client
+        .create(SessionCreation {
+            name: "f30".into(),
+            model: ModelBinding {
+                profile_name: Some("fake".into()),
+                provider: "openai".into(),
+                model: "fake-model".into(),
+                base_url,
+                api_key_env: None,
+                max_history_bytes: None,
+                context_tokens: None,
+                reserve_output_tokens: None,
+                vision: false,
+            },
+            cwd: temporary.path().into(),
+            persistence: PersistenceMode::Daemon,
+            visibility: Visibility::Fabric,
+            history: vec![ChatMessage::system("test")],
+            tools: Default::default(),
+        })
+        .unwrap();
+    let session_id = session.descriptor.id;
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    // A `$` command.
+    client
+        .submit(
+            session_id.clone(),
+            TurnInput::Shell {
+                command: orphan("shell", 3),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    let mut after = 0;
+    let mut shell_status = None;
+    'shell: loop {
+        assert!(Instant::now() < deadline, "the `$` command did not finish");
+        let batch = client.events(session_id.clone(), after, 100).unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::ShellFinished { status, .. } => shell_status = Some(status),
+                SessionEventKind::TurnCompleted => break 'shell,
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+    }
+    let shell_status = shell_status.expect("the `$` command reported no status");
+    assert!(shell_status.contains('3'), "`$` status: {shell_status}");
+
+    // An agent `run_shell` command.
+    let turn_id = client
+        .submit(
+            session_id.clone(),
+            TurnInput::Agent {
+                message: "run the tool".into(),
+                images: Vec::new(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    let mut tool_result = None;
+    'agent: loop {
+        assert!(Instant::now() < deadline, "the agent turn did not finish");
+        let batch = client.events(session_id.clone(), after, 100).unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            match record.event {
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ApprovalRequested { call, .. },
+                } => client
+                    .approve(
+                        session_id.clone(),
+                        turn_id.clone(),
+                        call.id,
+                        ApprovalDecision::Approve,
+                        interactive(),
+                    )
+                    .unwrap(),
+                SessionEventKind::Execution {
+                    event: ExecutionEvent::ToolResult { result, .. },
+                } => tool_result = Some(result),
+                SessionEventKind::TurnCompleted => break 'agent,
+                SessionEventKind::TurnFailed { message, .. } => panic!("turn failed: {message}"),
+                _ => {}
+            }
+        }
+    }
+    let tool_result = tool_result.expect("the run_shell call reported no result");
+    assert!(
+        tool_result.contains("exit status: 5"),
+        "run_shell result: {tool_result}"
+    );
+    model_server.join().unwrap();
+
+    // A PTY job.
+    let ticket = client
+        .pty_start(
+            session_id.clone(),
+            orphan("pty", 7),
+            PtySize {
+                rows: 24,
+                columns: 80,
+            },
+            Some("xterm-256color".into()),
+        )
+        .unwrap();
+    let (mut proxy, proxy_input, mut proxy_output) =
+        spawn_pty_proxy(&state, &socket, &ticket.ticket);
+    assert_eq!(
+        read_server_frame(&mut proxy_output).unwrap(),
+        ServerPtyFrame::Ready
+    );
+    let pty_status = loop {
+        match read_server_frame(&mut proxy_output).unwrap() {
+            ServerPtyFrame::Exit(status) => break status,
+            ServerPtyFrame::Output { .. } => {}
+            frame => panic!("unexpected PTY frame: {frame:?}"),
+        }
+    };
+    drop(proxy_input);
+    assert!(proxy.wait().unwrap().success());
+    assert!(pty_status.contains('7'), "PTY status: {pty_status}");
+
+    // Every orphan has exited by now or soon will, and is then reaped.
+    let orphans: Vec<i32> = ["shell", "agent", "pty"]
+        .iter()
+        .map(|name| wait_for_pid(&temporary.path().join(name)))
+        .collect();
+    let reaped_by = Instant::now() + Duration::from_secs(10);
+    while orphans.iter().any(|&pid| is_child_of(pid, daemon_pid)) {
+        assert!(
+            Instant::now() < reaped_by,
+            "an adopted orphan is still the daemon's child (a zombie): {orphans:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(daemon);
 }

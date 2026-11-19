@@ -238,8 +238,12 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
     let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
 
     // Orphaned descendants are re-parented to the daemon, so a child that
-    // double-forks is still recognised as one (F27).
-    xshell_platform::become_child_subreaper();
+    // double-forks is still recognised as one (F27). The daemon then owes
+    // them a wait: the reaper collects them, leaving alone the children the
+    // daemon waits on itself (F30). It starts before any child is spawned.
+    if xshell_platform::become_child_subreaper() {
+        xshell_platform::children::start_orphan_reaper();
+    }
     prepare_socket(&socket)?;
     // A fresh token for this run, written before the socket accepts anyone
     // (F27). Clients read it from beside the socket.
@@ -944,7 +948,11 @@ fn handle_client(
         send_error(
             &mut writer,
             "forbidden_descendant",
-            "processes started by this session host may not control it",
+            "this process was started by the xshelld it is connecting to (an agent \
+             command, a `$` command, a PTY job, or something they started, such as a \
+             tmux server), and processes a session host started may not control it, so \
+             an agent's commands cannot answer their own approvals; run `xshell` from a \
+             terminal outside xshell instead (see docs/session-fabric.md)",
         )?;
         return Ok(());
     }

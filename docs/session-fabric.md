@@ -225,14 +225,32 @@ checks two things on every connection:
   state directory, which is always blocked, and its own path is blocked too.
 - **Not one of its own processes.** A connection from a process the daemon
   started, or any of their descendants, is refused whatever it presents
-  (`forbidden_descendant`). That covers a shell command that reads the token
-  file with `cat`. On Linux the daemon is its descendants' subreaper, so a
-  process that double-forks to leave the tree is re-parented to the daemon
-  and is still refused. The check fails closed: a connecting process the
-  daemon cannot identify, or whose ancestry it cannot trace to the root or to
-  another user's process (because it has already exited, say), is refused
-  too, so a descendant
-  cannot hand its connection to a child and exit before the check.
+  (`forbidden_descendant`). The token alone would not stop them: the token
+  file is readable by every child, and running `xshell` reads it for them,
+  so refusing descendants is what keeps an agent command from running
+  `xshell` or reading the token with `cat` and connecting. The daemon walks
+  the connecting process's parents to its own pid or to pid 1. On Linux the
+  daemon is its descendants' subreaper, so a process that double-forks to
+  leave the tree is re-parented to the daemon and is still refused; the
+  daemon reaps the orphans it adopts. The walk fails closed for a process
+  that has gone, so a descendant cannot hand its connection to a child and
+  exit before the check. A process that exists but cannot be read (on Linux,
+  only under a `hidepid` mount of `/proc`) counts as outside the tree.
+
+**Refused workflows.** Because of this check, `xshell` cannot be run from
+inside xshell itself:
+
+- in a daemon-owned interactive process (a PTY job: a full-screen program or
+  shell run from xshell), in a `$` command, in an agent's `run_shell`
+  command, or in a script any of these runs. That includes
+  `xshell run --detach`, `wait` and `status`;
+- from a tmux or screen server first started inside an xshell PTY job.
+  The server stays one of the daemon's descendants (on Linux through the
+  subreaper), so every shell it later starts is refused too. Start the
+  server from an ordinary terminal instead.
+
+Each fails with `forbidden_descendant` (exit status 6). Run `xshell` from a
+terminal outside xshell, or over SSH.
 
 Remote clients over SSH are unaffected: `xshelld serve-stdio` and
 `serve-pty-stdio` run on the remote host as the user, read that host's token
@@ -240,13 +258,19 @@ and present it for the client, so SSH remains the remote connection's
 authentication. Terminal streams are claimed on an authenticated connection,
 with the ticket the controlling client received.
 
-**What this does not cover.** A program the user runs outside xshell can
-still read the token and connect, as it could edit any of the user's files.
-On macOS, where there is no subreaper, a descendant that both double-forks
-to leave the daemon's process tree and reads the token file (with a shell
-command; agent read tools cannot) can still connect. Separating the agent's
-commands from the user's own authority needs operating-system sandboxing
-([H6](futureshell-status.md)).
+**What this does not cover.** The descendant check is a speed bump, not a
+boundary (F27 is partially corrected). A program the user runs outside
+xshell can still read the token and connect, as it could edit any of the
+user's files. On macOS, where there is no subreaper, a descendant that
+double-forks to leave the daemon's process tree is re-parented to `launchd`
+and can then run `xshell`. On Linux, a descendant can ask a process outside
+the daemon's tree to run `xshell` for it: `systemd-run --user`, `at`, a tmux
+server started elsewhere, or `ssh localhost`. The planned robust control is
+a per-turn approval key that only the submitting client holds (R1 in
+[#143](https://github.com/rdevaul/xshell/issues/143)), so that however a
+process reaches the daemon it cannot answer another client's approvals.
+Separating the agent's commands from the user's own authority needs
+operating-system sandboxing ([H6](futureshell-status.md)).
 
 ## History compaction
 

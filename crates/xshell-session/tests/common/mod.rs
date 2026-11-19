@@ -4,17 +4,25 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use xshell_session::SessionClient;
 
+/// How long a test daemon may take to start. A loaded machine (a full
+/// workspace test run on a laptop) can take seconds.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn connect_when_ready(socket: &Path) -> SessionClient {
-    for _ in 0..100 {
-        if let Ok(client) = SessionClient::connect(socket, "test") {
-            return client;
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        match SessionClient::connect(socket, "test") {
+            Ok(client) => return client,
+            Err(error) if Instant::now() >= deadline => panic!(
+                "xshelld did not become ready at {} within {READY_TIMEOUT:?}: {error:#}",
+                socket.display()
+            ),
+            Err(_) => thread::sleep(Duration::from_millis(10)),
         }
-        thread::sleep(Duration::from_millis(10));
     }
-    panic!("xshelld did not become ready at {}", socket.display());
 }
 
 pub fn serve_sse(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
