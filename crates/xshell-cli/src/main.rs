@@ -804,7 +804,16 @@ async fn main() -> Result<()> {
                 }
             }
             InputRoute::Control(ControlCommand::Attach(path)) => {
-                match attach::handle_attach(&path, &mut sessions, &active_model, &mut attachments) {
+                let base = editor
+                    .helper()
+                    .map_or_else(|| cwd.clone(), XshellHelper::attachment_base);
+                match attach::handle_attach(
+                    &path,
+                    &base,
+                    &mut sessions,
+                    &active_model,
+                    &mut attachments,
+                ) {
                     Ok(message) => println!("{message}"),
                     Err(error) => eprintln!("xshell: {error:#}"),
                 }
