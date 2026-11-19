@@ -355,12 +355,12 @@ impl TurnBudget {
     /// the result is already produced, and keeping it keeps the history
     /// consistent. The next charge reports the exhaustion.
     pub fn record_tool_output(&self, bytes: usize) {
-        let _ =
-            self.0
-                .tool_output_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    Some(used.saturating_add(bytes))
-                });
+        let _ = self
+            .0
+            .tool_output_bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_add(bytes))
+            });
     }
 
     fn check_output(&self) -> Result<(), BudgetExhausted> {
@@ -471,7 +471,7 @@ fn charge(
     exhausted: fn(usize) -> BudgetExhausted,
 ) -> Result<(), BudgetExhausted> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             (used < limit).then_some(used + 1)
         })
         .map(|_| ())
