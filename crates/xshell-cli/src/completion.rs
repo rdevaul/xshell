@@ -9,6 +9,7 @@ use xshell_session::{SessionClient, ShellCompletionResult, complete_shell};
 
 const CONTROL_COMMANDS: &[&str] = &[
     "//agent",
+    "//attach",
     "//audit",
     "//close",
     "//connect",
@@ -83,6 +84,17 @@ impl XshellHelper {
         self.session_names = names;
     }
 
+    /// The directory `//attach` takes a relative path from: the session's
+    /// working directory, or, for a session on another host, the directory
+    /// xshell was started in, since the file is read on this machine.
+    pub fn attachment_base(&self) -> PathBuf {
+        if self.remote_shell_completion.is_some() {
+            std::env::current_dir().unwrap_or_else(|_| self.cwd.clone())
+        } else {
+            self.cwd.clone()
+        }
+    }
+
     fn shell_candidates(&self, line: &str, pos: usize) -> Option<ShellCompletionResult> {
         if !self.shell_completion_enabled {
             return None;
@@ -125,6 +137,10 @@ impl Completer for XshellHelper {
             let fragment = &line[..pos];
 
             if let Some(result) = complete_view(self, line, pos) {
+                return Ok(result);
+            }
+
+            if let Some(result) = complete_attach(self, line, pos) {
                 return Ok(result);
             }
 
@@ -260,6 +276,47 @@ fn complete_view(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usize
             .map(|candidate| Pair {
                 display: candidate.display,
                 replacement: candidate.replacement,
+            })
+            .collect(),
+    ))
+}
+
+/// Complete the path after `//attach`. The client reads the attached file
+/// itself, so this always looks at the local filesystem, from the directory
+/// `//attach` takes relative paths from.
+fn complete_attach(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+    const COMMAND: &str = "//attach";
+    let prefix = &line[..pos];
+    let rest = prefix.strip_prefix(COMMAND)?;
+    if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let fragment_start = prefix
+        .rfind(char::is_whitespace)
+        .map_or(COMMAND.len(), |index| index + 1);
+    let fragment = &prefix[fragment_start..];
+    if !fragment.is_empty() && "--clear".starts_with(fragment) {
+        return Some((
+            fragment_start,
+            vec![Pair {
+                display: "--clear".into(),
+                replacement: "--clear".into(),
+            }],
+        ));
+    }
+    let base = helper.attachment_base();
+    let synthetic = format!("$cat {fragment}");
+    let result = complete_shell(&synthetic, synthetic.len(), &base).ok()?;
+    // `//attach<Tab>` has no space yet, so each replacement supplies it.
+    let separator = if rest.is_empty() { " " } else { "" };
+    Some((
+        fragment_start,
+        result
+            .candidates
+            .into_iter()
+            .map(|candidate| Pair {
+                display: candidate.display,
+                replacement: format!("{separator}{}", candidate.replacement),
             })
             .collect(),
     ))
@@ -451,6 +508,25 @@ mod tests {
             .map(|candidate| candidate.replacement)
             .collect::<Vec<_>>();
         assert_eq!(replacements, ["//status", "//stop"]);
+    }
+
+    #[test]
+    fn completes_attach_paths_from_the_xshell_cwd() {
+        let helper = helper_with_profiles();
+        let history = DefaultHistory::new();
+        let context = Context::new(&history);
+        let replacements = |line: &str| {
+            let (start, matches) = helper.complete(line, line.len(), &context).unwrap();
+            matches
+                .into_iter()
+                .map(|candidate| apply_completion(line, line.len(), start, &candidate.replacement))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(replacements("//att"), ["//attach"]);
+        assert!(replacements("//attach Cargo").contains(&"//attach Cargo.toml".to_owned()));
+        assert!(replacements("//attach src/att").contains(&"//attach src/attach.rs".to_owned()));
+        assert!(replacements("//attach").contains(&"//attach src/".to_owned()));
+        assert_eq!(replacements("//attach --c"), ["//attach --clear"]);
     }
 
     #[test]

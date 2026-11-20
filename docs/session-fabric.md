@@ -320,8 +320,11 @@ they are sent as short text placeholders. See the
 
 With a vision model, `//attach PATH` attaches an image file to your next
 message (`//attach` lists pending attachments; `//attach --clear` drops
-them), and the agent gets a `view_image` tool for looking at image files in
-the working directory, such as renders its own commands produced.
+them). PATH completes with Tab; a relative PATH is taken from the session's
+working directory, and `~` is your home directory. The file is read on the
+machine xshell runs on, so in a session on another host a relative PATH is
+taken from the directory xshell was started in. The agent also gets a `view_image` tool for looking at image
+files in the working directory, such as renders its own commands produced.
 `view_image` is read-only and is gated, confined and blocked like
 `read_file`; policy entries name it like the other path tools
 (`view_image: renders/*`). Images are decoded, scaled to at most 1568 px on

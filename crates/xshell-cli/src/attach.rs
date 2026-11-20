@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Read `path` for upload: its label (the file name) and its bytes, at most
 /// the session host's upload limit.
@@ -30,12 +30,37 @@ pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>)> {
     Ok((label, bytes))
 }
 
+/// The file a `//attach` argument names. The argument is one shell word, so
+/// a completed `my\ render.png` or a quoted path works. `~` is the home
+/// directory, and a relative path is taken from `base`.
+pub fn resolve_attachment_path(argument: &str, base: &Path) -> Result<PathBuf> {
+    let mut words = shell_words::split(argument)
+        .context("invalid //attach quoting")?
+        .into_iter();
+    let (Some(word), None) = (words.next(), words.next()) else {
+        bail!("usage: //attach PATH (quote a path that contains spaces)");
+    };
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is not set")
+    };
+    Ok(if word == "~" {
+        home()?
+    } else if let Some(rest) = word.strip_prefix("~/") {
+        home()?.join(rest)
+    } else {
+        base.join(word)
+    })
+}
+
 /// `//attach [PATH | --clear]`: upload an image for the next agent message,
 /// list what is pending, or drop it. Attachments need the session fabric,
 /// because the session host stores and checks images; standalone xshell
-/// refuses them.
+/// refuses them. A relative PATH is taken from `base`.
 pub fn handle_attach(
     argument: &str,
+    base: &Path,
     sessions: &mut crate::session::SessionRuntime,
     active: &crate::config::ActiveModel,
     pending: &mut Vec<xshell_core::ImageRef>,
@@ -69,7 +94,7 @@ and checks images"
     if !active.vision {
         bail!("this model is not configured for images; set `vision = true` on its model profile");
     }
-    let path = Path::new(argument.trim());
+    let path = &resolve_attachment_path(argument, base)?;
     let (label, bytes) = read_attachment(path)?;
     let image = sessions
         .upload_image(&bytes, label)
@@ -96,5 +121,19 @@ mod tests {
             ("render.png".to_owned(), b"bytes".to_vec())
         );
         assert!(read_attachment(&directory.path().join("missing.png")).is_err());
+    }
+
+    #[test]
+    fn resolves_relative_home_and_quoted_paths() {
+        let base = Path::new("/work/project");
+        let resolve = |argument| resolve_attachment_path(argument, base).unwrap();
+        assert_eq!(resolve("photos/a.jpg"), base.join("photos/a.jpg"));
+        assert_eq!(resolve(" /tmp/a.jpg "), Path::new("/tmp/a.jpg"));
+        assert_eq!(resolve("my\\ render.png"), base.join("my render.png"));
+        assert_eq!(resolve("'my render.png'"), base.join("my render.png"));
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(resolve("~/a.jpg"), home.join("a.jpg"));
+        assert!(resolve_attachment_path("a.jpg b.jpg", base).is_err());
+        assert!(resolve_attachment_path("'unclosed", base).is_err());
     }
 }
