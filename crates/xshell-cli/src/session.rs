@@ -481,6 +481,24 @@ session's interactive process is running; stop it first"
         self.client_mut()?.upload_image(session_id, bytes, label)
     }
 
+    /// Attach an image file that is on the session host.
+    pub fn attach_image(&mut self, path: PathBuf) -> Result<xshell_core::ImageRef> {
+        let session_id = self.active_session_id()?;
+        self.client_mut()?.attach_image(session_id, path)
+    }
+
+    pub fn view_image(&mut self, path: PathBuf) -> Result<xshell_session::ImageResource> {
+        let session_id = self.active_session_id()?;
+        self.client_mut()?.view_image(session_id, path)
+    }
+
+    /// Whether the session host is another machine, reached over SSH.
+    pub fn is_remote(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| matches!(connection.endpoint, ConnectionEndpoint::Ssh(_)))
+    }
+
     pub fn view_source(&mut self, path: PathBuf) -> Result<ViewResource> {
         let session_id = self.active_session_id()?;
         self.client_mut()?.view_source(session_id, path)

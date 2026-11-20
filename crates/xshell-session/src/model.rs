@@ -21,8 +21,10 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // turn records. Version 25 adds `UploadImage`, `images` on
 // `TurnInput::Agent`, the `view_image` tool and `images` on
 // `ExecutionEvent::ToolResult`. Version 26 adds the control `token` on
-// `ClientRequest::Open` and refuses unauthenticated requests (F27).
-pub const SESSION_PROTOCOL_VERSION: u32 = 26;
+// `ClientRequest::Open` and refuses unauthenticated requests (F27). Version 27
+// adds `AttachImage` and `ViewImage`, which read an image file on the session
+// host.
+pub const SESSION_PROTOCOL_VERSION: u32 = 27;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -669,6 +671,17 @@ pub struct ViewResource {
     pub path: PathBuf,
     pub media_type: String,
     pub content: String,
+    pub byte_len: u64,
+    pub sha256: String,
+}
+
+/// An image file read on the session host for the client to display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageResource {
+    pub path: PathBuf,
+    pub media_type: String,
+    /// The file's bytes, base64-encoded.
+    pub data: String,
     pub byte_len: u64,
     pub sha256: String,
 }

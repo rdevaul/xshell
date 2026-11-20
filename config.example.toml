@@ -16,6 +16,9 @@ color = "auto"
 [view]
 pagination = "auto"
 pager = ["less", "-R", "-X"]
+# //view opens an image file with this command, with the file's path
+# appended. The default is "open" on macOS and "xdg-open" elsewhere.
+# image_viewer = ["open"]
 
 # Policy may be specialized by presentation class and then by canonical viewer
 # ID. Viewer policy has precedence over class policy; command flags win over both.

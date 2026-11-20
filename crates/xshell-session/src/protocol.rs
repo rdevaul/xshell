@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalReply, AttachmentRole, EventBatch, ModelBinding, PtySize, PtyTicket,
+    ApprovalReply, AttachmentRole, EventBatch, ImageResource, ModelBinding, PtySize, PtyTicket,
     SESSION_PROTOCOL_VERSION, SessionCreation, SessionDescriptor, SessionSnapshot,
     ShellCompletionResult, TurnInput, ViewResource,
 };
@@ -111,6 +111,18 @@ pub enum ClientRequest {
         /// A short description, such as the file's name.
         label: String,
     },
+    /// Store an image file that is on the session host, for a later
+    /// `TurnInput::Agent`. `path` is resolved like a view resource:
+    /// relative to the session's working directory.
+    AttachImage {
+        session_id: String,
+        path: PathBuf,
+    },
+    /// Read an image file on the session host for the client to display.
+    ViewImage {
+        session_id: String,
+        path: PathBuf,
+    },
 }
 
 /// Largest image file a client may upload: the store's per-image limit.
@@ -178,6 +190,9 @@ pub enum ServerResponse {
     },
     ViewSource {
         resource: ViewResource,
+    },
+    ViewImage {
+        resource: ImageResource,
     },
     PtyStarted {
         ticket: PtyTicket,

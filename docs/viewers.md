@@ -13,6 +13,7 @@ does not expose an inbound viewer service.
 //view --as markdown notes.txt
 //view --paginate long-report.md
 //view --no-paginate short-notes.md
+//view renders/bracket.png
 ```
 
 Relative paths are resolved against the active session cwd. `~` is expanded on
@@ -27,6 +28,29 @@ to 4 MiB with a three-second daemon deadline. The response contains the
 canonical host path, media type, byte length, SHA-256 hash, and content. The SSH
 proxy exposes only `fabric` sessions, and acquisition requires the requesting
 connection to own the selected session.
+
+## Images
+
+A path that ends in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` is opened in an
+image viewer on the machine xshell runs on, instead of being rendered in the
+terminal. `--as` still selects a text viewer explicitly. xshell starts the
+viewer and returns to the prompt without waiting for it.
+
+The viewer is `open` on macOS and `xdg-open` elsewhere. `view.image_viewer`
+names another command; the file's path is appended to it:
+
+```toml
+[view]
+image_viewer = ["feh", "--scale-down"]
+```
+
+When the session host is this machine, the viewer is given the file itself.
+When it is another host, protocol v27 `ViewImage` reads the file there, under
+the same deadline as text and bounded to 20 MiB, and the client writes a copy
+to a private temporary directory that is removed when xshell exits. The copy
+is named from the plain characters of the remote file's name, and the client
+checks that the bytes begin as a PNG, JPEG, GIF or WebP before a viewer is
+given them. The image decoder that then reads the file is the viewer's own.
 
 ## Library boundary
 

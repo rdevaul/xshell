@@ -1,8 +1,8 @@
 use crate::{
     ApprovalReply, AttachmentRole, ClientRequest, DAEMON_PROBE_SCHEMA_VERSION, DaemonProbeReport,
-    DaemonProbeStatus, EventBatch, ModelBinding, PtySize, PtyTicket, SESSION_PROTOCOL_VERSION,
-    ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot, ShellCompletionResult,
-    TurnInput, ViewResource,
+    DaemonProbeStatus, EventBatch, ImageResource, ModelBinding, PtySize, PtyTicket,
+    SESSION_PROTOCOL_VERSION, ServerResponse, SessionCreation, SessionDescriptor, SessionSnapshot,
+    ShellCompletionResult, TurnInput, ViewResource,
 };
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -526,6 +526,29 @@ impl SessionClient {
         match self.receive()? {
             ServerResponse::ImageStored { image } => Ok(image),
             response => response_error("image upload", response),
+        }
+    }
+
+    /// Attach the image file at `path` on the session host. A relative
+    /// `path` is taken from the session's working directory.
+    pub fn attach_image(
+        &mut self,
+        session_id: String,
+        path: PathBuf,
+    ) -> Result<xshell_core::ImageRef> {
+        self.send(&ClientRequest::AttachImage { session_id, path })?;
+        match self.receive()? {
+            ServerResponse::ImageStored { image } => Ok(image),
+            response => response_error("image attach", response),
+        }
+    }
+
+    /// Read the image file at `path` on the session host.
+    pub fn view_image(&mut self, session_id: String, path: PathBuf) -> Result<ImageResource> {
+        self.send(&ClientRequest::ViewImage { session_id, path })?;
+        match self.receive()? {
+            ServerResponse::ViewImage { resource } => Ok(resource),
+            response => response_error("view image", response),
         }
     }
 

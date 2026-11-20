@@ -228,6 +228,8 @@ async fn main() -> Result<()> {
     let mut explicit_limits = args.limits.clone();
     // Images uploaded with //attach for the next agent message.
     let mut attachments: Vec<xshell_core::ImageRef> = Vec::new();
+    // Images //view copied from another host for the local image viewer.
+    let mut viewed_images = view::ViewedImages::default();
     if let Some(name) = &explicit_limits {
         model_config.limit_profile(name)?;
     }
@@ -827,6 +829,7 @@ async fn main() -> Result<()> {
                     render_options,
                     &model_config.view,
                     &mut audit,
+                    &mut viewed_images,
                 ) {
                     eprintln!("xshell: {error:#}");
                 }
