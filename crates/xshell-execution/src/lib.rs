@@ -35,7 +35,7 @@ pub use images::{
 };
 pub use ingest::{
     IngestError, IngestedImage, MAX_IMAGE_EDGE, MAX_SOURCE_BYTES, MAX_SOURCE_PIXELS, ingest,
-    ingest_into,
+    ingest_into, source_image_type,
 };
 pub use policy::{
     ApprovalRules, CallFacts, DecisionBasis, Policy, PolicyConfig, PolicyDecision, PolicyLayer,

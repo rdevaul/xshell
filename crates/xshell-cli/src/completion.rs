@@ -84,9 +84,9 @@ impl XshellHelper {
         self.session_names = names;
     }
 
-    /// The directory `//attach` takes a relative path from: the session's
-    /// working directory, or, for a session on another host, the directory
-    /// xshell was started in, since the file is read on this machine.
+    /// The directory `//attach --local` takes a relative path from: the
+    /// session's working directory, or, for a session on another host, the
+    /// directory xshell was started in, since the file is on this machine.
     pub fn attachment_base(&self) -> PathBuf {
         if self.remote_shell_completion.is_some() {
             std::env::current_dir().unwrap_or_else(|_| self.cwd.clone())
@@ -281,11 +281,12 @@ fn complete_view(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usize
     ))
 }
 
-/// Complete the path after `//attach`. The client reads the attached file
-/// itself, so this always looks at the local filesystem, from the directory
-/// `//attach` takes relative paths from.
+/// Complete the path after `//attach`. It names a file on the session host,
+/// so it completes there, like `//view`. After `--local` it names a file on
+/// this machine and completes from the directory a local path is taken from.
 fn complete_attach(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
     const COMMAND: &str = "//attach";
+    const OPTIONS: &[&str] = &["--clear", "--local"];
     let prefix = &line[..pos];
     let rest = prefix.strip_prefix(COMMAND)?;
     if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
@@ -295,18 +296,28 @@ fn complete_attach(helper: &XshellHelper, line: &str, pos: usize) -> Option<(usi
         .rfind(char::is_whitespace)
         .map_or(COMMAND.len(), |index| index + 1);
     let fragment = &prefix[fragment_start..];
-    if !fragment.is_empty() && "--clear".starts_with(fragment) {
+    if fragment.starts_with('-') {
         return Some((
             fragment_start,
-            vec![Pair {
-                display: "--clear".into(),
-                replacement: "--clear".into(),
-            }],
+            OPTIONS
+                .iter()
+                .filter(|option| option.starts_with(fragment))
+                .map(|option| Pair {
+                    display: (*option).into(),
+                    replacement: (*option).into(),
+                })
+                .collect(),
         ));
     }
-    let base = helper.attachment_base();
+    let local = prefix[COMMAND.len()..fragment_start]
+        .split_whitespace()
+        .any(|word| word == "--local");
     let synthetic = format!("$cat {fragment}");
-    let result = complete_shell(&synthetic, synthetic.len(), &base).ok()?;
+    let result = if local || helper.remote_shell_completion.is_none() {
+        complete_shell(&synthetic, synthetic.len(), &helper.attachment_base()).ok()?
+    } else {
+        helper.shell_candidates(&synthetic, synthetic.len())?
+    };
     // `//attach<Tab>` has no space yet, so each replacement supplies it.
     let separator = if rest.is_empty() { " " } else { "" };
     Some((
@@ -527,6 +538,14 @@ mod tests {
         assert!(replacements("//attach src/att").contains(&"//attach src/attach.rs".to_owned()));
         assert!(replacements("//attach").contains(&"//attach src/".to_owned()));
         assert_eq!(replacements("//attach --c"), ["//attach --clear"]);
+        assert_eq!(
+            replacements("//attach --"),
+            ["//attach --clear", "//attach --local"]
+        );
+        assert!(
+            replacements("//attach --local src/att")
+                .contains(&"//attach --local src/attach.rs".to_owned())
+        );
     }
 
     #[test]

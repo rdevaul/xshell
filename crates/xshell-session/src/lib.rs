@@ -29,11 +29,11 @@ pub use execution::{DaemonPolicy, ExecutionCoordinator};
 pub use model::{
     AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, CapacityExhausted,
     DAEMON_PROBE_SCHEMA_VERSION, DEFAULT_MAX_CONCURRENT_TURNS, DEFAULT_MAX_SESSIONS,
-    DaemonProbeReport, DaemonProbeStatus, EventBatch, ModelBinding, PersistenceMode, PtySize,
-    PtyTicket, SESSION_PROTOCOL_VERSION, SensitivityAction, SensitivityClass, SessionActivity,
-    SessionConfig, SessionCreation, SessionDescriptor, SessionEvent, SessionEventKind,
-    SessionSnapshot, SessionStatus, SessionTools, ShellCompletionCandidate, ShellCompletionResult,
-    TurnAuditRef, TurnFailureReason, TurnInput, ViewResource, Visibility,
+    DaemonProbeReport, DaemonProbeStatus, EventBatch, ImageResource, ModelBinding, PersistenceMode,
+    PtySize, PtyTicket, SESSION_PROTOCOL_VERSION, SensitivityAction, SensitivityClass,
+    SessionActivity, SessionConfig, SessionCreation, SessionDescriptor, SessionEvent,
+    SessionEventKind, SessionSnapshot, SessionStatus, SessionTools, ShellCompletionCandidate,
+    ShellCompletionResult, TurnAuditRef, TurnFailureReason, TurnInput, ViewResource, Visibility,
 };
 pub use protocol::{ClientRequest, MAX_UPLOAD_IMAGE_BYTES, ServerResponse};
 pub use pty::{PtyAudit, PtyClaim, PtyCoordinator, PtyReadResult};
@@ -45,4 +45,4 @@ pub use registry::SessionRegistry;
 pub use turns::{
     MAX_RECORDED_ANSWER_BYTES, MAX_TURN_RECORDS, TurnLocation, TurnOutcome, TurnRecord, TurnStore,
 };
-pub use view::load_view_resource;
+pub use view::{ImageFile, load_image_file, load_view_resource};

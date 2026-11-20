@@ -30,37 +30,56 @@ pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>)> {
     Ok((label, bytes))
 }
 
-/// The file a `//attach` argument names. The argument is one shell word, so
-/// a completed `my\ render.png` or a quoted path works. `~` is the home
-/// directory, and a relative path is taken from `base`.
-pub fn resolve_attachment_path(argument: &str, base: &Path) -> Result<PathBuf> {
-    let mut words = shell_words::split(argument)
-        .context("invalid //attach quoting")?
-        .into_iter();
-    let (Some(word), None) = (words.next(), words.next()) else {
-        bail!("usage: //attach PATH (quote a path that contains spaces)");
-    };
+/// The file a `//attach --local` path names on this machine: `~` is the
+/// home directory, and a relative path is taken from `base`.
+pub fn resolve_local_path(path: &str, base: &Path) -> Result<PathBuf> {
     let home = || {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .context("HOME is not set")
     };
-    Ok(if word == "~" {
+    Ok(if path == "~" {
         home()?
-    } else if let Some(rest) = word.strip_prefix("~/") {
+    } else if let Some(rest) = path.strip_prefix("~/") {
         home()?.join(rest)
     } else {
-        base.join(word)
+        base.join(path)
     })
 }
 
-/// `//attach [PATH | --clear]`: upload an image for the next agent message,
-/// list what is pending, or drop it. Attachments need the session fabric,
-/// because the session host stores and checks images; standalone xshell
-/// refuses them. A relative PATH is taken from `base`.
+/// Where a `//attach` argument says the image is.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AttachSource {
+    /// A file on the session host, named as the session sees it.
+    SessionHost(PathBuf),
+    /// A file on the machine xshell runs on.
+    Local(String),
+}
+
+/// Parse `[--local] PATH`. The path is one shell word, so a completed
+/// `my\ render.png` or a quoted path works.
+pub fn parse_attach_source(argument: &str) -> Result<AttachSource> {
+    const USAGE: &str = "usage: //attach [--local] PATH (quote a path that contains spaces)";
+    let words = shell_words::split(argument).context("invalid //attach quoting")?;
+    match words.as_slice() {
+        [path] if path != "--local" => Ok(AttachSource::SessionHost(path.into())),
+        [flag, path] if flag == "--local" => Ok(AttachSource::Local(path.clone())),
+        _ => bail!(USAGE),
+    }
+}
+
+/// `//attach [[--local] PATH | --clear]`: store an image for the next agent
+/// message, list what is pending, or drop it. Attachments need the session
+/// fabric, because the session host stores and checks images; standalone
+/// xshell refuses them.
+///
+/// PATH names a file on the session host, relative to the session's working
+/// directory, as `//view` does. With `--local` it names a file on this
+/// machine instead, relative to `local_base`, and the client uploads it. The
+/// two differ only for a session on another host.
 pub fn handle_attach(
     argument: &str,
-    base: &Path,
+    local_base: &Path,
     sessions: &mut crate::session::SessionRuntime,
     active: &crate::config::ActiveModel,
     pending: &mut Vec<xshell_core::ImageRef>,
@@ -71,7 +90,7 @@ pub fn handle_attach(
     match argument.trim() {
         "" => {
             return Ok(if pending.is_empty() {
-                "no images attached; usage: //attach PATH".into()
+                "no images attached; usage: //attach [--local] PATH".into()
             } else {
                 format!(
                     "attached for the next message: {}",
@@ -94,11 +113,18 @@ and checks images"
     if !active.vision {
         bail!("this model is not configured for images; set `vision = true` on its model profile");
     }
-    let path = &resolve_attachment_path(argument, base)?;
-    let (label, bytes) = read_attachment(path)?;
-    let image = sessions
-        .upload_image(&bytes, label)
-        .with_context(|| format!("cannot attach {}", path.display()))?;
+    let image = match parse_attach_source(argument)? {
+        AttachSource::SessionHost(path) => sessions
+            .attach_image(path.clone())
+            .with_context(|| format!("cannot attach {}", path.display()))?,
+        AttachSource::Local(path) => {
+            let path = resolve_local_path(&path, local_base)?;
+            let (label, bytes) = read_attachment(&path)?;
+            sessions
+                .upload_image(&bytes, label)
+                .with_context(|| format!("cannot attach {}", path.display()))?
+        }
+    };
     let message = format!(
         "attached {}; it goes with your next message",
         describe(&image)
@@ -124,16 +150,30 @@ mod tests {
     }
 
     #[test]
-    fn resolves_relative_home_and_quoted_paths() {
+    fn resolves_local_paths_from_the_base_and_home() {
         let base = Path::new("/work/project");
-        let resolve = |argument| resolve_attachment_path(argument, base).unwrap();
+        let resolve = |path| resolve_local_path(path, base).unwrap();
         assert_eq!(resolve("photos/a.jpg"), base.join("photos/a.jpg"));
-        assert_eq!(resolve(" /tmp/a.jpg "), Path::new("/tmp/a.jpg"));
-        assert_eq!(resolve("my\\ render.png"), base.join("my render.png"));
-        assert_eq!(resolve("'my render.png'"), base.join("my render.png"));
+        assert_eq!(resolve("/tmp/a.jpg"), Path::new("/tmp/a.jpg"));
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         assert_eq!(resolve("~/a.jpg"), home.join("a.jpg"));
-        assert!(resolve_attachment_path("a.jpg b.jpg", base).is_err());
-        assert!(resolve_attachment_path("'unclosed", base).is_err());
+        assert_eq!(resolve("~"), home);
+    }
+
+    #[test]
+    fn parses_where_the_image_is() {
+        let host = |path: &str| AttachSource::SessionHost(path.into());
+        let parse = |argument| parse_attach_source(argument).unwrap();
+        assert_eq!(parse(" photos/a.jpg "), host("photos/a.jpg"));
+        assert_eq!(parse("my\\ render.png"), host("my render.png"));
+        assert_eq!(parse("'my render.png'"), host("my render.png"));
+        assert_eq!(parse("~/a.jpg"), host("~/a.jpg"));
+        assert_eq!(
+            parse("--local shots/a.png"),
+            AttachSource::Local("shots/a.png".into())
+        );
+        for refused in ["a.jpg b.jpg", "--local", "--local a b", "'unclosed"] {
+            assert!(parse_attach_source(refused).is_err(), "{refused}");
+        }
     }
 }

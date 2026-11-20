@@ -72,13 +72,15 @@ control commands:
   //model NAME      switch profiles and start a fresh conversation
   //limits          show the turn limits that apply and the known profiles
   //limits NAME     use the named limit profile for following turns
-  //attach PATH     attach an image to your next message (vision models)
+  //attach PATH     attach an image on the session host to your next message
+                    (vision models); //attach --local PATH takes it from this machine
   //attach          list pending attachments; //attach --clear drops them
   //agent            show active agent capabilities
   //tools            show tools exposed to the active agent
   //view [OPTIONS] PATH
                      render a Markdown or reStructuredText file
-                     (--as VIEWER, --paginate, --no-paginate)
+                     (--as VIEWER, --paginate, --no-paginate), or open
+                     an image in this machine's image viewer
   //quit             detach from the current session and exit xshell"
         ),
         ControlCommand::History => {

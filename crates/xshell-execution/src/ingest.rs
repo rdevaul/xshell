@@ -69,6 +69,18 @@ fn reader(source: &[u8]) -> Result<ImageReader<Cursor<&[u8]>>, IngestError> {
     Ok(reader)
 }
 
+/// The media type and usual file extension of `source`, when its header is
+/// one of the formats [`ingest`] accepts. Nothing is decoded.
+pub fn source_image_type(source: &[u8]) -> Option<(&'static str, &'static str)> {
+    match image::guess_format(source).ok()? {
+        ImageFormat::Png => Some(("image/png", "png")),
+        ImageFormat::Jpeg => Some(("image/jpeg", "jpg")),
+        ImageFormat::Gif => Some(("image/gif", "gif")),
+        ImageFormat::WebP => Some(("image/webp", "webp")),
+        _ => None,
+    }
+}
+
 /// Decode, bound, scale and re-encode `source`.
 pub fn ingest(source: &[u8]) -> Result<IngestedImage, IngestError> {
     let length = source.len() as u64;

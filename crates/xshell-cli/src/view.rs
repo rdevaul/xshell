@@ -9,7 +9,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use xshell_audit::AuditEvent;
-use xshell_session::load_view_resource;
+use xshell_session::{load_image_file, load_view_resource};
 use xshell_view::{RenderOptions, ViewInput, ViewerRegistry};
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -32,15 +32,26 @@ pub(crate) struct ViewPolicy {
 pub(crate) struct ViewConfig {
     pub(crate) pagination: PaginationMode,
     pub(crate) pager: Vec<String>,
+    /// The command `//view` runs on an image file, with the file's path
+    /// appended.
+    pub(crate) image_viewer: Vec<String>,
     pub(crate) classes: BTreeMap<String, ViewPolicy>,
     pub(crate) viewers: BTreeMap<String, ViewPolicy>,
 }
+
+/// The desktop's own "open this file" command.
+const DEFAULT_IMAGE_OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else {
+    "xdg-open"
+};
 
 impl Default for ViewConfig {
     fn default() -> Self {
         Self {
             pagination: PaginationMode::Auto,
             pager: vec!["less".into(), "-R".into(), "-X".into()],
+            image_viewer: vec![DEFAULT_IMAGE_OPENER.into()],
             classes: BTreeMap::new(),
             viewers: BTreeMap::new(),
         }
@@ -51,6 +62,9 @@ impl ViewConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.pager.first().is_none_or(String::is_empty) {
             bail!("view.pager must contain a non-empty executable name");
+        }
+        if self.image_viewer.first().is_none_or(String::is_empty) {
+            bail!("view.image_viewer must contain a non-empty executable name");
         }
         if self.classes.keys().any(String::is_empty) {
             bail!("view.classes keys cannot be empty");
@@ -137,6 +151,165 @@ pub(crate) fn parse_view_options(arguments: &str) -> Result<ViewOptions> {
     })
 }
 
+/// Image files copied from another host for a local viewer. They are kept in
+/// a private directory that is removed when xshell exits.
+#[derive(Default)]
+pub(crate) struct ViewedImages {
+    directory: Option<tempfile::TempDir>,
+    stored: usize,
+}
+
+impl ViewedImages {
+    /// Write `bytes` to a new file named after `source`, which another host
+    /// supplied: only its plain characters are kept.
+    fn store(&mut self, source: &Path, extension: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let directory = match &mut self.directory {
+            Some(directory) => directory,
+            empty => empty.insert(
+                tempfile::Builder::new()
+                    .prefix("xshell-view-")
+                    .tempdir()
+                    .context("cannot create a directory for viewed images")?,
+            ),
+        };
+        let stem: String = source
+            .file_stem()
+            .map(|stem| stem.to_string_lossy())
+            .unwrap_or_default()
+            .chars()
+            .filter(|character| character.is_alphanumeric() || "-_ ".contains(*character))
+            .take(64)
+            .collect();
+        self.stored += 1;
+        let path = directory
+            .path()
+            .join(format!("{}-{stem}.{extension}", self.stored));
+        std::fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(path)
+    }
+}
+
+/// Whether `path` is named like an image `//view` hands to the image viewer.
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["png", "jpg", "jpeg", "gif", "webp"]
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
+}
+
+/// An image ready for the viewer.
+struct AcquiredImage {
+    /// The file on this machine to open.
+    file: PathBuf,
+    /// The file's path on the session host.
+    source: PathBuf,
+    media_type: String,
+    byte_len: u64,
+    sha256: String,
+}
+
+/// Find the image `path` names. A file on this machine is opened where it
+/// is; one on another host is copied here first.
+fn acquire_image(
+    path: &Path,
+    sessions: &mut SessionRuntime,
+    cwd: &Path,
+    viewed: &mut ViewedImages,
+) -> Result<AcquiredImage> {
+    if !sessions.is_remote() {
+        let image = load_image_file(path, cwd)?;
+        return Ok(AcquiredImage {
+            file: image.path.clone(),
+            source: image.path,
+            media_type: image.media_type.into(),
+            byte_len: image.bytes.len() as u64,
+            sha256: image.sha256,
+        });
+    }
+    let resource = sessions.view_image(path.to_owned())?;
+    let bytes = resource.bytes()?;
+    // The other host says what it sent; check before a viewer is given it.
+    let Some((media_type, extension)) = xshell_execution::source_image_type(&bytes) else {
+        bail!("the session host did not send a supported image (PNG, JPEG, GIF or WebP)");
+    };
+    Ok(AcquiredImage {
+        file: viewed.store(&resource.path, extension, &bytes)?,
+        source: resource.path,
+        media_type: media_type.into(),
+        byte_len: bytes.len() as u64,
+        sha256: resource.sha256,
+    })
+}
+
+/// Start `viewer` on `file` and return without waiting for it: a desktop
+/// viewer stays open while the user goes on working.
+fn open_image_viewer(viewer: &[String], file: &Path) -> Result<()> {
+    let (program, arguments) = viewer
+        .split_first()
+        .context("view.image_viewer must contain an executable")?;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("cannot start image viewer {program:?}"))?;
+    // Reap the viewer whenever it exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// `//view` on an image: open it in the local image viewer.
+fn view_image(
+    path: &Path,
+    sessions: &mut SessionRuntime,
+    cwd: &Path,
+    view_config: &ViewConfig,
+    audit: &mut AuditRuntime,
+    viewed: &mut ViewedImages,
+) -> Result<()> {
+    let requested_path = path.display().to_string();
+    let image = match acquire_image(path, sessions, cwd, viewed) {
+        Ok(image) => image,
+        Err(error) => {
+            audit.append(AuditEvent::ViewOperation {
+                path: requested_path,
+                sha256: None,
+                viewer: Some("image".into()),
+                media_type: None,
+                byte_len: None,
+                outcome: format!("acquisition failed: {error:#}"),
+            })?;
+            return Err(error);
+        }
+    };
+    let opened = open_image_viewer(&view_config.image_viewer, &image.file);
+    audit.append(AuditEvent::ViewOperation {
+        path: image.source.display().to_string(),
+        sha256: Some(image.sha256),
+        viewer: Some("image".into()),
+        media_type: Some(image.media_type),
+        byte_len: Some(image.byte_len),
+        outcome: match &opened {
+            Ok(()) => format!("opened with {}", view_config.image_viewer[0]),
+            Err(error) => format!("display failed: {error:#}"),
+        },
+    })?;
+    opened?;
+    println!(
+        "opened {requested_path} with {}",
+        view_config.image_viewer[0]
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_view(
     arguments: &str,
     sessions: &mut SessionRuntime,
@@ -145,8 +318,20 @@ pub(crate) fn handle_view(
     render_options: RenderOptions,
     view_config: &ViewConfig,
     audit: &mut AuditRuntime,
+    viewed_images: &mut ViewedImages,
 ) -> Result<()> {
     let options = parse_view_options(arguments)?;
+    // An image goes to the image viewer unless a text viewer was asked for.
+    if options.viewer.is_none() && is_image_path(&options.path) {
+        return view_image(
+            &options.path,
+            sessions,
+            cwd,
+            view_config,
+            audit,
+            viewed_images,
+        );
+    }
     let requested_path = options.path.display().to_string();
     let resource = match if sessions.enabled() {
         sessions.view_source(options.path.clone())
@@ -375,6 +560,76 @@ mod tests {
         assert!(parse_view_options("").is_err());
         assert!(parse_view_options("one.md two.md").is_err());
         assert!(parse_view_options("--paginate --no-paginate one.md").is_err());
+    }
+
+    #[test]
+    fn images_are_recognised_by_extension() {
+        for image in ["a.png", "photos/B.JPG", "c.jpeg", "d.gif", "e.webp"] {
+            assert!(is_image_path(Path::new(image)), "{image}");
+        }
+        for other in ["notes.md", "png", "archive.png.txt", "render.svg"] {
+            assert!(!is_image_path(Path::new(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn image_viewer_is_configurable_and_must_name_a_program() {
+        assert_eq!(
+            ViewConfig::default().image_viewer,
+            [DEFAULT_IMAGE_OPENER.to_owned()]
+        );
+        let config: ViewConfig =
+            toml::from_str(r#"image_viewer = ["feh", "--scale-down"]"#).unwrap();
+        assert_eq!(config.image_viewer, ["feh", "--scale-down"]);
+        config.validate().unwrap();
+        let empty: ViewConfig = toml::from_str("image_viewer = []").unwrap();
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn viewed_images_get_plain_names_in_a_directory_removed_on_drop() {
+        let mut viewed = ViewedImages::default();
+        let first = viewed
+            .store(Path::new("/remote/../x/my render;$(rm).png"), "png", b"one")
+            .unwrap();
+        let second = viewed.store(Path::new("/"), "jpg", b"two").unwrap();
+        assert_eq!(first.file_name().unwrap(), "1-my renderrm.png");
+        assert_eq!(second.file_name().unwrap(), "2-.jpg");
+        assert_eq!(first.parent(), second.parent());
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        let directory = first.parent().unwrap().to_owned();
+        drop(viewed);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn the_image_viewer_is_started_with_the_file_and_not_waited_for() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let marker = directory.path().join("seen");
+        // `sh -c 'cp "$1" "$0"' MARKER FILE` copies the viewed file to MARKER.
+        let viewer = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            r#"cp "$1" "$0""#.to_owned(),
+            marker.display().to_string(),
+        ];
+        let file = directory.path().join("a.png");
+        std::fs::write(&file, b"image bytes").unwrap();
+        open_image_viewer(&viewer, &file).unwrap();
+        for _ in 0..200 {
+            if std::fs::read(&marker).is_ok_and(|bytes| bytes == b"image bytes") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the viewer was not run on the file");
+    }
+
+    #[test]
+    fn a_missing_image_viewer_is_an_error() {
+        let viewer = vec!["xshell-no-such-image-viewer".to_owned()];
+        let error = open_image_viewer(&viewer, Path::new("/tmp/a.png")).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot start image viewer"));
     }
 
     #[test]

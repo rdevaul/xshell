@@ -1645,8 +1645,46 @@ fn attached_and_viewed_images_reach_the_model_re_encoded_and_bounded() {
         "{refused:#}"
     );
 
+    // Nor will it attach a file on the session host.
+    let refused = client
+        .attach_image(blind.descriptor.id.clone(), "render.png".into())
+        .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("not configured for images"),
+        "{refused:#}"
+    );
+    // Viewing needs no vision model: the image is for the user.
+    let viewed = client
+        .view_image(blind.descriptor.id.clone(), "render.png".into())
+        .unwrap();
+    assert_eq!(viewed.media_type, "image/png");
+    assert_eq!(viewed.bytes().unwrap(), png(30, 20));
+    assert_eq!(viewed.byte_len, png(30, 20).len() as u64);
+    assert!(viewed.path.is_absolute() && viewed.path.ends_with("render.png"));
+
     let session = client.create(creation("vision", true)).unwrap();
     let session_id = session.descriptor.id.clone();
+    // A file on the session host is attached by its path, taken from the
+    // session's working directory, and labelled with its name.
+    let attached = client
+        .attach_image(session_id.clone(), "render.png".into())
+        .unwrap();
+    assert_eq!((attached.width(), attached.height()), (30, 20));
+    assert_eq!(attached.label(), "render.png");
+    // A file that is not an image is refused by either request.
+    std::fs::write(temporary.path().join("notes.png"), "plain text").unwrap();
+    for refused in ["notes.png", "missing.png"] {
+        assert!(
+            client
+                .attach_image(session_id.clone(), refused.into())
+                .is_err()
+        );
+        assert!(
+            client
+                .view_image(session_id.clone(), refused.into())
+                .is_err()
+        );
+    }
     // Garbage is refused by the daemon's decoder.
     assert!(
         client

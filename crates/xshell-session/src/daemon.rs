@@ -853,6 +853,8 @@ fn reject_remote_request(
         ClientRequest::CompleteShell { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::ViewSource { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::UploadImage { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::AttachImage { session_id, .. } => Some(session_id.as_str()),
+        ClientRequest::ViewImage { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyStart { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyAttach { session_id, .. } => Some(session_id.as_str()),
         ClientRequest::PtyClose { session_id } => Some(session_id.as_str()),
@@ -1351,6 +1353,35 @@ on its model profile to attach images"
             let image = xshell_execution::ingest_into(&store, &bytes, &label)?;
             Ok(ServerResponse::ImageStored { image })
         }
+        ClientRequest::AttachImage { session_id, path } => {
+            require_current(attached_session, &session_id)?;
+            let descriptor = registry.lock_recover().snapshot(&session_id)?.descriptor;
+            if !descriptor.model.vision {
+                bail!(
+                    "this session's model is not configured for images; set `vision = true` \
+on its model profile to attach images"
+                );
+            }
+            let file = load_image_file_bounded(path, descriptor.cwd)?;
+            let label = file.path.file_name().map_or_else(
+                || file.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let store = registry.lock_recover().image_store(&session_id)?;
+            let image = xshell_execution::ingest_into(&store, &file.bytes, &label)?;
+            Ok(ServerResponse::ImageStored { image })
+        }
+        ClientRequest::ViewImage { session_id, path } => {
+            require_current(attached_session, &session_id)?;
+            let cwd = registry
+                .lock_recover()
+                .snapshot(&session_id)?
+                .descriptor
+                .cwd;
+            Ok(ServerResponse::ViewImage {
+                resource: load_image_file_bounded(path, cwd)?.into(),
+            })
+        }
         ClientRequest::PtyStart {
             session_id,
             command,
@@ -1458,6 +1489,20 @@ fn load_view_resource_bounded(path: PathBuf, cwd: PathBuf) -> Result<crate::View
     receiver
         .recv_timeout(VIEW_TIMEOUT)
         .context("view-source acquisition timed out")?
+}
+
+/// Read an image file under the same deadline as a view resource.
+fn load_image_file_bounded(path: PathBuf, cwd: PathBuf) -> Result<crate::ImageFile> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("xshelld-view-image".into())
+        .spawn(move || {
+            let _ = sender.send(crate::load_image_file(&path, &cwd));
+        })
+        .context("cannot start image worker")?;
+    receiver
+        .recv_timeout(VIEW_TIMEOUT)
+        .context("reading the image timed out")?
 }
 
 fn require_current(attached_session: &Option<String>, session_id: &str) -> Result<()> {
