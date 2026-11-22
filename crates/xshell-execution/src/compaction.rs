@@ -398,6 +398,23 @@ impl CompactionConfig {
         }
     }
 
+    /// This budget with `bytes` set aside for text that every request of a
+    /// turn carries outside the history, such as a turn's context. Without
+    /// the reservation a history exactly at budget would overflow the model
+    /// once that text is added. A disabled budget stays disabled.
+    pub fn reserving(&self, bytes: usize) -> Self {
+        Self {
+            max_history_bytes: self.max_history_bytes.map(|max| match max {
+                0 => 0,
+                max => max.saturating_sub(bytes).max(1),
+            }),
+            context_tokens: self
+                .context_tokens
+                .map(|tokens| tokens.saturating_sub(bytes.div_ceil(BYTES_PER_TOKEN))),
+            reserve_output_tokens: self.reserve_output_tokens,
+        }
+    }
+
     pub fn build(&self) -> Box<dyn Compactor> {
         match self.effective_max_bytes() {
             Some(max_bytes) if max_bytes > 0 => Box::new(MaxBytesCompactor { max_bytes }),
@@ -791,6 +808,37 @@ mod tests {
             .build()
             .name(),
             "max_history_bytes"
+        );
+    }
+
+    #[test]
+    fn reserving_lowers_each_budget_and_keeps_a_disabled_one_disabled() {
+        let config = CompactionConfig {
+            max_history_bytes: Some(10_000),
+            context_tokens: Some(100_000),
+            ..Default::default()
+        };
+        let reserved = config.reserving(3_001);
+        assert_eq!(reserved.max_history_bytes, Some(6_999));
+        // Rounded up to whole tokens, so the reservation is never short.
+        assert_eq!(
+            reserved.context_tokens,
+            Some(100_000 - 3_001_usize.div_ceil(BYTES_PER_TOKEN))
+        );
+        assert!(reserved.effective_max_bytes() < config.effective_max_bytes());
+        assert_eq!(config.reserving(0), config);
+
+        // A reservation larger than the budget leaves the smallest budget,
+        // not the "disabled" value 0.
+        assert_eq!(config.reserving(1_000_000).max_history_bytes, Some(1));
+        let disabled = CompactionConfig {
+            max_history_bytes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(disabled.reserving(500).effective_max_bytes(), None);
+        assert_eq!(
+            CompactionConfig::default().reserving(500),
+            CompactionConfig::default()
         );
     }
 }

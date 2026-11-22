@@ -223,6 +223,12 @@ provider, name, access and approval. When the session limits its agent to
 some tools, `offered_tools` lists the names the agent was offered. Both are
 absent otherwise. See [tool providers](tool-providers.md#47-audit).
 
+When the session host has a compiled-in context provider and it supplies
+text for a turn, a `turn_context` record follows `turn_started`: the turn
+ID, the provider's name, and the SHA-256 and byte length of the text added
+to the system prompt of that turn's model requests. The text itself is not
+recorded. See [tool providers](tool-providers.md#53-turn-context).
+
 Each `tool_decision` record says what decided it in `basis`:
 
 | `kind` | Meaning | Other fields |
@@ -325,6 +331,7 @@ it:
 | 9 | 8 | `turn_finished` events; `provided_tools` on `turn_started` |
 | 10 | 9 | `offered_tools` on `turn_started` |
 | 11 | 10 | Hashes and signatures cover stored bytes; requests, responses and log entries reject unknown fields (F14) |
+| 12 | 11 | `turn_context` events |
 
 Image records hold the hash, media type, dimensions, byte length, and label,
 never the image bytes. Upgrade and restart `xshell-auditd` together with

@@ -25,7 +25,7 @@ pub use client::{
 pub use completion::complete_shell;
 pub use control_token::{control_token_path, read_token, tokens_match, write_new_token};
 pub use credentials::{ConfiguredModel, CredentialRoutes, default_model_base_url};
-pub use execution::{DaemonPolicy, ExecutionCoordinator};
+pub use execution::{ContextSource, DaemonPolicy, ExecutionCoordinator};
 pub use model::{
     AccessMode, AgentTurnPhase, ApprovalReply, AttachmentRole, CapacityExhausted,
     DAEMON_PROBE_SCHEMA_VERSION, DEFAULT_MAX_CONCURRENT_TURNS, DEFAULT_MAX_SESSIONS,

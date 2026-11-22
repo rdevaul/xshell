@@ -16,10 +16,10 @@ use xshell_audit::AuditEvent;
 use xshell_core::ToolCall;
 use xshell_execution::{
     AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalRules, ApprovalSource,
-    Approver, BudgetExhausted, CancellationFlag, CompactionConfig, ExecutionEvent, GateReason,
-    ModelBudget, Policy, SensitivePaths, ToolRegistry, ToolSet, TurnBudget, TurnLimits,
-    TurnObserver, TurnPolicy, TurnUsage, build_adapter, run_agent_turn_with_budget,
-    run_direct_shell_streaming_cancellable,
+    Approver, BudgetExhausted, CancellationFlag, CompactionConfig, ContextProvider, ContextRequest,
+    ExecutionEvent, GateReason, ModelBudget, Policy, SensitivePaths, ToolRegistry, ToolSet,
+    TurnBudget, TurnContext, TurnLimits, TurnObserver, TurnPolicy, TurnUsage, build_adapter,
+    resolve_turn_context, run_agent_turn_with_budget, run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
 
@@ -63,7 +63,27 @@ pub struct DaemonPolicy {
     /// The endpoints each provider credential may be sent to, from the
     /// daemon's own model profiles. A client's binding is held to these.
     pub credential_routes: CredentialRoutes,
+    /// Supplies system-prompt text for each agent turn; `None` in the stock
+    /// daemon.
+    pub context: Option<ContextSource>,
 }
+
+/// A compiled-in [`ContextProvider`], as the daemon's policy holds it.
+#[derive(Clone)]
+pub struct ContextSource(pub Arc<dyn ContextProvider>);
+
+impl std::fmt::Debug for ContextSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ContextSource")
+            .field(&self.0.name())
+            .finish()
+    }
+}
+
+/// Longest wait for a context provider before the turn fails. Generous for
+/// a provider that reads files or searches a store, and bounded so a hung
+/// one cannot hold a turn slot.
+const CONTEXT_DEADLINE: Duration = Duration::from_secs(30);
 
 impl Default for DaemonPolicy {
     fn default() -> Self {
@@ -77,6 +97,7 @@ impl Default for DaemonPolicy {
             tools: ToolRegistry::empty(),
             max_concurrent_turns: crate::DEFAULT_MAX_CONCURRENT_TURNS,
             credential_routes: CredentialRoutes::default(),
+            context: None,
         }
     }
 }
@@ -680,7 +701,39 @@ on its model profile to attach images"
                         api_key_env: model.api_key_env.clone(),
                         vision: model.vision,
                     })?;
+                    // Built before anything else runs in the turn, and
+                    // recorded before the model sees it. A provider that
+                    // fails here fails the turn: an agent without its
+                    // context should not act.
+                    let context = match &self.inner.policy.context {
+                        Some(ContextSource(provider)) => {
+                            resolve_turn_context(
+                                Arc::clone(provider),
+                                ContextRequest {
+                                    session_id: session_id.clone(),
+                                    session_name: snapshot.descriptor.name.clone(),
+                                    turn_id: turn_id.clone(),
+                                    cwd: snapshot.descriptor.cwd.clone(),
+                                    message: message.clone(),
+                                    cancellation: cancellation.clone(),
+                                },
+                                CONTEXT_DEADLINE,
+                            )
+                            .await?
+                        }
+                        None => None,
+                    };
+                    if let Some(context) = &context {
+                        audit.append(AuditEvent::TurnContext {
+                            turn_id: turn_id.clone(),
+                            provider: context.provider().to_owned(),
+                            sha256: context.sha256().to_owned(),
+                            bytes: context.bytes() as u64,
+                        })?;
+                    }
+                    let context_bytes = context.as_ref().map_or(0, TurnContext::bytes);
                     let mut policy = TurnPolicy::new(approval)
+                        .with_context(context)
                         .with_tools(self.toolset(&snapshot.descriptor.tools))
                         .with_session_id(session_id.clone())
                         .with_limits(limits)
@@ -690,11 +743,20 @@ on its model profile to attach images"
                         })
                         .with_sensitive_paths(self.inner.policy.sensitive_paths.clone())
                         .with_blocked_paths(self.inner.policy.blocked_paths.clone())
-                        .with_compaction(&self.inner.policy.compaction.for_model(ModelBudget {
-                            max_history_bytes: model.max_history_bytes,
-                            context_tokens: model.context_tokens,
-                            reserve_output_tokens: model.reserve_output_tokens,
-                        }))
+                        .with_compaction(
+                            &self
+                                .inner
+                                .policy
+                                .compaction
+                                .for_model(ModelBudget {
+                                    max_history_bytes: model.max_history_bytes,
+                                    context_tokens: model.context_tokens,
+                                    reserve_output_tokens: model.reserve_output_tokens,
+                                })
+                                // The context rides on every request outside
+                                // the history, so the history gets less room.
+                                .reserving(context_bytes),
+                        )
                         .with_message_images(images);
                     // The session's own store: a turn can only show its model
                     // images stored for this session.

@@ -7,11 +7,12 @@
 //! `docs/tool-providers.md`.
 
 use crate::{
-    ClientPtyFrame, ClientRequest, ConfiguredModel, CredentialRoutes, DAEMON_PROBE_SCHEMA_VERSION,
-    DaemonAudit, DaemonPolicy, DaemonProbeReport, DaemonProbeStatus, ExecutionCoordinator,
-    PersistenceMode, PtyAudit, PtyClaim, PtyCoordinator, SESSION_PROTOCOL_VERSION, ServerPtyFrame,
-    ServerResponse, SessionActivity, SessionConfig, SessionHandshake, SessionRegistry,
-    complete_shell, load_view_resource, read_client_frame, tokens_match, write_server_frame,
+    ClientPtyFrame, ClientRequest, ConfiguredModel, ContextSource, CredentialRoutes,
+    DAEMON_PROBE_SCHEMA_VERSION, DaemonAudit, DaemonPolicy, DaemonProbeReport, DaemonProbeStatus,
+    ExecutionCoordinator, PersistenceMode, PtyAudit, PtyClaim, PtyCoordinator,
+    SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity, SessionConfig,
+    SessionHandshake, SessionRegistry, complete_shell, load_view_resource, read_client_frame,
+    tokens_match, write_server_frame,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -27,7 +28,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_execution::ToolRegistry;
+use xshell_execution::{ContextProvider, ToolRegistry};
 use xshell_platform::LockExt;
 use xshell_platform::service::{ServiceDefinition, ServiceManager, ServiceState, ServiceVerb};
 
@@ -117,6 +118,7 @@ struct ConfigFile {
 #[derive(Debug, Clone)]
 pub struct Daemon {
     tools: Arc<ToolRegistry>,
+    context: Option<ContextSource>,
 }
 
 impl Default for Daemon {
@@ -130,6 +132,7 @@ impl Daemon {
     pub fn new() -> Self {
         Self {
             tools: ToolRegistry::empty(),
+            context: None,
         }
     }
 
@@ -140,10 +143,18 @@ impl Daemon {
         self
     }
 
+    /// Ask `provider` for system-prompt text at the start of every agent
+    /// turn. The text is sent with that turn's model requests, never stored
+    /// in the session's history, and its hash is recorded in the audit log.
+    pub fn with_context(mut self, provider: Arc<dyn ContextProvider>) -> Self {
+        self.context = Some(ContextSource(provider));
+        self
+    }
+
     /// Parse the process's command line and run, exactly as `xshelld` does.
     /// `--help` and argument errors exit the process, as for any CLI.
     pub fn main(self) -> Result<()> {
-        run(Args::parse(), self.tools)
+        run(Args::parse(), self.tools, self.context)
     }
 
     /// Run with an explicit command line (`args[0]` is the program name), for
@@ -154,11 +165,11 @@ impl Daemon {
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        run(Args::parse_from(args), self.tools)
+        run(Args::parse_from(args), self.tools, self.context)
     }
 }
 
-fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
+fn run(args: Args, tools: Arc<ToolRegistry>, context: Option<ContextSource>) -> Result<()> {
     let config_path = if args.no_user_config {
         None
     } else {
@@ -213,27 +224,31 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
     for warning in warnings {
         eprintln!("xshelld: approval policy: {warning}");
     }
+    let context_name = context.as_ref().map(|source| source.0.name().to_owned());
     let execution = ExecutionCoordinator::with_policy(
         Arc::clone(&registry),
         audit,
-        daemon_policy(
-            &config,
-            rules,
-            tools,
-            credential_routes,
-            // The block classes plus this daemon's own state, config and
-            // audit directories (F24).
-            // The control token beside the socket is blocked too, in case
-            // the socket lives outside the state directory (F27).
-            with_blocked_file(
-                config.protected_paths(
-                    Some(&state_directory),
-                    config_path.as_deref(),
-                    audit_config.directory.as_deref(),
+        DaemonPolicy {
+            context,
+            ..daemon_policy(
+                &config,
+                rules,
+                tools,
+                credential_routes,
+                // The block classes plus this daemon's own state, config and
+                // audit directories (F24).
+                // The control token beside the socket is blocked too, in case
+                // the socket lives outside the state directory (F27).
+                with_blocked_file(
+                    config.protected_paths(
+                        Some(&state_directory),
+                        config_path.as_deref(),
+                        audit_config.directory.as_deref(),
+                    ),
+                    &crate::control_token_path(&socket),
                 ),
-                &crate::control_token_path(&socket),
-            ),
-        )?,
+            )?
+        },
     );
     let ptys = PtyCoordinator::with_registry(Arc::clone(&registry));
 
@@ -262,6 +277,10 @@ fn run(args: Args, tools: Arc<ToolRegistry>) -> Result<()> {
     drop(identity);
     println!("max approval: {}", execution.max_approval());
     println!("provided tools: {}", describe_tools(execution.tools()));
+    println!(
+        "context provider: {}",
+        context_name.as_deref().unwrap_or("none")
+    );
     println!("max limits: {}", execution.max_limits().summary());
     println!(
         "budgets: {} sessions, {} concurrent turns",
@@ -369,6 +388,8 @@ fn daemon_policy(
         tools,
         max_concurrent_turns: config.max_concurrent_turns,
         credential_routes,
+        // Compiled in, not configured: set by `Daemon::with_context`.
+        context: None,
     })
 }
 

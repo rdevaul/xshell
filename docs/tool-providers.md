@@ -1,7 +1,7 @@
 # Tool providers: design
 
-**Status:** proposed; stages S1, S2 and S4 implemented (`crates/xshell-execution/src/provider.rs`, `crates/xshell-session/src/daemon.rs`).
-**Updated:** 12 November 2026
+**Status:** proposed; stages S1, S2, S4 and S6 implemented (`crates/xshell-execution/src/provider.rs`, `crates/xshell-execution/src/context.rs`, `crates/xshell-session/src/daemon.rs`).
+**Updated:** 22 November 2026
 
 ## 1. Summary
 
@@ -325,6 +325,72 @@ not a defense against the client itself.
 The `xshell` CLI does not yet offer a way to choose a selection; a
 `--tools` option on `//new` and `xshell run` would be a small follow-up.
 
+### 5.3 Turn context
+
+A session's system prompt is fixed when the session is created. Some
+embedding programs need system-prompt text that is rebuilt for every turn: an
+assistant's identity, the current user's memory, an index of skills. A
+**context provider** supplies it:
+
+```rust
+#[async_trait]
+pub trait ContextProvider: Send + Sync {
+    fn name(&self) -> &str;                    // recorded in audit
+    async fn context(&self, request: ContextRequest) -> anyhow::Result<Option<String>>;
+}
+
+pub struct ContextRequest {
+    pub session_id: String,
+    pub session_name: String,
+    pub turn_id: String,
+    pub cwd: PathBuf,
+    pub message: String,               // the message that starts the turn
+    pub cancellation: CancellationFlag,
+}
+```
+
+```rust
+Daemon::new().with_tools(tools).with_context(Arc::new(MyContext::new())).main()
+```
+
+A daemon has at most one context provider. Like a tool provider it is
+compiled in, and the stock `xshelld` has none.
+
+- **When it runs.** Once per agent turn, after the turn is accepted and
+  before its first model request. `$` commands do not call it.
+- **Where the text goes.** It is appended to the system prompt of every
+  model request in that turn, after the session's own system prompt and a
+  blank line. If the session has no system prompt, the text becomes it.
+- **Never stored.** The text is not written to the session's history, so
+  the next turn gets a fresh one and old context does not accumulate.
+  Clients reading the history do not see it.
+- **Subagents do not inherit it.** A `delegate_task` subagent gets its task
+  from its parent and the standard subagent prompt, nothing else.
+- **Failure stops the turn.** If the provider returns an error, panics,
+  takes longer than 30 seconds, or returns more than 256 KiB
+  (`MAX_TURN_CONTEXT_BYTES`), the turn fails before the model is asked
+  anything and the message is not added to the history. An agent without
+  its identity or its user's memory should not act. Return `Ok(None)`, or
+  blank text, for a turn that needs no context.
+- **Budgeted.** The text's size is set aside from the turn's history budget
+  (`CompactionConfig::reserving`), so a history at its limit is compacted
+  further instead of overflowing the model once the context is added.
+- **Audited.** A `turn_context` record follows `turn_started`, holding the
+  provider's name, the text's SHA-256 and its length. The text itself is
+  not recorded, because it can hold a user's private memory; whoever holds
+  the text can prove from the hash what the model was told. With required
+  auditing, a turn whose `turn_context` record cannot be written does not
+  run. Audit format 11, audit protocol 12.
+
+**What the provider is responsible for.** The text has the standing of the
+system prompt. The engine keeps untrusted text out of system messages (F16),
+and a context provider is the one deliberate exception, so the provider
+decides what goes in. Text an agent or a user wrote earlier, such as a memory
+file, can carry instructions. Label it as data, keep it apart from the
+operator's own instructions, and bound its size. As with tool providers, the
+provider must also keep one session's user out of another user's data: it is
+told the session, and choosing whose memory to load is its job.
+
 ## 6. Staged plan
 
 | Stage | Content | Status |
@@ -332,7 +398,8 @@ The `xshell` CLI does not yet offer a way to choose a selection; a
 | S1 | Provider trait, registry, toolset, engine dispatch, gate reason, delegation, `DaemonPolicy.tools`, session id, audit field | Done (#121) |
 | S2 | **Embeddable daemon.** `xshelld` moved into the library as `xshell_session::daemon::Daemon`, with `with_tools` (§5.1) | Done (#122) |
 | S3 | **Argument-scoped policy.** An optional `ToolProvider::policy_subject(tool, arguments) -> Option<String>` returning the string an argument pattern matches, so rules such as `memory_put: shared/*` work | When a provider needs it |
-| S4 | **Per-session tool selections.** A session's creation names the built-in and provided tools its agent may use (§5.2) | Done |
+| S4 | **Per-session tool selections.** A session's creation names the built-in and provided tools its agent may use (§5.2) | Done (#124) |
+| S6 | **Turn context.** A compiled-in `ContextProvider` supplies system-prompt text for each agent turn (§5.3) | Done |
 | S5 | **Model-facing errors and output.** Optional structured results (images through the content-addressed image store, A1–A4) | After A4 |
 
 Out-of-process providers are not planned. A tool that has to run out of

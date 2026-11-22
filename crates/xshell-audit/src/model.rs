@@ -24,7 +24,8 @@ use std::path::PathBuf;
 /// - 10: record hashes, checkpoint signatures and checkpoint hashes cover the
 ///   body bytes as stored in the line, not a re-serialization of the parsed
 ///   body (F14). Formats 1 to 9 are verified by re-encoding.
-pub const AUDIT_FORMAT_VERSION: u32 = 10;
+/// - 11: adds `AuditEvent::TurnContext`.
+pub const AUDIT_FORMAT_VERSION: u32 = 11;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 /// The first format whose hashes and signatures cover the stored body bytes.
 pub const STORED_BYTES_AUDIT_FORMAT_VERSION: u32 = 10;
@@ -45,11 +46,12 @@ pub const STORED_BYTES_AUDIT_FORMAT_VERSION: u32 = 10;
 /// - 10: adds `offered_tools` on `TurnStarted` (format 9).
 /// - 11: requests and responses reject unknown fields, and the daemon writes
 ///   format 10 (F14).
+/// - 12: adds `TurnContext` (format 11).
 ///
 /// Tagged enum variants are not forward-compatible in serde, so mixed-version
 /// peers must fail at handshake. New fields are not either: an older service
 /// would drop them and sign a record without them.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 11;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -294,6 +296,18 @@ pub enum AuditEvent {
         /// it offers them all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         offered_tools: Option<Vec<String>>,
+    },
+    /// Text a compiled-in context provider added to the system prompt of
+    /// this turn's model requests. Written after `TurnStarted` and before
+    /// the turn's first request. The text itself is not recorded: it can
+    /// hold a user's private memory. The hash lets a holder of the text
+    /// prove what the model was told.
+    TurnContext {
+        turn_id: String,
+        provider: String,
+        /// SHA-256 of the text's UTF-8 bytes, lowercase hex.
+        sha256: String,
+        bytes: u64,
     },
     /// How an agent turn ended and what it used: the turn's last record.
     /// A supervisor finds it from the identifiers a headless run reports,
