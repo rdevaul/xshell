@@ -590,6 +590,14 @@ mod tests {
             })
             .unwrap();
         writer
+            .append(AuditEvent::TurnContext {
+                turn_id: "t1".into(),
+                provider: "identity".into(),
+                sha256: "ef".repeat(32),
+                bytes: 4096,
+            })
+            .unwrap();
+        writer
             .append(AuditEvent::ToolDecision {
                 call_id: "c1".into(),
                 decision: "deny".into(),
@@ -610,6 +618,7 @@ mod tests {
             (r#""list":"denied""#, r#""list":"allowed""#),
             (r#""approval":"ask""#, r#""approval":"off""#),
             (r#""approval":"required""#, r#""approval":"not_required""#),
+            (r#""bytes":4096"#, r#""bytes":4097"#),
             (
                 r#""offered_tools":["read_file","#,
                 r#""offered_tools":["run_shell","#,

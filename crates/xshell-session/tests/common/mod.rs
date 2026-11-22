@@ -25,6 +25,8 @@ pub fn connect_when_ready(socket: &Path) -> SessionClient {
     }
 }
 
+// Each test binary compiles this module and uses its own subset of it.
+#[allow(dead_code)]
 pub fn serve_sse(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
     let (url, handle, _bodies) = serve_sse_recording(responses);
     (url, handle)

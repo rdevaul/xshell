@@ -12,7 +12,8 @@ use crate::tools::{
 use crate::{
     ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
     GateReason, PolicyDecision, SensitivePaths, SessionImages, Tool, ToolAccess, ToolApproval,
-    ToolSet, default_decision, drop_tool_payloads, estimate_history_tokens, history_bytes,
+    ToolSet, TurnContext, default_decision, drop_tool_payloads, estimate_history_tokens,
+    history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -422,6 +423,10 @@ pub struct TurnPolicy {
     /// The daemon session the turn belongs to, passed to tool providers so
     /// they can keep per-session state. `None` outside a daemon.
     pub session_id: Option<String>,
+    /// Text appended to the system prompt of this turn's provider requests
+    /// and never written to history (see [`crate::ContextProvider`]).
+    /// Subagents do not inherit it.
+    pub context: Option<Arc<TurnContext>>,
     /// The session's images: where the bytes of the conversation's images
     /// are read from, and where `view_image` stores what it shows. Set only
     /// for models that take images; `None` sends every image as a
@@ -446,6 +451,10 @@ impl std::fmt::Debug for TurnPolicy {
             .field("tools", &self.tools)
             .field("agent_scope", &self.agent_scope)
             .field("session_id", &self.session_id)
+            .field(
+                "context",
+                &self.context.as_ref().map(|context| context.sha256()),
+            )
             .field("images", &self.images.is_some())
             .field("message_images", &self.message_images)
             .field("limits", &self.limits)
@@ -464,6 +473,7 @@ impl Clone for TurnPolicy {
             tools: self.tools.clone(),
             agent_scope: self.agent_scope.clone(),
             session_id: self.session_id.clone(),
+            context: self.context.clone(),
             images: self.images.clone(),
             message_images: self.message_images.clone(),
             limits: self.limits,
@@ -482,6 +492,7 @@ impl TurnPolicy {
             tools: ToolSet::all(),
             agent_scope: None,
             session_id: None,
+            context: None,
             images: None,
             message_images: Vec::new(),
             limits: TurnLimits::default(),
@@ -508,6 +519,11 @@ impl TurnPolicy {
 
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_context(mut self, context: Option<TurnContext>) -> Self {
+        self.context = context.map(Arc::new);
         self
     }
 
@@ -705,6 +721,9 @@ pub async fn run_agent_turn_with_budget(
         // provider only. History keeps them where they were written; see
         // [`merge_system_messages`].
         merge_system_messages(&mut request_messages);
+        if let Some(context) = &policy.context {
+            append_turn_context(&mut request_messages, context.text());
+        }
         let outcome = {
             let observer = &mut *observer;
             let mut emit = |event| match event {
@@ -1277,7 +1296,10 @@ async fn run_delegation(
         .clone()
         .with_tools(tools.clone())
         .with_agent_scope(name.clone())
-        .with_message_images(Vec::new());
+        .with_message_images(Vec::new())
+        // The turn's context is written for the session's own agent. A
+        // subagent gets its task from its parent and nothing else.
+        .with_context(None);
     observer.emit(ExecutionEvent::SubagentStarted {
         agent: name.clone(),
         task: task.clone(),
@@ -1501,6 +1523,22 @@ fn merge_system_messages(history: &mut Vec<ChatMessage>) -> usize {
         history.insert(0, ChatMessage::system(merged));
     }
     misplaced.len()
+}
+
+/// Append a turn's context to the leading `system` message of a provider
+/// request, creating one when the history has none. Applied to the request
+/// only: stored history never holds a turn's context, so each turn starts
+/// from the session's own system prompt and a fresh context.
+fn append_turn_context(request_messages: &mut Vec<ChatMessage>, context: &str) {
+    match request_messages.first_mut() {
+        Some(prefix) if prefix.role == MessageRole::System => {
+            if !prefix.content.is_empty() {
+                prefix.content.push_str("\n\n");
+            }
+            prefix.content.push_str(context);
+        }
+        _ => request_messages.insert(0, ChatMessage::system(context)),
+    }
 }
 
 const FAILED_AFTER_TOOLS_RECORD: &str =
@@ -5413,5 +5451,122 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
                 .iter()
                 .all(|(_, context)| context.session_id.as_deref() == Some("session-1"))
         );
+    }
+
+    fn system_prompt(request: &ChatRequest) -> &str {
+        let first = &request.messages[0];
+        assert_eq!(first.role, MessageRole::System);
+        &first.content
+    }
+
+    fn turn_context(text: &str) -> Option<TurnContext> {
+        TurnContext::new("identity", text.into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn turn_context_reaches_every_request_and_never_the_history() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![list_call("l")]),
+                answer("first done"),
+                answer("second done"),
+            ]),
+            requests: Vec::new(),
+        };
+        let mut history = vec![ChatMessage::system("You are a shell assistant.")];
+        let policy =
+            TurnPolicy::new(ApprovalPolicy::Ask).with_context(turn_context("Alice likes tea."));
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &policy,
+            &mut recording_observer([]),
+        )
+        .await
+        .unwrap();
+        // Both requests of the turn, before and after the tool call.
+        for request in &adapter.requests[..2] {
+            assert_eq!(
+                system_prompt(request),
+                "You are a shell assistant.\n\nAlice likes tea."
+            );
+        }
+        assert_eq!(history[0].content, "You are a shell assistant.");
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("Alice"))
+        );
+
+        // The next turn carries its own context, not the previous one.
+        let policy =
+            TurnPolicy::new(ApprovalPolicy::Ask).with_context(turn_context("Alice likes coffee."));
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "again".into(),
+            temporary.path(),
+            &policy,
+            &mut recording_observer([]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            system_prompt(&adapter.requests[2]),
+            "You are a shell assistant.\n\nAlice likes coffee."
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_context_becomes_the_system_prompt_when_the_session_has_none() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([answer("done")]),
+            requests: Vec::new(),
+        };
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_context(turn_context("You are Sybil.")),
+            &mut recording_observer([]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(system_prompt(&adapter.requests[0]), "You are Sybil.");
+        assert_eq!(adapter.requests[0].messages[1].content, "hello");
+        assert_eq!(history[0].role, MessageRole::User);
+    }
+
+    #[tokio::test]
+    async fn subagents_do_not_inherit_the_turn_context() {
+        let temporary = TempDir::new().unwrap();
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                calls(vec![delegate_call("d", "count the files", None)]),
+                answer("three"),
+                answer("done"),
+            ]),
+            requests: Vec::new(),
+        };
+        run_agent_turn(
+            &mut adapter,
+            &mut vec![ChatMessage::system("base")],
+            "hello".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Ask).with_context(turn_context("Alice likes tea.")),
+            &mut recording_observer([]),
+        )
+        .await
+        .unwrap();
+        assert!(system_prompt(&adapter.requests[0]).contains("Alice"));
+        assert!(!system_prompt(&adapter.requests[1]).contains("Alice"));
+        // Back in the parent, after the delegation.
+        assert!(system_prompt(&adapter.requests[2]).contains("Alice"));
     }
 }

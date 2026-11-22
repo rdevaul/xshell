@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{connect_when_ready, serve_sse, sse_text, sse_tool_call};
+use common::{connect_when_ready, serve_sse_recording, sse_text, sse_tool_call};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,8 +15,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use xshell_core::{ChatMessage, ToolDefinition};
 use xshell_execution::{
-    ApprovalPolicy, ExecutionEvent, ProvidedTool, ToolAccess, ToolApproval, ToolContext,
-    ToolProvider, ToolRegistry,
+    ApprovalPolicy, ContextProvider, ContextRequest, ExecutionEvent, ProvidedTool, ToolAccess,
+    ToolApproval, ToolContext, ToolProvider, ToolRegistry,
 };
 use xshell_session::daemon::Daemon;
 use xshell_session::{
@@ -55,6 +55,26 @@ impl ToolProvider for Memory {
         );
         self.calls.lock().unwrap().push(context);
         Ok(answer)
+    }
+}
+
+/// Says who the agent is and what was asked, and fails on request.
+struct Identity;
+
+#[async_trait::async_trait]
+impl ContextProvider for Identity {
+    fn name(&self) -> &str {
+        "identity"
+    }
+
+    async fn context(&self, request: ContextRequest) -> anyhow::Result<Option<String>> {
+        if request.message == "fail the context" {
+            anyhow::bail!("memory is unreadable");
+        }
+        Ok(Some(format!(
+            "You are Sybil, in session {} ({}). Asked: {}",
+            request.session_name, request.session_id, request.message
+        )))
     }
 }
 
@@ -128,7 +148,7 @@ fn run_turn(
 
 #[test]
 fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
-    let (base_url, model_server) = serve_sse(vec![
+    let (base_url, model_server, requests) = serve_sse_recording(vec![
         // The unrestricted session's turn.
         sse_tool_call("call_1", "memory_get", serde_json::json!({})),
         sse_text("remembered"),
@@ -161,7 +181,12 @@ fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
             "--socket".to_owned(),
             socket.display().to_string(),
         ];
-        thread::spawn(move || Daemon::new().with_tools(tools).run_with_args(args))
+        thread::spawn(move || {
+            Daemon::new()
+                .with_tools(tools)
+                .with_context(Arc::new(Identity))
+                .run_with_args(args)
+        })
     };
 
     let mut client = connect_when_ready(&socket);
@@ -192,8 +217,60 @@ fn an_embedded_daemon_runs_its_provided_tools_in_agent_turns() {
         assert_eq!(calls[0].cwd, temporary.path().canonicalize().unwrap());
         assert_eq!(calls[0].agent, None);
     }
-    let history = client.snapshot(session_id).unwrap().history;
+    let history = client.snapshot(session_id.clone()).unwrap().history;
     assert_eq!(history.last().unwrap().content, "remembered");
+    // The context provider's text follows the session's own system prompt in
+    // both model requests of the turn, and is never stored in the history.
+    let expected_context = format!(
+        "test\n\nYou are Sybil, in session memory ({session_id}). Asked: what do you remember?"
+    );
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            let request: serde_json::Value = serde_json::from_str(request).unwrap();
+            assert_eq!(request["messages"][0]["role"], "system");
+            assert_eq!(request["messages"][0]["content"], expected_context);
+        }
+    }
+    assert_eq!(history[0].content, "test");
+    assert!(history.iter().all(|m| !m.content.contains("Sybil")));
+
+    // A context provider that fails stops the turn before the model is
+    // asked anything.
+    client
+        .submit(
+            session_id.clone(),
+            TurnInput::Agent {
+                message: "fail the context".into(),
+                images: Vec::new(),
+            },
+            ApprovalPolicy::Ask,
+        )
+        .unwrap();
+    let mut failure = None;
+    let mut after = 0;
+    for _ in 0..100 {
+        let batch = client.events(session_id.clone(), after, 500).unwrap();
+        for record in batch.events {
+            after = record.sequence;
+            if let SessionEventKind::TurnFailed { message, .. } = record.event {
+                failure = Some(message);
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+    let failure = failure.expect("the turn should fail");
+    assert!(
+        failure.contains("context provider \"identity\" failed"),
+        "{failure}"
+    );
+    assert!(failure.contains("memory is unreadable"), "{failure}");
+    assert_eq!(requests.lock().unwrap().len(), 2, "the model was asked");
+    let history = client.snapshot(session_id).unwrap().history;
+    assert!(history.iter().all(|m| m.content != "fail the context"));
 
     // A session limited to one tool: names the daemon does not offer, or
     // repeated names, are refused when the session is created.

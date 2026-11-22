@@ -1,6 +1,7 @@
 mod budget;
 mod call_id;
 mod compaction;
+mod context;
 mod engine;
 mod environment;
 mod images;
@@ -21,6 +22,9 @@ pub use compaction::{
     BYTES_PER_TOKEN, CompactionConfig, CompactionReport, Compactor, DEFAULT_RESERVE_OUTPUT_TOKENS,
     MINIMUM_HISTORY_TOKENS, MaxBytesCompactor, ModelBudget, NoCompaction, REQUEST_OVERHEAD_TOKENS,
     drop_tool_payloads, estimate_history_tokens, estimate_tokens, history_bytes, message_bytes,
+};
+pub use context::{
+    ContextProvider, ContextRequest, MAX_TURN_CONTEXT_BYTES, TurnContext, resolve_turn_context,
 };
 pub use engine::{
     AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalSource, Approver,
