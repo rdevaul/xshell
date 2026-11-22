@@ -25,8 +25,9 @@ pub use compaction::{
 pub use engine::{
     AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalSource, Approver,
     CancellationFlag, DirectShellResult, ExecutionEvent, TurnObserver, TurnPolicy, build_adapter,
-    captured_cd_destination, run_agent_turn, run_agent_turn_with_budget, run_direct_shell,
-    run_direct_shell_streaming, run_direct_shell_streaming_cancellable, validate_working_directory,
+    captured_cd_destination, offered_tools, run_agent_turn, run_agent_turn_with_budget,
+    run_direct_shell, run_direct_shell_streaming, run_direct_shell_streaming_cancellable,
+    validate_working_directory,
 };
 pub use environment::{AGENT_ENVIRONMENT_ALLOWLIST, protect_credential_variable};
 pub use images::{

@@ -506,6 +506,15 @@ impl TurnPolicy {
         self
     }
 
+    /// The tools a turn under this policy offers its model: `tools`, less
+    /// `view_image` when there is no session image store. `view_image`
+    /// needs a store to put what it shows and a model that takes images to
+    /// see it. The engine offers exactly this set, so a caller that records
+    /// a turn's authority records this, not `tools`.
+    pub fn offered_tools(&self) -> ToolSet {
+        offered_tools(self.tools.clone(), self.images.is_some())
+    }
+
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self
@@ -646,6 +655,17 @@ pub async fn run_agent_turn(
     run_agent_turn_with_budget(agent, history, message, cwd, policy, &budget, observer).await
 }
 
+/// `tools` as a turn offers them: without `view_image` unless the turn has
+/// a session image store (`has_image_store`). The one rule for both the
+/// engine and whoever records a turn's authority before it starts.
+pub fn offered_tools(tools: ToolSet, has_image_store: bool) -> ToolSet {
+    if has_image_store {
+        tools
+    } else {
+        tools.without(Tool::ViewImage)
+    }
+}
+
 /// Run one turn drawing from `budget`, which may be shared with the turn's
 /// parent and siblings. `policy.limits` is ignored; the budget's own limits
 /// apply. Exhaustion fails the turn with a [`BudgetExhausted`] error.
@@ -658,14 +678,12 @@ pub async fn run_agent_turn_with_budget(
     budget: &TurnBudget,
     observer: &mut dyn TurnObserver,
 ) -> Result<()> {
-    // `view_image` needs a session image store to put what it shows, and a
-    // model that takes images to see it; without them it is not offered,
-    // and a call to it is refused like any tool outside the set.
+    // Without a session image store `view_image` is not offered, and a call
+    // to it is refused like any tool outside the set. A caller that already
+    // narrowed its toolset with `offered_tools` passes through unchanged.
     let without_images;
     let policy = if policy.images.is_none() && policy.tools.contains(Tool::ViewImage) {
-        without_images = policy
-            .clone()
-            .with_tools(policy.tools.clone().without(Tool::ViewImage));
+        without_images = policy.clone().with_tools(policy.offered_tools());
         &without_images
     } else {
         policy
@@ -4912,6 +4930,26 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn a_policy_offers_view_image_only_with_an_image_store() {
+        let temporary = TempDir::new().unwrap();
+        // Every tool selected, no store: `view_image` is not offered, so a
+        // record of this turn's tools must list the rest.
+        let blind = TurnPolicy::new(ApprovalPolicy::Ask);
+        assert!(blind.tools.contains(Tool::ViewImage));
+        assert!(!blind.offered_tools().contains(Tool::ViewImage));
+        assert!(!blind.offered_tools().is_complete());
+        assert_eq!(
+            blind.offered_tools(),
+            ToolSet::all().without(Tool::ViewImage)
+        );
+        let sighted = TurnPolicy::new(ApprovalPolicy::Ask).with_images(image_store(&temporary));
+        assert!(sighted.offered_tools().is_complete());
+        // A store never adds a tool the policy does not hold.
+        let narrowed = sighted.with_tools(ToolSet::all().only(&["read_file"]));
+        assert_eq!(narrowed.offered_tools().names(), ["read_file"]);
     }
 
     #[tokio::test]

@@ -221,7 +221,10 @@ When the session host has compiled-in tool providers, `turn_started` also
 holds `provided_tools`: the registry's identity and each provided tool's
 provider, name, access and approval. When the session limits its agent to
 some tools, `offered_tools` lists the names the agent was offered. Both are
-absent otherwise. See [tool providers](tool-providers.md#47-audit).
+absent otherwise. A turn without a session image store (a model without
+`vision`) is not offered `view_image`, so its record always carries
+`offered_tools`, without `view_image`.
+See [tool providers](tool-providers.md#47-audit).
 
 Each `tool_decision` record says what decided it in `basis`:
 

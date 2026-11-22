@@ -3255,6 +3255,129 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
     assert!(audit.first_sequence.unwrap() < audit.last_sequence);
 }
 
+/// The `turn_started` record names the tools the model was actually
+/// offered. `view_image` is offered only to a model that takes images, so a
+/// session without one must not be recorded as holding it, whether it
+/// selected every tool or named `view_image` itself.
+#[test]
+fn turn_started_records_the_tools_the_model_was_offered() {
+    let temporary = TempDir::new().unwrap();
+    let fabric = start_audited_fabric(&temporary, "");
+    let (base_url, _model_server, bodies) =
+        common::serve_sse_recording(vec![sse_text("one"), sse_text("two"), sse_text("three")]);
+    let mut client = connect_when_ready(&fabric.socket);
+    let cases = [
+        ("blind", false, xshell_session::SessionTools::All),
+        (
+            "blind-selected",
+            false,
+            xshell_session::SessionTools::Only(vec!["read_file".into(), "view_image".into()]),
+        ),
+        ("sighted", true, xshell_session::SessionTools::All),
+    ];
+    for (name, vision, tools) in &cases {
+        let session = client
+            .create(SessionCreation {
+                name: (*name).into(),
+                model: ModelBinding {
+                    provider: "openai".into(),
+                    vision: *vision,
+                    base_url: base_url.clone(),
+                    ..model("fake")
+                },
+                cwd: temporary.path().into(),
+                persistence: PersistenceMode::Daemon,
+                visibility: Visibility::Fabric,
+                history: vec![ChatMessage::system(format!("session {name}"))],
+                tools: tools.clone(),
+            })
+            .unwrap();
+        complete_turn(
+            &mut client,
+            &session.descriptor.id,
+            TurnInput::Agent {
+                message: "hello".into(),
+                images: Vec::new(),
+            },
+        );
+        client.close(Some((*name).into())).unwrap();
+    }
+    drop(client);
+
+    // What each session's model was sent, by the session's system prompt.
+    let bodies = bodies.lock().unwrap().clone();
+    let sent_tools = |name: &str| -> Vec<String> {
+        let body = bodies
+            .iter()
+            .find(|body| body.contains(&format!("session {name}\"")))
+            .unwrap_or_else(|| panic!("no request for session {name}"));
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        body["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Each session's audit log, by the name its `session_started` carries.
+    let sessions_dir = fabric.audit_directory.join("sessions");
+    let started = |name: &str| -> serde_json::Value {
+        for _ in 0..200 {
+            let found = std::fs::read_dir(&sessions_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path()).ok())
+                .find(|text| {
+                    text.contains(&format!("\"name\":\"{name}\""))
+                        && text.contains("\"session_ended\"")
+                });
+            if let Some(text) = found {
+                return audit_events(&text)
+                    .into_iter()
+                    .find(|event| event["type"] == "turn_started")
+                    .unwrap_or_else(|| panic!("session {name} recorded no turn_started"));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no finished audit log for session {name}");
+    };
+
+    let without_view_image = ["read_file", "list_directory", "run_shell", "delegate_task"];
+    let blind = started("blind");
+    assert_eq!(
+        blind["offered_tools"],
+        serde_json::json!(without_view_image),
+        "{blind}"
+    );
+    assert_eq!(sent_tools("blind"), without_view_image);
+
+    let selected = started("blind-selected");
+    assert_eq!(
+        selected["offered_tools"],
+        serde_json::json!(["read_file"]),
+        "{selected}"
+    );
+    assert_eq!(sent_tools("blind-selected"), ["read_file"]);
+
+    // Every tool offered, `view_image` included: the record lists none.
+    let sighted = started("sighted");
+    assert!(sighted.get("offered_tools").is_none(), "{sighted}");
+    assert_eq!(
+        sent_tools("sighted"),
+        [
+            "read_file",
+            "list_directory",
+            "run_shell",
+            "delegate_task",
+            "view_image"
+        ]
+    );
+}
+
 /// Run one terminal job to completion through the daemon, feeding it `input`
 /// over the PTY stream transport, and return the finalized daemon audit log.
 fn run_terminal_job_and_collect_log(

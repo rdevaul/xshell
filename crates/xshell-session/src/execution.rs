@@ -18,7 +18,7 @@ use xshell_execution::{
     AdapterConfig, ApprovalAnswer, ApprovalDecision, ApprovalPolicy, ApprovalRules, ApprovalSource,
     Approver, BudgetExhausted, CancellationFlag, CompactionConfig, ExecutionEvent, GateReason,
     ModelBudget, Policy, SensitivePaths, ToolRegistry, ToolSet, TurnBudget, TurnLimits,
-    TurnObserver, TurnPolicy, TurnUsage, build_adapter, run_agent_turn_with_budget,
+    TurnObserver, TurnPolicy, TurnUsage, build_adapter, offered_tools, run_agent_turn_with_budget,
     run_direct_shell_streaming_cancellable,
 };
 use xshell_platform::LockExt;
@@ -26,6 +26,13 @@ use xshell_platform::LockExt;
 const MAX_JOURNAL_EVENTS: usize = 8_192;
 const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_WAIT: Duration = Duration::from_secs(30);
+
+/// The tools and image store of one agent turn. See
+/// [`ExecutionCoordinator::agent_turn_tools`].
+struct AgentTurnTools {
+    tools: ToolSet,
+    images: Option<xshell_execution::ImageStore>,
+}
 
 #[derive(Clone)]
 pub struct ExecutionCoordinator {
@@ -224,6 +231,36 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// What one agent turn of this session offers its model, decided once
+    /// before the turn's authority is recorded: the session's toolset as the
+    /// engine will offer it, and the image store the turn runs with.
+    /// `view_image` is offered only to a model that takes images and only
+    /// when the session's image store opens, so the audit record and the
+    /// turn agree on it.
+    fn agent_turn_tools(&self, snapshot: &crate::SessionSnapshot) -> AgentTurnTools {
+        let session_id = &snapshot.descriptor.id;
+        // The session's own store: a turn can only show its model images
+        // stored for this session.
+        let images = if snapshot.descriptor.model.vision {
+            match self.inner.registry.lock_recover().image_store(session_id) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    eprintln!(
+                        "xshelld warning: session {session_id}: cannot open its image \
+store, so images are sent as placeholders: {error:#}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        AgentTurnTools {
+            tools: offered_tools(self.toolset(&snapshot.descriptor.tools), images.is_some()),
+            images,
+        }
+    }
+
     pub fn audit(&self) -> &DaemonAudit {
         &self.inner.audit
     }
@@ -339,8 +376,11 @@ on its model profile to attach images"
             }
         };
         // An agent turn's authority is recorded before anything can run
-        // under it: decisions later in the log are read against it.
-        if matches!(input, TurnInput::Agent { .. }) {
+        // under it: decisions later in the log are read against it. The
+        // tools recorded here are the ones the turn is then run with.
+        let agent_tools =
+            matches!(input, TurnInput::Agent { .. }).then(|| self.agent_turn_tools(&snapshot));
+        if let Some(agent_tools) = &agent_tools {
             let rules = ApprovalRules {
                 base: self.inner.policy.rules.clone(),
                 overlay: overlay.clone(),
@@ -352,7 +392,7 @@ on its model profile to attach images"
                 &limits,
                 requested_limits.as_ref(),
                 &rules,
-                &self.toolset(&snapshot.descriptor.tools),
+                &agent_tools.tools,
             )) {
                 execution.finish(&turn_id);
                 return Err(error);
@@ -398,6 +438,7 @@ on its model profile to attach images"
                     session_id,
                     spawned_turn_id,
                     input,
+                    agent_tools,
                     approval,
                     limits,
                     overlay,
@@ -618,6 +659,7 @@ on its model profile to attach images"
         session_id: String,
         turn_id: String,
         input: TurnInput,
+        agent_tools: Option<AgentTurnTools>,
         approval: ApprovalPolicy,
         limits: TurnLimits,
         overlay: Option<Policy>,
@@ -680,8 +722,14 @@ on its model profile to attach images"
                         api_key_env: model.api_key_env.clone(),
                         vision: model.vision,
                     })?;
+                    // Decided by `submit`, which recorded these tools as
+                    // the turn's authority.
+                    let AgentTurnTools {
+                        tools,
+                        images: image_store,
+                    } = agent_tools.context("an agent turn was started without its toolset")?;
                     let mut policy = TurnPolicy::new(approval)
-                        .with_tools(self.toolset(&snapshot.descriptor.tools))
+                        .with_tools(tools)
                         .with_session_id(session_id.clone())
                         .with_limits(limits)
                         .with_rules(ApprovalRules {
@@ -696,16 +744,8 @@ on its model profile to attach images"
                             reserve_output_tokens: model.reserve_output_tokens,
                         }))
                         .with_message_images(images);
-                    // The session's own store: a turn can only show its model
-                    // images stored for this session.
-                    if model.vision {
-                        match self.inner.registry.lock_recover().image_store(&session_id) {
-                            Ok(store) => policy = policy.with_images(Arc::new(store)),
-                            Err(error) => eprintln!(
-                                "xshelld warning: session {session_id}: cannot open its image \
-store, so images are sent as placeholders: {error:#}"
-                            ),
-                        }
+                    if let Some(store) = image_store {
+                        policy = policy.with_images(Arc::new(store));
                     }
                     let outcome = run_agent_turn_with_budget(
                         agent.as_mut(),

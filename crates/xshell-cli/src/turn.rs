@@ -656,7 +656,9 @@ pub(crate) async fn run_agent_turn(
 ) -> Result<()> {
     // This process executes, so it records the turn's authority before
     // anything runs under it, as the daemon does. The mode and limits are
-    // the ones this process chose; nothing lowered them.
+    // the ones this process chose; nothing lowered them. The tools are the
+    // ones the engine offers under this policy, which leaves `view_image`
+    // out when the policy has no image store.
     audit.append(xshell_session::audit_turn_started(
         &uuid::Uuid::new_v4().to_string(),
         policy.approval,
@@ -664,7 +666,7 @@ pub(crate) async fn run_agent_turn(
         &policy.limits,
         None,
         &policy.rules,
-        &policy.tools,
+        &policy.offered_tools(),
     ))?;
     let mut observer = LocalObserver::new(audit, render_options, cwd);
     let outcome =
