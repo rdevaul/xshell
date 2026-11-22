@@ -1435,34 +1435,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn f12_a_second_pty_job_cannot_reach_the_first_jobs_master() {
-        let temporary = TempDir::new().unwrap();
-        let mut first = RemotePtyProcess::spawn(
+    fn spawn_job_waiting_for_a_line(cwd: &Path) -> RemotePtyProcess {
+        let mut job = RemotePtyProcess::spawn(
             "printf 'ready\\n'; read value; printf 'got:%s\\n' \"$value\"",
-            temporary.path(),
+            cwd,
             PtySize::default(),
             None,
         )
         .unwrap();
-        let (ready, _) = drain_until(&mut first, Vec::new(), Duration::from_secs(10), |text| {
+        let (ready, _) = drain_until(&mut job, Vec::new(), Duration::from_secs(10), |text| {
             text.contains("ready")
         });
         assert!(
             ready.contains("ready"),
             "first job did not start: {ready:?}"
         );
+        job
+    }
+
+    /// Run a second PTY job that hunts for `first`'s master, and check that
+    /// it neither holds it nor can type into `first`'s terminal.
+    fn assert_second_job_cannot_reach_master(mut first: RemotePtyProcess, cwd: &Path) {
         let first_master = first.master.as_raw_fd();
 
-        // The second job looks for the first job's master by number, reports
-        // any terminal above stdio, and tries the attack from the finding:
-        // typing into every descriptor it holds. It runs under /bin/sh so
-        // the descriptors a login shell keeps for itself do not count.
-        let script = temporary.path().join("probe.sh");
+        // The second job reports the first job's master if it holds it,
+        // reports any terminal above stdio, and tries the attack from the
+        // finding: typing into every descriptor it holds. It runs under
+        // /bin/sh so the descriptors a login shell keeps for itself do not
+        // count.
+        //
+        // A descriptor merely existing at the master's number proves
+        // nothing: the probing shell holds descriptors of its own (dash
+        // keeps its script open on 10), and the numbers can coincide. An
+        // inherited master is a terminal, and no shell keeps a private
+        // terminal above stdio, so that is what identifies it; `test -t`
+        // also works on macOS, which has no /proc to resolve the descriptor.
+        let script = cwd.join("probe.sh");
         std::fs::write(
             &script,
             format!(
-                "if [ -e /dev/fd/{first_master} ]; then echo leak:{first_master}; fi\n\
+                "if [ -t {first_master} ]; then echo leak:{first_master}; fi\n\
                  for f in /dev/fd/*; do\n\
                  n=${{f##*/}}\n\
                  [ \"$n\" -gt 2 ] || continue\n\
@@ -1474,8 +1486,7 @@ mod tests {
         )
         .unwrap();
         let probe = format!("exec /bin/sh {}", script.display());
-        let mut second =
-            RemotePtyProcess::spawn(&probe, temporary.path(), PtySize::default(), None).unwrap();
+        let mut second = RemotePtyProcess::spawn(&probe, cwd, PtySize::default(), None).unwrap();
         let (second_output, status) =
             drain_until(&mut second, Vec::new(), Duration::from_secs(10), |_| false);
 
@@ -1497,6 +1508,47 @@ mod tests {
         assert!(!second_output.contains("tty:"), "{second_output}");
         assert!(first_output.contains("got:genuine"), "{first_output}");
         assert!(!first_output.contains("INJECTED"), "{first_output}");
+    }
+
+    #[test]
+    fn f12_a_second_pty_job_cannot_reach_the_first_jobs_master() {
+        let temporary = TempDir::new().unwrap();
+        let first = spawn_job_waiting_for_a_line(temporary.path());
+        assert_second_job_cannot_reach_master(first, temporary.path());
+    }
+
+    /// The probe must not mistake one of its own shell's descriptors for the
+    /// first job's master when the two share a number. dash, the /bin/sh of
+    /// Debian and Ubuntu, reads its script from descriptor 10, so put the
+    /// master there.
+    #[test]
+    fn f12_probe_ignores_its_shells_own_descriptor_at_the_masters_number() {
+        const SHELL_SCRIPT_DESCRIPTOR: RawFd = 10;
+        let temporary = TempDir::new().unwrap();
+        // The master takes the lowest free number, so fill everything below
+        // the target first. Other tests open descriptors in this process at
+        // the same time and may take the target; retry a few times, then
+        // run the check on whatever number came up, where it holds as well.
+        let mut attempts = 0;
+        let first = loop {
+            let mut fillers = Vec::new();
+            loop {
+                let filler = File::open("/dev/null").unwrap();
+                if filler.as_raw_fd() >= SHELL_SCRIPT_DESCRIPTOR {
+                    break;
+                }
+                fillers.push(filler);
+            }
+            let first = spawn_job_waiting_for_a_line(temporary.path());
+            drop(fillers);
+            attempts += 1;
+            if first.master.as_raw_fd() == SHELL_SCRIPT_DESCRIPTOR || attempts == 20 {
+                break first;
+            }
+            drop(first);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_second_job_cannot_reach_master(first, temporary.path());
     }
 
     #[test]
