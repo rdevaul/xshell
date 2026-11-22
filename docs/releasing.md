@@ -7,6 +7,12 @@ URL, byte length, and SHA-256 digest. The controller verifies the manifest
 before selecting an artifact and verifies the downloaded bytes before they can
 be presented for installation approval.
 
+**Not wired up yet.** Signing, the manifest format and its verification are
+implemented in `xshell-release`, and the release workflow publishes signed
+manifests. The controller does not use them: `//connect` cannot install or
+upgrade `xshelld` on a remote host, and the `[remote_bootstrap]` table below
+is validated but has no effect today.
+
 ## One-time signing-key setup
 
 Generate the release keypair on a protected operator machine:

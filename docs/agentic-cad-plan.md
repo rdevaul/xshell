@@ -6,7 +6,9 @@
 ## 1. Summary
 
 This plan makes xshell practical for agent-driven engineering and CAD work.
-Three capabilities are missing:
+When it was written (4 November 2026) three capabilities were missing. Most
+of the first and all of the third have since been built; each section's
+status note says what has landed:
 
 1. **Images:** an agent can see images, from a file the user attaches or a
    render a tool produces, and the model receives them in the format its
@@ -32,7 +34,15 @@ headless approvals and relaxed limits (§6). The recommended order is B, then C,
 (§7). B unblocks long tasks within about two weeks, and C's event schema and
 exit codes should be fixed before images add new event types.
 
-## 2. Where xshell stands
+## 2. Where xshell stood (4 November 2026)
+
+This table is the starting point the plan was written against, kept for
+reference. Since then: messages carry images and both adapters send them
+(A1–A4); `//view` opens images in a local viewer and `//attach` and
+`view_image` reach the model; turn limits are configurable profiles with a
+`relaxed` profile, including the shell timeout and the auto-continue cap; and
+`xshell run` is the headless mode. F3D rendering and the yapCAD profile are
+still not built.
 
 | Area | Current state | Gap |
 |---|---|---|
@@ -55,13 +65,13 @@ mainly a new client, not new execution machinery.
 ### 3.1 Design
 
 **Status:** A1 is implemented. `ChatMessage.images` holds validated
-`ImageRef`s; `sessions.json` is format 2 (format 1 still loads); audit is
-format 6 and protocol 7. Until A3, both adapters refuse a request that
+`ImageRef`s. At A1, `sessions.json` became format 2 (format 1 still loads)
+and audit format 6, protocol 7; all three have moved on since. Until A3, both adapters refuse a request that
 carries images rather than send only its text.
 
 A3 is implemented. Model profiles have `vision = true|false` (default
 false), carried to the daemon on the session's model binding (session
-protocol 22). Before each provider request the engine reads the images the
+protocol 23). Before each provider request the engine reads the images the
 request refers to from the session's store, newest first, up to 64 MiB per
 request. Both adapters share one layout: a user message carries its images
 (OpenAI-compatible `image_url` data-URL parts; Ollama's `images` array),
@@ -84,9 +94,11 @@ A4 is implemented.
 - **Trusted metadata:** the store writes a record of each image's media
   type and dimensions beside it, and a client's history or attachment that
   claims anything else for an image is refused.
-- **`//attach PATH`** in the interactive CLI and **`xshell run --attach
-  FILE`** upload the file through the new `UploadImage` request (session
-  protocol 25); the daemon ingests it and the reference goes on the next
+- **`//attach PATH`** names an image on the session host, relative to the
+  session's working directory, which the daemon reads itself (`AttachImage`,
+  session protocol 27). **`//attach --local PATH`** and **`xshell run
+  --attach FILE`** upload a file from the client's machine (`UploadImage`,
+  protocol 25). Either way the daemon ingests it and the reference goes on the next
   agent message (`TurnInput::Agent.images`), checked and audited on the
   `input` record. Standalone xshell refuses attachments, because the
   session host stores and checks images.
@@ -204,7 +216,9 @@ decision, never the bytes, as `//view` already does.
 
 **Terminal display (optional, A6).** `//view` for images uses the kitty or
 iTerm2 inline protocols when the terminal supports them, and otherwise opens
-an external viewer or prints the path and dimensions.
+an external viewer or prints the path and dimensions. *(The external-viewer
+half is implemented: `//view` opens PNG, JPEG, GIF and WebP files with
+`open`, `xdg-open` or `view.image_viewer`. Inline display is not.)*
 
 ### 3.2 Tasks and estimates
 

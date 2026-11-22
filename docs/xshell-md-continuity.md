@@ -296,6 +296,14 @@ message after the session's own system prompt, delimited and labeled with the
 file's path and hash. They are assembled at request time from the content
 that passed the hash check and are never stored in the session's history.
 
+*Since this was written, the seam it needs has been built for another
+purpose: a compiled-in context provider supplies text that is appended to
+the system prompt of a turn's requests, never stored in history, set aside
+from the compaction budget, and recorded by hash in the audit log
+([tool providers §5.3](tool-providers.md#53-turn-context)). It is resolved
+once per turn, not per request, so a file changed during a turn would be seen
+on the next turn. This proposal should build on that seam.*
+
 Storing the file in history does not work. The history's first message is the
 session's own system prompt, which durable sessions save and compaction keeps.
 Writing the file there would go stale after every `update_handoff` and would
@@ -334,7 +342,8 @@ The session root and everything below it count as inside the session:
   still matches the trusted hash. If it changed in the meantime, the user is
   warned and the file must go through review before it can be activated.
 
-Each agent `run_shell` call already runs as a separate `sh -c` process started
+Each agent `run_shell` call already runs as a separate shell process (`$SHELL
+-c`, or `/bin/sh`) started
 in the session cwd, so an agent `cd` cannot change the session's directory
 today. Only the user moves the session: with `cd`, or with a client request
 that sets the working directory (the protocol's `Update` today). The root
@@ -400,7 +409,8 @@ prompt claims never satisfy execution predicates. Each criterion may name a
 
 Continuing a goal means the daemon starting turns with no client input, which
 xshell does not do today. The existing auto-continue mechanism is not a basis
-for it: it only nudges a model within one turn, at most twice. While a goal is
+for it: it only nudges a model within one turn, by default at most twice
+(the `auto_continues` limit). While a goal is
 `in_progress`, when a turn ends without the goal reaching `satisfied`,
 `reported_satisfied`, or `unsatisfied`, the daemon submits a continuation turn
 itself:

@@ -95,8 +95,8 @@ journal.
   operations. Daemon-recorded events are not duplicated by the CLI on replay.
 
 The daemon's audit session for an xshell session is finalized with a signed
-checkpoint when that session is closed with `//close`. A daemon that exits
-without closing its sessions leaves verifiable chains without final
+checkpoint when that session is closed with `//close` or the daemon shuts
+down gracefully. A daemon that is killed leaves verifiable chains without final
 checkpoints, which the verifier reports (`--allow-open` verifies them without
 failing).
 
@@ -124,8 +124,10 @@ been removed, and nothing may follow it.
 
 Every checkpoint also contains a blinded, domain-separated SHA-256 witness
 commitment. A future peer, RFC 3161, transparency-log, or OpenTimestamps backend
-can publish that commitment without changing the on-disk format or revealing
-the checkpoint itself.
+can publish that commitment without changing the on-disk format. The
+blinding nonce is stored in the same entry as the checkpoint, and nothing
+exports the commitment yet, so today it hides nothing from a holder of the
+log; it is there so a published commitment would not reveal the checkpoint.
 
 The daemon also appends every signed checkpoint, for every session, to
 `checkpoints.jsonl` in the audit directory (the same checkpoint without the
@@ -251,7 +253,8 @@ the known approvers and short reason codes, and refuses reports that
 contradict themselves. Only the daemon records `cancelled`, and
 `no_approver` only comes with a denial.
 
-Every agent turn ends with a `turn_finished` record: the turn ID, its
+Every agent turn run by `xshelld` ends with a `turn_finished` record (the
+standalone CLI records `turn_started` but not `turn_finished`): the turn ID, its
 `outcome` (`completed`, `failed`, or `cancelled`), a `reason` for a failure
 the client can act on (`budget_exhausted`, `audit_unavailable`), and `usage`
 against each turn limit (see [headless runs](headless.md#usage)). It is the

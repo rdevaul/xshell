@@ -1,8 +1,10 @@
 # xshell: Product and Technical Specification
 
 **Status:** Draft for review. This specification describes the target product.
-Several features it specifies, including `//share`, `//chroot`, and CAD
-rendering, are not implemented yet. The [development
+Several features it specifies, including `//share`, `//unshare`, `//chroot`,
+`//context`, `//agent set`, `//status --json`, and CAD rendering, are not
+implemented yet. Image attachment (`//attach`) and viewing images with
+`//view` are implemented for PNG, JPEG, GIF and WebP. The [development
 roadmap](docs/xshell-development-roadmap.md) records what is built and in what
 order the rest is planned; the [README](README.md) describes current behaviour.
 
@@ -81,7 +83,7 @@ A future, explicitly created multi-user session may define an ACL of authenticat
 
 ### 5.2 Context management
 
-Conversation context is session-owned state rather than terminal-client state. The protocol reserves context status, compaction, checkpoint, restore, and fork operations. Compaction must be explicit and auditable: the user can inspect token/size pressure, the material selected for retention, the generated summary, and provenance linking the compacted context to its source messages. Provider-initiated truncation must never be presented as successful xshell compaction.
+Conversation context is session-owned state rather than terminal-client state. Context status, checkpoint, restore, and fork operations are planned; the session protocol does not have them yet. Today the daemon compacts automatically, by dropping the oldest whole turns to a configured budget, and reports and audits each compaction. In the target design, compaction must be explicit and auditable: the user can inspect token/size pressure, the material selected for retention, the generated summary, and provenance linking the compacted context to its source messages. Provider-initiated truncation must never be presented as successful xshell compaction.
 
 ### 5.3 Agent adapter contract
 
@@ -99,7 +101,7 @@ Agents are integrated behind a versioned local RPC contract. A provider adapter 
 
 Core operations are: send message, stream events, request/cancel tool invocation, attach artifact, obtain session state, and stop/restart the provider. Initial adapters should target a local OpenAI-compatible endpoint or Ollama, plus a generic external-process adapter. Integrations for Berd, Codex, Hermes, and OpenClaw must be built only where their supported API/CLI semantics allow durable sessions and explicit approval boundaries.
 
-Beyond the built-in tools, a program that embeds the engine may register compiled-in tool providers. Their tools pass through the same toolset, policy, approval, audit and budget path as built-in tools, and the set is fixed when the engine is built; see [tool providers](docs/tool-providers.md). Tools from untrusted sources, such as MCP servers, use the [MCP bridge](docs/mcp-bridge.md).
+Beyond the built-in tools, a program that embeds the engine may register compiled-in tool providers. Their tools pass through the same toolset, policy, approval, audit and budget path as built-in tools, and the set is fixed when the engine is built; see [tool providers](docs/tool-providers.md). The same document covers per-session tool selections and the per-turn context a compiled-in provider can add to the system prompt. Tools from untrusted sources, such as MCP servers, will use the planned [MCP bridge](docs/mcp-bridge.md).
 
 ## 6. Connection and lifecycle
 

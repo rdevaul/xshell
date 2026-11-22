@@ -1,11 +1,13 @@
 # xshell development roadmap: daily driver and controlled deployment
 
-**Updated:** 4 November 2026
+**Updated:** 22 November 2026
 
-**Status:** M0 baseline recorded; F1–F6, F8, F9, and F11 corrected (M1.3
-prepared file access and the F6 audit bounds landed); F10 partly corrected by a
-whole-turn budget; the remaining F10 budgets and F7 persistence are the next
-work; later milestones remain planned.
+**Status:** M0 baseline recorded; F1–F9 and F11 corrected; F10 open in part
+(whole-turn and daemon-wide budgets landed; a session's budget across turns
+remains). The 12 and 17 November reviews added F12–F33, tracked in the
+[finding ledger](xshell-security-findings.md): most are corrected, F27 in
+part, and F15, F22, F25, F26, F28, F29 and F31–F33 are open. Later milestones
+remain planned.
 
 **Companion:** [Design, security, and usability review](xshell-design-security-usability-review.md).
 
@@ -195,7 +197,7 @@ Do not allow a connector to bypass shared authorization because it supplies its 
 2. Preserve the landed F1–F3 lifecycle corrections and F11 cwd boundary while completing the remaining findings.
 3. Done: prepared bounded file reads and stable sensitivity semantics for F4/F5/F8 as one boundary in `xshell-execution` (`prepared.rs`): classification on the canonical absolute path, descriptor-bound prepared operations that authorization and acquisition share, and acquisition bounded before allocation.
 4. Done: per-session audit connections with acknowledgement deadlines and no global lock across audit I/O (F6), and stream-completion handling (F9). Deadlines on the CLI's own session-service connection (local socket and SSH) remain a separate hardening item.
-5. **Next:** F7 transactional persistence. F10's global budgets landed (concurrent turns and sessions per daemon, and a per-turn tool output byte budget, on top of the whole-turn budget from #84); a session's budget across turns waits on persistent goals, and retained history is bounded only by configured compaction.
+5. Done: F7 transactional registry persistence (#126; per-session incremental writes remain). F10's global budgets landed (concurrent turns and sessions per daemon, and a per-turn tool output byte budget, on top of the whole-turn budget from #84); a session's budget across turns waits on persistent goals, and retained history is bounded only by configured compaction.
 6. Draft the M2 operation/grant/provider contract and run one operation through personal and restrictive mock policies.
 7. Baseline the M3 home-lab journeys while the controlled deployment owner selects the M4 target environment.
 

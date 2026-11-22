@@ -54,7 +54,8 @@ terminal_stream_max_bytes = 16777216
 # audited action is refused; one stalled exchange delays only its own session.
 ack_timeout_ms = 5000
 
-# Remote bootstrap stays disabled unless a signed release source is configured.
+# Reserved for remote installation of xshelld, which is not implemented yet:
+# this table is validated but has no effect today.
 # The public key is an Ed25519 verifying key encoded as 64 lowercase hex
 # characters. It is a trust anchor, not a secret. `{version}` resolves to the
 # exact version of the controlling xshell binary; manifests and artifacts must
@@ -126,9 +127,14 @@ api_key_env = "OPENAI_API_KEY"
 # When socket and state_directory are omitted, xshell uses $XDG_STATE_HOME or
 # ~/.local/state/xshell/sessions (Linux) and
 # ~/Library/Application Support/xshell/sessions (macOS). Only the owning user
-# may connect; the daemon checks the peer UID on every connection.
+# may connect: the daemon checks the peer UID, requires the control token it
+# writes beside the socket at each start, and refuses connections from
+# processes it started.
 [session_fabric]
 enabled = false
+# The name this daemon advertises; defaults to the hostname. Give each machine
+# a distinct one.
+# host_alias = "rich-laptop"
 required = true
 # socket = "/custom/private/dir/xshelld.sock"
 # state_directory = "/custom/private/dir"
@@ -144,7 +150,7 @@ max_approval = "ask"
 # exits 6) until one finishes or is closed.
 # max_concurrent_turns = 8
 # max_sessions = 256
-# Read-only agent tools (read_file, list_directory) normally run without a
+# Read-only agent tools (read_file, list_directory, view_image) normally run without a
 # prompt. Paths matching these globs are promoted to approval-gated so a model
 # cannot silently read credentials. Patterns are matched against the canonical
 # absolute path of the file or directory being read, so the result does not
@@ -200,8 +206,12 @@ pty_escape = "ctrl-]"
 # The approval policy every agent tool call on this daemon is decided by,
 # combined with the approval mode (see docs/session-fabric.md#approval-policy).
 # Entries name a tool, `run_shell: PATTERN` (matched against the parsed
-# command), or `read_file: PATH` / `list_directory: PATH`. A client's own policy
-# (xshell --approval-policy FILE) can only restrict this one.
+# command), or `read_file: PATH` / `list_directory: PATH` / `view_image: PATH`.
+# A client's own policy (xshell --approval-policy FILE) can only restrict this
+# one. An `allowed` list makes the policy closed: any call not in
+# `always_allowed` or `allowed` is denied, read tools included, so add
+# `read_file` and `list_directory` to `always_allowed` if the agent should
+# still read. Shell denials are matched against the programs a command runs.
 # [session_fabric.approval_policy]
 # always_allowed = ["run_shell: git status"]
 # allowed = ["run_shell: yapcad *", "run_shell: make *"]

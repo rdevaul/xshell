@@ -26,15 +26,15 @@ has not been approved for.
 
 The figures are for one engineer who knows the codebase, and include tests,
 documentation, and review fixes. Add 2 days for a security review of
-credential storage and the broker socket. Image results depend on
-workstream A of the [agentic CAD plan](agentic-cad-plan.md) (A1–A4); without
-it, images are saved to files and only their paths are printed.
+credential storage and the broker socket. Image results use the image store
+and ingestion from workstream A of the [agentic CAD plan](agentic-cad-plan.md)
+(A1–A4, since implemented).
 
 ## 2. Why not native MCP
 
 | Concern | Native MCP in the engine | Bridge |
 |---|---|---|
-| Tool set | `Tool` is a closed enum and `ToolSet` a `u8` bitset (`xshell-execution/src/tools.rs`); MCP would make the set open and server-defined | Unchanged; MCP is a program `run_shell` runs |
+| Tool set | `Tool` is a closed enum, and `ToolSet` holds built-in tools plus compiled-in provided tools from one fixed registry (`xshell-execution/src/tools.rs`); MCP would make the set open and server-defined | Unchanged; MCP is a program `run_shell` runs |
 | Descriptions | Every server's tool descriptions enter the system prompt on every turn, a standing prompt-injection channel | Descriptions reach the model only when it runs `describe`, as untrusted tool output |
 | Changed tools | A server can change a tool's description or behaviour after it was approved, and the model sees the new one silently | Tool lists are pinned by hash; a change stops calls until the user approves it (§3.5) |
 | Policy | Policy rules would need a new rule kind for each server's tools | Existing `run_shell` word rules apply, plus a broker-side allowlist |
@@ -188,7 +188,7 @@ start.
   through the same bounded decode and re-encode as `view_image`, and printed
   as a reference (`[image <sha256>: github/get_screenshot]`). The engine
   attaches referenced images to the tool's follow-up message, as for
-  `view_image`. This is the dependency on A1–A4.
+  `view_image`. This relies on A1–A4, which have landed.
 - **Embedded resources** are printed as their text; binary resources are
   saved to a file under the session's state directory and the path is
   printed. *(Amendment proposed in §6.3: agent read tools cannot open the
@@ -320,7 +320,8 @@ Consequences:
 | M4 | Tool-list pinning and `xshell mcp approve`; broker allowlist; default `block` class for broker state; policy examples; user documentation | 2–3 |
 | | **Total** | **17–25** |
 
-Image results (§3.7) are a small addition once A1–A4 land, about 1 day.
+Image results (§3.7) are a small addition now that A1–A4 have landed, about
+1 day.
 
 **Risks:**
 
@@ -446,6 +447,12 @@ reach another session's instance or world. Instead:
   from anything the CLI asserts.
 - The token is revoked when the turn ends. A turn sees only its own token,
   so it cannot name another session.
+- **Since F27 (#155):** `xshelld` refuses session-protocol connections from
+  its own descendants and requires its control token. The supervision
+  channel must therefore be something the daemon sets up for the broker it
+  starts, such as an inherited socket pair, not a connection to the session
+  socket. The agent shell's environment is also an allowlist now (F18), so
+  `XSHELL_MCP_TOKEN` has to be added to it deliberately.
 - **Limit:** a process running as the same user can read another process's
   environment (`/proc/PID/environ` on Linux, debugging APIs on macOS), so a
   same-user agent could in principle take a concurrent turn's token. As with

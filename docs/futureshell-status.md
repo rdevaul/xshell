@@ -1,6 +1,6 @@
 # FutureShell status
 
-**Last reviewed:** 2026-11-05
+**Last reviewed:** 2026-11-22
 
 **Overall status:** Pre-alpha design and planning prototype. FutureShell is not
 an executable language or runtime.
@@ -54,7 +54,8 @@ prerequisites:
 | Provider and audit bounds | Only finished provider responses dispatch tools (F9, #97); bounded audit I/O without a global lock (F6, #99) | Required-audit failure stopping at the next pre-action boundary is an FS2 acceptance item |
 | Turn budgets | Whole-turn budget shared with subagents (#84), raised counts (#101), configurable limits with a `relaxed` profile and a daemon ceiling (#107); daemon-wide concurrent-turn and session budgets and a per-turn tool output budget | First implementation of the FS5 autonomy budget; a session's budget across turns (with goals) and retained-history bounds remain open |
 | Subagents | `delegate_task` with per-agent toolsets under the parent's budget (#86) | Start of the `xshell-session` connector's capability narrowing |
-| Agentic CAD plan | Images, configurable limits, headless mode, and approval policy planned and decided (#105, #106) | See the harmonized direction below |
+| Agentic CAD plan | Configurable limits, headless mode, and approval policy decided (#105, #106) and built; images implemented through A4 (#112, #114, #125, #127), with `//view` opening images in a local viewer (#165) |
+| Tool providers | Compiled-in tool providers, the embeddable daemon, per-session tool selections, and per-turn context ([tool providers](tool-providers.md); #121, #122, #124, #166) | See the harmonized direction below |
 | Headless runs | `xshell run` with versioned JSONL events and exit codes (#108); `--detach`, `wait`, `status`, `result`, `cancel` (#109) | Surface of the FS5 `xshell-session` connector |
 | Approval policy | Daemon policy with stricter-wins client overlays, `prompt`/`block` sensitivity classes, and an approval channel (#110) | First form of the M2 decision function and gateway policy |
 
@@ -92,11 +93,11 @@ replace FS2–FS4.
 
 | Headless / CAD plan | FutureShell counterpart | Gap to close |
 |---|---|---|
-| `xshell run`, `--detach`, `wait`, `status`, `cancel` | Connector `open`, `send`, detach/attach, `status`, `cancel` ([implementation plan §9.2](futureshell-implementation-plan.md#92-connector-contract)) | Usage reporting and stable operation IDs: jobs are addressed by session, not turn |
+| `xshell run`, `--detach`, `wait`, `status`, `cancel` | Connector `open`, `send`, detach/attach, `status`, `cancel` ([implementation plan §9.2](futureshell-implementation-plan.md#92-connector-contract)) | Done: jobs are addressed by turn ID (`--turn`) or session, and usage is reported per limit; token usage is still `unavailable` |
 | JSONL event schema v1 | Connector event stream | A presentation contract, not evidence (H1) |
 | Exit codes 0–7 | `xshell-run` command exit codes | One shared outcome vocabulary (H2) |
 | Approval policy with daemon base and client overlay | M2 decision function; gateway policy (§9.3); capability envelope (§9.5) | Policy identity and decision source are audited (H3); approvals are not yet bound to the prepared operation |
-| Turn limits and the `relaxed` profile | Autonomy budget: model rounds and tool dispatches (§9.4) | Usage and assurance labels in the result (H4) |
+| Turn limits and the `relaxed` profile | Autonomy budget: model rounds and tool dispatches (§9.4) | Done (H4): reported in the `result` line; tokens are `unavailable` |
 | Approval channel (`--approval-channel FD`) | Gateway human-decision events; `on_exhausted request_approval` | Decisions should carry an authorization identity (H3) |
 | Sensitivity `block` class | Read-capability denial | Covers agent read tools only, not `run_shell` (H6) |
 | In-memory event journal | Durable task evidence | Each turn's outcome is kept as a durable record addressed by turn ID (H5); the events themselves are not |
@@ -184,8 +185,8 @@ replace FS2–FS4.
     with its own `blocked_path` basis rather than as a mode-default
     approval; the daemon refuses approver reports that contradict
     themselves (`cancelled` from a client, `no_approver` with an approval).
-- **Result record (H1, H4, closed).** Each agent turn ends with a signed
-  `turn_finished` audit record holding its outcome and usage. The headless
+- **Result record (H1, H4, closed).** Each agent turn run by `xshelld` ends
+  with a `turn_finished` audit record (signed once a checkpoint covers it) holding its outcome and usage. The headless
   `result` line reports usage against each limit, in model rounds and tool
   dispatches with an assurance label (`enforced`; tokens `unavailable`),
   and the audit session, sequence range and record hash of the turn's
