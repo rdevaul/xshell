@@ -130,19 +130,23 @@ key and the audit correlation key. The provider id appears only in history.
 ### Toolsets (step 1)
 
 `ToolSet` is a small value type over a closed `Tool` enum (`read_file`,
-`list_directory`, `run_shell`, and since step 3 `delegate_task`).
+`list_directory`, `run_shell`, since step 3 `delegate_task`, and later
+`view_image`).
 `TurnPolicy::tools` selects which tools are **advertised** to the model and
 which are **dispatchable**. A call to a tool outside the set — including a
 hallucinated tool name — is answered with a tool error without approval or
 execution, and does not count as observed tool activity, so a turn containing
 only such calls can still be rolled back. The default set is every tool, so
 since step 3 every agent is offered `delegate_task`; `ToolSet::read_only()`
-holds only `read_file` and `list_directory`.
+holds the read-only built-ins: `read_file`, `list_directory` and
+`view_image`.
 
 The enum stays closed on purpose: adding the delegate tool in step 3 was one
 variant, and keeping dispatch exhaustive lets the compiler find every place
-that must handle it. A dynamic registry can replace it when FS5 connectors
-need runtime-registered tools. Further agent tools, such as `update_handoff`
+that must handle it. Compiled-in [tool providers](tool-providers.md) now add
+tools beside the enum without opening it: a `ToolSet` also holds provided
+tools from one fixed registry. A dynamic registry can replace it when FS5
+connectors need runtime-registered tools. Further agent tools, such as `update_handoff`
 and `report_goal` from the [XSHELL.md proposal](xshell-md-continuity.md),
 must be removed from every subagent toolset the way `delegate_task` is.
 
@@ -161,7 +165,8 @@ with:
 |---|---|
 | History | A fresh one: the default system prompt plus subagent instructions, then `task` as its user message |
 | Model | The parent's adapter, reused; the parent is not using it while a tool runs |
-| Tools | `read_only` (the default): `read_file`, `list_directory`. `inherit`: the parent's tools. Either is intersected with the parent's set and loses `delegate_task`, so depth is 1 |
+| Tools | `read_only` (the default): the parent's read-only tools (`read_file`, `list_directory`, `view_image`, and read-only provided tools). `inherit`: the parent's tools, provided tools included. Either never exceeds the parent's set and loses `delegate_task`, so depth is 1 |
+| Turn context and images | Neither: the child does not get the text a context provider added to the parent's system prompt, nor the images attached to the parent's message |
 | Approval, sensitive paths, compaction | The parent's, unchanged |
 | Budget and cancellation | The root turn's, shared |
 | Scope | `<parent-scope>/delegate-<n>`, so its call ids are `delegate-<n>/<id>` |
@@ -195,7 +200,8 @@ since the budget is shared.
 not stream the child's text, whose answer arrives as the tool result. The
 audit trail gains `SubagentStarted` and `SubagentFinished` (audit format 5,
 audit protocol 6); every record between them belongs to the child, and its
-tool-call ids carry the scope. The session protocol is version 14.
+tool-call ids carry the scope. The session protocol was version 14 at
+step 3.
 
 **Deferred.** Choosing a different model for the child (a `model_profile`
 argument) needs a profile resolver on the daemon side, where credentials
@@ -240,13 +246,13 @@ Exhaustion fails the turn with a typed `BudgetExhausted` error and follows the
 usual failure rules: rolled back if no tool ran, otherwise kept with an
 execution record. `run_agent_turn` builds a fresh budget from the policy;
 `run_agent_turn_with_budget` lets a child draw from its root's budget and
-ignores the child policy's own limits. The 64-request default preserves the
-former 64-step limit.
+ignores the child policy's own limits.
 
 Exhaustion inside a subagent is reported as the subagent's
 `budget_exhausted` outcome, and the parent then fails on its own next charge
-because the budget is shared. Per-session and global budgets from F10 (#60)
-remain open. Token and cost limits wait for usage reporting from adapters
+because the budget is shared. Daemon-wide budgets (concurrent turns and
+sessions) have landed (#120); a session's budget across turns, from F10
+(#60), remains open. Token and cost limits wait for usage reporting from adapters
 (`AgentEvent` carries only text deltas today); until then budgets count
 requests, calls, and time, never cost.
 
@@ -269,7 +275,7 @@ As implemented in step 3:
 - `AuditEvent` gained `SubagentStarted` and `SubagentFinished`. Turns run
   sequentially, so every record between them belongs to the subagent, and
   its tool-call ids also carry the scope.
-- Versions: session protocol 14, audit protocol 6, audit format 5.
+- Versions at step 3: session protocol 14, audit protocol 6, audit format 5.
 
 Step 4 should add protocol version-range negotiation first, as the review
 recommends, so a child-session protocol does not force every connected host
@@ -293,5 +299,6 @@ to upgrade at once.
   (Step 3 answers: delegation is not gated, and every child gate applies
   independently.)
 - What is the default per-root-turn budget for personal profiles, and is it
-  user-configurable per model profile? (Step 2 set fixed defaults; they are
-  not configurable yet.)
+  user-configurable per model profile? (Answered since: limit profiles are
+  configurable and chosen with `--limits` or `//limits`, capped by the
+  daemon's `max_limits`; they are not tied to a model profile.)

@@ -10,7 +10,7 @@ must satisfy. It is not a claim that all guarantees are implemented today.
 | Mode | Authority location | Persistence | Cancellation owner | Required audit behavior | Current conformance |
 |---|---|---|---|---|---|
 | Standalone agent | CLI process, ambient user | Process-local conversation | CLI turn observer | Optional local audit only | F1/F2 lifecycle corrections implemented; broader profile conformance pending |
-| Local daemon agent | Host daemon, ambient user | Ephemeral, daemon, or durable session | Execution coordinator | Daemon execution boundary | F1/F2/F3/F6 corrected; F7 remains |
+| Local daemon agent | Host daemon, ambient user | Ephemeral, daemon, or durable session | Execution coordinator | Daemon execution boundary | F1/F2/F3/F6/F7 corrected (per-session incremental writes remain) |
 | SSH daemon agent | Remote host daemon, ambient remote user | Remote daemon/durable session | Remote execution coordinator | Remote daemon boundary | Local-daemon guarantees plus bounded control transport |
 | Captured direct shell | CLI or daemon process | Cwd and bounded output according to session mode | Owning turn/coordinator | Start, output policy, and terminal outcome | F2/F3/F11 corrected |
 | Agent shell tool | Shared execution engine | Tool facts projected into conversation/session | Owning agent turn | Request, decision, result, and terminal turn outcome | F1/F2 corrected |
@@ -46,8 +46,10 @@ environment. A command containing shell operators is executed by the selected
 shell and is not interpreted as the special `cd` operation. Only an exactly
 parsed `cd` command with zero or one argument updates session cwd. Environment
 changes such as `export` do not persist into later captured commands.
-Durable restore rejects a session whose recorded cwd is missing, inaccessible,
-or not a directory; it does not silently substitute another directory.
+Durable restore moves a session whose recorded cwd is missing, inaccessible,
+or not a directory to the user's home directory (or `/` when `HOME` is
+unset), warns, and records the change in the session's history (F21). That
+fallback is itself an open finding (F33, #159).
 
 ## Test map
 
@@ -55,7 +57,7 @@ or not a directory; it does not silently substitute another directory.
 |---|---|---|
 | Duplicate active submission | `rejected_duplicate_submit_is_not_recorded_as_accepted_input` | Preserve across lifecycle refactors |
 | Detach and reconnect | session service replay and switching tests | Add lost-acknowledgement identity coverage in M3 |
-| Agent effect recovery | Engine and durable-session restart regressions tagged F1 | Add storage-failure coverage under F7 |
+| Agent effect recovery | Engine and durable-session restart regressions tagged F1 | Storage-failure coverage added under F7 (`f7_*` registry tests) |
 | Agent/captured-shell cancellation | Pipeline and grandchild delayed-marker regressions tagged F2 | Repeat on supported macOS/Linux targets |
 | Daemon shutdown | SIGTERM all-mode, audit-ordering, and SIGKILL recovery tests tagged F3 | Repeat on supported macOS/Linux targets |
 | PTY termination | PTY coordinator and daemon SIGTERM integration tests | PTY audit records use the same deadline-bound session handle as F6 |

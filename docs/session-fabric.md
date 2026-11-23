@@ -1,6 +1,7 @@
 # xshell session fabric
 
-This document describes the local execution increment of the session fabric. The
+This document describes the session fabric: `xshelld`, its protocol, its
+policies and its transports. The
 wire types in `xshell-session` are authoritative; incompatible changes require
 a protocol-version increment.
 
@@ -15,7 +16,9 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 14. The daemon
+with protocol version 28 and, for anything beyond a probe, the daemon's
+control token (see [Who may control the daemon](#who-may-control-the-daemon)).
+The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
 OS user. Requests and responses are bounded at 64 MiB.
 Set `session_fabric.host_alias` to a short, distinct name for each machine; if
@@ -27,7 +30,29 @@ session listings, completion, selectors, and the interactive picker.
 Protocol versions are exact rather than negotiated across incompatible
 schemas. Any protocol bump therefore requires upgrading and restarting
 `xshelld` on the controller and every connected remote host before the new CLI
-can attach. Protocol v14 adds the `delegate_task` subagent events
+can attach. The current version is 28. Newest first:
+
+- v28 adds `shell`, a session's shell containment, on session creation and
+  the session descriptor ([contained shell commands](shell-sandbox.md)).
+- v27 adds `attach_image` and `view_image`, which read an image file on the
+  session host.
+- v26 adds the control `token` on `open` and refuses requests on a
+  connection that did not present it.
+- v25 adds `upload_image`, images on an agent turn's input, the `view_image`
+  agent tool, and images on tool results.
+- v24 adds `locate_turn` and durable turn records.
+- v23 adds `vision` on the model binding.
+- v22 adds `tools`, a session's tool selection, on session creation and the
+  session descriptor.
+- v21 adds the `turn_summary` event (usage and audit reference).
+- v20 adds the `tool_declared` approval reason, for provided tools that
+  require approval.
+- v19 adds `tool_output_bytes` to the turn limits.
+- v18 adds the `blocked_path` decision basis.
+- v17 adds `source` on approval replies, and `basis` and `approval` on
+  `tool_decision`.
+
+Protocol v14 adds the `delegate_task` subagent events
 (`subagent_started`, `subagent`, `subagent_finished`; see
 [subagents](#subagents)). Protocol v13 adds the `auto_continued` event and the
 `reasoning` and `finish_reason` fields on agent responses. Protocol v12 adds an
@@ -163,7 +188,9 @@ anchors a pattern to the filesystem root. Matching ignores letter case, so
 (and on a case-sensitive one, where they are different files, they are
 classified the same way to be safe); on macOS the path also carries the names
 the filesystem stores. A match is reported through `approval_requested` with
-`reason = "sensitive_path"` (shell tools report `"shell_execution"`) and then
+`reason = "sensitive_path"` (shell tools report `"shell_execution"`; an
+`allowed` policy entry that prompts reports `"policy"`; a provided tool that
+requires approval reports `"tool_declared"`) and then
 follows the turn's approval policy exactly like a shell tool. Omitting the key
 selects the built-in defaults; an empty list disables the check.
 
@@ -333,6 +360,12 @@ files in the working directory, such as renders its own commands produced.
 (`view_image: renders/*`). Images are decoded, scaled to at most 1568 px on
 the longest edge and re-encoded as PNG by the session host before they are
 stored or sent.
+
+Only PNG, JPEG, GIF and WebP files of at most 20 MiB and 50 million pixels
+are accepted. Each session keeps its images in its own store under `images/`
+in the state directory, limited to 512 MiB and 2,048 images and removed when
+the session is closed. Attaching needs the session fabric and a session whose
+model has `vision`; the session host refuses it otherwise.
 
 A profile can also declare the model's window with `context_tokens` (and
 `reserve_output_tokens`, default 1024). When it does, the enforced budget is
@@ -520,7 +553,9 @@ written.
 
 Each finished agent turn also leaves a record under `turns/` in the state
 directory (the 256 most recent are kept), which `xshell result --turn` reads
-after a restart; see [headless runs](headless.md#long-running-jobs).
+after a restart; see [headless runs](headless.md#long-running-jobs). Turns in
+`ephemeral` sessions leave no record, and a recorded answer longer than
+64 KiB is cut (the session's history keeps all of it).
 The `xshelld serve-stdio` boundary exports only `fabric` descriptors and rejects
 remote create, attach, switch, and named-close operations involving `host_only`
 sessions.
@@ -692,8 +727,9 @@ completion for remote sessions uses a separate, unattached protocol connection
 that the CLI uses only for completion. Completion scans the daemon's inherited
 `PATH` and the active session cwd, refreshing its command catalog at most once
 every 30 seconds, with a one-second daemon deadline and strict input, scan,
-candidate, and filename limits. Control-character names are excluded and
-insertions are shell-escaped. It does not launch a shell, evaluate input,
+candidate, and filename limits. The daemon excludes control-character names
+and shell-escapes insertions. The client does not check a remote daemon's
+candidates again (F22, #138), so this holds for a daemon you trust. It does not launch a shell, evaluate input,
 expand variables, or source shell startup/completion scripts.
 
 This increment requires a compatible `xshelld` to already be installed and its
@@ -704,20 +740,31 @@ work.
 ## Protocol operations
 
 - `list`: return descriptors visible to this local daemon client.
-- `create`: create and attach a session with initial model, cwd, and history.
+- `create`: create and attach a session with initial model, cwd, history,
+  persistence, visibility, and an optional tool selection.
 - `attach`: attach only when the connection is currently detached.
 - `switch`: atomically move the connection's attachment.
 - `update`: replace the attached session's model, cwd, and history snapshot.
 - `detach`: release control and apply lifecycle policy.
 - `close`: delete a detached session or the caller's attached session.
-- `submit`: start one daemon-owned agent or shell turn for the attached session.
+- `submit`: start one daemon-owned agent or shell turn for the attached
+  session, optionally with image references, requested limits, and an
+  approval policy that can only restrict the daemon's.
 - `events`: long-poll sequenced turn events from a replay cursor.
 - `approve`: answer a particular turn/tool approval rendezvous.
 - `cancel`: cancel the active turn by stable turn ID.
 - `snapshot`: obtain completed model, cwd, and conversation state.
+- `locate_turn`: find a turn by ID: the session running it, and its durable
+  record once it has finished. Local clients only; the SSH proxy refuses it.
 - `complete_shell`: return bounded executable/path candidates for a session.
 - `view_source`: return a bounded UTF-8 resource resolved against the attached
   session cwd, with media type, length, and SHA-256 metadata.
+- `view_image`: return an image file on the session host (PNG, JPEG, GIF or
+  WebP by its header, at most 20 MiB) for the client to display.
+- `attach_image`: store an image file read on the session host in the
+  session's image store, for the next agent message. Needs a `vision` model.
+- `upload_image`: store an image the client sends (at most 20 MiB) the same
+  way. Needs a `vision` model.
 - `pty_start`: start one session-owned interactive process and return its internal PTY ID and a
   one-time stream ticket.
 - `pty_attach`: mint a one-time ticket at a bounded replay offset.
@@ -729,7 +776,9 @@ work.
 The SSH proxy additionally rejects requests for `host_only` sessions. The
 daemon reads only regular files, enforces a 4 MiB limit and three-second
 deadline, and returns text through the existing authenticated stdio tunnel.
-Rendering remains local to the controller.
+Rendering remains local to the controller. `view_image`, `attach_image` and
+`upload_image` follow the same ownership and visibility rules, with a 20 MiB
+limit instead of 4 MiB.
 
 PTY creation requires the current attachment, and the SSH control proxy applies
 the same `fabric` visibility check used for completion and viewing. The CLI then
@@ -795,10 +844,6 @@ adapter follows HTTP redirects: a redirect fails the request with its status.
 
 Further federation work will add signed bootstrap installation, connection
 health/reconnect state, and discovery without exposing transcript contents.
-
-Execution events are currently mirrored into the audit stream by an attached
-client. Moving that append responsibility into `xshelld` is required before
-unattended remote execution can claim complete audit coverage.
 
 Multi-user sessions will be a distinct access mode with an explicit ACL.
 Owner, operator, and viewer authorization will be enforced by the daemon, with

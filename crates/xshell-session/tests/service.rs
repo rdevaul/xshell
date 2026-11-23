@@ -12,10 +12,10 @@ mod common;
 
 use common::{connect_when_ready, serve_sse, sse_text, sse_tool_call};
 use xshell_session::{
-    AttachmentRole, ClientPtyFrame, ClientRequest, ModelBinding, PersistenceMode, PtySize,
-    PtyStreamClient, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse, SessionActivity,
-    SessionClient, SessionCreation, SessionEventKind, TurnInput, Visibility, read_server_frame,
-    write_client_frame,
+    AttachmentRole, ClientPtyFrame, ClientRequest, IsolatedShell, ModelBinding, PersistenceMode,
+    PtySize, PtyStreamClient, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
+    SessionActivity, SessionClient, SessionCreation, SessionEventKind, ShellContainment,
+    ShellNetwork, TurnInput, Visibility, read_server_frame, write_client_frame,
 };
 
 struct Daemon(Child);
@@ -188,6 +188,7 @@ fn terminal_stream_detaches_and_reattaches_without_stopping_job() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let size = PtySize {
@@ -309,6 +310,7 @@ fn creating_a_session_preserves_the_previous_sessions_interactive_process() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test prompt")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     owner
@@ -332,6 +334,7 @@ fn creating_a_session_preserves_the_previous_sessions_interactive_process() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test prompt")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     assert_eq!(second.descriptor.name, "additional-work");
@@ -378,6 +381,7 @@ fn unauthorized_close_does_not_terminate_another_clients_process() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     owner
@@ -437,6 +441,7 @@ fn dedicated_pty_stdio_transport_claims_ticket_and_streams_binary_frames() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let size = PtySize {
@@ -520,6 +525,7 @@ fn f27_local_pty_stream_claims_its_ticket_with_the_control_token() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let ticket = owner
@@ -580,6 +586,7 @@ fn daemon_preserves_and_switches_named_sessions() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("be helpful")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client
@@ -600,6 +607,7 @@ fn daemon_preserves_and_switches_named_sessions() {
             visibility: Visibility::HostOnly,
             history: vec![ChatMessage::user("design a robot")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     assert_eq!(client.list().unwrap().len(), 2);
@@ -644,6 +652,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let private = readiness
@@ -655,6 +664,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
             visibility: Visibility::HostOnly,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     drop(readiness);
@@ -836,6 +846,7 @@ fn stdio_transport_proxies_protocol_to_running_daemon() {
                 visibility: Visibility::Fabric,
                 history: Vec::new(),
                 tools: Default::default(),
+                shell: Default::default(),
             },
         },
     );
@@ -1028,6 +1039,7 @@ fn shell_turn_continues_after_disconnect_and_replays_on_attach() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let turn_id = client
@@ -1096,6 +1108,7 @@ fn running_turn_survives_switching_to_another_session_and_back() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let other = client
@@ -1107,6 +1120,7 @@ fn running_turn_survives_switching_to_another_session_and_back() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client.switch(running.descriptor.id.clone()).unwrap();
@@ -1173,6 +1187,7 @@ fn event_journal_retains_completed_turns_until_its_bounds_require_eviction() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id;
@@ -1244,6 +1259,7 @@ fn running_shell_turn_can_be_cancelled() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let turn_id = client
@@ -1310,6 +1326,7 @@ fn f3_sigterm_cancels_captured_shell_process_group_before_exit() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client
@@ -1376,6 +1393,7 @@ fn f3_sigterm_cancels_agent_tool_process_group_before_exit() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id;
@@ -1456,6 +1474,7 @@ fn f3_sigterm_terminates_pty_process_group_before_exit() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client
@@ -1506,6 +1525,7 @@ fn f3_sigkill_recovers_durable_shell_as_outcome_unknown() {
                 visibility: Visibility::Fabric,
                 history: vec![ChatMessage::system("test")],
                 tools: Default::default(),
+                shell: Default::default(),
             })
             .unwrap();
         session_id = session.descriptor.id;
@@ -1633,6 +1653,7 @@ fn attached_and_viewed_images_reach_the_model_re_encoded_and_bounded() {
         visibility: Visibility::Fabric,
         history: vec![ChatMessage::system("test")],
         tools: Default::default(),
+        shell: Default::default(),
     };
 
     // A session whose model has no vision refuses uploads.
@@ -1808,6 +1829,7 @@ fn a_vision_model_is_shown_the_sessions_stored_images() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id.clone();
@@ -2053,6 +2075,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let other = client
@@ -2064,6 +2087,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client.switch(session.descriptor.id.clone()).unwrap();
@@ -2211,6 +2235,7 @@ fn f9_tool_call_from_an_unfinished_stream_never_runs() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client
@@ -2313,6 +2338,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let turn_id = client
@@ -2454,6 +2480,7 @@ fn f1_failed_agent_effect_survives_durable_session_reload() {
                 visibility: Visibility::Fabric,
                 history: vec![ChatMessage::system("test")],
                 tools: Default::default(),
+                shell: Default::default(),
             })
             .unwrap();
         session_id = session.descriptor.id.clone();
@@ -2596,6 +2623,7 @@ fn daemon_audits_execution_without_an_attached_client() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client
@@ -2760,6 +2788,7 @@ fn required_audit_failure_releases_turn_reservation_and_prevents_execution() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
 
@@ -2870,6 +2899,7 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     // The client asks for unattended execution; the daemon must not grant it.
@@ -3094,6 +3124,7 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id.clone();
@@ -3273,6 +3304,7 @@ fn run_terminal_job_and_collect_log(
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let ticket = client
@@ -3360,6 +3392,7 @@ fn f3_sigterm_records_shell_resolution_before_final_audit_closure() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     client
@@ -3398,6 +3431,7 @@ fn rejected_duplicate_submit_is_not_recorded_as_accepted_input() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let accepted = "sleep 0.25; printf accepted-marker";
@@ -3514,6 +3548,7 @@ fn terminating_an_active_process_finalizes_stream_before_completion() {
             visibility: Visibility::Fabric,
             history: Vec::new(),
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let command = "printf capture-ready; cat";
@@ -3680,6 +3715,7 @@ fn f6_a_hung_audit_peer_cannot_freeze_other_sessions_control_or_shutdown() {
                 visibility: Visibility::Fabric,
                 history: Vec::new(),
                 tools: Default::default(),
+                shell: Default::default(),
             })
             .unwrap()
             .descriptor
@@ -3803,6 +3839,7 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let requested = xshell_execution::TurnLimits {
@@ -3935,6 +3972,7 @@ base_url = \"{configured_url}\"\napi_key_env = \"F23_ROUTED_KEY\"\n"
         visibility: Visibility::Fabric,
         history: vec![ChatMessage::system("test")],
         tools: Default::default(),
+        shell: Default::default(),
     };
 
     // Creating a session that names an arbitrary variable is refused, and
@@ -4090,6 +4128,7 @@ fn f30_adopted_orphans_are_reaped() {
             visibility: Visibility::Fabric,
             history: vec![ChatMessage::system("test")],
             tools: Default::default(),
+            shell: Default::default(),
         })
         .unwrap();
     let session_id = session.descriptor.id;
@@ -4211,4 +4250,139 @@ fn f30_adopted_orphans_are_reaped() {
         thread::sleep(Duration::from_millis(50));
     }
     drop(daemon);
+}
+
+fn shell_creation(name: &str, cwd: &Path, shell: ShellContainment) -> SessionCreation {
+    SessionCreation {
+        name: name.into(),
+        model: model("local"),
+        cwd: cwd.into(),
+        persistence: PersistenceMode::Daemon,
+        visibility: Visibility::Fabric,
+        history: Vec::new(),
+        tools: Default::default(),
+        shell,
+    }
+}
+
+#[test]
+fn a_session_asking_for_an_isolated_shell_is_checked_then_refused_until_enforced() {
+    let temporary = TempDir::new().unwrap();
+    let work = temporary.path().join("work");
+    std::fs::create_dir_all(work.join("repo")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("elsewhere")).unwrap();
+    let (_daemon, socket) = f23_daemon(
+        &temporary,
+        &format!(
+            "[session_fabric.shell]\nallowed_roots = [\"{}\"]\n",
+            work.display()
+        ),
+    );
+    let mut client = connect_when_ready(&socket);
+    let isolated = |roots: &[&Path], network: ShellNetwork| {
+        ShellContainment::Isolated(IsolatedShell {
+            roots: roots.iter().map(|root| root.to_path_buf()).collect(),
+            network,
+            ..IsolatedShell::default()
+        })
+    };
+    let refused = |client: &mut SessionClient, shell: ShellContainment| {
+        let error = client
+            .create(shell_creation("contained", &work.join("repo"), shell))
+            .unwrap_err();
+        format!("{error:#}")
+    };
+
+    // The request is checked against the operator's bounds first, so a
+    // client learns what is wrong with it.
+    let outside = refused(
+        &mut client,
+        isolated(
+            &[&work.join("repo"), &temporary.path().join("elsewhere")],
+            ShellNetwork::None,
+        ),
+    );
+    assert!(outside.contains("outside the directories"), "{outside}");
+    let network = refused(
+        &mut client,
+        isolated(&[&work.join("repo")], ShellNetwork::Full),
+    );
+    assert!(
+        network.contains("network access up to \"none\", not \"full\""),
+        "{network}"
+    );
+    // The daemon's own state may not be a root.
+    let own_state = refused(
+        &mut client,
+        isolated(&[temporary.path()], ShellNetwork::None),
+    );
+    assert!(
+        own_state.contains("outside the directories") || own_state.contains("own files"),
+        "{own_state}"
+    );
+
+    // A request inside the bounds is still refused: nothing enforces it on
+    // this host yet, and a session is never recorded as isolated while its
+    // commands would run with full authority.
+    let unenforced = refused(
+        &mut client,
+        isolated(&[&work.join("repo")], ShellNetwork::None),
+    );
+    assert!(
+        unenforced.contains("cannot enforce an isolated shell yet"),
+        "{unenforced}"
+    );
+    assert!(client.list().unwrap().is_empty());
+
+    // An ambient session is created as before and reports no containment.
+    let ambient = client
+        .create(shell_creation(
+            "plain",
+            &work.join("repo"),
+            ShellContainment::Ambient,
+        ))
+        .unwrap();
+    assert!(ambient.descriptor.shell.is_ambient());
+}
+
+#[test]
+fn a_host_that_requires_isolation_refuses_ambient_sessions_and_bad_bounds() {
+    let temporary = TempDir::new().unwrap();
+    let work = temporary.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let (_daemon, socket) = f23_daemon(
+        &temporary,
+        &format!(
+            "[session_fabric.shell]\nminimum = \"isolated\"\nallowed_roots = [\"{}\"]\n",
+            work.display()
+        ),
+    );
+    let mut client = connect_when_ready(&socket);
+    let error = client
+        .create(shell_creation("plain", &work, ShellContainment::Ambient))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("requires an isolated shell"),
+        "{error:#}"
+    );
+
+    // Requiring isolation without saying which roots are allowed is a
+    // configuration error: the daemon does not start.
+    let broken = TempDir::new().unwrap();
+    let config = broken.path().join("config.toml");
+    std::fs::write(&config, "[session_fabric.shell]\nminimum = \"isolated\"\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xshelld"))
+        .args(["--config", config.to_str().unwrap()])
+        .args([
+            "--state-directory",
+            broken.path().join("state").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("allowed_roots"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

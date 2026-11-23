@@ -76,22 +76,24 @@ daily-driver milestones, and the separate controlled-deployment acceptance gates
 
 | Area | Current capability |
 |---|---|
-| Agent loop | Streaming Ollama and OpenAI-compatible Chat Completions, including OpenRouter; tool calling bounded by a whole-turn budget of provider requests, tool calls, calls per response, elapsed time, and shell-command time, chosen from configurable limit profiles (`default`, `relaxed`, or your own) and capped by the session host; `delegate_task` subagents that run with at most the parent's tools and approval policy |
+| Agent loop | Streaming Ollama and OpenAI-compatible Chat Completions, including OpenRouter; tool calling bounded by a whole-turn budget of provider requests, tool calls, calls per response, elapsed time, shell-command time, and bytes of tool output, chosen with `--limits` or `//limits` from configurable limit profiles (`default`, `relaxed`, or your own) and capped by the session host; `delegate_task` subagents that run with at most the parent's tools and approval policy |
 | Shell access | Direct `$` commands, sticky `$$` mode, persistent `cd`, command/path completion, pipelines, colors, pagers, and full-screen PTY applications |
 | Sessions | Multiple named sessions per user and host; ephemeral, daemon-lifetime, and durable lifecycle modes; common switching for idle prompts, active agent turns, and interactive processes |
 | Network fabric | SSH-connected macOS and Linux hosts in the same session catalog; remote creation, switching, execution, completion, viewing, detach, and manual reconnect |
 | Detachment | Daemon-owned agent turns and interactive processes continue after controller disconnect; bounded event and terminal-output replay on return |
-| Headless runs | `xshell run` runs one agent turn for a script: text or versioned JSON Lines output, documented exit codes, cancellation on SIGINT/SIGTERM, detached jobs with `wait`/`status`/`result`/`cancel`, and approvals decided by a policy file or an approval channel ([headless runs](docs/headless.md)) |
-| Models | Named profiles, live `//model` switching, per-session bindings, per-model history budgets, and environment-based credentials that are never printed or sent over the session protocol |
-| Viewing | Streamed terminal Markdown, tables, a safe reStructuredText subset, policy-driven pagination, and local rendering of text acquired from either local or remote sessions with `//view` |
-| Safety | Exact-command approval, a per-call approval policy (always allowed, allowed, denied) that clients can only tighten, blocked paths agent tools can never read, remote-host approval ceilings, cwd-confined file tools, sensitive-path gating, execution time/output limits, and process-group cleanup |
+| Headless runs | `xshell run` runs one agent turn for a script: text or versioned JSON Lines output, documented exit codes, cancellation on SIGINT/SIGTERM, detached jobs followed by session or by `--turn TURN_ID` with `wait`/`status`/`result`/`cancel`, turn outcomes that survive a daemon restart, per-turn usage and an audit-log reference in the result, image attachments (`--attach`), and approvals decided by a policy file or an approval channel ([headless runs](docs/headless.md)) |
+| Models | Named profiles, live `//model` switching, per-session bindings, per-model history budgets, and environment-based credentials that are never printed or sent over the session protocol; vision models (`vision = true`) take images attached with `//attach` or `xshell run --attach`, and can look at image files themselves with the `view_image` tool |
+| Viewing | Streamed terminal Markdown, tables, a safe reStructuredText subset, policy-driven pagination, local rendering of text acquired from either local or remote sessions with `//view`, and images opened in a local image viewer |
+| Safety | Exact-command approval, a per-call approval policy (always allowed, allowed, denied) that clients can only tighten, blocked paths agent tools can never read, remote-host approval ceilings, cwd-confined file tools, sensitive-path gating, execution time/output limits, process-group cleanup, a filtered environment for agent shell commands, a control token on daemon connections, and daemon-wide limits on sessions and concurrent turns |
+| Embedding | `xshelld` is also a library: another program can build the same daemon with its own compiled-in tools and per-turn system-prompt context, and limit each session to chosen tools ([tool providers](docs/tool-providers.md)) |
 | Audit | Separate append-only service, hash-chained JSONL, Ed25519-signed checkpoints, daemon-side execution events, and opt-in bounded byte-for-byte PTY stream capture |
 
 `//connect` can start or restart an already-installed remote daemon for you,
 with explicit authorization and a re-probe before it connects. The major pieces
 that are **not** implemented yet are automatic *installation* and upgrade of
 `xshelld` on remote hosts, resilient SSH supervision, a shared `/xshell`
-filesystem namespace, binary/media viewer plugins and CAD rendering, multi-user
+filesystem namespace, inline terminal graphics, viewer plugins beyond text and
+images, CAD rendering, multi-user
 sessions and ACLs, and restoration of an in-flight process across an `xshelld`
 restart. Durable per-directory handoff notes and persistent goals
 (`XSHELL.md`, `//goal`) are a [design proposal](docs/xshell-md-continuity.md),
@@ -218,6 +220,8 @@ To keep the daemon running without a terminal, install it as a per-user service
 ```sh
 xshelld service install     # write the unit, start it, report readiness
 xshelld service status      # unit state plus whether the daemon answers
+xshelld service stop        # stop it, keeping the unit
+xshelld service start       # start an installed service
 xshelld service restart     # replace the daemon, draining its work first
 xshelld service uninstall
 ```
@@ -260,7 +264,9 @@ Lifecycle modes differ deliberately:
 
 Active agent turns and interactive processes survive controller disconnect but
 not daemon restart. Durable session snapshots are written atomically and are
-restored detached.
+restored detached. A finished agent turn's outcome is kept as a record in the
+daemon's state directory (except for `ephemeral` sessions) and can still be
+read with `xshell result --turn` after a restart.
 
 ## One fabric across hosts
 
@@ -312,8 +318,8 @@ Remote command and path completion is evaluated by the remote daemon against
 its inherited `PATH` and the session cwd without sourcing shell startup files,
 aliases, functions, or native completion frameworks.
 
-Automatic remote bootstrap, service installation, reconnection supervision,
-and SSH connection multiplexing remain planned work. See the
+Automatic remote installation and upgrade of `xshelld`, reconnection
+supervision, and SSH connection multiplexing remain planned work. See the
 [session-fabric design](docs/session-fabric.md).
 
 ## Full terminal applications without a second abstraction
@@ -384,9 +390,9 @@ The modular viewer uses the same renderer for files:
 
 The active session host acquires the source and the controller renders it
 locally, so `//view` behaves consistently across SSH without opening a viewer
-port. Markdown and a safe reStructuredText subset are built in. Acquisition is
-bounded to regular UTF-8 files of at most 4 MiB and records content metadata in
-the audit trail. Long views are paged automatically on interactive terminals;
+port. Markdown and a safe reStructuredText subset are built in. Text
+acquisition is bounded to regular UTF-8 files of at most 4 MiB and records
+content metadata in the audit trail. Long views are paged automatically on interactive terminals;
 short or redirected output remains inline. Pagination can be configured by
 presentation class or viewer and overridden for one command. The configured
 pager is an argument vector executed directly rather than a shell command;
@@ -404,8 +410,25 @@ pagination = "auto"
 pagination = "always"
 ```
 
-Binary/media plugins, inline images, F3D integration, and multimodal-agent
-attachments are next-stage work. See the
+`//view` on a PNG, JPEG, GIF or WebP file (at most 20 MiB) opens it in this
+machine's image viewer: `open` on macOS, `xdg-open` elsewhere, or the command
+in `view.image_viewer`. When the session is on another host, the file is
+copied to a private temporary directory first.
+
+```text
+//view renders/bracket.png
+//attach renders/bracket.png        # send it to a vision model with your next message
+//attach --local ~/Desktop/photo.jpg  # a file on this machine, not the session host
+```
+
+With a model profile marked `vision = true`, `//attach` adds an image to your
+next message, and the agent can look at image files in its working directory
+with the `view_image` tool. Images are scaled to at most 1568 px and
+re-encoded by the session host before a model sees them. See
+[session fabric](docs/session-fabric.md#history-compaction).
+
+Inline terminal graphics, viewers for other binary or media types, viewer
+plugins, and F3D integration are next-stage work. See the
 [viewer architecture](docs/viewers.md).
 
 ## Safety and auditability
@@ -422,11 +445,30 @@ visible and bounded:
   `.git/config`, and Terraform state are approval-gated by default, judged
   from the file's full path so the answer is the same from any cwd.
 - Agent shell tools display an escaped, byte-faithful command before approval;
-  `y` runs it, `n` denies it and continues the turn, and `q` aborts the turn.
-- Shell tools use a non-login shell, bounded captured output, a 60-second
-  timeout, and a separate process group that is killed as a unit; on
+  `y` then Enter runs it, `n` (or Enter alone) denies it and continues the
+  turn, and `q` aborts the turn. Keys typed before the prompt appeared are
+  discarded, so typeahead cannot approve a command.
+- Agent shell commands run in a non-login shell with a filtered environment
+  (PATH, HOME, locale and terminal variables only; provider keys and other
+  variables the daemon holds are not passed), 64 KiB of captured output per
+  stream, a per-command timeout from the turn's limit profile (60 seconds by
+  default), and a separate process group that is killed as a unit; on
   cancellation or timeout the group is killed again, a bounded number of
   times, until it is empty, to catch a process forked during the first kill.
+- Shell deny rules (`denied = ["run_shell: rm *"]`) are matched against the
+  programs a command would actually run, not its text. A command the policy
+  cannot fully read is prompted in `ask` mode and denied otherwise. A deny
+  list cannot see what an allowed program does internally.
+- Connections to `xshelld` must present a control token the daemon writes
+  beside its socket at each start, and the daemon refuses connections from
+  processes it started itself, so an agent's commands cannot answer their own
+  approvals. One consequence: run `xshell` from a terminal outside xshell,
+  not from a `$` command or a program started inside it.
+- xshell's own state directory, audit directory, configuration file and
+  control token are always blocked from agent read tools.
+- A daemon accepts at most `session_fabric.max_sessions` sessions (256 by
+  default) and runs at most `max_concurrent_turns` turns at once (8 by
+  default); beyond either, requests are refused.
 - A `delegate_task` subagent runs inside its parent's turn with at most the
   parent's tools (read-only by default, never `delegate_task`), the parent's
   approval policy, and the same turn budget. Its shell requests are approved
@@ -477,8 +519,16 @@ rollback guarantees.
 - [Dual-mandate development roadmap](docs/xshell-development-roadmap.md)
 - [Security finding ledger](docs/xshell-security-findings.md)
 - [Execution mode conformance](docs/xshell-mode-conformance.md)
+- [Session fabric: daemon, protocol, policies, and transports](docs/session-fabric.md)
+- [Headless runs](docs/headless.md)
+- [PTY sessions](docs/pty.md)
+- [Viewers](docs/viewers.md)
+- [Auditing](docs/auditing.md)
 - [Subagents: design and staged plan](docs/subagents-design.md)
-- [Tool providers: compiled-in tools for programs that embed the engine](docs/tool-providers.md)
+- [Tool providers, per-session tool selections, turn context, and the embeddable daemon](docs/tool-providers.md)
+- [MCP bridge (design)](docs/mcp-bridge.md)
+- [Contained shell commands (design)](docs/shell-sandbox.md)
+- [Agentic CAD plan](docs/agentic-cad-plan.md)
 - [XSHELL.md durable handoff and goals (proposal)](docs/xshell-md-continuity.md)
 - [Home-lab service runner](docs/runall.md)
 - [Original implementation plan and detailed backlog](xshell-implementation-plan.md)

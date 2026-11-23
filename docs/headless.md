@@ -20,7 +20,8 @@ running in the daemon (an `--ephemeral` session ends with its client).
 ## Usage
 
 ```text
-xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral] [--prompt-file FILE] [--attach FILE]... [PROMPT]
+xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral | --detach] [--approval-channel FD]
+                            [--prompt-file FILE] [--attach FILE]... [PROMPT]
 ```
 
 - **Prompt:** the positional argument, `--prompt-file FILE`, or stdin when
@@ -31,7 +32,9 @@ xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral] [--prompt-file F
   exits 2 before connecting. The daemon decodes each image, scales it to at
   most 1568 px on its longest edge and re-encodes it as PNG; an image it
   cannot decode also exits 2, and a session the run created for it is
-  closed again.
+  closed again. FILE is read by the client, relative to the directory
+  `xshell` was started in, not `--cwd`. With `--session NAME` on an existing
+  session, that session's own model must have `vision` too.
 - **Session:**
   - By default, each run creates its own session, named `run-<time>-<id>`, which
     stays in the daemon afterwards.
@@ -40,7 +43,7 @@ xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral] [--prompt-file F
   - `--ephemeral` uses a session that is removed when the run ends.
 - **Shared options:** `--config`, `--profile`, `--provider`, `--model`,
   `--base-url`, `--api-key-env`, `--system-prompt`, `--session`, `--cwd`,
-  `--approval`, and `--limits` work as they do for interactive `xshell`,
+  `--approval`, `--approval-policy`, and `--limits` work as they do for interactive `xshell`,
   before or after `run`.
 - **Output:** `--output text` (the default) prints the final answer on stdout
   and progress on stderr. `--output jsonl` prints one JSON object per line on
@@ -78,7 +81,8 @@ With text output, `run --detach` prints the session name, for
   ends sessions that are not `durable`. They then print a warning and the
   `result` line, with the same exit code the turn had. The daemon keeps the
   256 most recent records. Turns in an `--ephemeral` session get no record:
-  the session leaves nothing behind when it ends.
+  the session leaves nothing behind when it ends. A recorded answer longer
+  than 64 KiB is cut; the session's history keeps all of it.
 - **`--session` follows the journal.** The session forms report the latest
   turn the daemon's in-memory journal still holds, so after a restart they
   have nothing to report; use `--turn`.
@@ -165,6 +169,7 @@ with os.fdopen(write_fd, "w") as channel:
 | Code | Outcome | Meaning |
 |---|---|---|
 | 0 | `completed` | The turn finished |
+| 0 | `detached` | `run --detach` started the turn and left it running |
 | 1 | `failed` | The turn failed for another reason (provider error, for example) |
 | 2 | `usage` | The command line or configuration is invalid |
 | 3 | `budget_exhausted` | A turn limit ran out |
@@ -173,12 +178,13 @@ with os.fdopen(write_fd, "w") as channel:
 | 6 | `unavailable` | Try again later: the daemon could not be reached, required auditing failed, or a [daemon budget](session-fabric.md#daemon-budgets) is spent |
 | 7 | `running` | The turn is still running (`result`, or an interrupted `wait`) |
 
-`run --detach` and `status` exit 0.
+`run --detach` and `status` exit 0. A `--turn` ID the daemon does not know
+(it never ran here, or its record is no longer kept) exits 2.
 
 ## JSON Lines schema (version 1)
 
-Every line is an object with an `event` field. The first line is
-`run_started` and the last is `result`; both carry `schema: 1`. Fields that
+Every line is an object with an `event` field. Apart from any `warning`
+lines, the first line of a run is `run_started`, and the last is `result`; both carry `schema: 1`. Fields that
 would be empty are left out. Events from a subagent carry an `agent` field
 naming it.
 
@@ -198,7 +204,7 @@ incompatible change increments `schema`.
 | `approval_decided` | `call_id`, `decision`, `source` | The run's own decision on that call |
 | `tool_decision` | `call_id`, `decision`, `basis`? | The decision the daemon applied, and what made it (`basis.kind`: `entry`, `not_listed`, `uncheckable_command`, `mode_default`, `not_in_toolset`, `turn_limit`, `blocked_path`; see [auditing](auditing.md#turn-authority-and-decision-basis)) |
 | `tool_skipped` | `call_id`, `name` | A call not evaluated because the turn was aborted |
-| `tool_result` | `call_id`, `name`, `result` | A tool's output |
+| `tool_result` | `call_id`, `name`, `result`, `images`? | A tool's output; `images` lists the images a `view_image` call returned (hash, media type, dimensions, size and label, not the bytes) |
 | `history_compacted` | `report` | The conversation was shrunk to fit its budget |
 | `subagent_started` | `subagent`, `task`, `tools` | A `delegate_task` call started a subagent |
 | `subagent_finished` | `subagent`, `outcome`, `message`? | That subagent ended |

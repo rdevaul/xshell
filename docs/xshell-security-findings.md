@@ -1,6 +1,6 @@
 # xshell security finding ledger
 
-**Updated:** 17 November 2026
+**Updated:** 22 November 2026
 
 **Authority:** The evidence and acceptance conditions in the
 [design, security, and usability review](xshell-design-security-usability-review.md)
@@ -26,13 +26,32 @@ historical review.
 | F16 | [#132](https://github.com/rdevaul/xshell/issues/132) | P0 | Provider bounds | Corrected | An injected tool name, HTTP error body, or mid-stream error never appears in a `system` message sent to the provider or persisted in history |
 | F17 | [#133](https://github.com/rdevaul/xshell/issues/133) | P0 | M1.2 cancellation and shutdown | Corrected (processes that `setsid` away are not contained) | A background job holding the pipes is killed at the timeout, at cancellation (its marker never appears), and after a short grace following a normal exit; the call returns promptly |
 | F18 | [#134](https://github.com/rdevaul/xshell/issues/134) | P0 | M1.4 credential bounds | Corrected (allowlist is a constant; configurability is follow-up) | The provider key variable and an arbitrary daemon variable are absent from `run_shell` output |
-| F19 | [#135](https://github.com/rdevaul/xshell/issues/135) | P1 | Approval integrity | Corrected (a denial sees the programs a command starts, not what an allowed program or script does internally, H6; names resolve with the daemon's `PATH`, not one a shell startup file sets; a copy of a denied program made earlier is not recognised) | Under `always_allowed=["run_shell"]`, `denied=["run_shell: rm *"]`, none of `RM -rf build`, `hash x=/bin/rm; x …`, `ln -s /bin/rm r && ./r …`, `repeat 1 rm …`, `time`/`coproc`/`exec`/`nohup rm …`, `sh -c 'rm …'`, `/bin/rm …`, `find . -delete` decides Run in `ask` or `auto`; a symlink or hard link to `rm` on `PATH` is denied; `rm -rf build/*` does not allow `rm -rf build/../..` and `cat docs/*` does not allow `cat docs/../../../etc/passwd`; `git status`, `make test`, `yapcad export a.step` still run |
+| F19 | [#135](https://github.com/rdevaul/xshell/issues/135) | P1 | Approval integrity | Corrected; follow-up F31 (#157) open: launchers not on the list and positional deny patterns (a denial sees the programs a command starts, not what an allowed program or script does internally, H6; names resolve with the daemon's `PATH`, not one a shell startup file sets; a copy of a denied program made earlier is not recognised) | Under `always_allowed=["run_shell"]`, `denied=["run_shell: rm *"]`, none of `RM -rf build`, `hash x=/bin/rm; x …`, `ln -s /bin/rm r && ./r …`, `repeat 1 rm …`, `time`/`coproc`/`exec`/`nohup rm …`, `sh -c 'rm …'`, `/bin/rm …`, `find . -delete` decides Run in `ask` or `auto`; a symlink or hard link to `rm` on `PATH` is denied; `rm -rf build/*` does not allow `rm -rf build/../..` and `cat docs/*` does not allow `cat docs/../../../etc/passwd`; `git status`, `make test`, `yapcad export a.step` still run |
 | F20 | [#136](https://github.com/rdevaul/xshell/issues/136) | P1 | Approval integrity | Corrected | Typeahead before the prompt is discarded on a PTY; "why", "okay" and a `y` with input behind its Enter re-prompt instead of approving; only `y`/`yes` + Enter approves; Enter alone denies |
-| F21 | [#137](https://github.com/rdevaul/xshell/issues/137) | P1 | Daemon startup and state | Corrected | Closing a session mid-turn, an orphaned in-flight marker, and a durable session whose cwd was deleted all leave a daemon that starts; a second daemon on the same state directory or live socket refuses to start and the first keeps serving; a failed detach keeps the connection attached |
+| F21 | [#137](https://github.com/rdevaul/xshell/issues/137) | P1 | Daemon startup and state | Corrected; follow-up F33 (#159) open: the cwd fallback is saved and widens the agent's scope | Closing a session mid-turn, an orphaned in-flight marker, and a durable session whose cwd was deleted all leave a daemon that starts; a second daemon on the same state directory or live socket refuses to start and the first keeps serving; a failed detach keeps the connection attached |
 | F23 | [#139](https://github.com/rdevaul/xshell/issues/139) | P1 | M1.4 credential bounds | Corrected (a keyless binding may still name any endpoint) | A client binding that names an arbitrary variable, or a configured variable with another endpoint, is refused at create, update, and turn start, and nothing reaches its endpoint; a binding one host supplied is never sent to another; a key over plain http to a non-loopback host is refused while loopback http works; a provider redirect is not followed |
-| F24 | [#140](https://github.com/rdevaul/xshell/issues/140) | P1 | M1.3 prepared file access | Corrected | Agent reads of the daemon's state directory (sessions, images, turn records), the audit directory and the config file are refused with the `blocked_path` basis in `auto` mode, in daemon and standalone turns, case variants included |
+| F24 | [#140](https://github.com/rdevaul/xshell/issues/140) | P1 | M1.3 prepared file access | Corrected; follow-up F32 (#158) open: macOS firmlink bypass and locations not covered | Agent reads of the daemon's state directory (sessions, images, turn records), the audit directory and the config file are refused with the `blocked_path` basis in `auto` mode, in daemon and standalone turns, case variants included |
 | F27 | [#143](https://github.com/rdevaul/xshell/issues/143) | P1 | Daemon control authentication | Partially corrected (descendants are refused, but on macOS a descendant that double-forks away still connects; on Linux so does anything started through a process outside the daemon's tree, such as `systemd-run --user`, `at`, an existing tmux server or `ssh localhost`; the token file is readable by every child, and running `xshell` reads it for them. The robust control is the per-turn approval key, R1 in #143) | A connection without the control token gets only the daemon's identity and every request is refused; a wrong token is refused at open; an agent `run_shell` command running the real `xshell` with the daemon's config and readable token is refused as a descendant, while the user's client keeps working |
 | F30 | [#156](https://github.com/rdevaul/xshell/issues/156) | P0 | Daemon control authentication | Corrected | The ancestry walk reads a setuid-root `login` and `launchd` on macOS, so the user's client under Terminal.app is not refused; a hidden ancestor counts as outside the daemon's tree and a vanished one as inside it; on Linux an orphan adopted by the daemon is reaped while `run_shell`, `$` and PTY exit statuses are still reported |
+
+## Open findings without a row yet
+
+A finding gets a row in the table above when it is corrected. These are open,
+each tracked in its issue:
+
+| ID | Issue | Priority | Subject |
+|---|---|---|---|
+| F15 | [#131](https://github.com/rdevaul/xshell/issues/131) | P1 | Audit completeness and attribution: records dropped after close, unrecorded `Update` and `ViewSource`, forgeable sessions, unauthenticated audit service |
+| F22 | [#138](https://github.com/rdevaul/xshell/issues/138) | P1 | Untrusted remote, path and model text reaches the terminal unsanitized |
+| F25 | [#141](https://github.com/rdevaul/xshell/issues/141) | P2 | The wall-time budget is not enforced across approval waits |
+| F26 | [#142](https://github.com/rdevaul/xshell/issues/142) | P2 | Lower-severity hardening items from the 12 November review |
+| F28 | [#144](https://github.com/rdevaul/xshell/issues/144) | P2 | Documentation and this ledger disagree with the code |
+| F29 | [#149](https://github.com/rdevaul/xshell/issues/149) | P2 | PTY terminate can hang in `wait4` on macOS when the job has unread output |
+| F31 | [#157](https://github.com/rdevaul/xshell/issues/157) | P1 | Shell denials miss unlisted program launchers and positional argument patterns (follow-up to F19) |
+| F32 | [#158](https://github.com/rdevaul/xshell/issues/158) | P1 | Protected state is readable through macOS firmlinks and uncovered locations (follow-up to F24) |
+| F33 | [#159](https://github.com/rdevaul/xshell/issues/159) | P1/P2 | The cwd fallback widens agent scope; a deleted cwd wedges a session (follow-up to F21) |
+
+F10 (#60) and F27 (#143) have rows above and remain open in part.
 
 ## Evidence rules
 
@@ -57,6 +76,10 @@ historical review.
    done; F10 partly done.)
 5. Complete F7 transactional persistence and crash-durability injection.
    (Done; per-session incremental writes remain.)
+
+This sequence covers F1 to F11 only. The findings from the 12 and 17 November
+reviews (F12 to F33) are not sequenced here; see the table and the list of
+open findings above.
 
 F3 has graceful SIGTERM coverage for agent tools, captured shell commands, and
 PTYs, including descendant-process cleanup and audit-close ordering. A durable

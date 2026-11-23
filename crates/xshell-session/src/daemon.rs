@@ -214,6 +214,7 @@ fn run(args: Args, tools: Arc<ToolRegistry>, context: Option<ContextSource>) -> 
     let user = args.user.unwrap_or_else(system_user);
     let host_id = load_or_create_host_id(&state_directory)?;
     config.validate_budgets()?;
+    config.shell.validate()?;
     // One daemon per state directory: held until the process exits (F21).
     let _state_lock = lock_state_directory(&state_directory)?;
     let mut registry = SessionRegistry::load(state_directory.clone(), host_id, host_alias, user)?;
@@ -230,6 +231,15 @@ fn run(args: Args, tools: Arc<ToolRegistry>, context: Option<ContextSource>) -> 
         audit,
         DaemonPolicy {
             context,
+            protected_paths: [
+                Some(state_directory.clone()),
+                config_path.clone(),
+                audit_config.directory.clone(),
+                Some(crate::control_token_path(&socket)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             ..daemon_policy(
                 &config,
                 rules,
@@ -390,6 +400,9 @@ fn daemon_policy(
         credential_routes,
         // Compiled in, not configured: set by `Daemon::with_context`.
         context: None,
+        shell: config.shell.clone(),
+        // Set by the caller, which knows the paths in use.
+        protected_paths: Vec::new(),
     })
 }
 
@@ -1183,6 +1196,11 @@ fn process_request(
                     .context("cannot resolve session host home directory")?;
             }
             execution.check_session_tools(&creation.tools)?;
+            // Resolved against the canonical working directory, and stored
+            // resolved: what the session shows and audits is what is
+            // enforced.
+            creation.cwd = xshell_execution::validate_working_directory(&creation.cwd)?;
+            creation.shell = execution.resolve_shell(&creation.shell, &creation.cwd)?;
             execution.check_model_binding(&creation.model)?;
             let session = registry.lock_recover().create(client_id, creation)?;
             if let Some(previous) = attached_session.take() {
