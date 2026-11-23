@@ -219,6 +219,9 @@ Two consequences need saying plainly:
   through its own environment variable (`CARGO_HOME`, `npm_config_cache`).
   The session's environment allowlist will need to carry such variables, so
   the runner sets them from the session's containment (part of C2).
+- **`HOME` is the scratch directory.** Tools that read their configuration
+  from the home directory start with none, rather than failing on one they
+  cannot read.
 - **Credentials are not inherited.** `~/.gitconfig`, `~/.ssh` and the macOS
   keychain are out of reach. A contained command gets a credential only as
   a named secret the daemon injects (§4.5). This is a feature: a contained
@@ -298,7 +301,9 @@ The profile is generated, never read from a file a command could change:
 ```scheme
 (version 1)
 (deny default)
-(allow process-fork process-exec* signal (target same-sandbox))
+(import "system.sb")                             ; dyld, libSystem start-up
+(allow process-fork process-exec*)
+(allow signal (target same-sandbox))             ; its own rule: see below
 (allow sysctl-read)
 (allow file-read* file-map-executable
        (subpath "/usr") (subpath "/bin") (subpath "/sbin")
@@ -309,14 +314,43 @@ The profile is generated, never read from a file a command could change:
 (allow file-read* file-write* (subpath (param "ROOT_0")) (subpath (param "TMP")))
 (allow file-read* file-map-executable (subpath (param "RO_0")))
 ;; with network = true:
-(allow network-outbound)
+(allow network-outbound (remote ip "*:*"))       ; IP only, not unix sockets
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
 (allow mach-lookup (global-name "com.apple.mDNSResponder"))
 ```
+
+The shell runs with `HOME` and `XDG_CONFIG_HOME` set to the scratch
+directory and `TMPDIR` set to it as well (§4.1).
 
 This sketch is a starting point. The exact rule set is the main work of C2
 and will be settled by running real toolchains under it (see §10).
 
 Things known to need care:
+
+- **Measured on macOS 26.6 (Apple silicon)** with
+  `scripts/macos-shell-sandbox-probe.sh`, which runs the profile above with
+  the network off and on, plus the two broken variants below:
+  - Without `(import "system.sb")` the shell aborts at start-up (SIGABRT).
+  - A filter on a rule applies to every operation in it. Written as
+    `(allow process-fork process-exec* signal (target same-sandbox))`, the
+    target filter also applies to exec, and `execvp` of the shell is denied.
+    Signals therefore get their own rule.
+  - An unfiltered `(allow network-outbound)` also allows connecting to any
+    unix socket, including the daemon's own and ssh, gpg or Docker agent
+    sockets. `(remote ip "*:*")` allows IP only. Name resolution then
+    needs the `mDNSResponder` socket as a literal, or every lookup fails.
+  - With the network off, unix sockets inside the roots are blocked too.
+    A tool or test suite that talks to a local socket in the workspace needs
+    the network on.
+  - git exits 128 on an unreadable `~/.gitconfig` (a missing one is fine),
+    which is why `HOME` points at the scratch directory.
+  - The `/usr/bin` shims (`git`, `python3`, …) run `xcrun`, which writes a
+    cache into `$(getconf DARWIN_USER_TEMP_DIR)` whatever `TMPDIR` says. The
+    write is denied and each call prints `couldn't create cache file`, but
+    the command still works. The runner should put the developer directory
+    (`xcode-select -p`, then `usr/bin`) ahead of `/usr/bin` on `PATH` rather
+    than grant the per-user temp directory, which holds other processes'
+    files.
 
 - **`sandbox-exec` is marked deprecated** in its manual page, and has been for
   years. It is still present and is what Chromium, Bazel and several coding
@@ -338,7 +372,8 @@ Things known to need care:
 
 **Fail closed.** At startup, on a host where isolated sessions are allowed,
 the daemon runs a self-test: a contained command that tries to write outside
-its root and to read a canary file outside it. If either succeeds, or the
+its root and to read a canary file outside it, and, with the network on,
+to connect to the daemon's socket. If any of these succeeds, or the
 sandbox cannot be started, isolated sessions are refused on that host with a
 clear reason. A session that is `isolated` never falls back to running a
 command ambient; the command fails and the model is told.
@@ -462,7 +497,7 @@ that C1's seam and containment model do not have to change to admit it.
 | # | Task | LoE (days) |
 |---|---|---|
 | C1 (done) | `ShellContainment` on session creation and descriptor; root resolution and validation; the operator's `[session_fabric.shell]` bounds and the most-restrictive rule; persisted with a state-format bump; session protocol bump; `ShellRunner` trait with the ambient runner. A host with no enforcing runner refuses isolated sessions | 4–5 |
-| C2 | macOS runner: profile generation, the scratch directory, the startup self-test, fail-closed behaviour. Tests on the macOS CI runner: writes and reads outside the roots fail, including through a symbolic link, `..`, and the `/System/Volumes/Data` spelling; the daemon socket and token are unreachable; network off blocks a connection; a `git` clone, a `cargo build` and a Python script work inside a root with the documented grants | 5–7 |
+| C2 | macOS runner: profile generation, the scratch directory, the startup self-test, fail-closed behaviour. Tests on the macOS CI runner: writes and reads outside the roots fail, including through a symbolic link, `..`, and the `/System/Volumes/Data` spelling; the daemon socket and token are unreachable, with the network off and on; network off blocks a connection; a `git` clone, a `cargo build` and a Python script work inside a root with the documented grants | 5–7 |
 | C3 | File tools confined to roots in isolated sessions; named secrets with output redaction; `user_commands` for `$` commands and interactive programs | 4–6 |
 | C4 | `max_approval_isolated`; `turn_started` and descriptor fields with an audit format bump; documentation; the security ledger | 2–3 |
 | C5 | Linux runner (bubblewrap where present, Landlock otherwise) with the same tests | 5–7 |
