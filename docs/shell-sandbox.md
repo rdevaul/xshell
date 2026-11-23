@@ -1,6 +1,7 @@
 # Contained shell commands: design
 
-**Status:** proposed; nothing here is implemented.
+**Status:** proposed, with the decisions of 23 November recorded in §11;
+nothing here is implemented.
 **Updated:** 23 November 2026
 
 ## 1. Summary
@@ -25,11 +26,12 @@ virtual machine fits behind the same seam and is sketched in §9.
 
 | Part | LoE (engineer-days) |
 |---|---|
-| C1. Containment model, session field, protocol, runner seam | 3–4 |
+| C1. Containment model, session field, operator bounds, protocol, runner seam | 4–5 |
 | C2. macOS enforcement (sandbox profile), self-test, tests on macOS CI | 5–7 |
-| C3. Approval ceiling for contained sessions, audit, descriptor, docs | 2–3 |
-| C4. Linux enforcement (bubblewrap or Landlock) | 5–7 |
-| **Total for macOS (C1–C3)** | **10–14** |
+| C3. File tools confined to roots; named secrets; contained user commands | 4–6 |
+| C4. Approval ceiling for contained sessions, audit, descriptor, docs | 2–3 |
+| C5. Linux enforcement (bubblewrap or Landlock) | 5–7 |
+| **Total for macOS (C1–C4)** | **15–21** |
 
 ## 2. Why the command's text cannot decide
 
@@ -81,10 +83,19 @@ pub struct IsolatedShell {
     /// Further directories and files commands may read but not write,
     /// beyond the system paths every command needs (§4.1).
     pub read_only: Vec<PathBuf>,
-    /// Whether commands may use the network.
+    /// Whether commands may use the network. Off unless asked for.
     pub network: bool,
+    /// Names of secrets the daemon puts in commands' environment (§4.5).
+    pub secrets: Vec<String>,
+    /// Whether the commands a person types (`$` commands and interactive
+    /// programs) are contained too, not only the agent's.
+    pub user_commands: bool,
 }
 ```
+
+Every field but `roots` defaults to the most restrictive value: no extra
+read-only grants, no network, no secrets, and only the agent's commands
+contained.
 
 On the wire, `SessionCreation` and `SessionDescriptor` gain an optional
 `shell` field; absent means `ambient`, so existing clients and saved sessions
@@ -93,7 +104,8 @@ are unchanged:
 ```json
 "shell": {"isolated": {"roots": ["/Users/rich/src/yapCAD"],
                        "read_only": ["/Users/rich/.cargo", "/Users/rich/.rustup"],
-                       "network": true}}
+                       "network": true,
+                       "secrets": ["GH_TOKEN"]}}
 ```
 
 - **Fixed for the session's life.** No request changes it, so a session's
@@ -131,20 +143,49 @@ resolve outside it.
 
 ### 3.4 What the operator controls
 
-The daemon's own configuration bounds what any client may ask for. A client,
-including a gateway, can only stay within it.
+What a session gets is **the most restrictive combination of what it asks
+for and what the daemon's own configuration allows.** A session never gets
+something it did not ask for, and never gets something the operator's
+configuration does not allow.
 
 ```toml
 [session_fabric.shell]
 # Refuse to create a session whose shell is less contained than this.
 minimum = "ambient"            # or "isolated"
-# When set, every root a session asks for must be inside one of these.
+# Every root a session asks for must be inside one of these.
 allowed_roots = ["~/src", "/srv/work"]
-# Read-only grants every isolated session gets, for toolchains.
-read_only = ["~/.cargo", "~/.rustup", "/opt/homebrew"]
+# Every read-only grant a session asks for must be inside one of these.
+allowed_read_only = ["~/.cargo", "~/.rustup", "/opt/homebrew"]
+# Whether a session may turn the network on.
+allow_network = true
 # The most permissive approval mode for sessions that are isolated (§6).
 max_approval_isolated = "auto"
+
+# The secrets a session may ask for by name, and where each comes from (§4.5).
+[session_fabric.shell.secrets]
+GH_TOKEN = { env = "XSHELL_SECRET_GH_TOKEN" }
 ```
+
+| The session asks for | The operator's setting | Result |
+|---|---|---|
+| A root | `allowed_roots` is set and the root is inside one | Granted |
+| A root | `allowed_roots` is set and the root is outside all | Session refused |
+| A read-only grant | Inside an `allowed_read_only` entry | Granted |
+| A read-only grant | Outside all, or the list is absent | Session refused |
+| `network = true` | `allow_network = true` | On |
+| `network = true` | `allow_network` false or absent | Session refused |
+| A secret by name | Named in the `secrets` table | Injected |
+| A secret by name | Not in the table | Session refused |
+
+A request outside the bounds refuses the session when it is created, with
+the reason. It is not silently narrowed: a session that quietly lacked its
+network or a grant would fail later in ways that are hard to trace.
+
+One bound has a different default. When `allowed_roots` is absent, a session
+may name any root (subject to §3.3), because a host that allows ambient
+shells already lets a session's commands reach everything, and a contained
+session only ever reaches less. Setting `minimum = "isolated"` requires
+`allowed_roots` to be set.
 
 With `minimum = "isolated"` no client can create a session whose agent has an
 ambient shell. That is the setting for a host where the operator does not
@@ -159,7 +200,7 @@ fully trust every client.
 | The session's roots | Read and write |
 | A scratch directory made for the session, set as `TMPDIR` | Read and write; removed with the session |
 | System paths: `/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/private/etc`, `/private/var/db/timezone`, selected `/dev` nodes | Read, and execute |
-| The operator's `read_only` list, and the session's | Read, and execute |
+| The session's `read_only` grants, within the operator's bounds | Read, and execute |
 | Everything else, including the rest of the home directory | Nothing |
 
 The last row is the point. A contained command cannot read `~/.ssh`, other
@@ -174,23 +215,23 @@ Two consequences need saying plainly:
   `~/.npm`) needs that cache redirected into a root or the scratch directory
   through its own environment variable (`CARGO_HOME`, `npm_config_cache`).
   The session's environment allowlist will need to carry such variables, so
-  C1 adds a per-session list of extra variables to set.
+  the runner sets them from the session's containment (part of C2).
 - **Credentials are not inherited.** `~/.gitconfig`, `~/.ssh` and the macOS
-  keychain are out of reach unless granted. For pushing code, the intended
-  route is a narrow credential the operator places deliberately: a token in
-  a file under a root or `read_only`, used through git's `credential.helper
-  store` or an environment variable. This is a feature. A contained agent
-  should hold a credential that can do the job and no more.
+  keychain are out of reach. A contained command gets a credential only as
+  a named secret the daemon injects (§4.5). This is a feature: a contained
+  agent should hold a credential that can do the job and no more.
 
 ### 4.2 Network
 
-`network = false` denies all network access. `network = true` allows outbound
-connections and name resolution.
+The network is off unless the session asks for it and the operator allows
+it. Off denies all network access. On allows outbound connections and name
+resolution.
 
 The macOS sandbox can allow or deny the network, and can limit it to the
 local machine or to given ports. It cannot filter by host name. A session
-that needs "only `github.com`" needs a filtering proxy that the sandbox allows
-as its only destination. That is out of scope here and noted in §11.
+that needs "only `github.com`" would need a filtering proxy that the sandbox
+allows as its only destination. That is not needed yet and is not part of
+this work.
 
 With the network on, **anything a command can read, it can send somewhere.**
 Roots and `read_only` grants are therefore also the list of what could leak.
@@ -212,6 +253,33 @@ sandbox. Process-group cleanup on timeout and cancellation (F2, F17) is
 unchanged.
 
 CPU, memory and process-count limits are not part of this design.
+
+### 4.5 Secrets
+
+A contained command gets a credential as a **named secret**. The session
+asks for it by name; the operator's `secrets` table says where its value
+comes from; the daemon puts it in the command's environment under that name.
+The value is never in a file a command reads, never in the session's
+description, and never sent over the session protocol.
+
+- **Source.** The first source is a variable in the daemon's own
+  environment (`{ env = "NAME" }`). The daemon's environment is already kept
+  from agent commands (F18), and each source variable is registered as a
+  credential variable so it is stripped everywhere it was not asked for. A
+  keychain source can follow.
+- **Scope.** Only sessions that ask for a secret by name get it, and only
+  if the operator's table defines it. An ambient session cannot ask for
+  secrets: this is a feature of contained sessions.
+- **What is recorded.** The names of the secrets a turn's commands could
+  see, in the audit record. Never a value.
+- **What it does not protect against.** Every process in the sandbox can
+  read the variable, and with the network on, can send it. A command can
+  also print it, which puts it in the tool's output and so in the model's
+  context and the audit log. The daemon replaces exact occurrences of an
+  injected value in tool output with a placeholder; that catches the plain
+  case and not an encoded one. So a secret should be scoped to the work: a
+  token that can open pull requests on one repository, not an account
+  password.
 
 ## 5. Enforcement on macOS
 
@@ -331,11 +399,23 @@ This is the "interface for enforced providers" that roadmap milestone M2 asks
 for, limited to shell execution. It does not change model calls or the file
 tools.
 
-**What uses it.** The agent's `run_shell`, including in subagents, which
-inherit the session's containment. Not the direct `$` commands a person types
-or their interactive programs: those are the user acting as themselves. The
-built-in file tools keep their own confinement to the working directory,
-which §3.3 requires to be inside a root.
+**What uses it.**
+
+- **The agent's `run_shell`**, including in subagents, which inherit the
+  session's containment.
+- **The commands a person types**, when the session sets `user_commands`:
+  direct `$` commands and interactive programs then start through the same
+  runner. Without it they are the user acting as themselves and run as they
+  do today. A client that hands its users a shared host can ask for it; the
+  profile then also allows the session's own terminal device.
+- **The built-in file tools.** In an isolated session `read_file`,
+  `list_directory` and `view_image` are confined to the session's roots,
+  not to its working directory: a path is accepted when its resolved
+  location is inside a root. They do not read the `read_only` grants, which
+  exist for toolchains. Relative paths are still taken from the working
+  directory. The same prepared, link-safe walk is used, started from the
+  root that contains the path, and the sensitive-path and blocked-path
+  rules apply as before.
 
 ## 9. A stronger tier: containers and virtual machines
 
@@ -378,10 +458,11 @@ that C1's seam and containment model do not have to change to admit it.
 
 | # | Task | LoE (days) |
 |---|---|---|
-| C1 | `ShellContainment` on session creation and descriptor; root resolution and validation; daemon `[session_fabric.shell]` bounds; persisted with a state-format bump; session protocol bump; `ShellRunner` trait with the ambient runner; per-session extra environment variables | 3–4 |
+| C1 | `ShellContainment` on session creation and descriptor; root resolution and validation; the operator's `[session_fabric.shell]` bounds and the most-restrictive rule; persisted with a state-format bump; session protocol bump; `ShellRunner` trait with the ambient runner. A host with no enforcing runner refuses isolated sessions | 4–5 |
 | C2 | macOS runner: profile generation, the scratch directory, the startup self-test, fail-closed behaviour. Tests on the macOS CI runner: writes and reads outside the roots fail, including through a symbolic link, `..`, and the `/System/Volumes/Data` spelling; the daemon socket and token are unreachable; network off blocks a connection; a `git` clone, a `cargo build` and a Python script work inside a root with the documented grants | 5–7 |
-| C3 | `max_approval_isolated`; `turn_started` and descriptor fields with an audit format bump; documentation; the security ledger | 2–3 |
-| C4 | Linux runner (bubblewrap where present, Landlock otherwise) with the same tests | 5–7 |
+| C3 | File tools confined to roots in isolated sessions; named secrets with output redaction; `user_commands` for `$` commands and interactive programs | 4–6 |
+| C4 | `max_approval_isolated`; `turn_started` and descriptor fields with an audit format bump; documentation; the security ledger | 2–3 |
+| C5 | Linux runner (bubblewrap where present, Landlock otherwise) with the same tests | 5–7 |
 
 **Risks:**
 
@@ -393,21 +474,30 @@ that C1's seam and containment model do not have to change to admit it.
   can be reached, not what can be sent. The documentation has to say so
   wherever the feature is described.
 
-## 11. Open questions
+## 11. Decisions and open questions
 
-1. **Default for `network`.** Off is safer and breaks `git fetch` and
-   dependency downloads. On is what coding needs. Should the field be
-   required, with no default?
-2. **Host filtering.** Is "only these hosts" needed soon enough to design the
-   filtering proxy with this work, or can it wait?
-3. **File tools and roots.** Should `read_file`, `list_directory` and
-   `view_image` be confined to the roots instead of to the working
-   directory, so an agent can read across all its roots without a shell?
-4. **Where grants for toolchains live.** Only in the operator's
-   configuration (as above), or may a session add its own `read_only`
-   entries within `allowed_roots`-style bounds?
-5. **Credentials.** Is a token file under a granted path enough, or should
-   the daemon inject a named secret into a contained command's environment,
-   as the MCP bridge plans to for servers?
-6. **`$` commands.** Should a session be able to ask for its user-typed
-   commands to be contained too, for a client that wants that?
+Decided on 23 November 2026:
+
+| Question | Decision |
+|---|---|
+| Default for `network` | Off. A session turns it on explicitly, and the operator must allow it (§4.2, §3.4) |
+| Filtering by host | Not needed yet; not part of this work |
+| File tools | Confined to the session's roots, not its working directory (§8) |
+| Who may grant | The most restrictive combination of the operator's configuration and the session's request (§3.4) |
+| Credentials | The daemon injects named secrets; no token files (§4.5) |
+| Commands a person types | A session can ask for them to be contained too (`user_commands`, §8) |
+
+Still open:
+
+1. **Keychain as a secret source.** An environment variable in the daemon's
+   environment is the first source. Reading from the macOS keychain or the
+   Linux secret service is the natural second one; the MCP bridge plans the
+   same storage for its tokens, and the two should share it.
+2. **How far output redaction goes.** Exact matches of an injected value are
+   replaced. Is that worth doing at all, given it cannot catch an encoded
+   value, or does it give a false sense of safety?
+3. **`sandbox-exec` deprecation.** Whether to write the `sandbox_init`
+   helper now or only if the tool is removed (§5).
+4. **Interactive programs under a sandbox.** Full-screen programs need the
+   session's terminal device and sometimes more. How much breaks under the
+   profile is unknown until C3 tries it.
