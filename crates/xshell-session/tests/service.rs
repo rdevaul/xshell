@@ -14,8 +14,8 @@ use common::{connect_when_ready, serve_sse, sse_text, sse_tool_call};
 use xshell_session::{
     AttachmentRole, ClientPtyFrame, ClientRequest, IsolatedShell, ModelBinding, PersistenceMode,
     PtySize, PtyStreamClient, SESSION_PROTOCOL_VERSION, ServerPtyFrame, ServerResponse,
-    SessionActivity, SessionClient, SessionCreation, SessionEventKind, ShellContainment, TurnInput,
-    Visibility, read_server_frame, write_client_frame,
+    SessionActivity, SessionClient, SessionCreation, SessionEventKind, ShellContainment,
+    ShellNetwork, TurnInput, Visibility, read_server_frame, write_client_frame,
 };
 
 struct Daemon(Child);
@@ -4279,7 +4279,7 @@ fn a_session_asking_for_an_isolated_shell_is_checked_then_refused_until_enforced
         ),
     );
     let mut client = connect_when_ready(&socket);
-    let isolated = |roots: &[&Path], network: bool| {
+    let isolated = |roots: &[&Path], network: ShellNetwork| {
         ShellContainment::Isolated(IsolatedShell {
             roots: roots.iter().map(|root| root.to_path_buf()).collect(),
             network,
@@ -4299,17 +4299,23 @@ fn a_session_asking_for_an_isolated_shell_is_checked_then_refused_until_enforced
         &mut client,
         isolated(
             &[&work.join("repo"), &temporary.path().join("elsewhere")],
-            false,
+            ShellNetwork::None,
         ),
     );
     assert!(outside.contains("outside the directories"), "{outside}");
-    let network = refused(&mut client, isolated(&[&work.join("repo")], true));
+    let network = refused(
+        &mut client,
+        isolated(&[&work.join("repo")], ShellNetwork::Full),
+    );
     assert!(
-        network.contains("does not allow isolated shells to use the network"),
+        network.contains("network access up to \"none\", not \"full\""),
         "{network}"
     );
     // The daemon's own state may not be a root.
-    let own_state = refused(&mut client, isolated(&[temporary.path()], false));
+    let own_state = refused(
+        &mut client,
+        isolated(&[temporary.path()], ShellNetwork::None),
+    );
     assert!(
         own_state.contains("outside the directories") || own_state.contains("own files"),
         "{own_state}"
@@ -4318,7 +4324,10 @@ fn a_session_asking_for_an_isolated_shell_is_checked_then_refused_until_enforced
     // A request inside the bounds is still refused: nothing enforces it on
     // this host yet, and a session is never recorded as isolated while its
     // commands would run with full authority.
-    let unenforced = refused(&mut client, isolated(&[&work.join("repo")], false));
+    let unenforced = refused(
+        &mut client,
+        isolated(&[&work.join("repo")], ShellNetwork::None),
+    );
     assert!(
         unenforced.contains("cannot enforce an isolated shell yet"),
         "{unenforced}"

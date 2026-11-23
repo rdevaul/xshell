@@ -47,15 +47,45 @@ pub struct IsolatedShell {
     /// Further directories and files commands may read but not write.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub read_only: Vec<PathBuf>,
-    /// Whether commands may use the network.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub network: bool,
+    /// How much of the network commands may use.
+    #[serde(skip_serializing_if = "ShellNetwork::is_none")]
+    pub network: ShellNetwork,
     /// Names of secrets the daemon puts in commands' environment.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
     /// Whether the commands a person types are contained too.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub user_commands: bool,
+}
+
+/// How much of the network an isolated shell's commands may use. Ordered
+/// from least to most.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellNetwork {
+    /// No network at all.
+    #[default]
+    None,
+    /// This machine only: commands may listen on and connect to loopback
+    /// addresses, as test suites and local development servers do. That
+    /// also reaches any other service listening on this machine.
+    Loopback,
+    /// Outbound connections anywhere, and loopback.
+    Full,
+}
+
+impl ShellNetwork {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Loopback => "loopback",
+            Self::Full => "full",
+        }
+    }
 }
 
 /// The least containment a daemon accepts.
@@ -89,8 +119,8 @@ pub struct ShellBounds {
     /// Every read-only grant a session asks for must be inside one of
     /// these. Absent or empty allows none.
     pub allowed_read_only: Vec<PathBuf>,
-    /// Whether a session may turn the network on.
-    pub allow_network: bool,
+    /// The most network access a session may ask for.
+    pub max_network: ShellNetwork,
     /// The secrets a session may ask for by name.
     pub secrets: BTreeMap<String, SecretSource>,
 }
@@ -204,10 +234,12 @@ directories the session may work in"
         }
     }
 
-    if isolated.network && !bounds.allow_network {
+    if isolated.network > bounds.max_network {
         bail!(
-            "this session host does not allow isolated shells to use the network \
-(session_fabric.shell.allow_network)"
+            "this session host allows isolated shells network access up to {:?}, not {:?} \
+(session_fabric.shell.max_network)",
+            bounds.max_network.as_str(),
+            isolated.network.as_str()
         );
     }
 
@@ -419,7 +451,7 @@ mod tests {
             [fixture.home.join("src/app"), fixture.home.join("src/lib")]
         );
         // The restrictive defaults survive.
-        assert!(!isolated.network && !isolated.user_commands);
+        assert!(isolated.network.is_none() && !isolated.user_commands);
         assert!(isolated.read_only.is_empty() && isolated.secrets.is_empty());
     }
 
@@ -488,8 +520,8 @@ mod tests {
                 "outside what this session host allows",
             ),
             (
-                ask(|r| r.network = true),
-                "does not allow isolated shells to use the network",
+                ask(|r| r.network = ShellNetwork::Loopback),
+                "network access up to \"none\", not \"loopback\"",
             ),
             (
                 ask(|r| r.secrets = vec!["GH_TOKEN".into()]),
@@ -502,7 +534,7 @@ mod tests {
 
         let generous = ShellBounds {
             allowed_read_only: vec!["~/tools".into()],
-            allow_network: true,
+            max_network: ShellNetwork::Full,
             secrets: BTreeMap::from([(
                 "GH_TOKEN".to_owned(),
                 SecretSource {
@@ -514,7 +546,7 @@ mod tests {
         generous.validate().unwrap();
         let mut request = roots(&["~/src/app"]);
         request.read_only = vec!["~/tools/bin/cc".into(), "~/tools".into()];
-        request.network = true;
+        request.network = ShellNetwork::Full;
         request.secrets = vec!["GH_TOKEN".into()];
         request.user_commands = true;
         let ShellContainment::Isolated(isolated) = fixture.resolve(request, &generous).unwrap()
@@ -528,7 +560,8 @@ mod tests {
                 fixture.home.join("tools")
             ]
         );
-        assert!(isolated.network && isolated.user_commands);
+        assert_eq!(isolated.network, ShellNetwork::Full);
+        assert!(isolated.user_commands);
         assert_eq!(isolated.secrets, ["GH_TOKEN"]);
 
         // What the operator allows and the session does not ask for is not
@@ -538,7 +571,23 @@ mod tests {
         else {
             panic!("expected an isolated shell");
         };
-        assert!(!modest.network && modest.read_only.is_empty() && modest.secrets.is_empty());
+        assert!(modest.network.is_none() && modest.read_only.is_empty());
+        assert!(modest.secrets.is_empty());
+
+        // A host that allows loopback only refuses full access and grants
+        // loopback.
+        let local = ShellBounds {
+            max_network: ShellNetwork::Loopback,
+            ..ShellBounds::default()
+        };
+        let error = message(fixture.resolve(ask(|r| r.network = ShellNetwork::Full), &local));
+        assert!(
+            error.contains("up to \"loopback\", not \"full\""),
+            "{error}"
+        );
+        fixture
+            .resolve(ask(|r| r.network = ShellNetwork::Loopback), &local)
+            .unwrap();
 
         // A grant outside the allowed list, a protected one, and a repeated
         // secret are refused even here.
@@ -595,13 +644,19 @@ mod tests {
             serde_json::to_string(&ShellContainment::Ambient).unwrap(),
             "\"ambient\""
         );
-        let parsed: ShellContainment =
-            serde_json::from_str(r#"{"isolated":{"roots":["/a"],"network":true,"secrets":["T"]}}"#)
-                .unwrap();
+        let parsed: ShellContainment = serde_json::from_str(
+            r#"{"isolated":{"roots":["/a"],"network":"loopback","secrets":["T"]}}"#,
+        )
+        .unwrap();
         let ShellContainment::Isolated(isolated) = parsed else {
             panic!("expected an isolated shell");
         };
-        assert!(isolated.network && !isolated.user_commands);
+        assert_eq!(isolated.network, ShellNetwork::Loopback);
+        assert!(!isolated.user_commands);
+        assert!(
+            ShellNetwork::None < ShellNetwork::Loopback
+                && ShellNetwork::Loopback < ShellNetwork::Full
+        );
         assert!(
             serde_json::from_str::<ShellContainment>(
                 r#"{"isolated":{"roots":["/a"],"sudo":true}}"#

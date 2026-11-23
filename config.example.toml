@@ -226,7 +226,7 @@ pty_escape = "ctrl-]"
 # minimum = "ambient"                     # or "isolated": refuse ambient shells
 # allowed_roots = ["~/src"]               # roots must be inside one of these
 # allowed_read_only = ["~/.cargo", "~/.rustup"]
-# allow_network = false
+# max_network = "none"                   # or "loopback", "full"
 
 # Sensitivity classes: "prompt" paths need approval for agent reads (as
 # sensitive_paths); "block" paths can never be read by agent read tools.

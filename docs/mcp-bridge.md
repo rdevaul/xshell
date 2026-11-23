@@ -138,7 +138,9 @@ on, such as "github: login required; ask the user to run
 ### 3.4 Sandboxing local servers
 
 Each stdio server is launched by the broker under a sandbox whose limits
-come from its configuration entry:
+come from its configuration entry. The containment model and the runner that
+enforces it are those of [contained shell commands](shell-sandbox.md), so
+the profile rules and their tests exist once:
 
 - **macOS:** a generated `sandbox-exec` profile.
 - **Linux:** bubblewrap where available, Landlock otherwise.

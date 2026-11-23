@@ -25,7 +25,7 @@ pub use client::{
 };
 pub use completion::complete_shell;
 pub use containment::{
-    IsolatedShell, MinimumContainment, SecretSource, ShellBounds, ShellContainment,
+    IsolatedShell, MinimumContainment, SecretSource, ShellBounds, ShellContainment, ShellNetwork,
 };
 pub use control_token::{control_token_path, read_token, tokens_match, write_new_token};
 pub use credentials::{ConfiguredModel, CredentialRoutes, default_model_base_url};
