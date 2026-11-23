@@ -24,7 +24,8 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `ClientRequest::Open` and refuses unauthenticated requests (F27). Version 27
 // adds `AttachImage` and `ViewImage`, which read an image file on the session
 // host. Version 28 adds `shell` on `SessionCreation` and `SessionDescriptor`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 28;
+// Version 29 adds `anthropic` on `ModelBinding`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 29;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -456,6 +457,13 @@ pub struct ModelBinding {
     /// placeholders. Absent in sessions saved before images.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vision: bool,
+    /// Settings for the Anthropic provider, from the client's profile.
+    /// Absent for other providers and in sessions saved before them.
+    #[serde(
+        default,
+        skip_serializing_if = "xshell_core::AnthropicSettings::is_default"
+    )]
+    pub anthropic: xshell_core::AnthropicSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

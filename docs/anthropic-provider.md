@@ -513,7 +513,7 @@ limits = "cad"
 
 | Stage | Content | Effort |
 |---|---|---|
-| P1 | `provider = "anthropic"`: request mapping, streaming, `stop_reason` mapping, images, `api_key_env`, both auth headers, `api_version`, effort and thinking settings, error classes and retry. Session protocol and `CredentialRoutes` accept the provider | 4–6 days |
+| P1 (in progress) | `provider = "anthropic"`: request mapping, streaming, `stop_reason` mapping, images, `api_key_env`, both auth headers, `api_version`, effort and thinking settings, error classes and retry. Session protocol and `CredentialRoutes` accept the provider | 4–6 days |
 | P2 | `provider_blocks` in core, session files and protocol; thinking replay; tool-id rewrite and history repair | 2–3 days |
 | P3 | Usage: `TokenUsage`, sums per turn, `result.usage.tokens`, audit record | 1–2 days |
 | P4 | `api_key_command` with TTL and 401 refresh; daemon-only route; audit event | 2–3 days |

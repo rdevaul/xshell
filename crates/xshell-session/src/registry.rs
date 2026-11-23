@@ -793,6 +793,7 @@ mod tests {
             context_tokens: None,
             reserve_output_tokens: None,
             vision: false,
+            anthropic: Default::default(),
         }
     }
 

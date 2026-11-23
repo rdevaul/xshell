@@ -4,7 +4,9 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use xshell_adapters::AnthropicOptions;
 use xshell_audit::AuditConfig;
+use xshell_core::AnthropicSettings;
 use xshell_execution::{LimitSettings, Policy, PolicyConfig, TurnLimits};
 use xshell_release::ReleaseSource;
 use xshell_session::{ModelBinding, SessionConfig};
@@ -17,6 +19,17 @@ use crate::view::ViewConfig;
 pub enum Provider {
     Ollama,
     Openai,
+    Anthropic,
+}
+
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Ollama => "ollama",
+            Provider::Openai => "openai",
+            Provider::Anthropic => "anthropic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -47,6 +60,61 @@ pub struct ModelProfile {
     /// conversation are sent as short text placeholders.
     #[serde(default)]
     pub vision: bool,
+    /// Anthropic only: the credential header, "x-api-key" or "bearer".
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// Anthropic only: the `anthropic-version` header.
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// Anthropic only: the effort level. Always set it: the default differs
+    /// by model.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Anthropic only: "adaptive" or "omit".
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Anthropic only: "omitted" or "summarized".
+    #[serde(default)]
+    pub thinking_display: Option<String>,
+    /// Anthropic only: the most tokens one reply may produce.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// Anthropic only: extra `anthropic-beta` values.
+    #[serde(default)]
+    pub betas: Vec<String>,
+    /// Anthropic only: whether to send `anthropic-beta` at all.
+    #[serde(default)]
+    pub send_betas: Option<bool>,
+}
+
+impl ModelProfile {
+    /// The profile's Anthropic settings, which are empty for other
+    /// providers.
+    pub fn anthropic_settings(&self) -> AnthropicSettings {
+        AnthropicSettings {
+            auth: self.auth.clone(),
+            api_version: self.api_version.clone(),
+            effort: self.effort.clone(),
+            thinking: self.thinking.clone(),
+            thinking_display: self.thinking_display.clone(),
+            max_output_tokens: self.max_output_tokens,
+            betas: self.betas.clone(),
+            send_betas: self.send_betas,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let settings = self.anthropic_settings();
+        if self.provider == Provider::Anthropic {
+            AnthropicOptions::from_settings(&settings).map_err(anyhow::Error::msg)?;
+        } else if !settings.is_default() {
+            bail!(
+                "auth, api_version, effort, thinking, thinking_display, max_output_tokens, betas \
+and send_betas apply only to provider = \"anthropic\""
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Turn limits: which profile applies when nothing else chooses one, and
@@ -84,11 +152,7 @@ impl ActiveModel {
     pub fn to_session_binding(&self) -> ModelBinding {
         ModelBinding {
             profile_name: self.profile_name.clone(),
-            provider: match self.provider {
-                Provider::Ollama => "ollama",
-                Provider::Openai => "openai",
-            }
-            .into(),
+            provider: self.provider.as_str().into(),
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
@@ -96,6 +160,7 @@ impl ActiveModel {
             context_tokens: self.context_tokens,
             reserve_output_tokens: self.reserve_output_tokens,
             vision: self.vision,
+            anthropic: self.anthropic.clone(),
         }
     }
 
@@ -103,6 +168,7 @@ impl ActiveModel {
         let provider = match binding.provider.as_str() {
             "ollama" => Provider::Ollama,
             "openai" => Provider::Openai,
+            "anthropic" => Provider::Anthropic,
             value => bail!("session uses unsupported provider {value:?}"),
         };
         let api_key_env = binding
@@ -119,6 +185,7 @@ impl ActiveModel {
             context_tokens: binding.context_tokens,
             reserve_output_tokens: binding.reserve_output_tokens,
             vision: binding.vision,
+            anthropic: binding.anthropic,
             origin_host_id: None,
         })
     }
@@ -143,6 +210,8 @@ pub struct ActiveModel {
     pub context_tokens: Option<usize>,
     pub reserve_output_tokens: Option<usize>,
     pub vision: bool,
+    /// Settings for the Anthropic provider; empty for the others.
+    pub anthropic: AnthropicSettings,
     /// The host whose session supplied this binding, or `None` when it came
     /// from this client's own configuration and command line. A binding a
     /// host supplied is that host's to use: it is never sent to another
@@ -179,6 +248,14 @@ impl XshellConfig {
         config
             .validate_limits()
             .with_context(|| format!("invalid configuration file {}", path.display()))?;
+        for (name, profile) in &config.models {
+            profile.validate().with_context(|| {
+                format!(
+                    "invalid configuration file {}: model profile {name:?}",
+                    path.display()
+                )
+            })?;
+        }
         // Every configured provider credential is kept out of the shells
         // this process starts, whichever profile ends up active.
         for profile in config.models.values() {
@@ -219,8 +296,12 @@ impl XshellConfig {
             .or_else(|| selected.and_then(|profile| profile.api_key_env.clone()))
             .map(|name| validate_api_key_env(name, selected_name.as_deref()))
             .transpose()?;
-        if api_key_env.is_none() && selected.is_none() && provider == Provider::Openai {
-            api_key_env = Some("OPENAI_API_KEY".into());
+        if api_key_env.is_none() && selected.is_none() {
+            api_key_env = match provider {
+                Provider::Openai => Some("OPENAI_API_KEY".into()),
+                Provider::Anthropic => Some("ANTHROPIC_API_KEY".into()),
+                Provider::Ollama => None,
+            };
         }
 
         Ok(ActiveModel {
@@ -233,6 +314,10 @@ impl XshellConfig {
             context_tokens: selected.and_then(|profile| profile.context_tokens),
             reserve_output_tokens: selected.and_then(|profile| profile.reserve_output_tokens),
             vision: selected.is_some_and(|profile| profile.vision),
+            anthropic: selected
+                .filter(|profile| profile.provider == provider)
+                .map(ModelProfile::anthropic_settings)
+                .unwrap_or_default(),
             origin_host_id: None,
         })
     }
@@ -256,6 +341,7 @@ impl XshellConfig {
             context_tokens: profile.context_tokens,
             reserve_output_tokens: profile.reserve_output_tokens,
             vision: profile.vision,
+            anthropic: profile.anthropic_settings(),
             origin_host_id: None,
         })
     }
@@ -410,6 +496,7 @@ fn default_base_url(provider: Provider) -> &'static str {
     match provider {
         Provider::Ollama => "http://127.0.0.1:11434",
         Provider::Openai => "https://api.openai.com",
+        Provider::Anthropic => "https://api.anthropic.com",
     }
 }
 
@@ -613,6 +700,82 @@ api_key_env = "OPENROUTER_API_KEY"
         assert_eq!(active.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
     }
 
+    fn parse(source: &str) -> XshellConfig {
+        toml::from_str(source).unwrap()
+    }
+
+    #[test]
+    fn resolves_an_anthropic_profile_with_its_settings() {
+        let config = parse(
+            r#"
+            [models.opus]
+            provider = "anthropic"
+            model = "claude-opus-5-5"
+            api_key_env = "ANTHROPIC_API_KEY"
+            auth = "bearer"
+            effort = "high"
+            thinking = "adaptive"
+            thinking_display = "summarized"
+            max_output_tokens = 64000
+            "#,
+        );
+        config.models["opus"].validate().unwrap();
+        let active = config.resolve_profile("opus").unwrap();
+        assert_eq!(active.provider, Provider::Anthropic);
+        assert_eq!(active.base_url, "https://api.anthropic.com");
+        assert_eq!(active.anthropic.effort.as_deref(), Some("high"));
+        assert_eq!(active.anthropic.max_output_tokens, Some(64000));
+        // The settings survive the round trip through a session binding.
+        let binding = active.to_session_binding();
+        assert_eq!(binding.provider, "anthropic");
+        let back = ActiveModel::from_session_binding(binding).unwrap();
+        assert_eq!(back.anthropic, active.anthropic);
+    }
+
+    #[test]
+    fn anthropic_settings_are_validated_and_scoped_to_the_provider() {
+        let rejected = parse(
+            r#"
+            [models.opus]
+            provider = "anthropic"
+            model = "claude-opus-5-5"
+            thinking = "disabled"
+            "#,
+        );
+        let error = rejected.models["opus"].validate().unwrap_err().to_string();
+        assert!(error.contains("budget_tokens"), "{error}");
+        let misplaced = parse(
+            r#"
+            [models.local]
+            provider = "openai"
+            model = "qwen"
+            effort = "high"
+            "#,
+        );
+        let error = misplaced.models["local"]
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only to provider"), "{error}");
+    }
+
+    #[test]
+    fn provider_anthropic_without_a_profile_uses_anthropic_api_key() {
+        let active = XshellConfig::default()
+            .resolve_startup(
+                None,
+                ModelOverrides {
+                    provider: Some(Provider::Anthropic),
+                    model: Some("claude-opus-5-5".into()),
+                    base_url: None,
+                    api_key_env: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(active.base_url, "https://api.anthropic.com");
+        assert_eq!(active.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
     #[test]
     fn command_line_values_override_profile() {
         let active = sample()
@@ -809,6 +972,7 @@ model = "m"
             context_tokens: None,
             reserve_output_tokens: None,
             vision: false,
+            anthropic: Default::default(),
             origin_host_id: Some(host.into()),
         }
     }

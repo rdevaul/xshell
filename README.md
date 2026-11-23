@@ -179,6 +179,21 @@ export OPENROUTER_API_KEY='your-key-here'
 cargo run -p xshell-cli -- --profile openrouter-qwen
 ```
 
+Anthropic models use `provider = "anthropic"`, which speaks the Messages API
+directly (see [docs/anthropic-provider.md](docs/anthropic-provider.md)). Set
+`effort` explicitly, since its default differs by model. Thinking stays off
+unless `thinking = "adaptive"`. Until thinking blocks are replayed, leave it
+off for tool use.
+
+```toml
+[models.opus]
+provider = "anthropic"
+model = "claude-opus-5-5"
+api_key_env = "ANTHROPIC_API_KEY"   # sent as x-api-key; auth = "bearer" for gateways
+effort = "high"
+max_output_tokens = 64000
+```
+
 Within xshell, `//model list` shows configured profiles and `//model NAME`
 switches the active session to a fresh conversation. Clearing history on a
 model switch prevents context supplied to one provider from silently crossing

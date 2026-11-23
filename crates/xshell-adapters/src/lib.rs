@@ -1,3 +1,4 @@
+mod anthropic;
 mod images;
 mod ollama;
 mod openai;
@@ -7,6 +8,7 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use xshell_core::{AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatRequest};
 
+pub use anthropic::{AnthropicAdapter, AnthropicAuth, AnthropicOptions};
 pub use ollama::OllamaAdapter;
 pub use openai::OpenAiCompatibleAdapter;
 

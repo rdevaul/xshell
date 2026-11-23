@@ -447,6 +447,44 @@ pub enum AgentEvent {
     TextDelta(String),
 }
 
+/// Settings only the Anthropic provider reads. They travel with a model
+/// binding, so the daemon sends what the client's profile chose. Every field
+/// is optional; the adapter applies its own default for one left unset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AnthropicSettings {
+    /// The credential header: "x-api-key" (the default) or "bearer".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// `anthropic-version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    /// `output_config.effort`: "low" to "max".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// "adaptive" to request thinking, or "omit" (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// How thinking is shown: "omitted" or "summarized".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<String>,
+    /// `max_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Extra `anthropic-beta` values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub betas: Vec<String>,
+    /// Whether to send `anthropic-beta` at all; some gateways reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_betas: Option<bool>,
+}
+
+impl AnthropicSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentDescriptor {
     pub id: String,

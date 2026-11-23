@@ -29,7 +29,9 @@ use std::sync::{
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Notify;
-use xshell_adapters::{AgentAdapter, OllamaAdapter, OpenAiCompatibleAdapter};
+use xshell_adapters::{
+    AgentAdapter, AnthropicAdapter, AnthropicOptions, OllamaAdapter, OpenAiCompatibleAdapter,
+};
 use xshell_core::{
     AdapterError, AgentEvent, AssistantResponse, ChatMessage, ChatRequest, DEFAULT_SYSTEM_PROMPT,
     ImageBytes, ImageSource, MessageRole, ToolCall,
@@ -305,6 +307,8 @@ pub struct AdapterConfig {
     /// Whether the model takes images. Without it, images are sent as text
     /// placeholders.
     pub vision: bool,
+    /// Settings for the Anthropic provider; ignored by the others.
+    pub anthropic: xshell_core::AnthropicSettings,
 }
 
 /// A one-way "stop" signal shared between a running turn and whoever may
@@ -381,6 +385,18 @@ pub fn build_adapter(config: &AdapterConfig) -> Result<Box<dyn AgentAdapter>> {
                     resolve_api_key(config)?,
                 )
                 .with_vision(config.vision),
+            )
+        }
+        "anthropic" => {
+            let options = AnthropicOptions::from_settings(&config.anthropic)
+                .map_err(|error| anyhow::anyhow!("invalid Anthropic settings: {error}"))?;
+            if config.api_key_env.is_some() {
+                xshell_adapters::check_credential_endpoint(&config.base_url)?;
+            }
+            Box::new(
+                AnthropicAdapter::new(&config.base_url, &config.model, resolve_api_key(config)?)
+                    .with_vision(config.vision)
+                    .with_options(options),
             )
         }
         provider => bail!("unsupported agent provider {provider:?}"),
