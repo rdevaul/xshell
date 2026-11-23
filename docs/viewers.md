@@ -44,6 +44,9 @@ names another command; the file's path is appended to it:
 image_viewer = ["feh", "--scale-down"]
 ```
 
+In both cases the file must be a regular file of at most 20 MiB that begins
+as a PNG, JPEG, GIF or WebP; the extension only selects the image path, so a
+text file named `x.png` is refused.
 When the session host is this machine, the viewer is given the file itself.
 When it is another host, protocol v27 `ViewImage` reads the file there, under
 the same deadline as text and bounded to 20 MiB, and the client writes a copy
@@ -133,6 +136,11 @@ content-addressed derived artifacts with render manifests. xshell will not load
 untrusted Rust dynamic libraries into its own process. F3D and future CAD
 renderers should use this process boundary.
 
-Binary viewer transport, content-addressed staging, external renderer processes,
-inline image protocols, multimodal attachment, and plugin installation remain
-unimplemented.
+Images are the only binary type handled so far. `//view` opens them in a
+local viewer, as described above. `//attach`, `xshell run --attach` and the
+agent's `view_image` tool send them to vision models, from a per-session,
+content-addressed image store; see
+[session fabric](session-fabric.md#history-compaction) and
+[headless runs](headless.md). Inline terminal image protocols, viewers for
+other binary or media types, out-of-process viewer plugins and plugin
+installation remain unimplemented.

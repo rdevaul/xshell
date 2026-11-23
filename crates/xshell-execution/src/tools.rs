@@ -7,6 +7,7 @@ use crate::process::{
     supervise_shell,
 };
 use crate::provider::{RegisteredTool, ToolAccess, ToolRegistry};
+use crate::shell::{AmbientRunner, ShellRunner};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(test)]
 use tokio::process::Command;
 use xshell_core::{ToolCall, ToolDefinition};
 
@@ -572,6 +574,7 @@ pub(crate) async fn execute_tool_cancellable(
         root,
         cancellation,
         crate::TurnLimits::default().shell_timeout,
+        &AmbientRunner,
     )
     .await
 }
@@ -584,6 +587,7 @@ pub(crate) async fn execute_prepared(
     root: &Path,
     cancellation: CancellationFlag,
     shell_timeout: Duration,
+    runner: &dyn ShellRunner,
 ) -> String {
     let output = match preparation {
         Preparation::Failed(message) | Preparation::Blocked(message) => return message,
@@ -601,7 +605,7 @@ pub(crate) async fn execute_prepared(
         },
         Preparation::Other => match Tool::from_name(&call.name) {
             Some(Tool::RunShell) => {
-                run_shell(&call.arguments, root, cancellation, shell_timeout).await
+                run_shell_under(runner, &call.arguments, root, cancellation, shell_timeout).await
             }
             Some(Tool::DelegateTask) => Err(anyhow::anyhow!(
                 "delegate_task is dispatched by the agent engine"
@@ -716,6 +720,7 @@ fn list_directory(object: PreparedObject) -> Result<String> {
     Ok(output)
 }
 
+#[cfg(test)]
 async fn run_shell(
     arguments: &Value,
     root: &Path,
@@ -725,9 +730,40 @@ async fn run_shell(
     run_shell_with_grace(arguments, root, cancellation, timeout, LINGER_GRACE).await
 }
 
+/// [`run_shell`] started by `runner`.
+async fn run_shell_under(
+    runner: &dyn ShellRunner,
+    arguments: &Value,
+    root: &Path,
+    cancellation: CancellationFlag,
+    timeout: Duration,
+) -> Result<String> {
+    run_shell_started_by(runner, arguments, root, cancellation, timeout, LINGER_GRACE).await
+}
+
 /// [`run_shell`] with an explicit linger grace, so tests can make
 /// cancellation or the timeout the only way a call can end.
+#[cfg(test)]
 async fn run_shell_with_grace(
+    arguments: &Value,
+    root: &Path,
+    cancellation: CancellationFlag,
+    timeout: Duration,
+    linger_grace: Duration,
+) -> Result<String> {
+    run_shell_started_by(
+        &AmbientRunner,
+        arguments,
+        root,
+        cancellation,
+        timeout,
+        linger_grace,
+    )
+    .await
+}
+
+async fn run_shell_started_by(
+    runner: &dyn ShellRunner,
     arguments: &Value,
     root: &Path,
     cancellation: CancellationFlag,
@@ -736,7 +772,10 @@ async fn run_shell_with_grace(
 ) -> Result<String> {
     let command = required_string(arguments, "command")?;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let mut process = Command::new(&shell);
+    // The runner decides how the shell is started: directly, or inside
+    // whatever contains this session's commands. Everything below applies
+    // to the process it describes.
+    let mut process = runner.command(Path::new(&shell), command, root)?;
     // Agent-requested commands run as a plain non-login shell: sourcing the
     // user's login profile on every tool call is slow and replays profile
     // side effects. Direct `$` input, which the user types, keeps `-l`.
@@ -751,9 +790,6 @@ async fn run_shell_with_grace(
     // cancellation kills the whole pipeline, background jobs included,
     // rather than only the shell leader.
     process
-        .arg("-c")
-        .arg(command)
-        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

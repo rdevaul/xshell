@@ -5,7 +5,8 @@
 
 ## 1. Summary
 
-The engine offers four built-in tools, held in a closed `Tool` enum. A
+The engine offers five built-in tools (`read_file`, `list_directory`,
+`view_image`, `run_shell` and `delegate_task`), held in a closed `Tool` enum. A
 **tool provider** lets trusted, compiled-in Rust code add more tools, such as
 `memory_get` or `send_message` for a chat gateway built on `xshelld`. Every
 provided tool goes through the same toolset check, approval policy, approval
@@ -133,7 +134,7 @@ built-in call:
 3. **Gate:** `ToolApproval::Required` produces the new
    `GateReason::ToolDeclared`, which is treated exactly like `run_shell`'s
    gate: prompted in `ask` mode, run in `auto`, denied in `off`. The new
-   reason is a wire change, so this change moves to session protocol 20.
+   reason was a wire change (session protocol 20 at the time).
    `NotRequired` tools are ungated, like the read-only built-in tools,
    with one exception: **`off` denies every `ReadWrite` tool**, gated or
    not, so `off` keeps meaning the agent changes nothing. A `ReadOnly`
@@ -155,8 +156,8 @@ and the path tools, so writing one fails loudly instead of matching nothing.
 ### 4.5 Subagents
 
 `delegate_task` with `tools: "read_only"` gets the parent's read-only subset,
-including read-only provided tools. With `"inherit"` it gets the parent's
-whole set. In both cases `delegate_task` itself is removed. Built-in tools
+including read-only provided tools and, for a vision model, `view_image`.
+With `"inherit"` it gets the parent's whole set. In both cases `delegate_task` itself is removed. Built-in tools
 behave exactly as before. A provided call from a subagent carries the
 subagent's scope in `ToolContext::agent`.
 
@@ -218,9 +219,12 @@ built-in and provided tool.
 
 ## 5. Where providers are registered
 
-`DaemonPolicy` has a new `tools: Arc<ToolRegistry>` field. `xshelld` builds
-every agent turn with `ToolSet::all().with_provided(registry)` and the
-turn's session id, and passes the registry to the audit record. The stock
+`DaemonPolicy` carries `tools: Arc<ToolRegistry>` and an optional context
+provider (§5.3). For every agent turn `xshelld` starts from
+`ToolSet::all().with_provided(registry)`, narrows it to the session's
+selection (§5.2), and drops `view_image` for a model without `vision`. It
+passes the turn's session id to providers and the registry to the audit
+record. The stock
 `xshelld` registers no providers (`ToolRegistry::empty()`), so nothing
 changes for existing deployments. The standalone CLI likewise has none.
 
@@ -249,7 +253,8 @@ and `service`. It speaks the same session protocol, so `xshell` clients
 connect to it unchanged. `Daemon::run_with_args` takes an explicit command
 line, for programs that build one themselves. At startup the daemon prints
 the provided tools and the first 12 characters of the registry identity, so
-an operator can match a running build against its audit records.
+an operator can match a running build against its audit records, and the
+name of its context provider, if any.
 
 `main` and `run_with_args` run the daemon as the whole process: they install
 the SIGTERM and SIGINT handlers that stop it, print to stdout, and exit the
@@ -399,8 +404,8 @@ told the session, and choosing whose memory to load is its job.
 | S2 | **Embeddable daemon.** `xshelld` moved into the library as `xshell_session::daemon::Daemon`, with `with_tools` (§5.1) | Done (#122) |
 | S3 | **Argument-scoped policy.** An optional `ToolProvider::policy_subject(tool, arguments) -> Option<String>` returning the string an argument pattern matches, so rules such as `memory_put: shared/*` work | When a provider needs it |
 | S4 | **Per-session tool selections.** A session's creation names the built-in and provided tools its agent may use (§5.2) | Done (#124) |
-| S6 | **Turn context.** A compiled-in `ContextProvider` supplies system-prompt text for each agent turn (§5.3) | Done |
-| S5 | **Model-facing errors and output.** Optional structured results (images through the content-addressed image store, A1–A4) | After A4 |
+| S5 | **Model-facing errors and output.** Optional structured results (images through the content-addressed image store) | Not started. The image store it needs has landed (#127), but a provider's result is still text only |
+| S6 | **Turn context.** A compiled-in `ContextProvider` supplies system-prompt text for each agent turn (§5.3) | Done (#166) |
 
 Out-of-process providers are not planned. A tool that has to run out of
 process should be an MCP server behind the bridge.

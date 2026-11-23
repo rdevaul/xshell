@@ -1,6 +1,7 @@
 mod audit;
 mod client;
 mod completion;
+mod containment;
 mod control_token;
 mod credentials;
 pub mod daemon;
@@ -23,6 +24,9 @@ pub use client::{
     SessionHandshake,
 };
 pub use completion::complete_shell;
+pub use containment::{
+    IsolatedShell, MinimumContainment, SecretSource, ShellBounds, ShellContainment, ShellNetwork,
+};
 pub use control_token::{control_token_path, read_token, tokens_match, write_new_token};
 pub use credentials::{ConfiguredModel, CredentialRoutes, default_model_base_url};
 pub use execution::{ContextSource, DaemonPolicy, ExecutionCoordinator};

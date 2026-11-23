@@ -10,10 +10,10 @@ use crate::tools::{
     Preparation, ToolRef, execute_prepared, execute_view_image, gate, prepare_call, truncate,
 };
 use crate::{
-    ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor, DecisionBasis,
-    GateReason, PolicyDecision, SensitivePaths, SessionImages, Tool, ToolAccess, ToolApproval,
-    ToolSet, TurnContext, default_decision, drop_tool_payloads, estimate_history_tokens,
-    history_bytes,
+    AmbientRunner, ApprovalRules, CallFacts, CompactionConfig, CompactionReport, Compactor,
+    DecisionBasis, GateReason, PolicyDecision, SensitivePaths, SessionImages, ShellRunner, Tool,
+    ToolAccess, ToolApproval, ToolSet, TurnContext, default_decision, drop_tool_payloads,
+    estimate_history_tokens, history_bytes,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -423,6 +423,10 @@ pub struct TurnPolicy {
     /// The daemon session the turn belongs to, passed to tool providers so
     /// they can keep per-session state. `None` outside a daemon.
     pub session_id: Option<String>,
+    /// How this agent's `run_shell` commands are started: directly, or
+    /// inside whatever contains the session's commands. Subagents inherit
+    /// it.
+    pub shell: Arc<dyn ShellRunner>,
     /// Text appended to the system prompt of this turn's provider requests
     /// and never written to history (see [`crate::ContextProvider`]).
     /// Subagents do not inherit it.
@@ -451,6 +455,7 @@ impl std::fmt::Debug for TurnPolicy {
             .field("tools", &self.tools)
             .field("agent_scope", &self.agent_scope)
             .field("session_id", &self.session_id)
+            .field("shell", &self.shell)
             .field(
                 "context",
                 &self.context.as_ref().map(|context| context.sha256()),
@@ -473,6 +478,7 @@ impl Clone for TurnPolicy {
             tools: self.tools.clone(),
             agent_scope: self.agent_scope.clone(),
             session_id: self.session_id.clone(),
+            shell: Arc::clone(&self.shell),
             context: self.context.clone(),
             images: self.images.clone(),
             message_images: self.message_images.clone(),
@@ -492,6 +498,7 @@ impl TurnPolicy {
             tools: ToolSet::all(),
             agent_scope: None,
             session_id: None,
+            shell: Arc::new(AmbientRunner),
             context: None,
             images: None,
             message_images: Vec::new(),
@@ -524,6 +531,11 @@ impl TurnPolicy {
 
     pub fn with_context(mut self, context: Option<TurnContext>) -> Self {
         self.context = context.map(Arc::new);
+        self
+    }
+
+    pub fn with_shell(mut self, shell: Arc<dyn ShellRunner>) -> Self {
+        self.shell = shell;
         self
     }
 
@@ -1159,6 +1171,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     cwd,
                     observer.cancellation(),
                     budget.limits().shell_timeout,
+                    policy.shell.as_ref(),
                 )
                 .await
             };

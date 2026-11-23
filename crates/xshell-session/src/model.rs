@@ -23,8 +23,8 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `ExecutionEvent::ToolResult`. Version 26 adds the control `token` on
 // `ClientRequest::Open` and refuses unauthenticated requests (F27). Version 27
 // adds `AttachImage` and `ViewImage`, which read an image file on the session
-// host.
-pub const SESSION_PROTOCOL_VERSION: u32 = 27;
+// host. Version 28 adds `shell` on `SessionCreation` and `SessionDescriptor`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 28;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +102,9 @@ pub struct SessionConfig {
     /// submission beyond it is refused, so one long job cannot be joined by
     /// an unbounded number of others.
     pub max_concurrent_turns: usize,
+    /// What sessions may ask for when they contain their shell commands
+    /// (see [`crate::ShellBounds`]).
+    pub shell: crate::ShellBounds,
 }
 
 /// Built-in `max_sessions`.
@@ -260,6 +263,7 @@ impl Default for SessionConfig {
             sensitivity: Vec::new(),
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_concurrent_turns: DEFAULT_MAX_CONCURRENT_TURNS,
+            shell: crate::ShellBounds::default(),
         }
     }
 }
@@ -476,6 +480,11 @@ pub struct SessionDescriptor {
     /// created; sessions saved before it existed offer every tool.
     #[serde(default, skip_serializing_if = "SessionTools::is_all")]
     pub tools: SessionTools,
+    /// Where this session's shell commands may work, with every path
+    /// resolved. Fixed when the session is created; sessions saved before it
+    /// existed are ambient.
+    #[serde(default, skip_serializing_if = "crate::ShellContainment::is_ambient")]
+    pub shell: crate::ShellContainment,
 }
 
 /// Which tools a session's agent may use, out of those its daemon offers:
@@ -519,6 +528,9 @@ pub struct SessionCreation {
     /// The tools the session's agent may use; every tool when omitted.
     #[serde(default, skip_serializing_if = "SessionTools::is_all")]
     pub tools: SessionTools,
+    /// Where the session's shell commands may work; ambient when omitted.
+    #[serde(default, skip_serializing_if = "crate::ShellContainment::is_ambient")]
+    pub shell: crate::ShellContainment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

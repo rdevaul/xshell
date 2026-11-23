@@ -22,7 +22,7 @@ with exactly that version.
 | Minimum Rust version | `RUSTUP_TOOLCHAIN=1.95.0 cargo check --locked --workspace --all-targets` | Linux |
 | Dependency advisories | `cargo audit` (RustSec) | Linux |
 | Home-lab runner | `cargo build --locked -p xshell-audit -p xshell-session -p xshell-cli --bins`, then `XSHELL_RUNALL_REAL_BIN_DIR=target/debug python3 -B -m unittest discover -s scripts/tests -v` | macOS, Linux |
-| FutureShell fixtures | `./scripts/futureshell-workspace-probe.sh` and `./fixtures/futureshell/fea/check-fixture.sh` | macOS, Linux |
+| FutureShell fixtures | `./scripts/futureshell-workspace-probe.sh` and `./fixtures/futureshell/fea/check-fixture.sh` | macOS, Linux x86_64 (the probe also on Linux arm64) |
 
 Clippy warnings fail the build. The workspace enables
 `clippy::undocumented_unsafe_blocks`, so every `unsafe` block needs a

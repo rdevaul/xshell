@@ -140,9 +140,10 @@ is rejected with directions to resume, switch, or stop the process.
 
 Daemon-lifetime and durable sessions retain interactive processes across controller and
 stream disconnections, but interactive processes do not yet survive an `xshelld`
-restart. Ephemeral sessions terminate jobs on detach. PTY activity appears as
-`running` in the session catalog, but terminal bytes are not added to the
-durable conversation. When auditing is enabled the daemon records each job's
+restart. Ephemeral sessions terminate jobs on detach. PTY activity appears in
+the session catalog as an interactive process, with its command and whether
+a controller is attached (`interactive (attached): emacs`), but terminal
+bytes are not added to the durable conversation. When auditing is enabled the daemon records each job's
 start and exit; the byte stream itself is recorded only if the operator opts
 in with `audit.terminal_stream` (see [auditing](auditing.md#terminal-stream-capture-opt-in)).
 

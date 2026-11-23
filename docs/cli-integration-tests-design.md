@@ -6,9 +6,12 @@
 ## 1. Problem
 
 The `xshell` binary is the part of the system people use, and it is the
-least tested. `xshell-cli` has about 6,300 lines and only unit tests. Every
-test of the daemon (`crates/xshell-session/tests/service.rs`) talks to
-`xshelld` through `SessionClient` and never runs the CLI.
+least tested. `xshell-cli` has about 9,600 lines. Its headless commands are now
+tested end to end with piped stdio (`crates/xshell-cli/tests/run.rs` runs the
+real `xshell` against a real `xshelld` and a scripted provider), but nothing
+drives the interactive CLI on a terminal. The daemon's own tests
+(`crates/xshell-session/tests/service.rs`) talk to
+`xshelld` through `SessionClient` and never run the CLI.
 
 The CLI's riskiest code is exactly what unit tests cannot reach:
 
@@ -237,8 +240,10 @@ run in parallel.
   this design targets sit in the real terminal, real escape handling, and the
   real process boundary, which an in-process seam replaces. Keep it as a
   complement, not the main approach.
-- **Run the CLI with piped stdin, not a terminal.** `scripts/tests` already
-  does this for `//quit`. With piped stdin the CLI sees no terminal: there
+- **Run the CLI with piped stdin, not a terminal.** `scripts/tests` and
+  `crates/xshell-cli/tests/run.rs` already do this, the latter for all the
+  headless commands. Its `xshelld_binary`, `sse_text` and `sse_tool_call`
+  helpers are a starting point for the harness here. With piped stdin the CLI sees no terminal: there
   is no raw mode, no escape prefix, no approval prompt in the terminal, and
   `$` commands do not use a PTY. That leaves out the code that breaks.
 - **`expectrl` or `rexpect`.** These spawn on a PTY and match output, but
