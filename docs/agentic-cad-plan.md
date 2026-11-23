@@ -588,4 +588,6 @@ These are included in the estimates above, except the security review: allow
    - running shell tools as a separate, less-privileged user.
 
    This deserves its own design document before headless runs with broad
-   `run_shell` allowances become common.
+   `run_shell` allowances become common. *(That document now exists:
+   [contained shell commands](shell-sandbox.md) proposes the operating-system
+   sandbox, with directory roots per session.)*
