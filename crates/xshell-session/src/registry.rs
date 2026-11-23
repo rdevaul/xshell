@@ -54,7 +54,10 @@ const IMAGES_DIRECTORY: &str = "images";
 /// - 3: session descriptors may carry `tools` (a tool selection). An older
 ///   daemon refuses a version 3 file rather than dropping a selection, which
 ///   would give that session's agent every tool.
-const SESSION_STATE_FORMAT_VERSION: u32 = 3;
+/// - 4: session descriptors may carry `shell` (shell containment). An
+///   older daemon refuses the file rather than dropping it, which would run a
+///   contained session's commands with full authority.
+const SESSION_STATE_FORMAT_VERSION: u32 = 4;
 /// Oldest `sessions.json` format this daemon still loads.
 const MIN_SESSION_STATE_FORMAT_VERSION: u32 = 1;
 
@@ -279,6 +282,7 @@ close one to create another",
             created_at_unix_ms: now,
             last_active_at_unix_ms: now,
             tools: creation.tools,
+            shell: creation.shell,
         };
         // A new session's store is empty, so history from the client may not
         // reference any image yet.
@@ -807,6 +811,7 @@ mod tests {
             visibility,
             history,
             tools: Default::default(),
+            shell: Default::default(),
         }
     }
 

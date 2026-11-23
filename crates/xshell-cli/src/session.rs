@@ -86,6 +86,7 @@ impl SessionRuntime {
                 visibility: Visibility::Fabric,
                 history: history.to_vec(),
                 tools: Default::default(),
+                shell: Default::default(),
             })?
         };
         let active = Some(snapshot.descriptor.clone());
@@ -269,6 +270,7 @@ impl SessionRuntime {
                 visibility: Visibility::Fabric,
                 history: vec![ChatMessage::system(system_prompt)],
                 tools: Default::default(),
+                shell: Default::default(),
             })?
         };
 
@@ -410,6 +412,7 @@ session's interactive process is running; stop it first"
             visibility,
             history,
             tools: Default::default(),
+            shell: Default::default(),
         })?;
         if let Some(previous) = previous {
             self.navigation_history.push(previous);
@@ -438,6 +441,7 @@ session's interactive process is running; stop it first"
             persistence: PersistenceMode::Daemon,
             visibility: Visibility::Fabric,
             tools: Default::default(),
+            shell: Default::default(),
         })?;
         self.navigation_history.push(previous);
         self.active = Some(created.descriptor.clone());
@@ -1113,6 +1117,7 @@ mod tests {
                     created_at_unix_ms: 0,
                     last_active_at_unix_ms: 0,
                     tools: Default::default(),
+                    shell: Default::default(),
                 },
                 history,
             }

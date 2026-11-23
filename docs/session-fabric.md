@@ -16,7 +16,7 @@ disabled.
 
 The client and daemon exchange newline-delimited JSON over a Unix-domain
 socket or an authenticated SSH stdio proxy. The first request must be `open`
-with protocol version 27 and, for anything beyond a probe, the daemon's
+with protocol version 28 and, for anything beyond a probe, the daemon's
 control token (see [Who may control the daemon](#who-may-control-the-daemon)).
 The daemon
 returns a connection-scoped client UUID and its stable host ID, host alias, and
@@ -30,8 +30,10 @@ session listings, completion, selectors, and the interactive picker.
 Protocol versions are exact rather than negotiated across incompatible
 schemas. Any protocol bump therefore requires upgrading and restarting
 `xshelld` on the controller and every connected remote host before the new CLI
-can attach. The current version is 27. Newest first:
+can attach. The current version is 28. Newest first:
 
+- v28 adds `shell`, a session's shell containment, on session creation and
+  the session descriptor ([contained shell commands](shell-sandbox.md)).
 - v27 adds `attach_image` and `view_image`, which read an image file on the
   session host.
 - v26 adds the control `token` on `open` and refuses requests on a

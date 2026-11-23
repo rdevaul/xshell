@@ -217,6 +217,17 @@ pty_escape = "ctrl-]"
 # allowed = ["run_shell: yapcad *", "run_shell: make *"]
 # denied = ["run_shell: rm *", "run_shell: git push *"]
 
+# What sessions may ask for when they contain their shell commands to chosen
+# directories (docs/shell-sandbox.md). A session gets the most restrictive
+# combination of what it asks for and what is allowed here. Nothing enforces
+# containment yet, so the daemon still refuses isolated sessions; these
+# settings already bound what a session may ask for.
+# [session_fabric.shell]
+# minimum = "ambient"                     # or "isolated": refuse ambient shells
+# allowed_roots = ["~/src"]               # roots must be inside one of these
+# allowed_read_only = ["~/.cargo", "~/.rustup"]
+# allow_network = false
+
 # Sensitivity classes: "prompt" paths need approval for agent reads (as
 # sensitive_paths); "block" paths can never be read by agent read tools.
 # [[session_fabric.sensitivity]]

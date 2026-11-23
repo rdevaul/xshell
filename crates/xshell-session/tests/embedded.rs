@@ -97,6 +97,7 @@ fn creation(name: &str, base_url: &str, cwd: &Path, tools: SessionTools) -> Sess
         visibility: Visibility::Fabric,
         history: vec![ChatMessage::system("test")],
         tools,
+        shell: Default::default(),
     }
 }
 

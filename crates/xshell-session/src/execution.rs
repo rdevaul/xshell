@@ -66,6 +66,12 @@ pub struct DaemonPolicy {
     /// Supplies system-prompt text for each agent turn; `None` in the stock
     /// daemon.
     pub context: Option<ContextSource>,
+    /// What sessions may ask for when they contain their shell commands.
+    pub shell: crate::ShellBounds,
+    /// The daemon's own files, which no session's roots or grants may
+    /// expose: its state directory, configuration file, audit directory and
+    /// control token.
+    pub protected_paths: Vec<std::path::PathBuf>,
 }
 
 /// A compiled-in [`ContextProvider`], as the daemon's policy holds it.
@@ -98,6 +104,8 @@ impl Default for DaemonPolicy {
             max_concurrent_turns: crate::DEFAULT_MAX_CONCURRENT_TURNS,
             credential_routes: CredentialRoutes::default(),
             context: None,
+            shell: crate::ShellBounds::default(),
+            protected_paths: Vec::new(),
         }
     }
 }
@@ -233,6 +241,37 @@ impl ExecutionCoordinator {
             }
         }
         Ok(())
+    }
+
+    /// Check a session's requested shell containment against the operator's
+    /// bounds and resolve its paths; `cwd` is the session's working
+    /// directory, already canonical.
+    ///
+    /// An isolated shell is refused on a host with nothing to enforce it. A
+    /// session must never be recorded as isolated while its commands would
+    /// run with full authority.
+    pub fn resolve_shell(
+        &self,
+        request: &crate::ShellContainment,
+        cwd: &std::path::Path,
+    ) -> Result<crate::ShellContainment> {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let resolved = crate::containment::resolve(
+            request,
+            &self.inner.policy.shell,
+            cwd,
+            &crate::containment::Host {
+                home: home.as_deref(),
+                protected: &self.inner.policy.protected_paths,
+            },
+        )?;
+        if !resolved.is_ambient() {
+            bail!(
+                "this session host cannot enforce an isolated shell yet, so it will not \
+create a session that asks for one"
+            );
+        }
+        Ok(resolved)
     }
 
     /// The tools a session's agent turns are offered: every built-in and

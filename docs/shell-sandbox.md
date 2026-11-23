@@ -1,7 +1,9 @@
 # Contained shell commands: design
 
-**Status:** proposed, with the decisions of 23 November recorded in §11;
-nothing here is implemented.
+**Status:** proposed, with the decisions of 23 November recorded in §11.
+Stage C1 is implemented: the model, the operator's bounds, root resolution
+and the runner seam. Nothing enforces containment yet, so a daemon refuses
+to create a session that asks for an isolated shell.
 **Updated:** 23 November 2026
 
 ## 1. Summary
@@ -159,7 +161,8 @@ allowed_read_only = ["~/.cargo", "~/.rustup", "/opt/homebrew"]
 # Whether a session may turn the network on.
 allow_network = true
 # The most permissive approval mode for sessions that are isolated (§6).
-max_approval_isolated = "auto"
+# Part of stage C4; not accepted yet.
+# max_approval_isolated = "auto"
 
 # The secrets a session may ask for by name, and where each comes from (§4.5).
 [session_fabric.shell.secrets]
@@ -458,7 +461,7 @@ that C1's seam and containment model do not have to change to admit it.
 
 | # | Task | LoE (days) |
 |---|---|---|
-| C1 | `ShellContainment` on session creation and descriptor; root resolution and validation; the operator's `[session_fabric.shell]` bounds and the most-restrictive rule; persisted with a state-format bump; session protocol bump; `ShellRunner` trait with the ambient runner. A host with no enforcing runner refuses isolated sessions | 4–5 |
+| C1 (done) | `ShellContainment` on session creation and descriptor; root resolution and validation; the operator's `[session_fabric.shell]` bounds and the most-restrictive rule; persisted with a state-format bump; session protocol bump; `ShellRunner` trait with the ambient runner. A host with no enforcing runner refuses isolated sessions | 4–5 |
 | C2 | macOS runner: profile generation, the scratch directory, the startup self-test, fail-closed behaviour. Tests on the macOS CI runner: writes and reads outside the roots fail, including through a symbolic link, `..`, and the `/System/Volumes/Data` spelling; the daemon socket and token are unreachable; network off blocks a connection; a `git` clone, a `cargo build` and a Python script work inside a root with the documented grants | 5–7 |
 | C3 | File tools confined to roots in isolated sessions; named secrets with output redaction; `user_commands` for `$` commands and interactive programs | 4–6 |
 | C4 | `max_approval_isolated`; `turn_started` and descriptor fields with an audit format bump; documentation; the security ledger | 2–3 |
