@@ -85,6 +85,10 @@ pub struct ModelProfile {
     /// Anthropic only: whether to send `anthropic-beta` at all.
     #[serde(default)]
     pub send_betas: Option<bool>,
+    /// Anthropic only: prompt-cache lifetime, "5m" (the default), "1h" or
+    /// "off".
+    #[serde(default)]
+    pub cache_ttl: Option<String>,
 }
 
 impl ModelProfile {
@@ -100,6 +104,7 @@ impl ModelProfile {
             max_output_tokens: self.max_output_tokens,
             betas: self.betas.clone(),
             send_betas: self.send_betas,
+            cache_ttl: self.cache_ttl.clone(),
         }
     }
 
@@ -109,8 +114,8 @@ impl ModelProfile {
             AnthropicOptions::from_settings(&settings).map_err(anyhow::Error::msg)?;
         } else if !settings.is_default() {
             bail!(
-                "auth, api_version, effort, thinking, thinking_display, max_output_tokens, betas \
-and send_betas apply only to provider = \"anthropic\""
+                "auth, api_version, effort, thinking, thinking_display, max_output_tokens, betas, \
+send_betas and cache_ttl apply only to provider = \"anthropic\""
             );
         }
         Ok(())

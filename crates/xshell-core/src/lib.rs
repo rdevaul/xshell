@@ -555,6 +555,9 @@ pub struct AnthropicSettings {
     /// Whether to send `anthropic-beta` at all; some gateways reject it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_betas: Option<bool>,
+    /// Prompt-cache lifetime: "5m" (the default), "1h", or "off".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<String>,
 }
 
 impl AnthropicSettings {

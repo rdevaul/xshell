@@ -415,9 +415,24 @@ request.
   shell command is what risks an expiry. With `cache_ttl = "auto"`, the adapter uses `1h`
   whenever the previous tool call ran longer than four minutes. That costs 2× on writes, against
   re-reading the whole prefix uncached.
-- **Verification.** `cache_read` in §5.3 shows whether caching works. A turn whose model rounds
-  report zero cache reads after the first gets a `warning` event naming the likely cause (system
-  or tool change, history edit).
+- **As built (P5).**
+  - Three markers are used, not four. The one on the last system block also caches the tools,
+    which render before it; the last tool carries the marker only when there is no system prompt.
+    The other two go on the last block of the newest user message and of the user message before
+    it.
+  - `cache_ttl` is `"5m"` (the default), `"1h"` or `"off"`. `"auto"` needs the engine to tell the
+    adapter how long the last tool ran, and is left for later.
+  - Every marker has the same lifetime, which keeps the API's rule that longer-lived entries come
+    first.
+  - Within one turn every request is the previous one plus new messages, which a test checks. A
+    new turn still changes the system prompt, because the engine appends the turn's context to it
+    (`engine.rs:1528`). So a new turn re-reads the tools and system prompt uncached once; a
+    one-turn headless run is not affected. Moving that context into `messages` is part of P6.
+- **Verification.** `cache_read` in §5.3 shows whether caching works. As built, the headless
+  client warns at the end of a run that made two or more model rounds, wrote cache entries and read
+  none back: the prompt changed between requests. The warning is the client's, since the engine has
+  no warning event; the per-response `usage` in the JSONL stream locates the round where reads
+  stopped.
 
 ## 8. Errors and retries
 
@@ -517,7 +532,7 @@ limits = "cad"
 | P2 (done) | `provider_blocks` in core, session files and protocol; thinking replay; tool-id rewrite and history repair | 2–3 days |
 | P3 (done) | Usage: `TokenUsage`, sums per turn, `result.usage.tokens`, audit record | 1–2 days |
 | P4 | `api_key_command` with TTL and 401 refresh; daemon-only route; audit event | 2–3 days |
-| P5 | Caching: breakpoints, stability tests, `cache_ttl`, zero-read warning | 1–2 days |
+| P5 (in progress) | Caching: breakpoints, stability tests, `cache_ttl`, zero-read warning | 1–2 days |
 | P6 | Append-only history: compaction mode, server compaction or tool-result clearing, per-turn context as a turn-scoped system message, live conformance test | 4–6 days |
 
 - **What each stage enables.**

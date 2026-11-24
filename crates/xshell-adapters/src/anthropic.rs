@@ -75,6 +75,28 @@ pub struct AnthropicOptions {
     pub betas: Vec<String>,
     /// Whether to send `anthropic-beta` at all. Some gateways reject it.
     pub send_betas: bool,
+    /// The lifetime of the prompt-cache entries the request asks for, or
+    /// `None` to ask for none.
+    pub cache_ttl: Option<CacheTtl>,
+}
+
+/// How long a prompt-cache entry lives after its last use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    /// The API's default. Requests in a tool loop arrive well within it.
+    FiveMinutes,
+    /// Survives longer pauses, such as a slow tool, at twice the write
+    /// price.
+    OneHour,
+}
+
+impl CacheTtl {
+    fn marker(self) -> Value {
+        match self {
+            Self::FiveMinutes => json!({"type": "ephemeral"}),
+            Self::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
+        }
+    }
 }
 
 /// Effort levels the API accepts.
@@ -124,6 +146,16 @@ reject \"disabled\" and budget_tokens"
                 ));
             }
         };
+        let cache_ttl = match settings.cache_ttl.as_deref() {
+            None | Some("5m") => Some(CacheTtl::FiveMinutes),
+            Some("1h") => Some(CacheTtl::OneHour),
+            Some("off") => None,
+            Some(other) => {
+                return Err(format!(
+                    "cache_ttl {other:?} is not \"5m\", \"1h\" or \"off\""
+                ));
+            }
+        };
         if settings.max_output_tokens == Some(0) {
             return Err("max_output_tokens must be positive".into());
         }
@@ -137,6 +169,7 @@ reject \"disabled\" and budget_tokens"
             thinking_display,
             betas: settings.betas.clone(),
             send_betas: settings.send_betas.unwrap_or(defaults.send_betas),
+            cache_ttl,
         })
     }
 }
@@ -151,6 +184,7 @@ impl Default for AnthropicOptions {
             thinking_display: None,
             betas: Vec::new(),
             send_betas: true,
+            cache_ttl: Some(CacheTtl::FiveMinutes),
         }
     }
 }
@@ -233,6 +267,9 @@ impl AnthropicAdapter {
         if let Some(effort) = &self.options.effort {
             body["output_config"] = json!({"effort": effort});
         }
+        if let Some(ttl) = self.options.cache_ttl {
+            place_cache_markers(&mut body, ttl);
+        }
         body
     }
 
@@ -254,6 +291,45 @@ impl AnthropicAdapter {
             };
         }
         Ok(builder)
+    }
+}
+
+/// Mark where the prompt cache should end, at the request's stability
+/// boundaries. Caching is a prefix match over tools, system, then messages,
+/// and the API allows four markers; three are used:
+///
+/// 1. The last system block, which caches the tools with it. With no system
+///    prompt, the last tool instead.
+/// 2. The last block of the newest user message: the next request reads
+///    everything up to here.
+/// 3. The last block of the user message before it, so that a request whose
+///    newest message added many blocks still finds the previous entry within
+///    the API's 20-position lookback.
+///
+/// Every marker has the same lifetime, which keeps the API's rule that
+/// longer-lived entries come before shorter ones.
+fn place_cache_markers(body: &mut Value, ttl: CacheTtl) {
+    let marker = ttl.marker();
+    let mark_last = |blocks: &mut Value| {
+        if let Some(last) = blocks.as_array_mut().and_then(|blocks| blocks.last_mut()) {
+            last["cache_control"] = marker.clone();
+        }
+    };
+    if body["system"].is_array() {
+        mark_last(&mut body["system"]);
+    } else if body["tools"].is_array() {
+        mark_last(&mut body["tools"]);
+    }
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for message in messages
+        .iter_mut()
+        .rev()
+        .filter(|message| message["role"] == "user")
+        .take(2)
+    {
+        mark_last(&mut message["content"]);
     }
 }
 
@@ -1107,6 +1183,13 @@ mod tests {
                 },
                 "positive",
             ),
+            (
+                AnthropicSettings {
+                    cache_ttl: Some("10m".into()),
+                    ..Default::default()
+                },
+                "cache_ttl",
+            ),
         ] {
             let error = AnthropicOptions::from_settings(&settings).unwrap_err();
             assert!(error.contains(reason), "{error}");
@@ -1463,10 +1546,160 @@ mod tests {
         }
     }
 
-    /// The JSON body sent for `messages` and `tools`.
+    /// The JSON body sent for `messages` and `tools`, without cache markers.
     fn body_for(messages: Vec<ChatMessage>, tools: Vec<ToolDefinition>) -> Value {
         AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_options(AnthropicOptions {
+                cache_ttl: None,
+                ..AnthropicOptions::default()
+            })
             .body(&ChatRequest::new(messages, tools))
+    }
+
+    /// The body as sent with caching at `ttl`.
+    fn cached_body(messages: Vec<ChatMessage>, tools: Vec<ToolDefinition>, ttl: CacheTtl) -> Value {
+        AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_options(AnthropicOptions {
+                cache_ttl: Some(ttl),
+                ..AnthropicOptions::default()
+            })
+            .body(&ChatRequest::new(messages, tools))
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: "d".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    /// Every block carrying a cache marker, by its JSON pointer.
+    fn markers(body: &Value) -> Vec<String> {
+        fn walk(value: &Value, path: String, found: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    if map.contains_key("cache_control") {
+                        found.push(path.clone());
+                    }
+                    for (key, child) in map {
+                        if key != "cache_control" {
+                            walk(child, format!("{path}/{key}"), found);
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        walk(child, format!("{path}/{index}"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(body, String::new(), &mut found);
+        found
+    }
+
+    fn without_markers(mut body: Value) -> Value {
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    map.remove("cache_control");
+                    map.values_mut().for_each(strip);
+                }
+                Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut body);
+        body
+    }
+
+    /// A tool loop's history after `rounds` read_file round trips.
+    fn tool_loop(rounds: usize) -> Vec<ChatMessage> {
+        let mut history = vec![
+            ChatMessage::system("You are xshell."),
+            ChatMessage::user("go"),
+        ];
+        for round in 0..rounds {
+            let call = call(&format!("toolu_{round}"), &format!("f{round}"));
+            history.push(ChatMessage::assistant_with_tools("", vec![call.clone()]));
+            history.push(ChatMessage::tool_result(&call, format!("contents {round}")));
+        }
+        history
+    }
+
+    #[test]
+    fn cache_markers_sit_on_system_and_the_two_newest_user_messages() {
+        let body = cached_body(
+            tool_loop(3),
+            vec![tool("b"), tool("a")],
+            CacheTtl::FiveMinutes,
+        );
+        assert_eq!(
+            markers(&body),
+            [
+                "/messages/4/content/0",
+                "/messages/6/content/0",
+                "/system/0"
+            ]
+        );
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        // At most four markers are allowed; three are used.
+        assert!(markers(&body).len() <= 4);
+    }
+
+    #[test]
+    fn without_a_system_prompt_the_last_tool_is_marked() {
+        let body = cached_body(
+            vec![ChatMessage::user("go")],
+            vec![tool("b"), tool("a")],
+            CacheTtl::OneHour,
+        );
+        assert_eq!(markers(&body), ["/messages/0/content/0", "/tools/1"]);
+        assert_eq!(body["tools"][1]["name"], "b", "the last tool after sorting");
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn caching_off_sends_no_markers() {
+        assert!(markers(&body_for(tool_loop(3), vec![tool("a")])).is_empty());
+    }
+
+    #[test]
+    fn each_request_is_the_previous_one_plus_new_messages() {
+        // The cache is a prefix match: with markers removed, every request in
+        // a tool loop must start with the previous request byte for byte.
+        let tools = vec![tool("read_file"), tool("write")];
+        let mut previous: Option<Value> = None;
+        for rounds in 0..6 {
+            let body = without_markers(cached_body(
+                tool_loop(rounds),
+                tools.clone(),
+                CacheTtl::FiveMinutes,
+            ));
+            if let Some(previous) = previous {
+                assert_eq!(body["tools"], previous["tools"]);
+                assert_eq!(body["system"], previous["system"]);
+                let (now, before) = (
+                    body["messages"].as_array().unwrap(),
+                    previous["messages"].as_array().unwrap(),
+                );
+                assert_eq!(&now[..before.len()], &before[..], "round {rounds}");
+                assert_eq!(
+                    serde_json::to_string(&now[..before.len()]).unwrap(),
+                    serde_json::to_string(&before[..]).unwrap()
+                );
+            }
+            previous = Some(body);
+        }
     }
 
     fn call(id: &str, path: &str) -> ToolCall {

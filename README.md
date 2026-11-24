@@ -183,7 +183,9 @@ Anthropic models use `provider = "anthropic"`, which speaks the Messages API
 directly (see [docs/anthropic-provider.md](docs/anthropic-provider.md)). Set
 `effort` explicitly, since its default differs by model. Thinking stays off
 unless `thinking = "adaptive"`; its signed blocks are kept with the session
-and sent back unchanged, as the API requires during tool use.
+and sent back unchanged, as the API requires during tool use. Prompts are
+cached for five minutes by default (`cache_ttl = "1h"` or `"off"` to change
+it); a run's `usage.tokens` shows the cache reads.
 
 ```toml
 [models.opus]
