@@ -1,14 +1,12 @@
 //! The Anthropic Messages API (`POST /v1/messages`), streamed.
 //!
-//! See `docs/anthropic-provider.md`. This is stage P1: request mapping,
-//! streaming, `stop_reason` mapping, images, both credential headers, the
-//! API version, effort and thinking settings, and retry with backoff.
-//! Replaying signed thinking blocks (P2), usage (P3), credential commands
-//! (P4), cache breakpoints (P5) and append-only history (P6) come later.
-//!
-//! Until P2, a profile that turns thinking on cannot run a tool loop: the API
-//! needs the thinking blocks of the assistant message that called a tool
-//! when its result comes back, and this adapter does not yet keep them.
+//! See `docs/anthropic-provider.md`. Built: request mapping, streaming,
+//! `stop_reason` mapping, images, both credential headers, the API version,
+//! effort and thinking settings, retry with backoff (P1); replay of signed
+//! thinking blocks (P2); usage (P3); cache breakpoints (P5); and server-side
+//! compaction at a token threshold (the adapter part of P6). Credential
+//! commands (P4) and the engine's append-only history mode (the rest of P6)
+//! come later.
 
 use crate::images::{Laid, lay_out};
 use crate::{AgentAdapter, stream_lines};
@@ -48,6 +46,22 @@ const RATE_LIMIT_RETRY_CAP: Duration = Duration::from_secs(60);
 /// Total time spent waiting between retries of one request.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
 
+/// The beta header and context edit for compaction at a token threshold.
+const COMPACT_BETA: &str = "compact-2026-01-12";
+const COMPACT_EDIT: &str = "compact_20260112";
+/// The API's default trigger, and the smallest it accepts.
+pub const DEFAULT_COMPACT_AT_TOKENS: u64 = 150_000;
+const MIN_COMPACT_AT_TOKENS: u64 = 50_000;
+/// The summarization prompt sent after the API's default prompt produced no
+/// summary. With tools defined, the model sometimes calls one instead of
+/// summarizing; the API then returns an empty `compaction` block and
+/// compacts nothing. This prompt rules tools out, at a cost: on some models
+/// a custom prompt summarizes without the earlier thinking.
+const NO_TOOLS_SUMMARY_PROMPT: &str = "Summarize the transcript inside <summary></summary> tags. \
+Include everything needed to continue the task in the next context window: the task, the state of \
+the work and of the files, decisions and why they were made, what failed, and the next steps. Do \
+not call any tools while writing this summary; respond with text only.";
+
 /// Which header carries the credential.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AnthropicAuth {
@@ -78,6 +92,21 @@ pub struct AnthropicOptions {
     /// The lifetime of the prompt-cache entries the request asks for, or
     /// `None` to ask for none.
     pub cache_ttl: Option<CacheTtl>,
+    /// Compaction on the server when the prompt reaches a size, or `None`.
+    pub compaction: Option<Compaction>,
+}
+
+/// Server-side compaction (`compact_20260112`): when a request's input
+/// reaches `at_tokens`, the API summarizes the conversation, returns the
+/// summary as a `compaction` block at the head of the response, and
+/// continues from it. The block is replayed like any other; the API ignores
+/// everything before it. The history is only appended to, so signed thinking
+/// stays valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compaction {
+    pub at_tokens: u64,
+    /// Replaces the API's summarization prompt.
+    pub instructions: Option<String>,
 }
 
 /// How long a prompt-cache entry lives after its last use.
@@ -159,6 +188,47 @@ reject \"disabled\" and budget_tokens"
         if settings.max_output_tokens == Some(0) {
             return Err("max_output_tokens must be positive".into());
         }
+        let send_betas = settings.send_betas.unwrap_or(defaults.send_betas);
+        let compaction = match settings.context_management.as_deref() {
+            None | Some("none") => {
+                if settings.compact_at_tokens.is_some() || settings.compact_instructions.is_some() {
+                    return Err(
+                        "compact_at_tokens and compact_instructions need context_management = \
+\"compact\""
+                            .into(),
+                    );
+                }
+                None
+            }
+            Some("compact") => {
+                let at_tokens = settings
+                    .compact_at_tokens
+                    .unwrap_or(DEFAULT_COMPACT_AT_TOKENS);
+                if at_tokens < MIN_COMPACT_AT_TOKENS {
+                    return Err(format!(
+                        "compact_at_tokens must be at least {MIN_COMPACT_AT_TOKENS}"
+                    ));
+                }
+                if !send_betas {
+                    return Err(format!(
+                        "context_management = \"compact\" needs the {COMPACT_BETA} beta header, \
+which send_betas = false turns off"
+                    ));
+                }
+                Some(Compaction {
+                    at_tokens,
+                    instructions: settings
+                        .compact_instructions
+                        .clone()
+                        .filter(|text| !text.trim().is_empty()),
+                })
+            }
+            Some(other) => {
+                return Err(format!(
+                    "context_management {other:?} is not \"compact\" or \"none\""
+                ));
+            }
+        };
         Ok(Self {
             auth,
             api_version: settings.api_version.clone().unwrap_or(defaults.api_version),
@@ -168,8 +238,9 @@ reject \"disabled\" and budget_tokens"
             effort: settings.effort.clone(),
             thinking_display,
             betas: settings.betas.clone(),
-            send_betas: settings.send_betas.unwrap_or(defaults.send_betas),
+            send_betas,
             cache_ttl,
+            compaction,
         })
     }
 }
@@ -185,6 +256,7 @@ impl Default for AnthropicOptions {
             betas: Vec::new(),
             send_betas: true,
             cache_ttl: Some(CacheTtl::FiveMinutes),
+            compaction: None,
         }
     }
 }
@@ -196,6 +268,9 @@ pub struct AnthropicAdapter {
     api_key: Option<String>,
     vision: bool,
     options: AnthropicOptions,
+    /// Whether a compaction produced no summary. Later requests then send
+    /// [`NO_TOOLS_SUMMARY_PROMPT`] unless the profile set a prompt.
+    summary_failed: bool,
 }
 
 impl AnthropicAdapter {
@@ -211,6 +286,7 @@ impl AnthropicAdapter {
             api_key,
             vision: false,
             options: AnthropicOptions::default(),
+            summary_failed: false,
         }
     }
 
@@ -270,7 +346,31 @@ impl AnthropicAdapter {
         if let Some(ttl) = self.options.cache_ttl {
             place_cache_markers(&mut body, ttl);
         }
+        if let Some(compaction) = &self.options.compaction {
+            let mut edit = json!({
+                "type": COMPACT_EDIT,
+                "trigger": {"type": "input_tokens", "value": compaction.at_tokens},
+            });
+            let instructions = compaction
+                .instructions
+                .as_deref()
+                .or(self.summary_failed.then_some(NO_TOOLS_SUMMARY_PROMPT));
+            if let Some(instructions) = instructions {
+                edit["instructions"] = json!(instructions);
+            }
+            body["context_management"] = json!({"edits": [edit]});
+        }
         body
+    }
+
+    /// The `anthropic-beta` values: the profile's, and those the request's
+    /// features need.
+    fn betas(&self) -> Vec<String> {
+        let mut betas = self.options.betas.clone();
+        if self.options.compaction.is_some() && !betas.iter().any(|beta| beta == COMPACT_BETA) {
+            betas.push(COMPACT_BETA.to_owned());
+        }
+        betas
     }
 
     fn request(&self, body: &Value) -> Result<reqwest::RequestBuilder, AdapterError> {
@@ -280,8 +380,9 @@ impl AnthropicAdapter {
             .header("accept", "text/event-stream")
             .header("anthropic-version", &self.options.api_version)
             .json(body);
-        if self.options.send_betas && !self.options.betas.is_empty() {
-            builder = builder.header("anthropic-beta", self.options.betas.join(","));
+        let betas = self.betas();
+        if self.options.send_betas && !betas.is_empty() {
+            builder = builder.header("anthropic-beta", betas.join(","));
         }
         if let Some(api_key) = &self.api_key {
             crate::check_credential_endpoint(&self.base_url)?;
@@ -613,6 +714,10 @@ enum Block {
     RedactedThinking {
         data: String,
     },
+    /// The summary server-side compaction wrote, or null when it wrote none.
+    Compaction {
+        content: Value,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -639,6 +744,10 @@ struct Collected {
     blocks: BTreeMap<usize, Value>,
     /// Whether any block is thinking, which must be replayed exactly.
     thinking: bool,
+    /// Compaction blocks received, and those of them with no summary. A
+    /// compaction block must be replayed too.
+    compactions: usize,
+    empty_summaries: usize,
     /// Usage as last reported: `message_start`'s, updated by `message_delta`.
     usage: Option<TokenUsage>,
 }
@@ -671,6 +780,9 @@ impl Collected {
                     }
                     Some("redacted_thinking") => Block::RedactedThinking {
                         data: block["data"].as_str().unwrap_or_default().to_owned(),
+                    },
+                    Some("compaction") => Block::Compaction {
+                        content: block.get("content").cloned().unwrap_or(Value::Null),
                     },
                     Some("tool_use") => {
                         if self.tool_calls.len() + self.open_tool_calls() >= crate::MAX_TOOL_CALLS {
@@ -726,6 +838,10 @@ impl Collected {
                         },
                     ) => {
                         pending_signature.push_str(delta["signature"].as_str().unwrap_or_default());
+                    }
+                    // The whole summary arrives in one delta.
+                    (Some("compaction_delta"), Block::Compaction { content }) => {
+                        *content = delta.get("content").cloned().unwrap_or(Value::Null);
                     }
                     (Some("input_json_delta"), Block::ToolUse { json, .. }) => {
                         let part = delta["partial_json"].as_str().unwrap_or_default();
@@ -804,6 +920,16 @@ impl Collected {
                         self.thinking = true;
                         json!({"type": "redacted_thinking", "data": data})
                     }
+                    Block::Compaction { content } => {
+                        self.compactions += 1;
+                        let summarized = content.as_str().is_some_and(|text| !text.is_empty());
+                        if !summarized {
+                            self.empty_summaries += 1;
+                        }
+                        // Replayed as received, null included: the API ignores
+                        // a block with no summary.
+                        json!({"type": "compaction", "content": content})
+                    }
                     Block::Text { text } => json!({"type": "text", "text": text}),
                     Block::Other(block) => block,
                 };
@@ -844,8 +970,42 @@ impl Collected {
 
     /// Take the counts `usage` reports. `message_delta` counts are
     /// cumulative, so each one present replaces the earlier value.
+    ///
+    /// With compaction on, `usage.iterations` lists each sampling step of
+    /// the request. The top-level counts leave out the compaction step, so
+    /// the total billed is the sum over `iterations`, which is what is kept.
     fn update_usage(&mut self, usage: &Value) {
         if !usage.is_object() {
+            return;
+        }
+        if let Some(iterations) = usage["iterations"]
+            .as_array()
+            .filter(|list| !list.is_empty())
+        {
+            let mut total = TokenUsage::default();
+            for step in iterations {
+                let count = |field: &str| step[field].as_u64().unwrap_or(0);
+                total = total
+                    + TokenUsage {
+                        input: count("input_tokens"),
+                        output: count("output_tokens"),
+                        cache_read: count("cache_read_input_tokens"),
+                        cache_write: count("cache_creation_input_tokens"),
+                        cache_write_1h: step["cache_creation"]["ephemeral_1h_input_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
+                        compactions: 0,
+                    };
+            }
+            // Steps may not break cache writes down by lifetime; the top level
+            // does.
+            if total.cache_write_1h == 0 {
+                total.cache_write_1h = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(total.cache_write);
+            }
+            self.usage = Some(total);
             return;
         }
         let mut current = self.usage.unwrap_or_default();
@@ -911,9 +1071,10 @@ call; raise max_output_tokens. Its {calls} tool call(s) were not run"
             }
         };
         crate::require_dispatchable(true, Some(finish_reason), self.tool_calls.len())?;
-        // Kept only when thinking needs exact replay; otherwise the text and
-        // tool calls rebuild the same message.
-        let provider_blocks = self.thinking.then(|| ProviderBlocks {
+        // Kept only when thinking or compaction needs exact replay;
+        // otherwise the text and tool calls rebuild the same message.
+        // A compaction block is replayed too: the API continues from it.
+        let provider_blocks = (self.thinking || self.compactions > 0).then(|| ProviderBlocks {
             provider: PROVIDER.to_owned(),
             model: self.model.unwrap_or_else(|| requested_model.to_owned()),
             blocks: self
@@ -928,7 +1089,10 @@ call; raise max_output_tokens. Its {calls} tool call(s) were not run"
             reasoning: Some(self.reasoning).filter(|text| !text.is_empty()),
             finish_reason: Some(finish_reason.to_owned()),
             provider_blocks,
-            usage: self.usage,
+            usage: self.usage.map(|usage| TokenUsage {
+                compactions: self.compactions as u64,
+                ..usage
+            }),
         })
     }
 }
@@ -1044,7 +1208,12 @@ impl AgentAdapter for AnthropicAdapter {
                 available_tokens: None,
             }),
             Err(error) => Err(error),
-            Ok(()) => collected.finish(&self.model),
+            Ok(()) => {
+                if collected.empty_summaries > 0 {
+                    self.summary_failed = true;
+                }
+                collected.finish(&self.model)
+            }
         }
     }
 }
@@ -1341,6 +1510,7 @@ mod tests {
                 cache_read: 4000,
                 cache_write: 300,
                 cache_write_1h: 200,
+                compactions: 0,
             }
         );
     }
@@ -1887,5 +2057,201 @@ mod tests {
         headers.insert("retry-after", "600".parse().unwrap());
         assert_eq!(retry_wait(0, 429, &headers), RATE_LIMIT_RETRY_CAP);
         assert!(retryable_status(529) && retryable_status(429) && !retryable_status(400));
+    }
+
+    fn compacting(at_tokens: u64) -> AnthropicOptions {
+        AnthropicOptions {
+            cache_ttl: None,
+            compaction: Some(Compaction {
+                at_tokens,
+                instructions: None,
+            }),
+            ..AnthropicOptions::default()
+        }
+    }
+
+    #[test]
+    fn compaction_settings_are_validated() {
+        let settings = |management: Option<&str>, at: Option<u64>| AnthropicSettings {
+            context_management: management.map(str::to_owned),
+            compact_at_tokens: at,
+            ..AnthropicSettings::default()
+        };
+        let options = AnthropicOptions::from_settings(&settings(Some("compact"), None)).unwrap();
+        assert_eq!(
+            options.compaction,
+            Some(Compaction {
+                at_tokens: DEFAULT_COMPACT_AT_TOKENS,
+                instructions: None
+            })
+        );
+        let options =
+            AnthropicOptions::from_settings(&settings(Some("compact"), Some(400_000))).unwrap();
+        assert_eq!(options.compaction.unwrap().at_tokens, 400_000);
+        assert_eq!(
+            AnthropicOptions::from_settings(&settings(None, None))
+                .unwrap()
+                .compaction,
+            None
+        );
+        for (bad, reason) in [
+            (settings(Some("compact"), Some(10_000)), "at least 50000"),
+            (settings(None, Some(400_000)), "need context_management"),
+            (
+                settings(Some("none"), Some(400_000)),
+                "need context_management",
+            ),
+            (settings(Some("summarize"), None), "is not \"compact\""),
+            (
+                AnthropicSettings {
+                    send_betas: Some(false),
+                    ..settings(Some("compact"), None)
+                },
+                "send_betas = false",
+            ),
+        ] {
+            let error = AnthropicOptions::from_settings(&bad).unwrap_err();
+            assert!(error.contains(reason), "{error:?} lacks {reason:?}");
+        }
+    }
+
+    #[test]
+    fn compaction_sends_the_edit_and_its_beta() {
+        let adapter = AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_options(compacting(400_000));
+        let body = adapter.body(&ChatRequest::new(vec![ChatMessage::user("hi")], Vec::new()));
+        assert_eq!(
+            body["context_management"],
+            json!({"edits": [{"type": "compact_20260112",
+                "trigger": {"type": "input_tokens", "value": 400_000}}]})
+        );
+        assert_eq!(adapter.betas(), vec![COMPACT_BETA.to_owned()]);
+        // A profile that already lists the beta does not get it twice.
+        let listed = AnthropicAdapter::new("https://api.anthropic.com", "m", None).with_options(
+            AnthropicOptions {
+                betas: vec!["beta-a".into(), COMPACT_BETA.into()],
+                ..compacting(400_000)
+            },
+        );
+        assert_eq!(
+            listed.betas(),
+            vec!["beta-a".to_owned(), COMPACT_BETA.to_owned()]
+        );
+        // Without compaction, neither is sent.
+        let plain = AnthropicAdapter::new("https://api.anthropic.com", "m", None);
+        let body = plain.body(&ChatRequest::new(vec![ChatMessage::user("hi")], Vec::new()));
+        assert!(body.get("context_management").is_none());
+        assert!(plain.betas().is_empty());
+    }
+
+    fn compaction_block(index: usize, content: Value) -> [Value; 3] {
+        [
+            json!({"type": "content_block_start", "index": index,
+                "content_block": {"type": "compaction", "content": null}}),
+            json!({"type": "content_block_delta", "index": index,
+                "delta": {"type": "compaction_delta", "content": content}}),
+            json!({"type": "content_block_stop", "index": index}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_compaction_block_is_kept_for_replay_and_its_tokens_counted() {
+        let mut events = vec![start()];
+        events.extend(compaction_block(0, json!("<summary>state</summary>")));
+        events.extend(text_block(1, "continuing"));
+        events.extend(tool_block(
+            2,
+            "toolu_1",
+            "run_shell",
+            &[r#"{"command":"ls"}"#],
+        ));
+        events.push(
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+            "usage": {"input_tokens": 30, "output_tokens": 40,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 3000,
+                "iterations": [
+                    {"type": "compaction", "input_tokens": 180_000, "output_tokens": 3500},
+                    {"type": "message", "input_tokens": 30, "output_tokens": 40,
+                        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 3000},
+                ]}}),
+        );
+        events.push(json!({"type": "message_stop"}));
+        let response = stream(sse(&events)).await.unwrap();
+        let blocks = response.provider_blocks.expect("blocks kept for replay");
+        assert_eq!(
+            blocks.blocks,
+            json!([
+                {"type": "compaction", "content": "<summary>state</summary>"},
+                {"type": "text", "text": "continuing"},
+                {"type": "tool_use", "id": "toolu_1", "name": "run_shell", "input": {"command": "ls"}},
+            ])
+        );
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                input: 180_030,
+                output: 3540,
+                cache_read: 0,
+                cache_write: 3000,
+                cache_write_1h: 0,
+                compactions: 1,
+            })
+        );
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+
+        // Replayed as received, after the history it summarizes.
+        let assistant = ChatMessage::assistant("continuing").with_provider_blocks(Some(blocks));
+        let body = body_for(vec![ChatMessage::user("task"), assistant], Vec::new());
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({"type": "compaction", "content": "<summary>state</summary>"})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_summary_switches_to_the_no_tools_prompt() {
+        let mut events = vec![start()];
+        events.extend(compaction_block(0, Value::Null));
+        events.extend(text_block(1, "x"));
+        events.extend(stop("end_turn"));
+        let (base_url, server) = serve_once("text/event-stream", sse(&events));
+        let mut adapter =
+            AnthropicAdapter::new(base_url, "m", None).with_options(compacting(100_000));
+        let request = ChatRequest::new(vec![ChatMessage::user("hello")], Vec::new());
+        assert!(
+            adapter.body(&request)["context_management"]["edits"][0]
+                .get("instructions")
+                .is_none()
+        );
+        let response = adapter
+            .chat_stream(request.clone(), &mut |_| {})
+            .await
+            .unwrap();
+        server.join().unwrap();
+        // Replayed, though the API ignores it.
+        assert_eq!(
+            response.provider_blocks.unwrap().blocks[0],
+            json!({"type": "compaction", "content": null})
+        );
+        assert_eq!(
+            adapter.body(&request)["context_management"]["edits"][0]["instructions"],
+            NO_TOOLS_SUMMARY_PROMPT
+        );
+        // A prompt the profile set is kept.
+        let mut own = AnthropicAdapter::new("https://api.anthropic.com", "m", None).with_options(
+            AnthropicOptions {
+                compaction: Some(Compaction {
+                    at_tokens: 100_000,
+                    instructions: Some("mine".into()),
+                }),
+                ..AnthropicOptions::default()
+            },
+        );
+        own.summary_failed = true;
+        assert_eq!(
+            own.body(&request)["context_management"]["edits"][0]["instructions"],
+            "mine"
+        );
     }
 }

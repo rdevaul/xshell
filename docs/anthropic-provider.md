@@ -311,6 +311,30 @@ descriptor reports it by default for the models above. Under it:
 
 The 1M context window of the current models leaves a large margin. Most turns never compact.
 
+**As built (server compaction, the adapter part of P6).**
+- A profile sets `context_management = "compact"` and, optionally, `compact_at_tokens` (default
+  150000, at least 50000) and `compact_instructions`. The default is `"none"`.
+  `clear_tool_uses` is not built.
+- Each request then carries a `compact_20260112` edit with an `input_tokens` trigger. The
+  adapter adds `compact-2026-01-12` to `anthropic-beta`, so compaction cannot be combined with
+  `send_betas = false`.
+- The `compaction` block, which streams as one `compaction_delta`, is kept in `provider_blocks`
+  with the rest of the response and replayed as received. The API ignores everything before it.
+  The history is sent in full: xshell's copy is never shortened, so the request stays
+  append-only and signed thinking keeps passing the prefix check.
+- Usage is the sum over `usage.iterations`, because the top-level counts leave out the
+  summarization step. `TokenUsage.compactions` counts the compactions a response carried, and
+  appears in the per-response and per-turn usage. The audit record keeps the token counts but
+  not this count.
+- A block with a null `content` means the API wrote no summary and compacted nothing. The
+  documented cause is that the model called a tool instead of summarizing. After one such block,
+  the adapter sends a summarization prompt that rules out tools on that adapter's later
+  requests, unless the profile set its own prompt. On Opus 5.5 a custom prompt summarizes
+  without the earlier thinking, so the API's default prompt is tried first.
+- Not built: the engine's `history = "append_only"` mode and the per-turn context as a
+  turn-scoped message. A one-turn headless run needs neither: client compaction is off when
+  `max_history_bytes = 0`, and the turn's context does not change within the turn.
+
 ### 5.3 Token usage
 
 `AssistantResponse` gains an optional `usage`:
@@ -533,7 +557,7 @@ limits = "cad"
 | P3 (done) | Usage: `TokenUsage`, sums per turn, `result.usage.tokens`, audit record | 1–2 days |
 | P4 | `api_key_command` with TTL and 401 refresh; daemon-only route; audit event | 2–3 days |
 | P5 (done) | Caching: breakpoints, stability tests, `cache_ttl`, zero-read warning | 1–2 days |
-| P6 | Append-only history: compaction mode, server compaction or tool-result clearing, per-turn context as a turn-scoped system message, live conformance test | 4–6 days |
+| P6 (adapter part done) | Append-only history: compaction mode, server compaction or tool-result clearing, per-turn context as a turn-scoped system message, live conformance test | 4–6 days |
 
 - **What each stage enables.**
   - P1–P3 are enough for a short comparison run.

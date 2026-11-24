@@ -185,7 +185,10 @@ directly (see [docs/anthropic-provider.md](docs/anthropic-provider.md)). Set
 unless `thinking = "adaptive"`; its signed blocks are kept with the session
 and sent back unchanged, as the API requires during tool use. Prompts are
 cached for five minutes by default (`cache_ttl = "1h"` or `"off"` to change
-it); a run's `usage.tokens` shows the cache reads.
+it); a run's `usage.tokens` shows the cache reads. For long runs,
+`context_management = "compact"` has the API summarize the conversation once the
+prompt reaches `compact_at_tokens` (150000 by default). Set `max_history_bytes = 0`
+with it, so that xshell's own compaction does not edit the history as well.
 
 ```toml
 [models.opus]

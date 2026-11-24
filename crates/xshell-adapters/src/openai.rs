@@ -407,6 +407,7 @@ fn openai_usage(usage: &Value) -> Option<TokenUsage> {
         cache_read: cached,
         cache_write: 0,
         cache_write_1h: 0,
+        compactions: 0,
     })
 }
 
