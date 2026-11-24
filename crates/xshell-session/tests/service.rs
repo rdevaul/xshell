@@ -4134,6 +4134,7 @@ fn f30_adopted_orphans_are_reaped() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
