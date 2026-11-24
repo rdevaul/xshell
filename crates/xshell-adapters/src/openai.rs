@@ -373,6 +373,7 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
             tool_calls,
             reasoning: Some(reasoning).filter(|text| !text.is_empty()),
             finish_reason,
+            provider_blocks: None,
         })
     }
 }

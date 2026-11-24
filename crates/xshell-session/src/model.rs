@@ -24,7 +24,8 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // `ClientRequest::Open` and refuses unauthenticated requests (F27). Version 27
 // adds `AttachImage` and `ViewImage`, which read an image file on the session
 // host. Version 28 adds `shell` on `SessionCreation` and `SessionDescriptor`.
-// Version 29 adds `anthropic` on `ModelBinding`.
+// Version 29 adds `anthropic` on `ModelBinding` and `provider_blocks` on
+// `ChatMessage`.
 pub const SESSION_PROTOCOL_VERSION: u32 = 29;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 

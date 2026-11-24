@@ -923,7 +923,8 @@ Start a new session with //new or lower max_history_bytes to continue.",
         let continue_reason = auto_continue_reason(&response);
         history.push(
             ChatMessage::assistant_with_tools(response.content, response.tool_calls.clone())
-                .with_reasoning(response.reasoning),
+                .with_reasoning(response.reasoning)
+                .with_provider_blocks(response.provider_blocks),
         );
         if response.tool_calls.is_empty() {
             if let Some((reason, prompt)) = continue_reason

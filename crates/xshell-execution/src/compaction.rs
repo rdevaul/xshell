@@ -113,6 +113,10 @@ pub fn message_bytes(message: &ChatMessage) -> usize {
     message.content.len()
         + message.reasoning.as_ref().map_or(0, String::len)
         + message
+            .provider_blocks
+            .as_ref()
+            .map_or(0, xshell_core::ProviderBlocks::bytes)
+        + message
             .tool_calls
             .iter()
             .map(|call| call.name.len() + call.arguments.to_string().len())
@@ -202,8 +206,14 @@ fn elide_oversized_bodies(history: &mut [ChatMessage], max_bytes: usize) -> usiz
             if total <= max_bytes {
                 break;
             }
-            if let Some(reasoning) = message.reasoning.take() {
-                total -= reasoning.len();
+            // Stored provider blocks carry the same reasoning, signed.
+            let blocks = message.provider_blocks.take();
+            let reasoning = message.reasoning.take();
+            if blocks.is_some() || reasoning.is_some() {
+                total -= blocks
+                    .as_ref()
+                    .map_or(0, xshell_core::ProviderBlocks::bytes)
+                    + reasoning.as_ref().map_or(0, String::len);
                 changed += 1;
             }
         }
@@ -224,6 +234,7 @@ pub fn drop_tool_payloads(messages: &mut [ChatMessage]) -> usize {
     let mut changed = 0;
     for message in messages.iter_mut() {
         let mut touched = message.reasoning.take().is_some();
+        touched |= message.provider_blocks.take().is_some();
         if message.role == MessageRole::Tool && message.content != OVERFLOW_DROPPED_MARKER {
             message.content = OVERFLOW_DROPPED_MARKER.to_owned();
             touched = true;
@@ -595,6 +606,37 @@ mod tests {
         assert_eq!(h[3].content, ELIDED_MARKER, "older results go first");
         assert!(h[2].reasoning.is_none(), "reasoning is elided last");
         assert_eq!(h[5].content.len(), 4096, "the newest result is exempt");
+        assert!(is_well_formed(&h));
+    }
+
+    #[test]
+    fn stored_provider_blocks_count_and_are_elided_with_reasoning() {
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "a"}),
+        };
+        let signed = ChatMessage::assistant_with_tools("", vec![call.clone()]).with_provider_blocks(
+            Some(xshell_core::ProviderBlocks {
+                provider: "anthropic".into(),
+                model: "m".into(),
+                blocks: json!([{"type": "thinking", "thinking": "", "signature": "s".repeat(8192)}]),
+            }),
+        );
+        assert!(
+            message_bytes(&signed) > 8192,
+            "signatures count toward the budget"
+        );
+        let mut h = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("go"),
+            signed,
+            ChatMessage::tool_result(&call, "ok"),
+        ];
+        MaxBytesCompactor { max_bytes: 1 }
+            .compact(&mut h)
+            .expect("over budget must compact");
+        assert!(h[2].provider_blocks.is_none());
         assert!(is_well_formed(&h));
     }
 

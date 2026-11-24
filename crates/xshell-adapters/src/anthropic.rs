@@ -19,10 +19,12 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use xshell_core::{
-    AdapterError, AgentDescriptor, AgentEvent, AnthropicSettings, AssistantResponse, ChatRequest,
-    MessageRole, ToolCall,
+    AdapterError, AgentDescriptor, AgentEvent, AnthropicSettings, AssistantResponse, ChatMessage,
+    ChatRequest, MessageRole, ProviderBlocks, ToolCall,
 };
 
+/// The provider name stored with replayable blocks.
+const PROVIDER: &str = "anthropic";
 /// `anthropic-version` sent when the profile names none.
 pub const DEFAULT_API_VERSION: &str = "2023-06-01";
 /// `max_tokens` sent when the profile names none. Streaming makes large
@@ -287,6 +289,22 @@ fn wire_messages(laid: &[Laid<'_>]) -> (Vec<Value>, Vec<Value>) {
         let (wire_role, blocks) = match (&role, message.source) {
             (MessageRole::Assistant, Some(source)) => {
                 close_calls(&mut messages, &mut open_calls);
+                if let Some(stored) = replayable(source) {
+                    let blocks = stored
+                        .iter()
+                        .map(|block| {
+                            let mut block = block.clone();
+                            if block["type"] == "tool_use" {
+                                let id = ids.wire(block["id"].as_str().unwrap_or_default());
+                                open_calls.push(id.clone());
+                                block["id"] = json!(id);
+                            }
+                            block
+                        })
+                        .collect();
+                    messages.push(("assistant", blocks));
+                    continue;
+                }
                 let mut blocks = Vec::new();
                 push_text(&mut blocks, &message.content);
                 for call in &source.tool_calls {
@@ -374,6 +392,16 @@ fn wire_messages(laid: &[Laid<'_>]) -> (Vec<Value>, Vec<Value>) {
         .map(|(role, content)| json!({"role": role, "content": content}))
         .collect();
     (system, messages)
+}
+
+/// The stored blocks to send for an assistant message, when they came from
+/// this provider. Blocks from another provider are never sent; the message's
+/// text and tool calls are used instead. Blocks from another Anthropic model
+/// are sent: the API drops thinking a model cannot read, unbilled.
+fn replayable(message: &ChatMessage) -> Option<&Vec<Value>> {
+    let stored = message.provider_blocks.as_ref()?;
+    (stored.provider == PROVIDER).then_some(())?;
+    stored.blocks.as_array().filter(|blocks| !blocks.is_empty())
 }
 
 /// Supply an interrupted-call result for every call still open, at the head
@@ -490,28 +518,38 @@ struct StreamEvent {
     delta: Option<Value>,
     #[serde(default)]
     error: Option<Value>,
+    #[serde(default)]
+    message: Option<Value>,
 }
 
 /// A content block being streamed.
 enum Block {
-    Text,
+    Text {
+        text: String,
+    },
     Thinking {
+        thinking: String,
         /// The signature, attached only once the block is complete.
         pending_signature: String,
     },
-    RedactedThinking,
+    RedactedThinking {
+        data: String,
+    },
     ToolUse {
         id: String,
         name: String,
         json: String,
     },
-    /// A block type this adapter does not know (a server tool's, say).
-    Other,
+    /// A block type this adapter does not know (a server tool's, say),
+    /// kept as it started.
+    Other(Value),
 }
 
 /// What a stream has delivered so far.
 #[derive(Default)]
 struct Collected {
+    /// The model that answered, from `message_start`.
+    model: Option<String>,
     content: String,
     reasoning: String,
     open: BTreeMap<usize, Block>,
@@ -519,6 +557,10 @@ struct Collected {
     tool_argument_bytes: usize,
     stop_reason: Option<String>,
     stopped: bool,
+    /// Completed blocks by index, in the form they are replayed.
+    blocks: BTreeMap<usize, Value>,
+    /// Whether any block is thinking, which must be replayed exactly.
+    thinking: bool,
 }
 
 impl Collected {
@@ -535,16 +577,21 @@ impl Collected {
                     Some("text") => {
                         let text = block["text"].as_str().unwrap_or_default();
                         self.text(text, events);
-                        Block::Text
+                        Block::Text {
+                            text: text.to_owned(),
+                        }
                     }
                     Some("thinking") => {
-                        self.reasoning
-                            .push_str(block["thinking"].as_str().unwrap_or_default());
+                        let thinking = block["thinking"].as_str().unwrap_or_default();
+                        self.reasoning.push_str(thinking);
                         Block::Thinking {
+                            thinking: thinking.to_owned(),
                             pending_signature: String::new(),
                         }
                     }
-                    Some("redacted_thinking") => Block::RedactedThinking,
+                    Some("redacted_thinking") => Block::RedactedThinking {
+                        data: block["data"].as_str().unwrap_or_default().to_owned(),
+                    },
                     Some("tool_use") => {
                         if self.tool_calls.len() + self.open_tool_calls() >= crate::MAX_TOOL_CALLS {
                             return Err(AdapterError::InvalidResponse(format!(
@@ -564,7 +611,7 @@ impl Collected {
                             json: String::new(),
                         }
                     }
-                    _ => Block::Other,
+                    _ => Block::Other(block),
                 };
                 if self.open.insert(index, opened).is_some() {
                     return Err(AdapterError::InvalidResponse(format!(
@@ -581,15 +628,23 @@ impl Collected {
                     )));
                 };
                 match (delta["type"].as_str(), block) {
-                    (Some("text_delta"), Block::Text) => {
-                        let text = delta["text"].as_str().unwrap_or_default().to_owned();
-                        self.text(&text, events);
+                    (Some("text_delta"), Block::Text { text }) => {
+                        let part = delta["text"].as_str().unwrap_or_default();
+                        text.push_str(part);
+                        let part = part.to_owned();
+                        self.text(&part, events);
                     }
-                    (Some("thinking_delta"), Block::Thinking { .. }) => {
-                        self.reasoning
-                            .push_str(delta["thinking"].as_str().unwrap_or_default());
+                    (Some("thinking_delta"), Block::Thinking { thinking, .. }) => {
+                        let part = delta["thinking"].as_str().unwrap_or_default();
+                        thinking.push_str(part);
+                        self.reasoning.push_str(part);
                     }
-                    (Some("signature_delta"), Block::Thinking { pending_signature }) => {
+                    (
+                        Some("signature_delta"),
+                        Block::Thinking {
+                            pending_signature, ..
+                        },
+                    ) => {
                         pending_signature.push_str(delta["signature"].as_str().unwrap_or_default());
                     }
                     (Some("input_json_delta"), Block::ToolUse { json, .. }) => {
@@ -618,7 +673,7 @@ impl Collected {
                         "the agent endpoint closed content block {index}, which is not open"
                     )));
                 };
-                match block {
+                let replayed = match block {
                     Block::ToolUse { id, name, json } => {
                         let arguments = if json.trim().is_empty() {
                             Value::Object(Map::new())
@@ -641,19 +696,38 @@ impl Collected {
                         } else {
                             id
                         };
+                        let replayed = json!({
+                            "type": "tool_use", "id": id, "name": name, "input": arguments,
+                        });
                         self.tool_calls.push(ToolCall {
                             id,
                             name,
                             arguments,
                         });
+                        replayed
                     }
-                    // A thinking block's complete signature, and a redacted
-                    // block's data, are what P2 keeps for replay.
-                    Block::Thinking { .. }
-                    | Block::Text
-                    | Block::RedactedThinking
-                    | Block::Other => {}
-                }
+                    Block::Thinking {
+                        thinking,
+                        pending_signature,
+                    } => {
+                        // Replay needs the signature; without one the block
+                        // cannot be sent back, and the turn cannot continue.
+                        if pending_signature.is_empty() {
+                            return Err(AdapterError::InvalidResponse(format!(
+                                "thinking block {index} ended without a signature"
+                            )));
+                        }
+                        self.thinking = true;
+                        json!({"type": "thinking", "thinking": thinking, "signature": pending_signature})
+                    }
+                    Block::RedactedThinking { data } => {
+                        self.thinking = true;
+                        json!({"type": "redacted_thinking", "data": data})
+                    }
+                    Block::Text { text } => json!({"type": "text", "text": text}),
+                    Block::Other(block) => block,
+                };
+                self.blocks.insert(index, replayed);
             }
             "message_delta" => {
                 let delta = event.delta.unwrap_or_default();
@@ -661,13 +735,20 @@ impl Collected {
                     self.stop_reason = Some(reason.to_owned());
                 }
             }
+            "message_start" => {
+                self.model = event
+                    .message
+                    .as_ref()
+                    .and_then(|message| message["model"].as_str())
+                    .map(str::to_owned);
+            }
             "message_stop" => self.stopped = true,
             "error" => {
                 return Err(crate::stream_error(
                     &event.error.unwrap_or_else(|| json!("unknown error")),
                 ));
             }
-            // `message_start`, `ping`, and event types added later.
+            // `ping`, and event types added later.
             _ => {}
         }
         Ok(())
@@ -688,7 +769,7 @@ impl Collected {
     }
 
     /// The response, once the stream has ended.
-    fn finish(self) -> Result<AssistantResponse, AdapterError> {
+    fn finish(self, requested_model: &str) -> Result<AssistantResponse, AdapterError> {
         let calls = self.tool_calls.len() + self.open_tool_calls();
         if self.stop_reason.as_deref() == Some("max_tokens") && self.open_tool_calls() > 0 {
             return Err(AdapterError::InvalidResponse(format!(
@@ -723,11 +804,23 @@ call; raise max_output_tokens. Its {calls} tool call(s) were not run"
             }
         };
         crate::require_dispatchable(true, Some(finish_reason), self.tool_calls.len())?;
+        // Kept only when thinking needs exact replay; otherwise the text and
+        // tool calls rebuild the same message.
+        let provider_blocks = self.thinking.then(|| ProviderBlocks {
+            provider: PROVIDER.to_owned(),
+            model: self.model.unwrap_or_else(|| requested_model.to_owned()),
+            blocks: self
+                .blocks
+                .into_values()
+                .filter(|block| block["type"] != "text" || block["text"] != "")
+                .collect(),
+        });
         Ok(AssistantResponse {
             content: self.content,
             tool_calls: self.tool_calls,
             reasoning: Some(self.reasoning).filter(|text| !text.is_empty()),
             finish_reason: Some(finish_reason.to_owned()),
+            provider_blocks,
         })
     }
 }
@@ -843,7 +936,7 @@ impl AgentAdapter for AnthropicAdapter {
                 available_tokens: None,
             }),
             Err(error) => Err(error),
-            Ok(()) => collected.finish(),
+            Ok(()) => collected.finish(&self.model),
         }
     }
 }
@@ -852,7 +945,7 @@ impl AgentAdapter for AnthropicAdapter {
 mod tests {
     use super::*;
     use crate::test_support::serve_once;
-    use xshell_core::{ChatMessage, ToolDefinition};
+    use xshell_core::ToolDefinition;
 
     fn sse(events: &[Value]) -> String {
         events
@@ -1068,6 +1161,129 @@ mod tests {
         let response = stream(sse(&events)).await.unwrap();
         assert_eq!(response.reasoning.as_deref(), Some("consider it"));
         assert_eq!(response.content, "answer");
+    }
+
+    fn thinking_block(index: usize, thinking: &str, signature: &str) -> Vec<Value> {
+        let mut events = vec![json!({"type": "content_block_start", "index": index,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""}})];
+        if !thinking.is_empty() {
+            events.push(json!({"type": "content_block_delta", "index": index,
+                "delta": {"type": "thinking_delta", "thinking": thinking}}));
+        }
+        if !signature.is_empty() {
+            events.push(json!({"type": "content_block_delta", "index": index,
+                "delta": {"type": "signature_delta", "signature": signature}}));
+        }
+        events.push(json!({"type": "content_block_stop", "index": index}));
+        events
+    }
+
+    #[tokio::test]
+    async fn keeps_signed_thinking_and_tool_calls_for_replay() {
+        let mut events = vec![json!({"type": "message_start",
+            "message": {"id": "msg_1", "model": "claude-answered", "usage": {}}})];
+        // Opus 5.5 omits the thinking text by default; the signature remains.
+        events.extend(thinking_block(0, "", "c2lnLTE="));
+        events.extend(tool_block(1, "toolu_a", "read_file", &["{\"path\":\"a\"}"]));
+        events.extend(stop("tool_use"));
+        let response = stream(sse(&events)).await.unwrap();
+        let stored = response.provider_blocks.expect("thinking is kept");
+        assert_eq!(stored.provider, "anthropic");
+        assert_eq!(stored.model, "claude-answered", "the model that answered");
+        assert_eq!(
+            stored.blocks,
+            json!([
+                {"type": "thinking", "thinking": "", "signature": "c2lnLTE="},
+                {"type": "tool_use", "id": "toolu_a", "name": "read_file", "input": {"path": "a"}},
+            ])
+        );
+        assert!(
+            response.reasoning.is_none(),
+            "no readable reasoning was shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_without_thinking_store_no_blocks() {
+        let mut events = vec![start()];
+        events.extend(text_block(0, "plain"));
+        events.extend(stop("end_turn"));
+        assert!(
+            stream(sse(&events))
+                .await
+                .unwrap()
+                .provider_blocks
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn redacted_thinking_is_kept_verbatim() {
+        let mut events = vec![
+            start(),
+            json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "redacted_thinking", "data": "b3BhcXVl"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+        ];
+        events.extend(text_block(1, "done"));
+        events.extend(stop("end_turn"));
+        let stored = stream(sse(&events)).await.unwrap().provider_blocks.unwrap();
+        assert_eq!(
+            stored.blocks,
+            json!([
+                {"type": "redacted_thinking", "data": "b3BhcXVl"},
+                {"type": "text", "text": "done"},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_thinking_block_without_a_signature_is_refused() {
+        let mut events = vec![start()];
+        events.extend(thinking_block(0, "partial thought", ""));
+        events.extend(text_block(1, "x"));
+        events.extend(stop("end_turn"));
+        assert_refused(stream(sse(&events)).await, "without a signature");
+    }
+
+    #[test]
+    fn stored_blocks_are_replayed_exactly() {
+        let a = call("toolu_a", "a");
+        let blocks = json!([
+            {"type": "thinking", "thinking": "", "signature": "c2lnLTE="},
+            {"type": "text", "text": "Reading."},
+            {"type": "tool_use", "id": "toolu_a", "name": "read_file", "input": {"path": "a"}},
+        ]);
+        let assistant = ChatMessage::assistant_with_tools("Reading.", vec![a.clone()])
+            .with_reasoning(Some("a summary that is never sent".into()))
+            .with_provider_blocks(Some(ProviderBlocks {
+                provider: "anthropic".into(),
+                model: "m".into(),
+                blocks: blocks.clone(),
+            }));
+        let body = body_for(
+            vec![
+                ChatMessage::user("go"),
+                assistant.clone(),
+                ChatMessage::tool_result(&a, "A"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(body["messages"][1]["content"], blocks);
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu_a");
+        assert!(!body.to_string().contains("never sent"));
+
+        // Blocks another provider wrote are not sent; the message is rebuilt.
+        let foreign = assistant.with_provider_blocks(Some(ProviderBlocks {
+            provider: "openai".into(),
+            model: "m".into(),
+            blocks,
+        }));
+        let body = body_for(vec![ChatMessage::user("go"), foreign], Vec::new());
+        assert_eq!(
+            body["messages"][1]["content"][0],
+            json!({"type": "text", "text": "Reading."})
+        );
     }
 
     #[tokio::test]

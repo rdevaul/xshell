@@ -145,6 +145,30 @@ pub struct ChatMessage {
     /// with the message. Absent in sessions written before images existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageRef>,
+    /// The assistant message's content blocks exactly as the provider
+    /// returned them, for replay to the same provider: signed thinking must
+    /// come back unchanged. Opaque to everything but the adapter that wrote
+    /// it, and absent in sessions written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_blocks: Option<ProviderBlocks>,
+}
+
+/// Content blocks a provider returned, kept for replay to that provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderBlocks {
+    /// The provider that wrote them, such as "anthropic".
+    pub provider: String,
+    /// The model that produced them.
+    pub model: String,
+    /// The message's content array.
+    pub blocks: serde_json::Value,
+}
+
+impl ProviderBlocks {
+    /// Approximate size, for history budgets.
+    pub fn bytes(&self) -> usize {
+        self.blocks.to_string().len()
+    }
 }
 
 impl ChatMessage {
@@ -157,6 +181,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -169,6 +194,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -181,6 +207,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -193,6 +220,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -200,6 +228,12 @@ impl ChatMessage {
     /// is stored as `None`.
     pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
         self.reasoning = reasoning.filter(|text| !text.trim().is_empty());
+        self
+    }
+
+    /// Keep the provider's own content blocks with an assistant message.
+    pub fn with_provider_blocks(mut self, blocks: Option<ProviderBlocks>) -> Self {
+        self.provider_blocks = blocks;
         self
     }
 
@@ -218,6 +252,7 @@ impl ChatMessage {
             tool_name: Some(call.name.clone()),
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 }
@@ -440,6 +475,9 @@ pub struct AssistantResponse {
     /// The provider's stated reason for ending generation ("stop",
     /// "tool_calls", "length", ...), when reported.
     pub finish_reason: Option<String>,
+    /// The response's content blocks, when the provider needs them replayed
+    /// exactly (signed thinking). Stored on the history message.
+    pub provider_blocks: Option<ProviderBlocks>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -569,6 +607,26 @@ impl AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_blocks_round_trip_and_are_optional() {
+        let message = ChatMessage::assistant("x").with_provider_blocks(Some(ProviderBlocks {
+            provider: "anthropic".into(),
+            model: "m".into(),
+            blocks: serde_json::json!([{"type": "thinking", "thinking": "", "signature": "c2ln"}]),
+        }));
+        let text = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<ChatMessage>(&text).unwrap(), message);
+        // Messages written before the field existed still load.
+        let old: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"x"}"#).unwrap();
+        assert!(old.provider_blocks.is_none());
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("provider_blocks")
+        );
+    }
 
     #[test]
     fn f16_record_summary_never_quotes_provider_or_model_text() {

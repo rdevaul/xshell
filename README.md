@@ -182,8 +182,8 @@ cargo run -p xshell-cli -- --profile openrouter-qwen
 Anthropic models use `provider = "anthropic"`, which speaks the Messages API
 directly (see [docs/anthropic-provider.md](docs/anthropic-provider.md)). Set
 `effort` explicitly, since its default differs by model. Thinking stays off
-unless `thinking = "adaptive"`. Until thinking blocks are replayed, leave it
-off for tool use.
+unless `thinking = "adaptive"`; its signed blocks are kept with the session
+and sent back unchanged, as the API requires during tool use.
 
 ```toml
 [models.opus]
