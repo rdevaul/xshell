@@ -21,13 +21,18 @@ pub fn default_model_base_url(provider: &str) -> Option<&'static str> {
     match provider {
         "ollama" => Some("http://127.0.0.1:11434"),
         "openai" => Some("https://api.openai.com"),
+        "anthropic" => Some("https://api.anthropic.com"),
         _ => None,
     }
 }
 
-/// The variable the client uses for `--provider openai` when no profile is
-/// selected. It is allowed only with OpenAI's own endpoint.
-const BUILTIN_OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+/// The variables the client uses for `--provider openai` and `--provider
+/// anthropic` when no profile is selected. Each is allowed only with its
+/// provider's own endpoint.
+const BUILTIN_KEY_ENVS: [(&str, &str); 2] = [
+    ("openai", "OPENAI_API_KEY"),
+    ("anthropic", "ANTHROPIC_API_KEY"),
+];
 
 /// The parts of a `[models.NAME]` profile the daemon reads. The client owns
 /// the full profile format and validates it; the daemon ignores the rest.
@@ -48,7 +53,8 @@ pub struct CredentialRoutes {
 }
 
 impl Default for CredentialRoutes {
-    /// Only the built-in route: `OPENAI_API_KEY` to OpenAI's endpoint.
+    /// Only the built-in routes: `OPENAI_API_KEY` to OpenAI's endpoint and
+    /// `ANTHROPIC_API_KEY` to Anthropic's.
     fn default() -> Self {
         Self::from_profiles(&BTreeMap::new())
     }
@@ -57,11 +63,15 @@ impl Default for CredentialRoutes {
 impl CredentialRoutes {
     pub fn from_profiles(profiles: &BTreeMap<String, ConfiguredModel>) -> Self {
         let mut routes = BTreeSet::new();
-        routes.insert((
-            "openai".to_owned(),
-            normalize(default_model_base_url("openai").expect("openai has a default endpoint")),
-            BUILTIN_OPENAI_KEY_ENV.to_owned(),
-        ));
+        for (provider, variable) in BUILTIN_KEY_ENVS {
+            routes.insert((
+                provider.to_owned(),
+                normalize(
+                    default_model_base_url(provider).expect("built-in providers have an endpoint"),
+                ),
+                variable.to_owned(),
+            ));
+        }
         for profile in profiles.values() {
             let Some(variable) = &profile.api_key_env else {
                 continue;
@@ -132,6 +142,7 @@ mod tests {
             context_tokens: None,
             reserve_output_tokens: None,
             vision: false,
+            anthropic: Default::default(),
         }
     }
 
@@ -201,6 +212,11 @@ mod tests {
             ),
             binding("openai", "https://api.openai.com", Some("WORK_OPENAI_KEY")),
             binding("openai", "https://api.openai.com/", Some("OPENAI_API_KEY")),
+            binding(
+                "anthropic",
+                "https://api.anthropic.com",
+                Some("ANTHROPIC_API_KEY"),
+            ),
             // No credential: any endpoint.
             binding("ollama", "http://gpu-box.lan:11434", None),
             binding("openai", "http://127.0.0.1:8080/v1", None),
@@ -209,7 +225,12 @@ mod tests {
         }
         assert_eq!(
             routes.variables().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["OPENAI_API_KEY", "OPENROUTER_API_KEY", "WORK_OPENAI_KEY"])
+            BTreeSet::from([
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "WORK_OPENAI_KEY"
+            ])
         );
     }
 }

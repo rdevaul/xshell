@@ -14,17 +14,14 @@ pub(crate) fn build_adapter(
     include_credentials: bool,
 ) -> Result<Box<dyn AgentAdapter>> {
     build_execution_adapter(&AdapterConfig {
-        provider: match active.provider {
-            Provider::Ollama => "ollama",
-            Provider::Openai => "openai",
-        }
-        .into(),
+        provider: active.provider.as_str().into(),
         model: active.model.clone(),
         base_url: active.base_url.clone(),
         api_key_env: include_credentials
             .then(|| active.api_key_env.clone())
             .flatten(),
         vision: active.vision,
+        anthropic: active.anthropic.clone(),
     })
 }
 
@@ -136,7 +133,7 @@ pub(crate) fn print_model(active: &ActiveModel, daemon_owned: bool) {
             None => println!("context window: {tokens} tokens"),
         }
     }
-    if active.provider == Provider::Openai {
+    if active.provider != Provider::Ollama {
         if daemon_owned {
             println!("credentials: resolved by xshelld");
             return;

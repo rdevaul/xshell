@@ -197,7 +197,7 @@ incompatible change increments `schema`.
 | `run_started` | `schema`, `session`, `session_id`, `turn_id`, `limits_profile` | The turn was accepted |
 | `turn_started` | `approval`, `limits`, `requested_approval`?, `requested_limits`? | The daemon started the turn with this approval mode and these limits; the `requested_*` fields appear when it lowered what was asked |
 | `text` | `text` | Streamed response text |
-| `assistant_message` | `content`, `tool_calls`, `finish_reason`? | One complete model response |
+| `assistant_message` | `content`, `tool_calls`, `finish_reason`?, `reasoning`?, `usage`? | One complete model response; `reasoning` is the readable reasoning the provider reported, such as an Anthropic profile's summarized thinking; `usage` is the response's token counts (`input`, `output`, `cache_read`, `cache_write`, `cache_write_1h`?), as in [Usage](#usage) |
 | `auto_continued` | `reason` | The turn continued automatically after an unfinished response |
 | `tool_requested` | `call_id`, `name`, `arguments` | The model asked for a tool |
 | `approval_needed` | `call_id`, `name`, `arguments`, `reason`? | A gated call needs a decision |
@@ -227,8 +227,8 @@ starting at `turn_started`, followed by a `result` line.
 `usage` in the `result` line reports what the turn used against each of its
 limits, counted by the daemon across the turn and its subagents. Each
 measure has an `assurance`: `enforced` means the engine counted it and
-would have stopped the turn at the limit; `unavailable` means it is not
-known.
+would have stopped the turn at the limit; `measured` means a provider
+reported it and no limit applies; `unavailable` means it is not known.
 
 ```json
 "usage": {
@@ -236,13 +236,29 @@ known.
   "tool_dispatches":   {"used": 5, "limit": 256, "assurance": "enforced"},
   "tool_output_bytes": {"used": 18234, "limit": 8388608, "assurance": "enforced"},
   "wall_time_ms":      {"used": 41210, "limit": 3600000, "assurance": "enforced"},
-  "tokens":            {"assurance": "unavailable"}
+  "tokens":            {"input": 2210, "output": 1874, "cache_read": 48120,
+                        "cache_write": 6031, "assurance": "measured"}
 }
 ```
 
 *Model rounds* are provider requests, including automatic continuations;
 *tool dispatches* are evaluated tool calls, whether run, denied, or refused.
-Token counts are not collected yet.
+
+*Tokens* are the providers' own counts, summed over every model response in
+the turn and its subagents:
+
+- `input` is input that was neither read from nor written to a prompt
+  cache, so the prompts' full size is `input + cache_read + cache_write`.
+- `cache_write_1h` appears when some cache writes used the one-hour
+  lifetime, which is billed at a higher rate.
+- `unreported_responses` appears when some responses came from a provider
+  that reported no usage, so the counts miss them.
+
+With no report at all, `tokens` is `{"assurance": "unavailable"}`. The
+Anthropic provider always reports usage. OpenAI-compatible servers report it
+only when they send a `usage` object in the stream. xshell does not compute
+a cost: prices vary by model and by gateway, so a runner applies its own
+price table to these counts.
 
 ### Audit reference
 

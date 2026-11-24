@@ -16,8 +16,8 @@ mod shell_policy;
 mod tools;
 
 pub use budget::{
-    Assurance, BudgetExhausted, LimitSettings, MAX_LIMIT_DURATION, TurnBudget, TurnLimits,
-    TurnUsage, UsageMeasure, parse_duration,
+    Assurance, BudgetExhausted, LimitSettings, MAX_LIMIT_DURATION, TokenMeasure, TurnBudget,
+    TurnLimits, TurnUsage, UsageMeasure, parse_duration,
 };
 pub use compaction::{
     BYTES_PER_TOKEN, CompactionConfig, CompactionReport, Compactor, DEFAULT_RESERVE_OUTPUT_TOKENS,

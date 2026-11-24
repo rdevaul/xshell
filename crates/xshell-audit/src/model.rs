@@ -25,7 +25,8 @@ use std::path::PathBuf;
 ///   body bytes as stored in the line, not a re-serialization of the parsed
 ///   body (F14). Formats 1 to 9 are verified by re-encoding.
 /// - 11: adds `AuditEvent::TurnContext`.
-pub const AUDIT_FORMAT_VERSION: u32 = 11;
+/// - 12: adds the `usage` field on `AuditEvent::AgentResponse`.
+pub const AUDIT_FORMAT_VERSION: u32 = 12;
 pub const MIN_SUPPORTED_AUDIT_FORMAT_VERSION: u32 = 1;
 /// The first format whose hashes and signatures cover the stored body bytes.
 pub const STORED_BYTES_AUDIT_FORMAT_VERSION: u32 = 10;
@@ -47,11 +48,41 @@ pub const STORED_BYTES_AUDIT_FORMAT_VERSION: u32 = 10;
 /// - 11: requests and responses reject unknown fields, and the daemon writes
 ///   format 10 (F14).
 /// - 12: adds `TurnContext` (format 11).
+/// - 13: adds `usage` on `AgentResponse` (format 12).
 ///
 /// Tagged enum variants are not forward-compatible in serde, so mixed-version
 /// peers must fail at handshake. New fields are not either: an older service
 /// would drop them and sign a record without them.
-pub const AUDIT_PROTOCOL_VERSION: u32 = 12;
+pub const AUDIT_PROTOCOL_VERSION: u32 = 13;
+
+/// Tokens a provider reported for one model response. `input` excludes
+/// input read from or written to a prompt cache.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditTokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_1h: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl From<xshell_core::TokenUsage> for AuditTokenUsage {
+    fn from(usage: xshell_core::TokenUsage) -> Self {
+        Self {
+            input: usage.input,
+            output: usage.output,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            cache_write_1h: usage.cache_write_1h,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -248,6 +279,10 @@ pub enum AuditEvent {
         /// The provider's reason for ending generation, when reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
+        /// Tokens the provider reported for this response. Skipped when
+        /// absent, so earlier records hash unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<AuditTokenUsage>,
     },
     /// The model ended a response without a tool call while apparently
     /// mid-task, so xshell sent `prompt` as a user message and kept the turn

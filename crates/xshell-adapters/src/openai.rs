@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use xshell_core::{
-    AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatRequest, ToolCall,
-    ToolDefinition,
+    AdapterError, AgentDescriptor, AgentEvent, AssistantResponse, ChatRequest, TokenUsage,
+    ToolCall, ToolDefinition,
 };
 
 pub struct OpenAiCompatibleAdapter {
@@ -165,6 +165,9 @@ struct OpenAiChunk {
     /// An error the provider reports inside a successful stream.
     #[serde(default)]
     error: Option<Value>,
+    /// Token counts, which some servers send in the last chunk.
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +266,7 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         let mut saw_done = false;
         let mut partial_calls = BTreeMap::<usize, ToolCallAccumulator>::new();
         let mut tool_argument_bytes = 0_usize;
+        let mut usage = None;
         stream_lines(response, |line| {
             let Some(data) = line.trim().strip_prefix("data:") else {
                 return Ok(());
@@ -279,6 +283,9 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
                 .map_err(|error| AdapterError::InvalidResponse(error.to_string()))?;
             if let Some(error) = &chunk.error {
                 return Err(crate::stream_error(error));
+            }
+            if let Some(reported) = chunk.usage.as_ref().and_then(openai_usage) {
+                usage = Some(reported);
             }
             for choice in chunk.choices {
                 if choice.index != 0 {
@@ -373,8 +380,34 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
             tool_calls,
             reasoning: Some(reasoning).filter(|text| !text.is_empty()),
             finish_reason,
+            provider_blocks: None,
+            usage,
         })
     }
+}
+
+/// Token counts from a chat-completions `usage` object. Cached prompt
+/// tokens, when reported, count as cache reads and not as input.
+fn openai_usage(usage: &Value) -> Option<TokenUsage> {
+    let (prompt, completion) = (
+        usage["prompt_tokens"].as_u64(),
+        usage["completion_tokens"].as_u64(),
+    );
+    if prompt.is_none() && completion.is_none() {
+        return None;
+    }
+    let prompt = prompt.unwrap_or(0);
+    let cached = usage["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(prompt);
+    Some(TokenUsage {
+        input: prompt - cached,
+        output: completion.unwrap_or(0),
+        cache_read: cached,
+        cache_write: 0,
+        cache_write_1h: 0,
+    })
 }
 
 #[cfg(test)]
@@ -636,6 +669,9 @@ mod tests {
         assert_eq!(response.content, "answer");
         assert_eq!(response.reasoning.as_deref(), Some("think more"));
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        // The empty `usage` object is not a report; the later one is.
+        let usage = response.usage.unwrap();
+        assert_eq!((usage.input, usage.output), (0, 3));
     }
 
     #[test]

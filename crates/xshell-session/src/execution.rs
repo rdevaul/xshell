@@ -739,6 +739,7 @@ on its model profile to attach images"
                         base_url: model.base_url.clone(),
                         api_key_env: model.api_key_env.clone(),
                         vision: model.vision,
+                        anthropic: model.anthropic.clone(),
                     })?;
                     // Built before anything else runs in the turn, and
                     // recorded before the model sees it. A provider that
@@ -1145,12 +1146,14 @@ impl DaemonObserver {
                 partial,
                 reasoning,
                 finish_reason,
+                usage,
             } => self.audit(AuditEvent::AgentResponse {
                 content: content.clone(),
                 tool_call_count: *tool_call_count,
                 partial: *partial,
                 reasoning: reasoning.clone(),
                 finish_reason: finish_reason.clone(),
+                usage: usage.map(Into::into),
             }),
             ExecutionEvent::AutoContinued { reason, prompt } => {
                 self.audit(AuditEvent::AutoContinued {

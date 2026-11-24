@@ -91,6 +91,7 @@ fn creation(name: &str, base_url: &str, cwd: &Path, tools: SessionTools) -> Sess
             context_tokens: None,
             reserve_output_tokens: None,
             vision: false,
+            anthropic: Default::default(),
         },
         cwd: cwd.into(),
         persistence: PersistenceMode::Daemon,

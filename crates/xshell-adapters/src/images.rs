@@ -148,7 +148,7 @@ fn append_line_owned(text: &mut String, line: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
     use xshell_core::{ImageMediaType, ToolCall};

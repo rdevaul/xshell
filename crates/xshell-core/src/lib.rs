@@ -145,6 +145,30 @@ pub struct ChatMessage {
     /// with the message. Absent in sessions written before images existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageRef>,
+    /// The assistant message's content blocks exactly as the provider
+    /// returned them, for replay to the same provider: signed thinking must
+    /// come back unchanged. Opaque to everything but the adapter that wrote
+    /// it, and absent in sessions written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_blocks: Option<ProviderBlocks>,
+}
+
+/// Content blocks a provider returned, kept for replay to that provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderBlocks {
+    /// The provider that wrote them, such as "anthropic".
+    pub provider: String,
+    /// The model that produced them.
+    pub model: String,
+    /// The message's content array.
+    pub blocks: serde_json::Value,
+}
+
+impl ProviderBlocks {
+    /// Approximate size, for history budgets.
+    pub fn bytes(&self) -> usize {
+        self.blocks.to_string().len()
+    }
 }
 
 impl ChatMessage {
@@ -157,6 +181,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -169,6 +194,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -181,6 +207,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -193,6 +220,7 @@ impl ChatMessage {
             tool_name: None,
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 
@@ -200,6 +228,12 @@ impl ChatMessage {
     /// is stored as `None`.
     pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
         self.reasoning = reasoning.filter(|text| !text.trim().is_empty());
+        self
+    }
+
+    /// Keep the provider's own content blocks with an assistant message.
+    pub fn with_provider_blocks(mut self, blocks: Option<ProviderBlocks>) -> Self {
+        self.provider_blocks = blocks;
         self
     }
 
@@ -218,6 +252,7 @@ impl ChatMessage {
             tool_name: Some(call.name.clone()),
             reasoning: None,
             images: Vec::new(),
+            provider_blocks: None,
         }
     }
 }
@@ -440,11 +475,92 @@ pub struct AssistantResponse {
     /// The provider's stated reason for ending generation ("stop",
     /// "tool_calls", "length", ...), when reported.
     pub finish_reason: Option<String>,
+    /// The response's content blocks, when the provider needs them replayed
+    /// exactly (signed thinking). Stored on the history message.
+    pub provider_blocks: Option<ProviderBlocks>,
+    /// Tokens the provider reported for this response, when it did.
+    pub usage: Option<TokenUsage>,
+}
+
+/// Tokens a provider reported for one response.
+///
+/// `input` counts only input that was neither read from nor written to a
+/// prompt cache, as the Anthropic API reports it; the prompt's full size is
+/// `input + cache_read + cache_write`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    /// Input written to the cache, at either lifetime.
+    pub cache_write: u64,
+    /// The part of `cache_write` written with the one-hour lifetime, when
+    /// reported. It is billed at a higher rate.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_1h: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// The sum of two counts, as for responses within one turn. Saturates
+/// rather than overflowing.
+impl std::ops::Add for TokenUsage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            cache_write_1h: self.cache_write_1h.saturating_add(other.cache_write_1h),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
     TextDelta(String),
+}
+
+/// Settings only the Anthropic provider reads. They travel with a model
+/// binding, so the daemon sends what the client's profile chose. Every field
+/// is optional; the adapter applies its own default for one left unset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AnthropicSettings {
+    /// The credential header: "x-api-key" (the default) or "bearer".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    /// `anthropic-version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    /// `output_config.effort`: "low" to "max".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// "adaptive" to request thinking, or "omit" (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// How thinking is shown: "omitted" or "summarized".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<String>,
+    /// `max_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Extra `anthropic-beta` values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub betas: Vec<String>,
+    /// Whether to send `anthropic-beta` at all; some gateways reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_betas: Option<bool>,
+}
+
+impl AnthropicSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -531,6 +647,26 @@ impl AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_blocks_round_trip_and_are_optional() {
+        let message = ChatMessage::assistant("x").with_provider_blocks(Some(ProviderBlocks {
+            provider: "anthropic".into(),
+            model: "m".into(),
+            blocks: serde_json::json!([{"type": "thinking", "thinking": "", "signature": "c2ln"}]),
+        }));
+        let text = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<ChatMessage>(&text).unwrap(), message);
+        // Messages written before the field existed still load.
+        let old: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"x"}"#).unwrap();
+        assert!(old.provider_blocks.is_none());
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("provider_blocks")
+        );
+    }
 
     #[test]
     fn f16_record_summary_never_quotes_provider_or_model_text() {

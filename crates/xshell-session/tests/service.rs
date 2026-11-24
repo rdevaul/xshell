@@ -38,6 +38,7 @@ fn model(name: &str) -> ModelBinding {
         context_tokens: None,
         reserve_output_tokens: None,
         vision: false,
+        anthropic: Default::default(),
     }
 }
 
@@ -1387,6 +1388,7 @@ fn f3_sigterm_cancels_agent_tool_process_group_before_exit() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Durable,
@@ -1644,6 +1646,7 @@ fn attached_and_viewed_images_reach_the_model_re_encoded_and_bounded() {
         context_tokens: None,
         reserve_output_tokens: None,
         vision,
+        anthropic: Default::default(),
     };
     let creation = |name: &str, vision| SessionCreation {
         name: name.into(),
@@ -1819,6 +1822,7 @@ fn a_vision_model_is_shown_the_sessions_stored_images() {
         context_tokens: None,
         reserve_output_tokens: None,
         vision,
+        anthropic: Default::default(),
     };
     let session = client
         .create(SessionCreation {
@@ -2069,6 +2073,7 @@ fn agent_turn_waits_for_remote_approval_then_continues() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -2229,6 +2234,7 @@ fn f9_tool_call_from_an_unfinished_stream_never_runs() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -2332,6 +2338,7 @@ fn subagent_approval_round_trips_through_the_daemon_under_its_scoped_id() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -2474,6 +2481,7 @@ fn f1_failed_agent_effect_survives_durable_session_reload() {
                     context_tokens: None,
                     reserve_output_tokens: None,
                     vision: false,
+                    anthropic: Default::default(),
                 },
                 cwd: temporary.path().into(),
                 persistence: PersistenceMode::Durable,
@@ -2893,6 +2901,7 @@ fn daemon_clamps_client_approval_to_its_configured_ceiling() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -3118,6 +3127,7 @@ fn h3_audit_records_turn_authority_and_what_decided_each_call() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -3833,6 +3843,7 @@ fn daemon_clamps_requested_limits_to_its_ceiling_and_enforces_them() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,
@@ -3946,6 +3957,7 @@ fn f23_binding(base_url: &str, api_key_env: Option<&str>) -> ModelBinding {
         context_tokens: None,
         reserve_output_tokens: None,
         vision: false,
+        anthropic: Default::default(),
     }
 }
 
@@ -4122,6 +4134,7 @@ fn f30_adopted_orphans_are_reaped() {
                 context_tokens: None,
                 reserve_output_tokens: None,
                 vision: false,
+                anthropic: Default::default(),
             },
             cwd: temporary.path().into(),
             persistence: PersistenceMode::Daemon,

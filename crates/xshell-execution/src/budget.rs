@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use xshell_core::TokenUsage;
 
 /// The longest duration a limit may be configured with. Keeps deadline
 /// arithmetic far from overflow; a turn that needs longer should be split.
@@ -297,6 +298,16 @@ struct BudgetInner {
     provider_requests: AtomicUsize,
     tool_calls: AtomicUsize,
     tool_output_bytes: AtomicUsize,
+    tokens: Mutex<TokenTally>,
+}
+
+/// Tokens the providers reported over a turn.
+#[derive(Debug, Default)]
+struct TokenTally {
+    total: TokenUsage,
+    /// Responses whose provider reported usage, and those whose did not.
+    reported: u64,
+    unreported: u64,
 }
 
 impl TurnBudget {
@@ -314,7 +325,26 @@ impl TurnBudget {
             provider_requests: AtomicUsize::new(0),
             tool_calls: AtomicUsize::new(0),
             tool_output_bytes: AtomicUsize::new(0),
+            tokens: Mutex::default(),
         }))
+    }
+
+    /// Count one model response's tokens, or that its provider reported
+    /// none. Subagents share the turn's budget, so their tokens are counted
+    /// here too.
+    pub fn record_tokens(&self, usage: Option<TokenUsage>) {
+        let mut tally = self
+            .0
+            .tokens
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match usage {
+            Some(usage) => {
+                tally.total = tally.total + usage;
+                tally.reported += 1;
+            }
+            None => tally.unreported += 1,
+        }
     }
 
     pub fn limits(&self) -> TurnLimits {
@@ -388,7 +418,27 @@ impl TurnBudget {
                 duration_ms(self.0.started.elapsed()),
                 duration_ms(limits.wall_time),
             ),
-            tokens: UsageMeasure::unavailable(),
+            tokens: self.token_measure(),
+        }
+    }
+
+    fn token_measure(&self) -> TokenMeasure {
+        let tally = self
+            .0
+            .tokens
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if tally.reported == 0 {
+            return TokenMeasure::default();
+        }
+        TokenMeasure {
+            input: Some(tally.total.input),
+            output: Some(tally.total.output),
+            cache_read: Some(tally.total.cache_read),
+            cache_write: Some(tally.total.cache_write),
+            cache_write_1h: Some(tally.total.cache_write_1h).filter(|tokens| *tokens > 0),
+            unreported_responses: Some(tally.unreported).filter(|count| *count > 0),
+            assurance: Assurance::Measured,
         }
     }
 
@@ -415,8 +465,46 @@ pub struct TurnUsage {
     pub tool_dispatches: UsageMeasure,
     pub tool_output_bytes: UsageMeasure,
     pub wall_time_ms: UsageMeasure,
-    /// Providers' token counts are not collected yet.
-    pub tokens: UsageMeasure,
+    /// Tokens the providers reported, summed over the turn and its
+    /// subagents. Measured, never enforced: no limit applies to them.
+    #[serde(default)]
+    pub tokens: TokenMeasure,
+}
+
+/// Tokens a turn used, as its providers reported them. With no report at
+/// all, only `assurance: "unavailable"` is written, as before tokens were
+/// collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenMeasure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<u64>,
+    /// Responses whose provider reported no usage, so the counts above miss
+    /// them. Absent when every response reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreported_responses: Option<u64>,
+    pub assurance: Assurance,
+}
+
+impl Default for TokenMeasure {
+    fn default() -> Self {
+        Self {
+            input: None,
+            output: None,
+            cache_read: None,
+            cache_write: None,
+            cache_write_1h: None,
+            unreported_responses: None,
+            assurance: Assurance::Unavailable,
+        }
+    }
 }
 
 /// One measure of use against its limit.
@@ -435,14 +523,6 @@ impl UsageMeasure {
             used: Some(used),
             limit: Some(limit),
             assurance: Assurance::Enforced,
-        }
-    }
-
-    fn unavailable() -> Self {
-        Self {
-            used: None,
-            limit: None,
-            assurance: Assurance::Unavailable,
         }
     }
 }
@@ -546,6 +626,39 @@ mod tests {
             serde_json::to_value(usage.tokens).unwrap(),
             serde_json::json!({"assurance": "unavailable"})
         );
+    }
+
+    #[test]
+    fn tokens_are_summed_and_measured() {
+        let budget = TurnBudget::new(limits(4, 5));
+        let usage = |input, output, cache_read, cache_write| TokenUsage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write_1h: 0,
+        };
+        budget.record_tokens(Some(usage(10, 5, 0, 100)));
+        budget.record_tokens(Some(usage(3, 7, 100, 0)));
+        assert_eq!(
+            serde_json::to_value(budget.usage().tokens).unwrap(),
+            serde_json::json!({
+                "input": 13, "output": 12, "cache_read": 100, "cache_write": 100,
+                "assurance": "measured",
+            })
+        );
+        budget.record_tokens(None);
+        assert_eq!(budget.usage().tokens.unreported_responses, Some(1));
+        // A turn record written before tokens were collected still loads.
+        let old: TurnUsage = serde_json::from_value(serde_json::json!({
+            "model_rounds": {"assurance": "unavailable"},
+            "tool_dispatches": {"assurance": "unavailable"},
+            "tool_output_bytes": {"assurance": "unavailable"},
+            "wall_time_ms": {"assurance": "unavailable"},
+            "tokens": {"assurance": "unavailable"},
+        }))
+        .unwrap();
+        assert_eq!(old.tokens, TokenMeasure::default());
     }
 
     #[test]
