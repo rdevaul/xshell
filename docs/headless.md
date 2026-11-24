@@ -197,7 +197,7 @@ incompatible change increments `schema`.
 | `run_started` | `schema`, `session`, `session_id`, `turn_id`, `limits_profile` | The turn was accepted |
 | `turn_started` | `approval`, `limits`, `requested_approval`?, `requested_limits`? | The daemon started the turn with this approval mode and these limits; the `requested_*` fields appear when it lowered what was asked |
 | `text` | `text` | Streamed response text |
-| `assistant_message` | `content`, `tool_calls`, `finish_reason`? | One complete model response |
+| `assistant_message` | `content`, `tool_calls`, `finish_reason`?, `reasoning`? | One complete model response; `reasoning` is the readable reasoning the provider reported, such as an Anthropic profile's summarized thinking |
 | `auto_continued` | `reason` | The turn continued automatically after an unfinished response |
 | `tool_requested` | `call_id`, `name`, `arguments` | The model asked for a tool |
 | `approval_needed` | `call_id`, `name`, `arguments`, `reason`? | A gated call needs a decision |

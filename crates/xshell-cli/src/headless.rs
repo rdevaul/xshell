@@ -931,17 +931,23 @@ fn handle_execution(
             content,
             tool_call_count,
             finish_reason,
+            reasoning,
             ..
         } => {
             if agent.is_none() && !content.trim().is_empty() {
                 summary.answer = content.clone();
             }
-            output.event(tagged(json!({
+            let mut message = json!({
                 "event": "assistant_message",
                 "content": content,
                 "tool_calls": tool_call_count,
                 "finish_reason": finish_reason,
-            })));
+            });
+            // The readable reasoning, when the provider reported any.
+            if let Some(reasoning) = reasoning.as_ref().filter(|text| !text.trim().is_empty()) {
+                message["reasoning"] = json!(reasoning);
+            }
+            output.event(tagged(message));
         }
         ExecutionEvent::AutoContinued { reason, .. } => {
             output.event(tagged(json!({"event": "auto_continued", "reason": reason})));
