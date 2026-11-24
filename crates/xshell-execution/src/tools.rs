@@ -960,7 +960,9 @@ async fn write_file(target: WriteTarget, arguments: &Value) -> Result<String> {
             prepared::MAX_EDIT_BYTES
         );
     }
-    let path = target.path().display().to_string();
+    // The path as the agent gave it: shorter than the canonical one, and it
+    // does not spell out where the session's directory is.
+    let path = required_string(arguments, "path")?.to_owned();
     let bytes = content.len();
     let created = run_blocking(move || target.write(content.as_bytes())).await?;
     let verb = if created { "created" } else { "replaced" };
@@ -980,7 +982,7 @@ async fn edit_file(target: WriteTarget, arguments: &Value) -> Result<String> {
     if old == new {
         bail!("old_string and new_string are the same");
     }
-    let path = target.path().display().to_string();
+    let path = required_string(arguments, "path")?.to_owned();
     let shown = path.clone();
     let count = run_blocking(move || {
         target.edit(|text| {
