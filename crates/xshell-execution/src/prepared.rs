@@ -408,6 +408,267 @@ fn file_type(status: &libc::stat) -> libc::mode_t {
     status.st_mode & libc::S_IFMT
 }
 
+/// Largest file `edit_file` reads in order to change it.
+pub(crate) const MAX_EDIT_BYTES: usize = 8 << 20;
+
+/// Where a write tool will write, resolved for authorization before anything
+/// is created (the write counterpart of [`PreparedObject`]).
+///
+/// - The deepest directory on the path that exists is opened by the same
+///   confined walk as a read ([`prepare`]), so its ancestors may be symlinks
+///   that stay inside the root, and the path recorded is the one the walk
+///   took.
+/// - Directories below it that do not exist yet are only named here; they
+///   are created by [`write`](Self::write), after approval, each opened with
+///   `O_NOFOLLOW` so that one swapped for a symlink in the meantime fails.
+/// - The file itself is never followed: a symlink at the final component is
+///   refused, as is anything that is not a regular file.
+#[derive(Debug)]
+pub(crate) struct WriteTarget {
+    directory: OwnedFd,
+    missing: Vec<OsString>,
+    name: OsString,
+    path: PathBuf,
+    sensitive: bool,
+    exists: bool,
+}
+
+/// Resolve `requested` beneath `root` as a file to create or replace (or,
+/// with `must_exist`, to change in place), and classify its path.
+pub(crate) fn prepare_write(
+    root: &Path,
+    requested: &str,
+    sensitive: &SensitivePaths,
+    must_exist: bool,
+) -> Result<WriteTarget> {
+    if requested.trim().is_empty() {
+        bail!("path is empty");
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve tool root {}", root.display()))?;
+    let relative = relative_to_root(&canonical_root, root, Path::new(requested))?;
+    let mut components: Vec<OsString> = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => components.push(name.to_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => components.push(OsString::from("..")),
+            Component::RootDir | Component::Prefix(_) => bail!(OUTSIDE_ROOT),
+        }
+    }
+    let Some(name) = components.pop().filter(|name| name != "..") else {
+        bail!("{requested} does not name a file");
+    };
+    // The deepest existing directory: try the whole parent, then drop
+    // trailing names that do not exist yet. `..` is only resolved within
+    // existing directories, by the walk.
+    let mut missing = Vec::new();
+    let directory = loop {
+        let parent: PathBuf = components.iter().collect();
+        let spelled = if parent.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            parent.to_string_lossy().into_owned()
+        };
+        match prepare(
+            root,
+            &spelled,
+            ObjectKind::Directory,
+            &SensitivePaths::none(),
+        ) {
+            Ok(directory) => break directory,
+            Err(error) if is_not_found(&error) && !components.is_empty() => {
+                let last = components.pop().expect("not empty");
+                if last == ".." {
+                    return Err(error);
+                }
+                missing.insert(0, last);
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    if must_exist && !missing.is_empty() {
+        bail!("{requested} does not exist");
+    }
+    let path = missing
+        .iter()
+        .fold(directory.path.clone(), |path, name| path.join(name))
+        .join(&name);
+    let exists = if missing.is_empty() {
+        match stat_at(directory.descriptor.as_raw_fd(), &c_name(&name)?) {
+            Ok(status) => match file_type(&status) {
+                libc::S_IFREG => true,
+                libc::S_IFLNK => bail!(
+                    "{} is a symbolic link; write to the file it points to instead",
+                    path.display()
+                ),
+                _ => bail!("{} is not a regular file", path.display()),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+            }
+        }
+    } else {
+        false
+    };
+    if must_exist && !exists {
+        bail!("{} does not exist", path.display());
+    }
+    let sensitive = sensitive.matches(&path);
+    Ok(WriteTarget {
+        directory: directory.descriptor,
+        missing,
+        name,
+        path,
+        sensitive,
+        exists,
+    })
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|cause| cause.kind() == io::ErrorKind::NotFound)
+}
+
+impl WriteTarget {
+    /// The canonical absolute path the file will have.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn sensitive(&self) -> bool {
+        self.sensitive
+    }
+
+    /// Whether the file existed when the target was prepared.
+    #[cfg(test)]
+    pub(crate) fn exists(&self) -> bool {
+        self.exists
+    }
+
+    /// Create the missing directories, then create or truncate the file and
+    /// write `bytes`. Returns whether the file was created.
+    pub(crate) fn write(self, bytes: &[u8]) -> Result<bool> {
+        let directory = self.create_directories()?;
+        let file = open_file_at(
+            directory.as_raw_fd(),
+            &self.name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        )
+        .map_err(|error| self.open_error(error))?;
+        let mut file = self.regular(file)?;
+        let created = !self.exists;
+        std::io::Write::write_all(&mut file, bytes)
+            .with_context(|| format!("cannot write {}", self.path.display()))?;
+        Ok(created)
+    }
+
+    /// Read the existing file (at most [`MAX_EDIT_BYTES`]), pass its text to
+    /// `change`, and write back what it returns, in the same open file.
+    pub(crate) fn edit<T>(self, change: impl FnOnce(&str) -> Result<(String, T)>) -> Result<T> {
+        let file = open_file_at(self.directory.as_raw_fd(), &self.name, libc::O_RDWR)
+            .map_err(|error| self.open_error(error))?;
+        let mut file = self.regular(file)?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(MAX_EDIT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("cannot read {}", self.path.display()))?;
+        if bytes.len() > MAX_EDIT_BYTES {
+            bail!(
+                "{} is larger than the {MAX_EDIT_BYTES}-byte edit limit",
+                self.path.display()
+            );
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("{} is not UTF-8 text", self.path.display()))?;
+        let (changed, outcome) = change(&text)?;
+        file.set_len(0)
+            .with_context(|| format!("cannot truncate {}", self.path.display()))?;
+        std::io::Seek::rewind(&mut file)
+            .with_context(|| format!("cannot rewind {}", self.path.display()))?;
+        std::io::Write::write_all(&mut file, changed.as_bytes())
+            .with_context(|| format!("cannot write {}", self.path.display()))?;
+        Ok(outcome)
+    }
+
+    fn create_directories(&self) -> Result<OwnedFd> {
+        let mut directory = duplicate(&self.directory)?;
+        for name in &self.missing {
+            let c = c_name(name)?;
+            // SAFETY: `c` is a valid C string; `directory` an open directory.
+            let made = unsafe { libc::mkdirat(directory.as_raw_fd(), c.as_ptr(), 0o777) };
+            if made != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error).with_context(|| {
+                        format!("cannot create a directory for {}", self.path.display())
+                    });
+                }
+            }
+            directory = open_at(
+                directory.as_raw_fd(),
+                name,
+                libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+            .with_context(|| format!("cannot open a directory for {}", self.path.display()))?;
+        }
+        Ok(directory)
+    }
+
+    fn open_error(&self, error: io::Error) -> anyhow::Error {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            anyhow::anyhow!(
+                "{} is a symbolic link; write to the file it points to instead",
+                self.path.display()
+            )
+        } else {
+            anyhow::Error::new(error).context(format!("cannot open {}", self.path.display()))
+        }
+    }
+
+    fn regular(&self, file: OwnedFd) -> Result<File> {
+        let status = stat_descriptor(file.as_raw_fd())
+            .with_context(|| format!("cannot inspect {}", self.path.display()))?;
+        if file_type(&status) != libc::S_IFREG {
+            bail!("{} is not a regular file", self.path.display());
+        }
+        Ok(File::from(file))
+    }
+}
+
+fn duplicate(descriptor: &OwnedFd) -> Result<OwnedFd> {
+    descriptor
+        .try_clone()
+        .context("cannot duplicate a directory descriptor")
+}
+
+/// Open `name` in `parent` for writing, never following a symlink and never
+/// blocking on a FIFO.
+fn open_file_at(parent: RawFd, name: &OsStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: `name` is a valid C string and `parent` a directory descriptor;
+    // the returned descriptor is owned below.
+    let descriptor = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o666 as libc::c_uint,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat succeeded, so `descriptor` is a new descriptor nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -689,5 +950,127 @@ pub(crate) mod tests {
         assert!(!truncated);
         assert!(entries.contains(&(OsString::from("subdir"), true)));
         assert!(entries.contains(&(OsString::from("file0"), false)));
+    }
+
+    fn target(root: &Path, path: &str) -> Result<WriteTarget> {
+        prepare_write(root, path, &SensitivePaths::new([".env".to_owned()]), false)
+    }
+
+    #[test]
+    fn writes_create_missing_directories_only_when_written() {
+        let (_temporary, root) = workspace();
+        let prepared = target(&root, "new/deep/file.txt").unwrap();
+        assert_eq!(prepared.path(), root.join("new/deep/file.txt"));
+        assert!(!prepared.exists());
+        // Preparing creates nothing: approval comes first.
+        assert!(!root.join("new").exists());
+        assert!(prepared.write(b"hello").unwrap());
+        assert_eq!(
+            fs::read_to_string(root.join("new/deep/file.txt")).unwrap(),
+            "hello"
+        );
+        // Overwriting reports an existing file and truncates it.
+        let again = target(&root, "new/deep/file.txt").unwrap();
+        assert!(again.exists());
+        assert!(!again.write(b"hi").unwrap());
+        assert_eq!(
+            fs::read_to_string(root.join("new/deep/file.txt")).unwrap(),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn writes_stay_inside_the_root() {
+        let (temporary, root) = workspace();
+        for escape in [
+            "../outside/notes.txt",
+            "dir/../../outside/x.txt",
+            "/etc/xshell-test",
+        ] {
+            let error = target(&root, escape).unwrap_err().to_string();
+            assert!(error.contains("outside"), "{escape}: {error}");
+        }
+        // A directory symlink that leaves the root is refused by the walk.
+        symlink(temporary.path().join("outside"), root.join("out")).unwrap();
+        assert!(target(&root, "out/x.txt").is_err());
+        assert!(!temporary.path().join("outside/x.txt").exists());
+        // One that stays inside is followed.
+        symlink(root.join("dir"), root.join("inside")).unwrap();
+        let prepared = target(&root, "inside/x.txt").unwrap();
+        assert_eq!(prepared.path(), root.join("dir/x.txt"));
+        prepared.write(b"x").unwrap();
+        assert_eq!(fs::read_to_string(root.join("dir/x.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn a_symlink_at_the_file_is_never_written_through() {
+        let (temporary, root) = workspace();
+        symlink(
+            temporary.path().join("outside/notes.txt"),
+            root.join("link.txt"),
+        )
+        .unwrap();
+        let error = target(&root, "link.txt").unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("outside/notes.txt")).unwrap(),
+            "outside"
+        );
+        // Swapped in after preparation: the open fails instead of following.
+        let prepared = target(&root, "late.txt").unwrap();
+        symlink(
+            temporary.path().join("outside/notes.txt"),
+            root.join("late.txt"),
+        )
+        .unwrap();
+        let error = prepared.write(b"x").unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("outside/notes.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn write_targets_are_classified_and_checked() {
+        let (_temporary, root) = workspace();
+        assert!(target(&root, ".env").unwrap().sensitive());
+        assert!(!target(&root, "notes.txt").unwrap().sensitive());
+        assert!(
+            target(&root, "dir")
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        assert!(target(&root, "notes.txt/x").is_err());
+        assert!(target(&root, "").is_err());
+        assert!(target(&root, "dir/..").is_err());
+        let missing = prepare_write(&root, "nope.txt", &SensitivePaths::none(), true);
+        assert!(missing.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn edits_change_the_file_in_place() {
+        let (_temporary, root) = workspace();
+        let prepared =
+            prepare_write(&root, "dir/notes.txt", &SensitivePaths::none(), true).unwrap();
+        let count = prepared
+            .edit(|text| Ok((text.replace("nested", "edited"), 1)))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            fs::read_to_string(root.join("dir/notes.txt")).unwrap(),
+            "edited notes"
+        );
+        // A shorter result leaves no trailing bytes.
+        let prepared =
+            prepare_write(&root, "dir/notes.txt", &SensitivePaths::none(), true).unwrap();
+        prepared.edit(|_| Ok(("x".to_owned(), ()))).unwrap();
+        assert_eq!(fs::read_to_string(root.join("dir/notes.txt")).unwrap(), "x");
+        // A refused change leaves the file alone.
+        let prepared =
+            prepare_write(&root, "dir/notes.txt", &SensitivePaths::none(), true).unwrap();
+        assert!(prepared.edit::<()>(|_| bail!("no match")).is_err());
+        assert_eq!(fs::read_to_string(root.join("dir/notes.txt")).unwrap(), "x");
     }
 }

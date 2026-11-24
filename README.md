@@ -461,6 +461,16 @@ visible and bounded:
   and the read uses the object that walk opened, so it cannot be swapped
   between the approval decision and the read. Reads and listings are bounded
   before memory is allocated.
+- `write_file` and `edit_file` are confined the same way: the deepest
+  existing directory is opened by that walk, missing directories are created
+  only after approval, and a symlink at the file itself is refused, never
+  written through. Every write is gated like a shell command (run in `auto`,
+  prompted in `ask`, refused in `off`). See
+  [agent tools](docs/agent-tools.md).
+- Long commands run as background jobs (`run_shell` with `background: true`):
+  xshell holds each job's process group, `job_output` reads or waits for it
+  and `job_kill` stops it, and every job, and any process a foreground command
+  left running, is killed when the turn ends.
 - Credential-like paths such as `.env`, `.ssh/**`, private keys,
   `.git/config`, and Terraform state are approval-gated by default, judged
   from the file's full path so the answer is the same from any cwd.
@@ -485,7 +495,7 @@ visible and bounded:
   approvals. One consequence: run `xshell` from a terminal outside xshell,
   not from a `$` command or a program started inside it.
 - xshell's own state directory, audit directory, configuration file and
-  control token are always blocked from agent read tools.
+  control token are always blocked from agent file tools, reads and writes.
 - A daemon accepts at most `session_fabric.max_sessions` sessions (256 by
   default) and runs at most `max_concurrent_turns` turns at once (8 by
   default); beyond either, requests are refused.

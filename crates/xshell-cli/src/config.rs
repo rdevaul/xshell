@@ -658,7 +658,9 @@ api_key_env = "OPENROUTER_API_KEY"
             })
             .effective_max_bytes()
             .expect("a declared window always enforces a budget");
-        let derived = (8192 - 2 * 1024) * 9 / 10 * xshell_execution::BYTES_PER_TOKEN;
+        // The reply reserve, and the measured size of the tool definitions.
+        let overhead = 1024 + xshell_execution::tool_schema_overhead_tokens();
+        let derived = (8192 - overhead) * 9 / 10 * xshell_execution::BYTES_PER_TOKEN;
         assert_eq!(enforced, derived, "the declared window must cap the budget");
         assert!(enforced < 262144);
 

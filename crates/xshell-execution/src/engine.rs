@@ -932,6 +932,35 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 .with_provider_blocks(response.provider_blocks),
         );
         if response.tool_calls.is_empty() {
+            // The root agent ended its response while a background job it
+            // started is still running: wait for the next job to end, then
+            // continue with what happened, as if it had been notified. A
+            // wall-time expiry while waiting ends the turn with this answer.
+            if policy.agent_scope.is_none()
+                && (budget.jobs().background_running() || budget.jobs().has_notices())
+            {
+                let cancellation = observer.cancellation();
+                budget
+                    .jobs()
+                    .wait_for_background(
+                        &cancellation,
+                        tokio::time::Instant::from_std(budget.deadline()),
+                    )
+                    .await;
+                let notices = budget.jobs().take_notices();
+                if !notices.is_empty() && !cancellation.is_cancelled() {
+                    let prompt = format!(
+                        "[xshell] A background job ended after your last response:{notices}\n\
+Continue the task. If it is complete, say so."
+                    );
+                    observer.emit(ExecutionEvent::AutoContinued {
+                        reason: "background_job_ended".into(),
+                        prompt: prompt.clone(),
+                    });
+                    history.push(ChatMessage::user(prompt));
+                    continue;
+                }
+            }
             if let Some((reason, prompt)) = continue_reason
                 && auto_continues < budget.limits().auto_continues
             {
@@ -1060,7 +1089,9 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 sensitive: gate_reason == Some(GateReason::SensitivePath),
                 writes: match tool {
                     ToolRef::Provided(provided) => provided.access() == ToolAccess::ReadWrite,
-                    ToolRef::Builtin(builtin) => builtin == Tool::RunShell,
+                    ToolRef::Builtin(builtin) => {
+                        builtin == Tool::RunShell || builtin.writes_files()
+                    }
                 },
                 cwd: Some(cwd),
                 search_path: None,
@@ -1194,9 +1225,12 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     observer.cancellation(),
                     budget.limits().shell_timeout,
                     policy.shell.as_ref(),
+                    budget.jobs(),
                 )
                 .await
             };
+            // Jobs that ended since the agent was last told, once.
+            let result = result + &budget.jobs().take_notices();
             observer.emit(ExecutionEvent::ToolResult {
                 call_id: scoped.id.clone(),
                 name: call.name.clone(),
@@ -2194,6 +2228,114 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn the_turn_waits_for_a_background_job_and_continues_with_its_end() {
+        let temporary = TempDir::new().unwrap();
+        let background = ToolCall {
+            id: "a".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "sleep 0.3; echo built > out.txt", "background": true}),
+        };
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![background],
+                    ..Default::default()
+                },
+                // Ends while the job runs: the engine waits, then continues.
+                AssistantResponse {
+                    content: "Waiting for the build.".into(),
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "build it".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(adapter.requests.len(), 3);
+        assert!(temporary.path().join("out.txt").exists());
+        let continued: Vec<_> = observer
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::AutoContinued { reason, prompt } => {
+                    Some((reason.clone(), prompt.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].0, "background_job_ended");
+        assert!(
+            continued[0].1.contains("exited with status 0"),
+            "{}",
+            continued[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn background_jobs_are_killed_when_the_turn_ends() {
+        let temporary = TempDir::new().unwrap();
+        let background = ToolCall {
+            id: "a".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "sleep 30; touch late", "background": true}),
+        };
+        let kill = ToolCall {
+            id: "b".into(),
+            name: "job_kill".into(),
+            arguments: json!({"job_id": 1}),
+        };
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![background],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    tool_calls: vec![kill],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "stopped".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "go".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        let results = tool_results(&observer.events);
+        assert!(results[1].1.contains("killed"), "{}", results[1].1);
+        // Killed, so it never got to the touch; and no wait at the end.
+        assert_eq!(adapter.requests.len(), 3);
+        assert!(!temporary.path().join("late").exists());
     }
 
     #[tokio::test]
@@ -5233,6 +5375,10 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
                 "list_directory",
                 "run_shell",
                 "delegate_task",
+                "write_file",
+                "edit_file",
+                "job_output",
+                "job_kill",
                 "memory_get",
                 "memory_put",
                 "memory_purge"
@@ -5452,6 +5598,10 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
                 "read_file",
                 "list_directory",
                 "run_shell",
+                "write_file",
+                "edit_file",
+                "job_output",
+                "job_kill",
                 "memory_get",
                 "memory_put",
                 "memory_purge"

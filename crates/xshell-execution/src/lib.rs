@@ -6,6 +6,7 @@ mod engine;
 mod environment;
 mod images;
 mod ingest;
+mod jobs;
 mod policy;
 mod prepared;
 mod process;
@@ -23,6 +24,7 @@ pub use compaction::{
     BYTES_PER_TOKEN, CompactionConfig, CompactionReport, Compactor, DEFAULT_RESERVE_OUTPUT_TOKENS,
     MINIMUM_HISTORY_TOKENS, MaxBytesCompactor, ModelBudget, NoCompaction, REQUEST_OVERHEAD_TOKENS,
     drop_tool_payloads, estimate_history_tokens, estimate_tokens, history_bytes, message_bytes,
+    tool_schema_overhead_tokens,
 };
 pub use context::{
     ContextProvider, ContextRequest, MAX_TURN_CONTEXT_BYTES, TurnContext, resolve_turn_context,
@@ -42,6 +44,7 @@ pub use ingest::{
     IngestError, IngestedImage, MAX_IMAGE_EDGE, MAX_SOURCE_BYTES, MAX_SOURCE_PIXELS, ingest,
     ingest_into, source_image_type,
 };
+pub use jobs::ShellJobs;
 pub use policy::{
     ApprovalRules, CallFacts, DecisionBasis, Policy, PolicyConfig, PolicyDecision, PolicyLayer,
     PolicyList, RuledDecision, default_decision, policy_identity,

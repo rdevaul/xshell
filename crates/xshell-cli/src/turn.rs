@@ -316,7 +316,7 @@ fn confirm_daemon_tool(
         return confirm_tool(call, reason).map(ApprovalPromptOutcome::Decision);
     };
     let why = match reason {
-        GateReason::ShellExecution => String::new(),
+        GateReason::ShellExecution | GateReason::FileWrite => String::new(),
         GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
         GateReason::Policy => " (the approval policy requires approval)".to_owned(),
         GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),
@@ -802,7 +802,7 @@ pub(crate) fn confirm_tool(call: &ToolCall, reason: GateReason) -> Result<Approv
         // user approves is exactly the command that will run: no control
         // sequences can redraw the line, and embedded newlines are visible.
         let why = match reason {
-            GateReason::ShellExecution => String::new(),
+            GateReason::ShellExecution | GateReason::FileWrite => String::new(),
             GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
             GateReason::Policy => " (the approval policy requires approval)".to_owned(),
             GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),

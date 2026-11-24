@@ -92,8 +92,8 @@ denied         = ["run_shell: rm *", "run_shell: git push *"]
 
 An entry names a tool, `run_shell` with a pattern matched word for word
 against the command's parsed arguments (`*` matches within a word, and a final
-`*` matches any remaining words), or `read_file` or `list_directory` with a
-path pattern (matched as sensitive paths are, except that only `denied`
+`*` matches any remaining words), or a file tool (`read_file`,
+`list_directory`, `view_image`, `write_file`, `edit_file`) with a path pattern (matched as sensitive paths are, except that only `denied`
 entries ignore letter case; write allow patterns in the case stored on disk). Each call is decided by the
 first rule that matches:
 
@@ -210,9 +210,10 @@ patterns = ["*.pem", "*.key", "*.p12", "id_rsa", "id_ed25519"]
 A `prompt` path stays gated even when the approval policy always allows its
 tool, unless the daemon's own policy names the path (`read_file:
 config/.env`); a client policy never can. A `block` path is refused to
-`read_file`, `list_directory` and `view_image` in every mode, whatever either
-policy says. Sensitivity governs the agent's read tools; a shell command that
-reads such a file is governed by the policy's `run_shell` rules.
+`read_file`, `list_directory`, `view_image`, `write_file` and `edit_file` in
+every mode, whatever either policy says. A write to a `prompt` path is gated as
+a sensitive path. Sensitivity governs the agent's file tools; a shell command
+that reads or writes such a file is governed by the policy's `run_shell` rules.
 
 **xshell's own files are always blocked**, whatever the configuration:
 - the session state directory, which holds every durable session's history,
