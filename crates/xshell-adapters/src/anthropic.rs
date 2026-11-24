@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use xshell_core::{
     AdapterError, AgentDescriptor, AgentEvent, AnthropicSettings, AssistantResponse, ChatMessage,
-    ChatRequest, MessageRole, ProviderBlocks, ToolCall,
+    ChatRequest, MessageRole, ProviderBlocks, TokenUsage, ToolCall,
 };
 
 /// The provider name stored with replayable blocks.
@@ -520,6 +520,8 @@ struct StreamEvent {
     error: Option<Value>,
     #[serde(default)]
     message: Option<Value>,
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 /// A content block being streamed.
@@ -561,6 +563,8 @@ struct Collected {
     blocks: BTreeMap<usize, Value>,
     /// Whether any block is thinking, which must be replayed exactly.
     thinking: bool,
+    /// Usage as last reported: `message_start`'s, updated by `message_delta`.
+    usage: Option<TokenUsage>,
 }
 
 impl Collected {
@@ -734,13 +738,14 @@ impl Collected {
                 if let Some(reason) = delta["stop_reason"].as_str() {
                     self.stop_reason = Some(reason.to_owned());
                 }
+                if let Some(usage) = &event.usage {
+                    self.update_usage(usage);
+                }
             }
             "message_start" => {
-                self.model = event
-                    .message
-                    .as_ref()
-                    .and_then(|message| message["model"].as_str())
-                    .map(str::to_owned);
+                let message = event.message.unwrap_or_default();
+                self.model = message["model"].as_str().map(str::to_owned);
+                self.update_usage(&message["usage"]);
             }
             "message_stop" => self.stopped = true,
             "error" => {
@@ -759,6 +764,32 @@ impl Collected {
             self.content.push_str(text);
             events(AgentEvent::TextDelta(text.to_owned()));
         }
+    }
+
+    /// Take the counts `usage` reports. `message_delta` counts are
+    /// cumulative, so each one present replaces the earlier value.
+    fn update_usage(&mut self, usage: &Value) {
+        if !usage.is_object() {
+            return;
+        }
+        let mut current = self.usage.unwrap_or_default();
+        let count = |field: &Value| field.as_u64();
+        if let Some(tokens) = count(&usage["input_tokens"]) {
+            current.input = tokens;
+        }
+        if let Some(tokens) = count(&usage["output_tokens"]) {
+            current.output = tokens;
+        }
+        if let Some(tokens) = count(&usage["cache_read_input_tokens"]) {
+            current.cache_read = tokens;
+        }
+        if let Some(tokens) = count(&usage["cache_creation_input_tokens"]) {
+            current.cache_write = tokens;
+        }
+        if let Some(tokens) = count(&usage["cache_creation"]["ephemeral_1h_input_tokens"]) {
+            current.cache_write_1h = tokens;
+        }
+        self.usage = Some(current);
     }
 
     fn open_tool_calls(&self) -> usize {
@@ -821,6 +852,7 @@ call; raise max_output_tokens. Its {calls} tool call(s) were not run"
             reasoning: Some(self.reasoning).filter(|text| !text.is_empty()),
             finish_reason: Some(finish_reason.to_owned()),
             provider_blocks,
+            usage: self.usage,
         })
     }
 }
@@ -1200,6 +1232,33 @@ mod tests {
         assert!(
             response.reasoning.is_none(),
             "no readable reasoning was shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_usage_with_delta_counts_replacing_start_counts() {
+        let events = [
+            json!({"type": "message_start", "message": {"id": "msg_1", "model": "m", "usage": {
+                "input_tokens": 12, "output_tokens": 1,
+                "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 300,
+                "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+            }}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 57}}),
+            json!({"type": "message_stop"}),
+        ];
+        let mut events = events.to_vec();
+        events.splice(1..1, text_block(0, "x"));
+        let usage = stream(sse(&events)).await.unwrap().usage.unwrap();
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input: 12,
+                output: 57,
+                cache_read: 4000,
+                cache_write: 300,
+                cache_write_1h: 200,
+            }
         );
     }
 

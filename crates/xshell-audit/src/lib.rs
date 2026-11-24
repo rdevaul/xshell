@@ -9,7 +9,7 @@ pub use log::{AuditLogWriter, SigningIdentity};
 pub use model::{
     AUDIT_FORMAT_VERSION, AUDIT_PROTOCOL_VERSION, AuditApproval, AuditCheckpoint, AuditConfig,
     AuditDecisionBasis, AuditEvent, AuditImage, AuditLogEntry, AuditPolicy, AuditProvidedTool,
-    AuditProvidedTools, AuditRecord, MIN_SUPPORTED_AUDIT_FORMAT_VERSION,
+    AuditProvidedTools, AuditRecord, AuditTokenUsage, MIN_SUPPORTED_AUDIT_FORMAT_VERSION,
     STORED_BYTES_AUDIT_FORMAT_VERSION, WitnessCommitment,
 };
 pub use protocol::{ClientRequest, ServerResponse};

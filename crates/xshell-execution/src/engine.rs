@@ -199,6 +199,9 @@ pub enum ExecutionEvent {
         reasoning: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
+        /// Tokens the provider reported for this response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<xshell_core::TokenUsage>,
     },
     /// The model ended a response without a tool call while apparently
     /// mid-task; `prompt` was added to the history as a user message and the
@@ -775,13 +778,13 @@ pub async fn run_agent_turn_with_budget(
                         tools: tools.clone(),
                     },
                     &mut emit,
-                ) => ProviderOutcome::Response(response),
+                ) => ProviderOutcome::Response(Box::new(response)),
                 () = cancellation.wait() => ProviderOutcome::Cancelled,
                 () = budget.expired() => ProviderOutcome::Expired,
             }
         };
         let response = match outcome {
-            ProviderOutcome::Response(response) => response,
+            ProviderOutcome::Response(response) => *response,
             ProviderOutcome::Cancelled => {
                 preserve_or_rollback_failed_turn(
                     history,
@@ -903,12 +906,14 @@ Start a new session with //new or lower max_history_bytes to continue.",
             *history = compacted;
         }
 
+        budget.record_tokens(response.usage);
         observer.emit(ExecutionEvent::AgentResponse {
             content: response.content.clone(),
             tool_call_count: response.tool_calls.len(),
             partial: false,
             reasoning: response.reasoning.clone(),
             finish_reason: response.finish_reason.clone(),
+            usage: response.usage,
         });
         // History keeps the provider's ids; everything a client or auditor
         // sees uses the scoped ids, which are unique within the root turn.
@@ -1243,7 +1248,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
 }
 
 enum ProviderOutcome {
-    Response(Result<AssistantResponse, AdapterError>),
+    Response(Box<Result<AssistantResponse, AdapterError>>),
     Cancelled,
     Expired,
 }
@@ -1257,6 +1262,7 @@ fn emit_partial_response(observer: &mut dyn TurnObserver, streamed_text: String)
             partial: true,
             reasoning: None,
             finish_reason: None,
+            usage: None,
         });
     }
 }
@@ -2645,6 +2651,7 @@ mod tests {
             partial: true,
             reasoning: None,
             finish_reason: None,
+            usage: None,
         }));
     }
 

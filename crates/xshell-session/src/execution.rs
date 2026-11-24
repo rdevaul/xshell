@@ -1146,12 +1146,14 @@ impl DaemonObserver {
                 partial,
                 reasoning,
                 finish_reason,
+                usage,
             } => self.audit(AuditEvent::AgentResponse {
                 content: content.clone(),
                 tool_call_count: *tool_call_count,
                 partial: *partial,
                 reasoning: reasoning.clone(),
                 finish_reason: finish_reason.clone(),
+                usage: usage.map(Into::into),
             }),
             ExecutionEvent::AutoContinued { reason, prompt } => {
                 self.audit(AuditEvent::AutoContinued {

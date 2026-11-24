@@ -26,6 +26,7 @@ serde_json = { workspace = true, features = ["float_roundtrip", "raw_value"] }
 sha2.workspace = true
 toml = "1.1"
 uuid.workspace = true
+xshell-core = { path = "../xshell-core" }
 xshell-platform = { path = "../xshell-platform" }
 
 [dev-dependencies]

@@ -932,6 +932,7 @@ fn handle_execution(
             tool_call_count,
             finish_reason,
             reasoning,
+            usage,
             ..
         } => {
             if agent.is_none() && !content.trim().is_empty() {
@@ -946,6 +947,9 @@ fn handle_execution(
             // The readable reasoning, when the provider reported any.
             if let Some(reasoning) = reasoning.as_ref().filter(|text| !text.trim().is_empty()) {
                 message["reasoning"] = json!(reasoning);
+            }
+            if let Some(usage) = usage {
+                message["usage"] = json!(usage);
             }
             output.event(tagged(message));
         }

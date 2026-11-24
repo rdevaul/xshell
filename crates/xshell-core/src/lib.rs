@@ -478,6 +478,46 @@ pub struct AssistantResponse {
     /// The response's content blocks, when the provider needs them replayed
     /// exactly (signed thinking). Stored on the history message.
     pub provider_blocks: Option<ProviderBlocks>,
+    /// Tokens the provider reported for this response, when it did.
+    pub usage: Option<TokenUsage>,
+}
+
+/// Tokens a provider reported for one response.
+///
+/// `input` counts only input that was neither read from nor written to a
+/// prompt cache, as the Anthropic API reports it; the prompt's full size is
+/// `input + cache_read + cache_write`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    /// Input written to the cache, at either lifetime.
+    pub cache_write: u64,
+    /// The part of `cache_write` written with the one-hour lifetime, when
+    /// reported. It is billed at a higher rate.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_1h: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// The sum of two counts, as for responses within one turn. Saturates
+/// rather than overflowing.
+impl std::ops::Add for TokenUsage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            cache_write_1h: self.cache_write_1h.saturating_add(other.cache_write_1h),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

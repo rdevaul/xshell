@@ -102,6 +102,7 @@ requested \"{requested}\" was not applied"
                             partial,
                             reasoning,
                             finish_reason,
+                            usage,
                         } => {
                             if agent.is_none() {
                                 if !renderer.received_delta() && !content.is_empty() {
@@ -117,6 +118,7 @@ requested \"{requested}\" was not applied"
                                 partial,
                                 reasoning,
                                 finish_reason,
+                                usage: usage.map(Into::into),
                             })?;
                         }
                         ExecutionEvent::AutoContinued { reason, prompt } => {
@@ -500,6 +502,7 @@ impl TurnObserver for LocalObserver<'_> {
                 partial,
                 reasoning,
                 finish_reason,
+                usage,
             } => {
                 let mut result = Ok(());
                 if agent.is_none() {
@@ -526,6 +529,7 @@ impl TurnObserver for LocalObserver<'_> {
                     partial,
                     reasoning,
                     finish_reason,
+                    usage: usage.map(Into::into),
                 }))
             }
             ExecutionEvent::AutoContinued { reason, prompt } => {
