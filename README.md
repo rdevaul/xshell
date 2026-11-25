@@ -545,6 +545,7 @@ rollback guarantees.
 - [Tool providers, per-session tool selections, turn context, and the embeddable daemon](docs/tool-providers.md)
 - [MCP bridge (design)](docs/mcp-bridge.md)
 - [Contained shell commands (design)](docs/shell-sandbox.md)
+- [Signed skills (design)](docs/signed-skills.md)
 - [Agentic CAD plan](docs/agentic-cad-plan.md)
 - [XSHELL.md durable handoff and goals (proposal)](docs/xshell-md-continuity.md)
 - [Home-lab service runner](docs/runall.md)
