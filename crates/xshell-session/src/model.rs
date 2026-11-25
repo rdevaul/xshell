@@ -29,7 +29,7 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // 31 adds `context_management`, `compact_at_tokens` and `compact_instructions`
 // on `AnthropicSettings`, and `compactions` on `TokenUsage`. Version 32 adds
 // `target` on `ExecutionEvent::ApprovalRequested` and
-// `ExecutionEvent::WaitingForJobs`.
+// `ExecutionEvent::WaitingForJobs`, and the `auto_sensitive` approval policy.
 pub const SESSION_PROTOCOL_VERSION: u32 = 32;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 

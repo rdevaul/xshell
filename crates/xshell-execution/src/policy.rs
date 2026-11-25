@@ -531,7 +531,7 @@ pub fn default_decision(call: &CallFacts, mode: ApprovalPolicy) -> PolicyDecisio
         ApprovalPolicy::Auto if call.writes && call.sensitive && call.path.is_some() => {
             PolicyDecision::Prompt
         }
-        ApprovalPolicy::Auto => PolicyDecision::Run,
+        ApprovalPolicy::Auto | ApprovalPolicy::AutoSensitive => PolicyDecision::Run,
     }
 }
 

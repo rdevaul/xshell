@@ -468,7 +468,9 @@ visible and bounded:
   rename. Every write is gated like a shell command (run in `auto`, prompted in
   `ask`, refused in `off`), and the prompt shows the canonical path and a
   preview. A write to a sensitive path, or to a shell start-up file, git hook
-  or the like, prompts even in `auto`. See [agent tools](docs/agent-tools.md).
+  or the like, prompts even in `auto`, so a headless run refuses it;
+  `--approve-sensitive-writes` (`--approval auto-sensitive`) runs it, where the
+  daemon's `max_approval` allows. See [agent tools](docs/agent-tools.md).
 - Long commands run as background jobs (`run_shell` with `background: true`):
   xshell holds each job's process group, `job_output` reads or waits for it
   and `job_kill` stops it, and every job, and any process a foreground command

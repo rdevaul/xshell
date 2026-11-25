@@ -70,7 +70,10 @@ response.
 
 The daemon executes agent tools, so the daemon owns the upper bound on how
 much unattended execution it permits. `session_fabric.max_approval` (default
-`ask`) is the most permissive policy applied to any turn. A client requesting
+`ask`) is the most permissive policy applied to any turn. The levels, least
+permissive first, are `off`, `ask`, `auto` and `auto_sensitive`, which is
+`auto` with writes to sensitive paths run too (see
+[agent tools](agent-tools.md)). A client requesting
 a more permissive policy is clamped and informed through the `turn_started`
 event's `requested_approval` field; the CLI prints a one-line notice. This
 matters once a controller on one host submits turns to `xshelld` on another:
