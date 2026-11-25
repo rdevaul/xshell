@@ -752,9 +752,6 @@ pub async fn run_agent_turn_with_budget(
         // provider only. History keeps them where they were written; see
         // [`merge_system_messages`].
         merge_system_messages(&mut request_messages);
-        if let Some(context) = &policy.context {
-            append_turn_context(&mut request_messages, context.text());
-        }
         let outcome = {
             let observer = &mut *observer;
             let mut emit = |event| match event {
@@ -776,6 +773,7 @@ pub async fn run_agent_turn_with_budget(
                         },
                         messages: request_messages,
                         tools: tools.clone(),
+                        context: policy.context.as_ref().map(|context| context.text().to_owned()),
                     },
                     &mut emit,
                 ) => ProviderOutcome::Response(Box::new(response)),
@@ -1559,22 +1557,6 @@ fn merge_system_messages(history: &mut Vec<ChatMessage>) -> usize {
         history.insert(0, ChatMessage::system(merged));
     }
     misplaced.len()
-}
-
-/// Append a turn's context to the leading `system` message of a provider
-/// request, creating one when the history has none. Applied to the request
-/// only: stored history never holds a turn's context, so each turn starts
-/// from the session's own system prompt and a fresh context.
-fn append_turn_context(request_messages: &mut Vec<ChatMessage>, context: &str) {
-    match request_messages.first_mut() {
-        Some(prefix) if prefix.role == MessageRole::System => {
-            if !prefix.content.is_empty() {
-                prefix.content.push_str("\n\n");
-            }
-            prefix.content.push_str(context);
-        }
-        _ => request_messages.insert(0, ChatMessage::system(context)),
-    }
 }
 
 const FAILED_AFTER_TOOLS_RECORD: &str =
@@ -5490,10 +5472,11 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
         );
     }
 
-    fn system_prompt(request: &ChatRequest) -> &str {
-        let first = &request.messages[0];
+    fn system_prompt(request: &ChatRequest) -> String {
+        let messages = request.messages_with_context();
+        let first = &messages[0];
         assert_eq!(first.role, MessageRole::System);
-        &first.content
+        first.content.clone()
     }
 
     fn turn_context(text: &str) -> Option<TurnContext> {
@@ -5576,7 +5559,10 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
         .await
         .unwrap();
         assert_eq!(system_prompt(&adapter.requests[0]), "You are Sybil.");
-        assert_eq!(adapter.requests[0].messages[1].content, "hello");
+        assert_eq!(
+            adapter.requests[0].messages_with_context()[1].content,
+            "hello"
+        );
         assert_eq!(history[0].role, MessageRole::User);
     }
 
