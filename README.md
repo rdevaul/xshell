@@ -187,8 +187,8 @@ and sent back unchanged, as the API requires during tool use. Prompts are
 cached for five minutes by default (`cache_ttl = "1h"` or `"off"` to change
 it); a run's `usage.tokens` shows the cache reads. For long runs,
 `context_management = "compact"` has the API summarize the conversation once the
-prompt reaches `compact_at_tokens` (150000 by default). Set `max_history_bytes = 0`
-with it, so that xshell's own compaction does not edit the history as well.
+prompt reaches `compact_at_tokens` (150000 by default); xshell's own compaction is
+then off for that profile.
 
 ```toml
 [models.opus]

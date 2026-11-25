@@ -605,6 +605,12 @@ impl AnthropicSettings {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Whether the provider compacts the conversation on the server, in
+    /// which case xshell's own compaction is turned off.
+    pub fn compacts_on_server(&self) -> bool {
+        self.context_management.as_deref() == Some("compact")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
