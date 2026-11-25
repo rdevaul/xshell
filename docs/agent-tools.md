@@ -45,6 +45,12 @@ confined the way reads are (`crates/xshell-execution/src/prepared.rs`):
   not affected. **A sensitive write prompts even in `auto` mode**; with nobody to answer, as in
   a headless run, it is denied. An `always_allowed` rule from the host's own policy that names
   the path still lets it run.
+- **`auto-sensitive`** is `auto` with sensitive writes run too, for batch work and testing where
+  nobody answers and the task needs such a write. Ask for it with `--approval auto-sensitive`,
+  or `--approval auto --approve-sensitive-writes` (`XSHELL_APPROVE_SENSITIVE_WRITES=1`). A
+  session daemon applies it only when `session_fabric.max_approval = "auto_sensitive"`;
+  otherwise the turn is lowered to `auto` and the client is told, as for any approval above the
+  ceiling.
 - **The approval prompt** shows, above the usual line, the canonical path and whether the file
   is created, replaced or changed, the content's size, and a bounded, escaped preview: the first
   lines of the content, or the old and new text of an edit.

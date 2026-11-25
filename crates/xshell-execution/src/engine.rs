@@ -53,17 +53,24 @@ pub enum ApprovalPolicy {
     #[default]
     Ask,
     Auto,
+    /// `auto`, and writes to sensitive paths run too instead of being put
+    /// to a person. For batch work and testing where nobody answers and the
+    /// task needs such a write.
+    #[serde(alias = "auto-sensitive")]
+    AutoSensitive,
     Off,
 }
 
 impl ApprovalPolicy {
     /// How much a policy lets an agent do without a human decision.
-    /// `Off` (deny shell) < `Ask` (prompt) < `Auto` (run everything).
+    /// `Off` (deny shell) < `Ask` (prompt) < `Auto` (run all but sensitive
+    /// writes) < `AutoSensitive` (run everything).
     fn permissiveness(self) -> u8 {
         match self {
             Self::Off => 0,
             Self::Ask => 1,
             Self::Auto => 2,
+            Self::AutoSensitive => 3,
         }
     }
 
@@ -82,7 +89,8 @@ impl std::fmt::Display for ApprovalPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Ask => "ask before shell execution",
-            Self::Auto => "auto-run all tools",
+            Self::Auto => "auto-run all tools except writes to sensitive paths",
+            Self::AutoSensitive => "auto-run all tools, writes to sensitive paths included",
             Self::Off => "deny shell execution",
         })
     }
@@ -2946,6 +2954,29 @@ mod tests {
                 .any(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
         );
         assert!(!root.join(".zshenv").exists());
+        // auto-sensitive: written without a prompt.
+        let events = one_call_turn(
+            root,
+            write_call(".zshenv"),
+            ApprovalPolicy::AutoSensitive,
+            vec![],
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
+        );
+        assert!(root.join(".zshenv").exists());
+        // A daemon whose ceiling is `auto` lowers it to `auto`.
+        assert_eq!(
+            ApprovalPolicy::AutoSensitive.clamp_to(ApprovalPolicy::Auto),
+            ApprovalPolicy::Auto
+        );
+        assert_eq!(
+            ApprovalPolicy::Auto.clamp_to(ApprovalPolicy::AutoSensitive),
+            ApprovalPolicy::Auto
+        );
     }
 
     fn calls(tool_calls: Vec<ToolCall>) -> AssistantResponse {
