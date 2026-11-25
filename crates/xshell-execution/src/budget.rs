@@ -33,7 +33,8 @@ pub struct TurnLimits {
     /// runs; a running `run_shell` call is bounded by `shell_timeout` plus a
     /// fixed kill-and-drain allowance of a few seconds (background jobs
     /// included, see F17), so a turn overruns by at most about one shell
-    /// timeout. Other tools carry their own bounds.
+    /// timeout. A `job_output` wait ends at the deadline. Other tools carry
+    /// their own bounds.
     #[serde(with = "seconds")]
     pub wall_time: Duration,
     /// How long one `run_shell` tool call may run before its process group
@@ -337,7 +338,7 @@ impl TurnBudget {
             tool_calls: AtomicUsize::new(0),
             tool_output_bytes: AtomicUsize::new(0),
             tokens: Mutex::default(),
-            jobs: ShellJobs::new(),
+            jobs: ShellJobs::until(deadline.into()),
         }))
     }
 

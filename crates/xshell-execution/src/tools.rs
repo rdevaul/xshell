@@ -629,6 +629,22 @@ impl Preparation {
     }
 }
 
+impl Preparation {
+    /// For a write, the canonical path and what the write does to it, as
+    /// shown when the write is put to a person for approval.
+    pub(crate) fn write_description(&self) -> Option<String> {
+        let Self::Write(target) = self else {
+            return None;
+        };
+        let effect = match (target.must_exist(), target.exists()) {
+            (true, _) => "changes the existing file",
+            (false, true) => "replaces the existing file",
+            (false, false) => "creates a new file",
+        };
+        Some(format!("{} ({effect})", target.path().display()))
+    }
+}
+
 /// Why `call` needs a human decision, judged from its preparation.
 pub(crate) fn gate(call: &ToolCall, preparation: &Preparation) -> Option<GateReason> {
     match preparation {
@@ -684,6 +700,59 @@ fn write_request(call: &ToolCall) -> Option<Result<(String, bool)>> {
 /// Whether a tool is gated regardless of its arguments.
 pub fn requires_approval_by_name(name: &str) -> bool {
     Tool::from_name(name).is_some_and(|tool| tool == Tool::RunShell || tool.writes_files())
+}
+
+/// Lines shown above an approval prompt for a file write: where it goes,
+/// its size, and a bounded preview of the content or of the change. Each
+/// line is raw model output; the caller escapes it for the terminal.
+pub fn approval_preview(call: &ToolCall, target: Option<&str>) -> Vec<String> {
+    const LINES: usize = 12;
+    const BYTES: usize = 1200;
+    fn excerpt(text: &str, mark: &str, lines: &mut Vec<String>) {
+        let mut shown = 0;
+        let total = text.lines().count().max(1);
+        for (index, line) in text.lines().enumerate() {
+            if index == LINES || shown + line.len() > BYTES {
+                lines.push(format!("    … {} more lines", total - index));
+                return;
+            }
+            shown += line.len();
+            lines.push(format!("  {mark} {line}"));
+        }
+        if text.is_empty() {
+            lines.push(format!("  {mark} (empty)"));
+        }
+    }
+    let text = |key: &str| call.arguments.get(key).and_then(Value::as_str);
+    let mut lines = Vec::new();
+    match call.name.as_str() {
+        "write_file" => {
+            let content = text("content").unwrap_or_default();
+            lines.push(format!(
+                "  to: {}",
+                target.unwrap_or(text("path").unwrap_or("?"))
+            ));
+            lines.push(format!(
+                "  content: {} bytes, {} lines",
+                content.len(),
+                content.lines().count()
+            ));
+            excerpt(content, "|", &mut lines);
+        }
+        "edit_file" => {
+            lines.push(format!(
+                "  in: {}",
+                target.unwrap_or(text("path").unwrap_or("?"))
+            ));
+            if call.arguments.get("replace_all").and_then(Value::as_bool) == Some(true) {
+                lines.push("  every occurrence of:".to_owned());
+            }
+            excerpt(text("old_string").unwrap_or_default(), "-", &mut lines);
+            excerpt(text("new_string").unwrap_or_default(), "+", &mut lines);
+        }
+        _ => {}
+    }
+    lines
 }
 
 pub fn tool_summary(call: &ToolCall) -> String {
@@ -901,7 +970,7 @@ async fn run_blocking_within<T: Send + 'static>(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(anyhow::anyhow!("filesystem worker failed: {error}")),
         Err(_) => bail!(
-            "the filesystem did not respond within {} ms",
+            "the filesystem did not respond within {} ms; the operation may still finish",
             deadline.as_millis()
         ),
     }
@@ -987,18 +1056,30 @@ async fn edit_file(target: WriteTarget, arguments: &Value) -> Result<String> {
     let count = run_blocking(move || {
         target.edit(|text| {
             let count = text.matches(old.as_str()).count();
-            match count {
-                0 => bail!(
+            if count == 0 {
+                bail!(
                     "old_string was not found in {shown}; it must match exactly, including \
 whitespace and indentation"
-                ),
-                1 => Ok((text.replacen(old.as_str(), &new, 1), 1)),
-                _ if replace_all => Ok((text.replace(old.as_str(), &new), count)),
-                _ => bail!(
+                );
+            }
+            if count > 1 && !replace_all {
+                bail!(
                     "old_string occurs {count} times in {shown}; include more surrounding text to \
 make it unique, or set replace_all"
-                ),
+                );
             }
+            // Bound the result before building it: a short old_string with
+            // many matches and a long new_string could otherwise ask for more
+            // memory than the host has.
+            let size = (text.len() as u128 + count as u128 * new.len() as u128)
+                - count as u128 * old.len() as u128;
+            if size > prepared::MAX_EDIT_BYTES as u128 {
+                bail!(
+                    "the edit would make {shown} {size} bytes, over the {}-byte limit",
+                    prepared::MAX_EDIT_BYTES
+                );
+            }
+            Ok((text.replace(old.as_str(), &new), count))
         })
     })
     .await?;
@@ -2196,6 +2277,84 @@ print $f $$; close $f; sleep 1000000' & sleep 1000000",
         assert_eq!(jobs.take_notices(), "");
         let output = run_with(&tool("job_output", json!({"job_id": 9})), root, &jobs).await;
         assert!(output.contains("there is no job 9"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn an_edit_whose_result_would_exceed_the_limit_is_refused() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        std::fs::write(root.join("a.txt"), "a".repeat(1 << 20)).unwrap();
+        let output = execute_tool(
+            &tool(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "a", "new_string": "b".repeat(500_000),
+                    "replace_all": true}),
+            ),
+            root,
+        )
+        .await;
+        assert!(output.contains("over the"), "{output}");
+        assert_eq!(
+            std::fs::metadata(root.join("a.txt")).unwrap().len(),
+            1 << 20
+        );
+    }
+
+    #[tokio::test]
+    async fn processes_a_background_shell_leaves_running_become_a_job_killed_at_turn_end() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let jobs = ShellJobs::new();
+        run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "sleep 60 >/dev/null 2>&1 &", "background": true}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        let group = jobs_group(&jobs, 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while jobs.group_of(2).is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(jobs.group_of(2), Some(group), "the survivors are adopted");
+        let notice = jobs.take_notices();
+        assert!(
+            notice.contains("job 1") && notice.contains("status 0"),
+            "{notice}"
+        );
+        let output = run_with(&tool("job_output", json!({"job_id": 2})), root, &jobs).await;
+        assert!(output.contains("leftover processes, running"), "{output}");
+        jobs.shut_down();
+        assert!(!group_alive(group));
+    }
+
+    #[tokio::test]
+    async fn a_job_output_wait_ends_at_the_turn_deadline() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let jobs = ShellJobs::until(tokio::time::Instant::now() + Duration::from_millis(300));
+        run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "sleep 30", "background": true}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let output = run_with(
+            &tool("job_output", json!({"job_id": 1, "wait_seconds": 600})),
+            root,
+            &jobs,
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5), "{output}");
+        assert!(output.contains("running"), "{output}");
+        jobs.shut_down();
     }
 
     #[tokio::test]
