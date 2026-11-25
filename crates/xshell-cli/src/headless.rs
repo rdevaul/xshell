@@ -315,6 +315,13 @@ fn execute(
         outcome: refusal_outcome(&error),
         error,
     })?;
+    if existing && args.durable && snapshot.descriptor.persistence != PersistenceMode::Durable {
+        output.warning(&format!(
+            "--durable applies only to a session the run creates; {session_name} already exists \
+and keeps its persistence ({:?})",
+            snapshot.descriptor.persistence
+        ));
+    }
     let session_id = snapshot.descriptor.id.clone();
     // A session this run created for a turn that never started is closed
     // again, so refused runs do not use up the daemon's session budget. An

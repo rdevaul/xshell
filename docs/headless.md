@@ -44,7 +44,14 @@ xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral | --durable] [--d
   - `--durable` creates the session durable: it is kept in the state directory and
     restored when the daemon restarts, so a later `run --session NAME` continues the
     same conversation, thinking blocks included. It applies only to a session the
-    run creates; otherwise a run's session lasts as long as the daemon.
+    run creates, and a run that names an existing session with `--durable` warns
+    that the session keeps its own persistence. Otherwise a run's session lasts as
+    long as the daemon. Durable sessions count against
+    `session_fabric.max_sessions` (256 by default) and are never removed
+    automatically: a harness that makes one per run should close it when done
+    (`//close` in the session, or a session client's `close` request). Its history,
+    signed thinking included, is stored in the state directory, which the agent's
+    file tools cannot read.
 - **Shared options:** `--config`, `--profile`, `--provider`, `--model`,
   `--base-url`, `--api-key-env`, `--system-prompt`, `--session`, `--cwd`,
   `--approval`, `--approval-policy`, and `--limits` work as they do for interactive `xshell`,
