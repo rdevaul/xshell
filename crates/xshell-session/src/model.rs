@@ -25,8 +25,8 @@ use xshell_execution::{ApprovalDecision, ApprovalPolicy, ExecutionEvent};
 // adds `AttachImage` and `ViewImage`, which read an image file on the session
 // host. Version 28 adds `shell` on `SessionCreation` and `SessionDescriptor`.
 // Version 29 adds `anthropic` on `ModelBinding` and `provider_blocks` on
-// `ChatMessage`.
-pub const SESSION_PROTOCOL_VERSION: u32 = 29;
+// `ChatMessage`. Version 30 adds `cache_ttl` on `AnthropicSettings`.
+pub const SESSION_PROTOCOL_VERSION: u32 = 30;
 pub const DAEMON_PROBE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

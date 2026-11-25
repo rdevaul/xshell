@@ -1369,16 +1369,19 @@ pub fn watch_signals(interrupted: Arc<AtomicBool>) {
 }
 
 /// A warning when the provider wrote prompt-cache entries over several
-/// model rounds but never read one back. Something in the prompt then
-/// changed between requests, and every round paid the write price for
-/// nothing.
+/// model rounds but never read one back. Either something in the prompt
+/// changed between requests, or the gaps between requests (a long tool run)
+/// outlasted the cache lifetime; every round paid the write price for
+/// nothing. It covers one headless run only; the per-response `usage`
+/// events locate the round where reads stopped.
 fn cache_warning(usage: &xshell_execution::TurnUsage) -> Option<String> {
     let tokens = &usage.tokens;
     let rounds = usage.model_rounds.used.unwrap_or(0);
     (rounds >= 2 && tokens.cache_read == Some(0) && tokens.cache_write.unwrap_or(0) > 0).then(|| {
         format!(
             "the provider wrote {} prompt-cache tokens over {rounds} model rounds but read none \
-back; the prompt changed between requests, so caching saved nothing",
+back, so caching saved nothing: the prompt changed between requests, or a gap between \
+requests (such as a long tool run) outlasted the cache lifetime",
             tokens.cache_write.unwrap_or(0)
         )
     })

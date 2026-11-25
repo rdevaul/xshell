@@ -416,23 +416,28 @@ request.
   whenever the previous tool call ran longer than four minutes. That costs 2× on writes, against
   re-reading the whole prefix uncached.
 - **As built (P5).**
-  - Three markers are used, not four. The one on the last system block also caches the tools,
-    which render before it; the last tool carries the marker only when there is no system prompt.
-    The other two go on the last block of the newest user message and of the user message before
-    it.
+  - All four markers are used: the last tool, the last system block, and the last block of the
+    newest user message and of the user message before it. The tool marker keeps the tools cached
+    when the system prompt changes, as it does when an execution record from a failed turn is
+    folded into it.
   - `cache_ttl` is `"5m"` (the default), `"1h"` or `"off"`. `"auto"` needs the engine to tell the
     adapter how long the last tool ran, and is left for later.
   - Every marker has the same lifetime, which keeps the API's rule that longer-lived entries come
     first.
-  - Within one turn every request is the previous one plus new messages, which a test checks. A
-    new turn still changes the system prompt, because the engine appends the turn's context to it
-    (`engine.rs:1528`). So a new turn re-reads the tools and system prompt uncached once; a
-    one-turn headless run is not affected. Moving that context into `messages` is part of P6.
+  - Within one turn every request is the previous one plus new messages, which a test checks.
+  - **A turn context (S6) still costs a new turn its history.** The engine passes the context
+    apart from the messages (`ChatRequest::context`). The adapter sends it as its own system block
+    after the marked system prompt, so the tools and system prompt stay cached. But the system
+    blocks precede `messages`, so a new context means the whole history is written again, at the
+    cache-write price, on the first request of each turn. Without a context source, and within a
+    turn, nothing is rewritten. Sending the context after the history is part of P6.
 - **Verification.** `cache_read` in §5.3 shows whether caching works. As built, the headless
   client warns at the end of a run that made two or more model rounds, wrote cache entries and read
-  none back: the prompt changed between requests. The warning is the client's, since the engine has
-  no warning event; the per-response `usage` in the JSONL stream locates the round where reads
-  stopped.
+  none back. Either the prompt changed between requests, or a gap between requests, such as a tool
+  that ran longer than the 5-minute lifetime, let the entries expire; the warning cannot tell which.
+  It covers one headless run, not interactive sessions. The warning is the client's, since the
+  engine has no warning event; the per-response `usage` in the JSONL stream locates the round where
+  reads stopped.
 
 ## 8. Errors and retries
 

@@ -270,6 +270,16 @@ impl AnthropicAdapter {
         if let Some(ttl) = self.options.cache_ttl {
             place_cache_markers(&mut body, ttl);
         }
+        // The turn's context goes after the marked system prompt, so a new
+        // context costs one uncached block, not the tools and system prompt.
+        // It still precedes `messages`, so the history is written again.
+        if let Some(context) = request.context.as_deref().filter(|text| !text.is_empty()) {
+            let block = json!({"type": "text", "text": context});
+            match body["system"].as_array_mut() {
+                Some(system) => system.push(block),
+                None => body["system"] = json!([block]),
+            }
+        }
         body
     }
 
@@ -296,13 +306,16 @@ impl AnthropicAdapter {
 
 /// Mark where the prompt cache should end, at the request's stability
 /// boundaries. Caching is a prefix match over tools, system, then messages,
-/// and the API allows four markers; three are used:
+/// and the API allows four markers:
 ///
-/// 1. The last system block, which caches the tools with it. With no system
-///    prompt, the last tool instead.
-/// 2. The last block of the newest user message: the next request reads
+/// 1. The last tool, so the tools stay cached when the system prompt
+///    changes (an execution record folded into it after a failed turn).
+/// 2. The last block of the system prompt. The turn's context is added
+///    after this marker (see [`AnthropicAdapter::body`]), so it is not part
+///    of the cached prefix.
+/// 3. The last block of the newest user message: the next request reads
 ///    everything up to here.
-/// 3. The last block of the user message before it, so that a request whose
+/// 4. The last block of the user message before it, so that a request whose
 ///    newest message added many blocks still finds the previous entry within
 ///    the API's 20-position lookback.
 ///
@@ -315,11 +328,8 @@ fn place_cache_markers(body: &mut Value, ttl: CacheTtl) {
             last["cache_control"] = marker.clone();
         }
     };
-    if body["system"].is_array() {
-        mark_last(&mut body["system"]);
-    } else if body["tools"].is_array() {
-        mark_last(&mut body["tools"]);
-    }
+    mark_last(&mut body["tools"]);
+    mark_last(&mut body["system"]);
     let Some(messages) = body["messages"].as_array_mut() else {
         return;
     };
@@ -1631,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_markers_sit_on_system_and_the_two_newest_user_messages() {
+    fn cache_markers_sit_on_tools_system_and_the_two_newest_user_messages() {
         let body = cached_body(
             tool_loop(3),
             vec![tool("b"), tool("a")],
@@ -1642,30 +1652,124 @@ mod tests {
             [
                 "/messages/4/content/0",
                 "/messages/6/content/0",
-                "/system/0"
+                "/system/0",
+                "/tools/1"
             ]
         );
         assert_eq!(
             body["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
         );
-        // At most four markers are allowed; three are used.
-        assert!(markers(&body).len() <= 4);
+        assert_eq!(body["tools"][1]["name"], "b", "the last tool after sorting");
     }
 
     #[test]
-    fn without_a_system_prompt_the_last_tool_is_marked() {
+    fn without_a_system_prompt_the_last_tool_is_still_marked() {
         let body = cached_body(
             vec![ChatMessage::user("go")],
             vec![tool("b"), tool("a")],
             CacheTtl::OneHour,
         );
         assert_eq!(markers(&body), ["/messages/0/content/0", "/tools/1"]);
-        assert_eq!(body["tools"][1]["name"], "b", "the last tool after sorting");
         assert_eq!(
             body["tools"][1]["cache_control"],
             json!({"type": "ephemeral", "ttl": "1h"})
         );
+    }
+
+    /// The body for `messages` with `context` as the turn's context.
+    fn body_with_context(messages: Vec<ChatMessage>, context: &str) -> Value {
+        let mut request = ChatRequest::new(messages, vec![tool("a")]);
+        request.context = Some(context.into());
+        AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_options(AnthropicOptions {
+                cache_ttl: Some(CacheTtl::FiveMinutes),
+                ..AnthropicOptions::default()
+            })
+            .body(&request)
+    }
+
+    #[test]
+    fn the_turn_context_follows_the_marked_system_prompt() {
+        let body = body_with_context(tool_loop(1), "It is Tuesday.");
+        assert_eq!(
+            body["system"],
+            json!([
+                {"type": "text", "text": "You are xshell.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "It is Tuesday."},
+            ])
+        );
+        // At most four markers are allowed.
+        assert!(markers(&body).len() <= 4);
+
+        // A new turn with a different context keeps the marked prefix (tools
+        // and the system prompt) byte for byte.
+        let next = body_with_context(tool_loop(2), "It is Wednesday.");
+        assert_eq!(next["tools"], body["tools"]);
+        assert_eq!(next["system"][0], body["system"][0]);
+        assert_ne!(next["system"][1], body["system"][1]);
+
+        // With no system prompt, the context is the only system block and
+        // carries no marker; the last tool still does.
+        let bare = body_with_context(vec![ChatMessage::user("go")], "It is Tuesday.");
+        assert_eq!(
+            bare["system"],
+            json!([{"type": "text", "text": "It is Tuesday."}])
+        );
+        assert_eq!(markers(&bare), ["/messages/0/content/0", "/tools/0"]);
+    }
+
+    #[test]
+    fn markers_go_after_images_and_never_on_thinking() {
+        let (image, bytes) = crate::images::tests::image(7, "plot.png");
+        let a = call("toolu_a", "a");
+        let assistant = ChatMessage::assistant_with_tools("", vec![a.clone()])
+            .with_provider_blocks(Some(ProviderBlocks {
+                provider: "anthropic".into(),
+                model: "m".into(),
+                blocks: json!([
+                    {"type": "thinking", "thinking": "", "signature": "c2lnLTE="},
+                    {"type": "tool_use", "id": "toolu_a", "name": "read_file", "input": {"path": "a"}},
+                ]),
+            }));
+        let mut request = ChatRequest::new(
+            vec![
+                ChatMessage::user("go"),
+                assistant,
+                ChatMessage::tool_result(&a, "rendered").with_images([image.clone()]),
+            ],
+            Vec::new(),
+        );
+        request.images = [(image.sha256().to_owned(), std::sync::Arc::new(bytes))].into();
+        let body = AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_vision(true)
+            .with_options(AnthropicOptions {
+                cache_ttl: Some(CacheTtl::FiveMinutes),
+                ..AnthropicOptions::default()
+            })
+            .body(&request);
+        let found = markers(&body);
+        assert_eq!(
+            found,
+            [
+                "/messages/0/content/0",
+                format!(
+                    "/messages/2/content/{}",
+                    body["messages"][2]["content"].as_array().unwrap().len() - 1
+                )
+                .as_str()
+            ]
+        );
+        let last = body["messages"][2]["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(
+            last["type"], "image",
+            "the marker is on the last block, the image"
+        );
+        assert!(!body["messages"][1].to_string().contains("cache_control"));
     }
 
     #[test]
