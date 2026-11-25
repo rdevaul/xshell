@@ -70,6 +70,34 @@ pub const DEFAULT_SENSITIVE_PATTERNS: &[&str] = &[
     "*.secrets",
 ];
 
+/// Files that are not secrets, but that run code or change how tools behave
+/// once written: shell start-up files, git hooks and settings, SSH's
+/// `authorized_keys` and the like. A write to one is gated like a write to a
+/// sensitive path, so it prompts even in `auto` mode. Reads are not affected.
+pub const WRITE_SENSITIVE_PATTERNS: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".inputrc",
+    ".gitconfig",
+    ".git/config",
+    ".git/hooks/**",
+    ".ssh/**",
+    ".config/fish/**",
+    ".config/git/**",
+    ".config/autostart/**",
+    "Library/LaunchAgents/**",
+    ".xshell/**",
+    ".config/xshell/**",
+];
+
 #[derive(Debug, Clone)]
 pub struct SensitivePaths {
     patterns: Vec<String>,
@@ -90,6 +118,11 @@ impl SensitivePaths {
                 .filter(|p| !p.is_empty())
                 .collect(),
         }
+    }
+
+    /// [`WRITE_SENSITIVE_PATTERNS`].
+    pub fn write_targets() -> Self {
+        Self::new(WRITE_SENSITIVE_PATTERNS.iter().map(|s| (*s).to_owned()))
     }
 
     /// No patterns: nothing is ever promoted.

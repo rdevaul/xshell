@@ -431,6 +431,7 @@ pub(crate) struct WriteTarget {
     path: PathBuf,
     sensitive: bool,
     exists: bool,
+    must_exist: bool,
 }
 
 /// Resolve `requested` beneath `root` as a file to create or replace (or,
@@ -516,7 +517,7 @@ pub(crate) fn prepare_write(
     if must_exist && !exists {
         bail!("{} does not exist", path.display());
     }
-    let sensitive = sensitive.matches(&path);
+    let sensitive = sensitive.matches(&path) || write_targets().matches(&path);
     Ok(WriteTarget {
         directory: directory.descriptor,
         missing,
@@ -524,7 +525,14 @@ pub(crate) fn prepare_write(
         path,
         sensitive,
         exists,
+        must_exist,
     })
+}
+
+/// The write-sensitive patterns, built once.
+fn write_targets() -> &'static SensitivePaths {
+    static TARGETS: std::sync::OnceLock<SensitivePaths> = std::sync::OnceLock::new();
+    TARGETS.get_or_init(SensitivePaths::write_targets)
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
@@ -545,34 +553,56 @@ impl WriteTarget {
     }
 
     /// Whether the file existed when the target was prepared.
-    #[cfg(test)]
     pub(crate) fn exists(&self) -> bool {
         self.exists
     }
 
-    /// Create the missing directories, then create or truncate the file and
-    /// write `bytes`. Returns whether the file was created.
+    /// Whether the target was prepared for an edit of an existing file.
+    pub(crate) fn must_exist(&self) -> bool {
+        self.must_exist
+    }
+
+    /// Create the missing directories, then write `bytes` to a new file
+    /// beside the target and move it into place. Returns whether the file was
+    /// created.
+    ///
+    /// The target changes all at once or not at all: a failed or interrupted
+    /// write leaves it as it was. A file the target named when it was
+    /// prepared is replaced keeping its mode; when it did not exist, a file
+    /// that appeared since (during an approval wait) is not replaced.
     pub(crate) fn write(self, bytes: &[u8]) -> Result<bool> {
         let directory = self.create_directories()?;
-        let file = open_file_at(
-            directory.as_raw_fd(),
-            &self.name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-        )
-        .map_err(|error| self.open_error(error))?;
-        let mut file = self.regular(file)?;
-        let created = !self.exists;
-        std::io::Write::write_all(&mut file, bytes)
-            .with_context(|| format!("cannot write {}", self.path.display()))?;
-        Ok(created)
+        let mode = if self.exists {
+            match stat_at(directory.as_raw_fd(), &c_name(&self.name)?) {
+                Ok(status) if file_type(&status) == libc::S_IFREG => Some(status.st_mode & 0o777),
+                Ok(status) if file_type(&status) == libc::S_IFLNK => {
+                    return Err(self.open_error(io::Error::from_raw_os_error(libc::ELOOP)));
+                }
+                Ok(_) => bail!("{} is not a regular file", self.path.display()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot inspect {}", self.path.display()));
+                }
+            }
+        } else {
+            None
+        };
+        self.replace(&directory, bytes, mode, !self.exists)?;
+        Ok(!self.exists)
     }
 
     /// Read the existing file (at most [`MAX_EDIT_BYTES`]), pass its text to
-    /// `change`, and write back what it returns, in the same open file.
+    /// `change`, and write what it returns in place of the file, as
+    /// [`Self::write`] does.
     pub(crate) fn edit<T>(self, change: impl FnOnce(&str) -> Result<(String, T)>) -> Result<T> {
-        let file = open_file_at(self.directory.as_raw_fd(), &self.name, libc::O_RDWR)
+        let file = open_file_at(self.directory.as_raw_fd(), &self.name, libc::O_RDONLY)
             .map_err(|error| self.open_error(error))?;
         let mut file = self.regular(file)?;
+        let mode = stat_descriptor(file.as_raw_fd())
+            .with_context(|| format!("cannot inspect {}", self.path.display()))?
+            .st_mode
+            & 0o777;
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take(MAX_EDIT_BYTES as u64 + 1)
@@ -587,13 +617,67 @@ impl WriteTarget {
         let text = String::from_utf8(bytes)
             .map_err(|_| anyhow::anyhow!("{} is not UTF-8 text", self.path.display()))?;
         let (changed, outcome) = change(&text)?;
-        file.set_len(0)
-            .with_context(|| format!("cannot truncate {}", self.path.display()))?;
-        std::io::Seek::rewind(&mut file)
-            .with_context(|| format!("cannot rewind {}", self.path.display()))?;
-        std::io::Write::write_all(&mut file, changed.as_bytes())
-            .with_context(|| format!("cannot write {}", self.path.display()))?;
+        drop(file);
+        let directory = duplicate(&self.directory)?;
+        self.replace(&directory, changed.as_bytes(), Some(mode), false)?;
         Ok(outcome)
+    }
+
+    /// Write `bytes` to a temporary file in `directory`, flush it to disk,
+    /// and move it to the target's name: by `rename`, or with `exclusive`, by
+    /// `link`, which fails if the name has appeared. The temporary file is
+    /// removed on every path.
+    fn replace(
+        &self,
+        directory: &OwnedFd,
+        bytes: &[u8],
+        mode: Option<libc::mode_t>,
+        exclusive: bool,
+    ) -> Result<()> {
+        let parent = directory.as_raw_fd();
+        let (temporary, file) = create_temporary(parent, &self.name)
+            .with_context(|| format!("cannot create a file beside {}", self.path.display()))?;
+        let removed = RemoveOnDrop(parent, temporary.clone());
+        let mut file = File::from(file);
+        // A new file has the usual 0666 less the umask, from `open`. A
+        // replacement keeps the permission bits of the file it replaces, but
+        // never set-id bits.
+        if let Some(mode) = mode {
+            // SAFETY: `file` is an open descriptor.
+            if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+                return Err(io::Error::last_os_error())
+                    .with_context(|| format!("cannot set the mode of {}", self.path.display()));
+            }
+        }
+        std::io::Write::write_all(&mut file, bytes)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("cannot write {}", self.path.display()))?;
+        drop(file);
+        let from = c_name(&temporary)?;
+        let to = c_name(&self.name)?;
+        // SAFETY: both names are valid C strings and `parent` an open directory.
+        let moved = unsafe {
+            if exclusive {
+                libc::linkat(parent, from.as_ptr(), parent, to.as_ptr(), 0)
+            } else {
+                libc::renameat(parent, from.as_ptr(), parent, to.as_ptr())
+            }
+        };
+        if moved != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                bail!(
+                    "{} was created by something else after this write was prepared; it was not \
+replaced",
+                    self.path.display()
+                );
+            }
+            return Err(error).with_context(|| format!("cannot write {}", self.path.display()));
+        }
+        drop(removed);
+        // SAFETY: `parent` is an open directory.
+        unsafe { libc::fsync(parent) };
+        Ok(())
     }
 
     fn create_directories(&self) -> Result<OwnedFd> {
@@ -645,6 +729,45 @@ fn duplicate(descriptor: &OwnedFd) -> Result<OwnedFd> {
     descriptor
         .try_clone()
         .context("cannot duplicate a directory descriptor")
+}
+
+/// Create a new, empty, private file beside `name` in `parent`, with a name
+/// no other file has.
+fn create_temporary(parent: RawFd, name: &OsStr) -> io::Result<(OsString, OwnedFd)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let mut temporary = OsString::from(".");
+        temporary.push(name);
+        temporary.push(format!(
+            ".xshell-{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match open_file_at(
+            parent,
+            &temporary,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        ) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Removes the temporary file `name` in `parent` when dropped. After a
+/// rename it names nothing, and the removal fails harmlessly; after a link
+/// it removes the extra name.
+struct RemoveOnDrop(RawFd, OsString);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Ok(name) = CString::new(self.1.as_bytes()) {
+            // SAFETY: `name` is a valid C string and the directory is open.
+            unsafe { libc::unlinkat(self.0, name.as_ptr(), 0) };
+        }
+    }
 }
 
 /// Open `name` in `parent` for writing, never following a symlink and never
@@ -1016,7 +1139,8 @@ pub(crate) mod tests {
             fs::read_to_string(temporary.path().join("outside/notes.txt")).unwrap(),
             "outside"
         );
-        // Swapped in after preparation: the open fails instead of following.
+        // Swapped in after preparation: a new file is linked into place only
+        // where nothing is, so the link is neither followed nor replaced.
         let prepared = target(&root, "late.txt").unwrap();
         symlink(
             temporary.path().join("outside/notes.txt"),
@@ -1024,11 +1148,71 @@ pub(crate) mod tests {
         )
         .unwrap();
         let error = prepared.write(b"x").unwrap_err().to_string();
-        assert!(error.contains("symbolic link"), "{error}");
+        assert!(error.contains("not replaced"), "{error}");
+        assert!(
+            fs::symlink_metadata(root.join("late.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             fs::read_to_string(temporary.path().join("outside/notes.txt")).unwrap(),
             "outside"
         );
+    }
+
+    #[test]
+    fn a_replacement_is_atomic_keeps_the_mode_and_leaves_hard_links_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temporary, root) = workspace();
+        fs::write(root.join("run.sh"), "old").unwrap();
+        fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::hard_link(root.join("run.sh"), root.join("other-name")).unwrap();
+        target(&root, "run.sh").unwrap().write(b"new").unwrap();
+        assert_eq!(fs::read_to_string(root.join("run.sh")).unwrap(), "new");
+        assert_eq!(
+            fs::metadata(root.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        // The other name still has the old content: the write replaced the
+        // directory entry, not the shared file.
+        assert_eq!(fs::read_to_string(root.join("other-name")).unwrap(), "old");
+        // No temporary file is left behind.
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.contains(".xshell-"))
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn a_file_that_appears_after_preparation_is_not_replaced() {
+        let (_temporary, root) = workspace();
+        let prepared = target(&root, "new.txt").unwrap();
+        assert!(!prepared.exists());
+        fs::write(root.join("new.txt"), "someone else's").unwrap();
+        let error = prepared.write(b"mine").unwrap_err().to_string();
+        assert!(error.contains("not replaced"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("new.txt")).unwrap(),
+            "someone else's"
+        );
+    }
+
+    #[test]
+    fn writes_to_start_up_files_and_hooks_are_sensitive() {
+        let (_temporary, root) = workspace();
+        for path in [".zshenv", ".bashrc", ".git/hooks/pre-commit", ".gitconfig"] {
+            let prepared = prepare_write(&root, path, &SensitivePaths::none(), false).unwrap();
+            assert!(prepared.sensitive(), "{path}");
+        }
+        let plain = prepare_write(&root, "src/main.rs", &SensitivePaths::none(), false).unwrap();
+        assert!(!plain.sensitive());
     }
 
     #[test]

@@ -964,6 +964,10 @@ fn handle_execution(
         ExecutionEvent::AutoContinued { reason, .. } => {
             output.event(tagged(json!({"event": "auto_continued", "reason": reason})));
         }
+        ExecutionEvent::WaitingForJobs { jobs } => {
+            output.progress("waiting for background jobs");
+            output.event(tagged(json!({"event": "waiting_for_jobs", "jobs": jobs})));
+        }
         ExecutionEvent::ToolRequested { call } => {
             summary.tool_calls += 1;
             output.progress(&format!("tool: {}", call.name));
@@ -974,13 +978,18 @@ fn handle_execution(
                 "arguments": call.arguments,
             })));
         }
-        ExecutionEvent::ApprovalRequested { call, reason } => {
+        ExecutionEvent::ApprovalRequested {
+            call,
+            reason,
+            target,
+        } => {
             output.event(tagged(json!({
                 "event": "approval_needed",
                 "call_id": call.id,
                 "name": call.name,
                 "arguments": call.arguments,
                 "reason": reason,
+                "target": target,
             })));
             // Without a channel nobody can answer, so a prompt is denied and
             // the model is told. A prompt replayed from the journal may
@@ -1377,16 +1386,19 @@ pub fn watch_signals(interrupted: Arc<AtomicBool>) {
 }
 
 /// A warning when the provider wrote prompt-cache entries over several
-/// model rounds but never read one back. Something in the prompt then
-/// changed between requests, and every round paid the write price for
-/// nothing.
+/// model rounds but never read one back. Either something in the prompt
+/// changed between requests, or the gaps between requests (a long tool run)
+/// outlasted the cache lifetime; every round paid the write price for
+/// nothing. It covers one headless run only; the per-response `usage`
+/// events locate the round where reads stopped.
 fn cache_warning(usage: &xshell_execution::TurnUsage) -> Option<String> {
     let tokens = &usage.tokens;
     let rounds = usage.model_rounds.used.unwrap_or(0);
     (rounds >= 2 && tokens.cache_read == Some(0) && tokens.cache_write.unwrap_or(0) > 0).then(|| {
         format!(
             "the provider wrote {} prompt-cache tokens over {rounds} model rounds but read none \
-back; the prompt changed between requests, so caching saved nothing",
+back, so caching saved nothing: the prompt changed between requests, or a gap between \
+requests (such as a long tool run) outlasted the cache lifetime",
             tokens.cache_write.unwrap_or(0)
         )
     })

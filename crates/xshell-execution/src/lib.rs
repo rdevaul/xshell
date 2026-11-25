@@ -56,6 +56,6 @@ pub use provider::{
 pub use sensitive::{DEFAULT_SENSITIVE_PATTERNS, SensitivePaths};
 pub use shell::{AmbientRunner, ShellAssurance, ShellRunner};
 pub use tools::{
-    GateReason, Tool, ToolRef, ToolSet, definitions, execute_tool, requires_approval,
-    requires_approval_by_name, tool_summary,
+    GateReason, Tool, ToolRef, ToolSet, approval_preview, definitions, execute_tool,
+    requires_approval, requires_approval_by_name, tool_summary,
 };

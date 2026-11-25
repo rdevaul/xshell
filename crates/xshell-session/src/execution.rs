@@ -793,6 +793,7 @@ on its model profile to attach images"
                                     context_tokens: model.context_tokens,
                                     reserve_output_tokens: model.reserve_output_tokens,
                                 })
+                                .unless_server_compacts(model.anthropic.compacts_on_server())
                                 // The context rides on every request outside
                                 // the history, so the history gets less room.
                                 .reserving(context_bytes),
@@ -1139,7 +1140,9 @@ impl DaemonObserver {
     /// `SubagentFinished` records.
     fn audit_execution(&mut self, event: &ExecutionEvent) {
         match event {
-            ExecutionEvent::TextDelta { .. } | ExecutionEvent::ApprovalRequested { .. } => {}
+            ExecutionEvent::TextDelta { .. }
+            | ExecutionEvent::ApprovalRequested { .. }
+            | ExecutionEvent::WaitingForJobs { .. } => {}
             ExecutionEvent::AgentResponse {
                 content,
                 tool_call_count,

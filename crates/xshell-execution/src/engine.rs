@@ -213,12 +213,24 @@ pub enum ExecutionEvent {
     ToolRequested {
         call: ToolCall,
     },
+    /// The root agent gave its answer while background jobs still run; the
+    /// turn waits for the next to end (or for the wall time), then continues.
+    /// `jobs` lists them, one per line.
+    WaitingForJobs {
+        jobs: String,
+    },
     ApprovalRequested {
         call: ToolCall,
         /// Why this call is gated. Absent in journals written before the
         /// field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<GateReason>,
+        /// For a file write, what the session host resolved it to: the
+        /// canonical path, and whether the file is created or replaced. The
+        /// agent's spelling of the path can hide where a symlinked directory
+        /// leads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     ToolDecision {
         call_id: String,
@@ -752,9 +764,6 @@ pub async fn run_agent_turn_with_budget(
         // provider only. History keeps them where they were written; see
         // [`merge_system_messages`].
         merge_system_messages(&mut request_messages);
-        if let Some(context) = &policy.context {
-            append_turn_context(&mut request_messages, context.text());
-        }
         let outcome = {
             let observer = &mut *observer;
             let mut emit = |event| match event {
@@ -776,6 +785,7 @@ pub async fn run_agent_turn_with_budget(
                         },
                         messages: request_messages,
                         tools: tools.clone(),
+                        context: policy.context.as_ref().map(|context| context.text().to_owned()),
                     },
                     &mut emit,
                 ) => ProviderOutcome::Response(Box::new(response)),
@@ -940,6 +950,11 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 && (budget.jobs().background_running() || budget.jobs().has_notices())
             {
                 let cancellation = observer.cancellation();
+                if budget.jobs().background_running() {
+                    observer.emit(ExecutionEvent::WaitingForJobs {
+                        jobs: budget.jobs().running_summary(),
+                    });
+                }
                 budget
                     .jobs()
                     .wait_for_background(
@@ -1109,6 +1124,7 @@ Continue the task. If it is complete, say so."
                     observer.emit(ExecutionEvent::ApprovalRequested {
                         call: scoped.clone(),
                         reason: Some(reason),
+                        target: preparation.write_description(),
                     });
                     let answer = observer.approve(scoped, reason).await;
                     (answer.decision, Some(answer.source))
@@ -1229,8 +1245,14 @@ Continue the task. If it is complete, say so."
                 )
                 .await
             };
-            // Jobs that ended since the agent was last told, once.
-            let result = result + &budget.jobs().take_notices();
+            // Jobs that ended since the root agent was last told, once. Only
+            // the root agent is told: it started them, and a subagent that
+            // took the once-only notice would leave it never knowing.
+            let result = if policy.agent_scope.is_none() {
+                result + &budget.jobs().take_notices()
+            } else {
+                result
+            };
             observer.emit(ExecutionEvent::ToolResult {
                 call_id: scoped.id.clone(),
                 name: call.name.clone(),
@@ -1593,22 +1615,6 @@ fn merge_system_messages(history: &mut Vec<ChatMessage>) -> usize {
         history.insert(0, ChatMessage::system(merged));
     }
     misplaced.len()
-}
-
-/// Append a turn's context to the leading `system` message of a provider
-/// request, creating one when the history has none. Applied to the request
-/// only: stored history never holds a turn's context, so each turn starts
-/// from the session's own system prompt and a fresh context.
-fn append_turn_context(request_messages: &mut Vec<ChatMessage>, context: &str) {
-    match request_messages.first_mut() {
-        Some(prefix) if prefix.role == MessageRole::System => {
-            if !prefix.content.is_empty() {
-                prefix.content.push_str("\n\n");
-            }
-            prefix.content.push_str(context);
-        }
-        _ => request_messages.insert(0, ChatMessage::system(context)),
-    }
 }
 
 const FAILED_AFTER_TOOLS_RECORD: &str =
@@ -2019,6 +2025,7 @@ mod tests {
                 ExecutionEvent::TurnAborted => "aborted",
                 ExecutionEvent::HistoryCompacted { .. } => "compacted",
                 ExecutionEvent::AutoContinued { .. } => "continued",
+                ExecutionEvent::WaitingForJobs { .. } => "waiting",
                 ExecutionEvent::SubagentStarted { .. } => "subagent_started",
                 ExecutionEvent::Subagent { .. } => "subagent",
                 ExecutionEvent::SubagentFinished { .. } => "subagent_finished",
@@ -2853,6 +2860,92 @@ mod tests {
             name: "delegate_task".into(),
             arguments,
         }
+    }
+
+    /// Run one turn that asks for `call` under `approval`, answering any
+    /// prompt with `decisions`; return the events.
+    async fn one_call_turn(
+        root: &std::path::Path,
+        call: ToolCall,
+        approval: ApprovalPolicy,
+        decisions: Vec<ApprovalDecision>,
+    ) -> Vec<ExecutionEvent> {
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([calls(vec![call]), answer("done")]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer(decisions);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "go".into(),
+            root,
+            &TurnPolicy::new(approval),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        observer.events
+    }
+
+    fn write_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            arguments: json!({"path": path, "content": "echo hi\n"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_follows_the_approval_mode() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        // off: denied, nothing written.
+        one_call_turn(root, write_call("a.txt"), ApprovalPolicy::Off, vec![]).await;
+        assert!(!root.join("a.txt").exists());
+        // ask: prompted, with the canonical target; a denial writes nothing.
+        let events = one_call_turn(
+            root,
+            write_call("a.txt"),
+            ApprovalPolicy::Ask,
+            vec![ApprovalDecision::Deny],
+        )
+        .await;
+        let target = events.iter().find_map(|event| match event {
+            ExecutionEvent::ApprovalRequested { target, .. } => target.clone(),
+            _ => None,
+        });
+        let canonical = root.canonicalize().unwrap().join("a.txt");
+        assert_eq!(
+            target,
+            Some(format!("{} (creates a new file)", canonical.display()))
+        );
+        assert!(!root.join("a.txt").exists());
+        // auto: written without a prompt.
+        let events = one_call_turn(root, write_call("a.txt"), ApprovalPolicy::Auto, vec![]).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "echo hi\n"
+        );
+        // auto, but a shell start-up file: prompted, and a denial holds.
+        let events = one_call_turn(
+            root,
+            write_call(".zshenv"),
+            ApprovalPolicy::Auto,
+            vec![ApprovalDecision::Deny],
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
+        );
+        assert!(!root.join(".zshenv").exists());
     }
 
     fn calls(tool_calls: Vec<ToolCall>) -> AssistantResponse {
@@ -5640,10 +5733,11 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
         );
     }
 
-    fn system_prompt(request: &ChatRequest) -> &str {
-        let first = &request.messages[0];
+    fn system_prompt(request: &ChatRequest) -> String {
+        let messages = request.messages_with_context();
+        let first = &messages[0];
         assert_eq!(first.role, MessageRole::System);
-        &first.content
+        first.content.clone()
     }
 
     fn turn_context(text: &str) -> Option<TurnContext> {
@@ -5726,7 +5820,10 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
         .await
         .unwrap();
         assert_eq!(system_prompt(&adapter.requests[0]), "You are Sybil.");
-        assert_eq!(adapter.requests[0].messages[1].content, "hello");
+        assert_eq!(
+            adapter.requests[0].messages_with_context()[1].content,
+            "hello"
+        );
         assert_eq!(history[0].role, MessageRole::User);
     }
 

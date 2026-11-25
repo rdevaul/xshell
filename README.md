@@ -187,8 +187,8 @@ and sent back unchanged, as the API requires during tool use. Prompts are
 cached for five minutes by default (`cache_ttl = "1h"` or `"off"` to change
 it); a run's `usage.tokens` shows the cache reads. For long runs,
 `context_management = "compact"` has the API summarize the conversation once the
-prompt reaches `compact_at_tokens` (150000 by default). Set `max_history_bytes = 0`
-with it, so that xshell's own compaction does not edit the history as well.
+prompt reaches `compact_at_tokens` (150000 by default); xshell's own compaction is
+then off for that profile.
 
 ```toml
 [models.opus]
@@ -464,9 +464,11 @@ visible and bounded:
 - `write_file` and `edit_file` are confined the same way: the deepest
   existing directory is opened by that walk, missing directories are created
   only after approval, and a symlink at the file itself is refused, never
-  written through. Every write is gated like a shell command (run in `auto`,
-  prompted in `ask`, refused in `off`). See
-  [agent tools](docs/agent-tools.md).
+  written through. A write lands all at once, through a temporary file and a
+  rename. Every write is gated like a shell command (run in `auto`, prompted in
+  `ask`, refused in `off`), and the prompt shows the canonical path and a
+  preview. A write to a sensitive path, or to a shell start-up file, git hook
+  or the like, prompts even in `auto`. See [agent tools](docs/agent-tools.md).
 - Long commands run as background jobs (`run_shell` with `background: true`):
   xshell holds each job's process group, `job_output` reads or waits for it
   and `job_kill` stops it, and every job, and any process a foreground command
@@ -558,6 +560,7 @@ rollback guarantees.
 - [Tool providers, per-session tool selections, turn context, and the embeddable daemon](docs/tool-providers.md)
 - [MCP bridge (design)](docs/mcp-bridge.md)
 - [Contained shell commands (design)](docs/shell-sandbox.md)
+- [Signed skills (design)](docs/signed-skills.md)
 - [Agentic CAD plan](docs/agentic-cad-plan.md)
 - [XSHELL.md durable handoff and goals (proposal)](docs/xshell-md-continuity.md)
 - [Home-lab service runner](docs/runall.md)

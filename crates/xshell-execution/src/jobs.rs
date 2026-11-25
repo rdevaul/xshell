@@ -42,6 +42,12 @@ pub(crate) const JOB_OUTPUT_BYTES: usize = 1 << 20;
 pub(crate) const JOB_READ_BYTES: usize = 64 * 1024;
 /// Jobs that may run at once.
 pub(crate) const MAX_RUNNING_JOBS: usize = 8;
+/// Leftover groups watched at once. A command that leaves more running has
+/// its group killed at once instead.
+pub(crate) const MAX_LEFTOVERS: usize = 16;
+/// Output kept, in all, for jobs that have ended; the oldest ended job's
+/// output is freed first.
+const ENDED_OUTPUT_BYTES: usize = 8 << 20;
 /// Longest single wait `job_output` accepts.
 pub(crate) const MAX_JOB_WAIT: Duration = Duration::from_secs(1800);
 /// How often a leftover group is checked for members.
@@ -124,11 +130,20 @@ struct State {
     next_id: u32,
     jobs: BTreeMap<u32, Job>,
     shut_down: bool,
+    /// The turn's deadline; no `job_output` wait outlasts it.
+    deadline: Option<Instant>,
 }
 
 impl ShellJobs {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The jobs of a turn that ends at `deadline`.
+    pub fn until(deadline: Instant) -> Arc<Self> {
+        let jobs = Self::new();
+        jobs.lock().deadline = Some(deadline);
+        jobs
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -175,7 +190,19 @@ with job_output or stop one with job_kill"
             })
             .await;
             let end = match end {
-                Ok(ShellEnd::Exited(status)) => End::Exited(status_text(status)),
+                Ok(ShellEnd::Exited(status)) => {
+                    // The shell exited, but something it started in the
+                    // background (`server >log 2>&1 &`) may still run in its
+                    // group, holding none of its output. Watch that as a
+                    // leftover, so it is reported and killed with the turn.
+                    if group_alive(group) {
+                        let command = jobs.lock().jobs.get(&id).map(|job| job.command.clone());
+                        if let Some(command) = command {
+                            jobs.adopt(&command, group);
+                        }
+                    }
+                    End::Exited(status_text(status))
+                }
                 Ok(ShellEnd::ExitedLingering(status)) => End::ExitedLingering(status_text(status)),
                 Ok(ShellEnd::Cancelled | ShellEnd::TimedOut) => End::Killed,
                 Err(error) => End::Exited(format!("unknown ({error:#})")),
@@ -192,9 +219,18 @@ with job_output or stop one with job_kill"
         if group <= 1 {
             return None;
         }
-        if self.lock().shut_down {
-            kill_group(group);
-            return None;
+        {
+            let state = self.lock();
+            let leftovers = state
+                .jobs
+                .values()
+                .filter(|job| job.running() && job.kind == Kind::Leftover)
+                .count();
+            if state.shut_down || leftovers >= MAX_LEFTOVERS {
+                drop(state);
+                kill_group(group);
+                return None;
+            }
         }
         let id = self.insert(command, Kind::Leftover, group, CancellationFlag::default());
         let jobs = Arc::clone(self);
@@ -253,6 +289,7 @@ with job_output or stop one with job_kill"
             {
                 job.end = Some((end, Instant::now()));
             }
+            state.trim_ended_output();
         }
         self.changed.notify_waiters();
     }
@@ -282,7 +319,10 @@ with job_output or stop one with job_kill"
         wait: Duration,
         cancellation: &CancellationFlag,
     ) -> Result<String, String> {
-        let deadline = Instant::now() + wait.min(MAX_JOB_WAIT);
+        let mut deadline = Instant::now() + wait.min(MAX_JOB_WAIT);
+        if let Some(turn_ends) = self.lock().deadline {
+            deadline = deadline.min(turn_ends);
+        }
         loop {
             let notified = self.changed.notified();
             match self.lock().jobs.get(&id) {
@@ -324,6 +364,10 @@ with job_output or stop one with job_kill"
             text.push('\n');
         }
         job.shown = job.received;
+        // An ended job whose output has all been read keeps none.
+        if !job.running() {
+            job.output = VecDeque::new();
+        }
         Ok(text)
     }
 
@@ -389,6 +433,19 @@ with job_output or stop one with job_kill"
         text
     }
 
+    /// The running background jobs, one line each, for the event that says
+    /// the turn is waiting on them.
+    pub(crate) fn running_summary(&self) -> String {
+        let state = self.lock();
+        state
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.running() && job.kind == Kind::Background)
+            .map(|(id, job)| format!("job {id} ({}): {}", job.command_summary(), job.status()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Wait until a background job ends, cancellation, or `deadline`.
     pub(crate) async fn wait_for_background(
         &self,
@@ -435,6 +492,28 @@ with job_output or stop one with job_kill"
         }
         drop(state);
         self.changed.notify_waiters();
+    }
+}
+
+impl State {
+    /// Free the output of the oldest ended jobs until what ended jobs keep
+    /// fits in [`ENDED_OUTPUT_BYTES`].
+    fn trim_ended_output(&mut self) {
+        let mut kept: usize = self
+            .jobs
+            .values()
+            .filter(|job| !job.running())
+            .map(|job| job.output.len())
+            .sum();
+        for job in self.jobs.values_mut() {
+            if kept <= ENDED_OUTPUT_BYTES {
+                break;
+            }
+            if !job.running() && !job.output.is_empty() {
+                kept -= job.output.len();
+                job.output = VecDeque::new();
+            }
+        }
     }
 }
 

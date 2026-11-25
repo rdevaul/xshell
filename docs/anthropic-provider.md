@@ -317,23 +317,39 @@ The 1M context window of the current models leaves a large margin. Most turns ne
   `clear_tool_uses` is not built.
 - Each request then carries a `compact_20260112` edit with an `input_tokens` trigger. The
   adapter adds `compact-2026-01-12` to `anthropic-beta`, so compaction cannot be combined with
-  `send_betas = false`.
-- The `compaction` block, which streams as one `compaction_delta`, is kept in `provider_blocks`
-  with the rest of the response and replayed as received. The API ignores everything before it.
-  The history is sent in full: xshell's copy is never shortened, so the request stays
-  append-only and signed thinking keeps passing the prefix check.
-- Usage is the sum over `usage.iterations`, because the top-level counts leave out the
-  summarization step. `TokenUsage.compactions` counts the compactions a response carried, and
-  appears in the per-response and per-turn usage. The audit record keeps the token counts but
-  not this count.
+  `send_betas = false`. The beta is also sent whenever a request replays a compaction block, as it
+  does after compaction is turned off or the session moves to another Anthropic profile.
+- **xshell's own compaction is off while the server compacts.** The session's byte budget and the
+  profile's `context_tokens` are ignored for such a profile (`unless_server_compacts`). Otherwise
+  the stored history, which the server never shortens, would eventually exceed the budget, and
+  xshell would drop the oldest turns, compaction block or signed thinking included.
+- The `compaction` block, which streams as one `compaction_delta`, is stored in `provider_blocks`
+  with the rest of the response. **Requests start at the latest compaction block that has a
+  summary**, after one user message that says the earlier conversation was compacted (a request
+  must open with a user message). The API ignores everything before that block, so sending it would
+  only grow each request until the body passed the API's size limit. xshell's stored history keeps
+  everything.
+- Usage is the top-level counts plus the compaction steps of `usage.iterations`, which the
+  top-level counts leave out. It does not depend on which event carries `iterations`, or on whether
+  the entries carry the cache fields. `TokenUsage.compactions` counts the compactions a response
+  carried, and appears in the per-response and per-turn usage.
 - A block with a null `content` means the API wrote no summary and compacted nothing. The
-  documented cause is that the model called a tool instead of summarizing. After one such block,
-  the adapter sends a summarization prompt that rules out tools on that adapter's later
-  requests, unless the profile set its own prompt. On Opus 5.5 a custom prompt summarizes
-  without the earlier thinking, so the API's default prompt is tried first.
-- Not built: the engine's `history = "append_only"` mode and the per-turn context as a
-  turn-scoped message. A one-turn headless run needs neither: client compaction is off when
-  `max_history_bytes = 0`, and the turn's context does not change within the turn.
+  documented cause is that the model called a tool instead of summarizing. Such a block is stored
+  but never sent back. While the latest compaction in the history is one of these, requests carry
+  a summarization prompt that rules out tools, unless the profile set its own prompt. This is read
+  from the history, so it holds across turns, although the daemon builds a new adapter for each
+  turn. On Opus 5.5 a custom prompt summarizes without the earlier thinking, so the API's default
+  prompt is tried first.
+- `stop_reason: "compaction"` is treated as the end of the turn. It only occurs with
+  `pause_after_compaction`, which xshell does not send.
+- **Not built.**
+  - The `history_compacted` event with `kind = "provider"`, and a compaction count in the audit
+    record. Only `usage.tokens.compactions` reports a server compaction.
+  - A fallback for a model or gateway that rejects the beta; that shows as a plain HTTP error.
+  - The engine's `history = "append_only"` mode, and sending the turn's context after the history.
+- **Needs a live check:** that a request may open with the stand-in user message and the
+  compaction block, and that the signed thinking after the block still passes the prefix check
+  when what precedes the block is replaced.
 
 ### 5.3 Token usage
 
@@ -440,23 +456,28 @@ request.
   whenever the previous tool call ran longer than four minutes. That costs 2× on writes, against
   re-reading the whole prefix uncached.
 - **As built (P5).**
-  - Three markers are used, not four. The one on the last system block also caches the tools,
-    which render before it; the last tool carries the marker only when there is no system prompt.
-    The other two go on the last block of the newest user message and of the user message before
-    it.
+  - All four markers are used: the last tool, the last system block, and the last block of the
+    newest user message and of the user message before it. The tool marker keeps the tools cached
+    when the system prompt changes, as it does when an execution record from a failed turn is
+    folded into it.
   - `cache_ttl` is `"5m"` (the default), `"1h"` or `"off"`. `"auto"` needs the engine to tell the
     adapter how long the last tool ran, and is left for later.
   - Every marker has the same lifetime, which keeps the API's rule that longer-lived entries come
     first.
-  - Within one turn every request is the previous one plus new messages, which a test checks. A
-    new turn still changes the system prompt, because the engine appends the turn's context to it
-    (`engine.rs:1528`). So a new turn re-reads the tools and system prompt uncached once; a
-    one-turn headless run is not affected. Moving that context into `messages` is part of P6.
+  - Within one turn every request is the previous one plus new messages, which a test checks.
+  - **A turn context (S6) still costs a new turn its history.** The engine passes the context
+    apart from the messages (`ChatRequest::context`). The adapter sends it as its own system block
+    after the marked system prompt, so the tools and system prompt stay cached. But the system
+    blocks precede `messages`, so a new context means the whole history is written again, at the
+    cache-write price, on the first request of each turn. Without a context source, and within a
+    turn, nothing is rewritten. Sending the context after the history is part of P6.
 - **Verification.** `cache_read` in §5.3 shows whether caching works. As built, the headless
   client warns at the end of a run that made two or more model rounds, wrote cache entries and read
-  none back: the prompt changed between requests. The warning is the client's, since the engine has
-  no warning event; the per-response `usage` in the JSONL stream locates the round where reads
-  stopped.
+  none back. Either the prompt changed between requests, or a gap between requests, such as a tool
+  that ran longer than the 5-minute lifetime, let the entries expire; the warning cannot tell which.
+  It covers one headless run, not interactive sessions. The warning is the client's, since the
+  engine has no warning event; the per-response `usage` in the JSONL stream locates the round where
+  reads stopped.
 
 ## 8. Errors and retries
 
