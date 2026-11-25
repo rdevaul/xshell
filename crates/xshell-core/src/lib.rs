@@ -428,6 +428,12 @@ pub struct ChatRequest {
     /// with no entry here is sent as a text placeholder, never dropped
     /// silently.
     pub images: ImageBytes,
+    /// The turn's context, kept apart from `messages` because it changes
+    /// every turn while the system prompt does not. A provider that takes a
+    /// single system prompt folds it in with [`Self::messages_with_context`];
+    /// one with prompt caching can send it after the stable prompt, so a new
+    /// context does not invalidate the cached prefix before it.
+    pub context: Option<String>,
 }
 
 impl ChatRequest {
@@ -437,7 +443,27 @@ impl ChatRequest {
             messages,
             tools,
             images: ImageBytes::new(),
+            context: None,
         }
+    }
+
+    /// The messages with the turn's context appended to the leading `system`
+    /// message, which is created when there is none.
+    pub fn messages_with_context(&self) -> std::borrow::Cow<'_, [ChatMessage]> {
+        let Some(context) = &self.context else {
+            return std::borrow::Cow::Borrowed(&self.messages);
+        };
+        let mut messages = self.messages.clone();
+        match messages.first_mut() {
+            Some(prefix) if prefix.role == MessageRole::System => {
+                if !prefix.content.is_empty() {
+                    prefix.content.push_str("\n\n");
+                }
+                prefix.content.push_str(context);
+            }
+            _ => messages.insert(0, ChatMessage::system(context.clone())),
+        }
+        std::borrow::Cow::Owned(messages)
     }
 }
 
@@ -555,6 +581,9 @@ pub struct AnthropicSettings {
     /// Whether to send `anthropic-beta` at all; some gateways reject it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_betas: Option<bool>,
+    /// Prompt-cache lifetime: "5m" (the default), "1h", or "off".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<String>,
 }
 
 impl AnthropicSettings {

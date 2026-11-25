@@ -238,7 +238,8 @@ impl AgentAdapter for OpenAiCompatibleAdapter {
         request: ChatRequest,
         events: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<AssistantResponse, AdapterError> {
-        let laid = lay_out(&request.messages, &request.images, self.vision);
+        let messages = request.messages_with_context();
+        let laid = lay_out(&messages, &request.images, self.vision);
         let messages = laid.iter().map(OpenAiMessage::from).collect();
         let tools = request
             .tools

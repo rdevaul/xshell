@@ -1244,6 +1244,9 @@ impl Output {
     }
 
     fn result(&mut self, summary: &Summary) {
+        if let Some(warning) = summary.usage.as_ref().and_then(cache_warning) {
+            self.warning(&warning);
+        }
         let outcome = summary.outcome.unwrap_or_default();
         match self.format {
             OutputFormat::Jsonl => self.event(json!({
@@ -1365,9 +1368,61 @@ pub fn watch_signals(interrupted: Arc<AtomicBool>) {
     });
 }
 
+/// A warning when the provider wrote prompt-cache entries over several
+/// model rounds but never read one back. Either something in the prompt
+/// changed between requests, or the gaps between requests (a long tool run)
+/// outlasted the cache lifetime; every round paid the write price for
+/// nothing. It covers one headless run only; the per-response `usage`
+/// events locate the round where reads stopped.
+fn cache_warning(usage: &xshell_execution::TurnUsage) -> Option<String> {
+    let tokens = &usage.tokens;
+    let rounds = usage.model_rounds.used.unwrap_or(0);
+    (rounds >= 2 && tokens.cache_read == Some(0) && tokens.cache_write.unwrap_or(0) > 0).then(|| {
+        format!(
+            "the provider wrote {} prompt-cache tokens over {rounds} model rounds but read none \
+back, so caching saved nothing: the prompt changed between requests, or a gap between \
+requests (such as a long tool run) outlasted the cache lifetime",
+            tokens.cache_write.unwrap_or(0)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warns_when_cache_writes_are_never_read() {
+        let usage = |rounds: u64, read: u64, write: u64| {
+            let mut usage: xshell_execution::TurnUsage = serde_json::from_value(json!({
+                "model_rounds": {"used": rounds, "limit": 128, "assurance": "enforced"},
+                "tool_dispatches": {"assurance": "unavailable"},
+                "tool_output_bytes": {"assurance": "unavailable"},
+                "wall_time_ms": {"assurance": "unavailable"},
+            }))
+            .unwrap();
+            usage.tokens.cache_read = Some(read);
+            usage.tokens.cache_write = Some(write);
+            usage
+        };
+        assert!(
+            cache_warning(&usage(3, 0, 5000))
+                .unwrap()
+                .contains("read none back")
+        );
+        assert!(
+            cache_warning(&usage(3, 9000, 5000)).is_none(),
+            "reads happened"
+        );
+        assert!(
+            cache_warning(&usage(1, 0, 5000)).is_none(),
+            "one round cannot read"
+        );
+        assert!(
+            cache_warning(&usage(3, 0, 0)).is_none(),
+            "nothing was cached"
+        );
+    }
 
     #[test]
     fn exit_codes_are_stable() {
