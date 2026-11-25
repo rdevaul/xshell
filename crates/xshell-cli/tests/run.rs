@@ -1140,3 +1140,51 @@ fn a_closed_approval_channel_denies() {
     assert_eq!(decided["source"], "approval_channel_closed");
     assert!(!marker.exists());
 }
+
+#[test]
+fn a_durable_run_session_survives_a_daemon_restart() {
+    let provider = serve(vec![sse_text("first answer"), sse_text("second answer")]);
+    let mut fabric = Fabric::new(&provider, true, true);
+
+    let output = fabric.run(&[
+        "--output",
+        "jsonl",
+        "--durable",
+        "--session",
+        "keep",
+        "first",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registry = std::fs::read_to_string(fabric.directory.path().join("state/sessions.json"))
+        .expect("a durable session is written to the registry");
+    assert!(registry.contains("\"keep\""), "{registry}");
+    assert!(
+        registry.contains("first answer"),
+        "the history is kept: {registry}"
+    );
+
+    fabric.restart_daemon();
+    let output = fabric.run(&["--output", "jsonl", "--session", "keep", "second"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = events(&output);
+    assert_eq!(events[0]["session"], "keep");
+    let result = events.last().unwrap();
+    assert_eq!(result["answer"], "second answer");
+}
+
+#[test]
+fn durable_and_ephemeral_conflict() {
+    let fabric = Fabric::new("http://127.0.0.1:9", false, true);
+    let output = fabric.run(&["--durable", "--ephemeral", "hello"]);
+    assert_eq!(output.status.code(), Some(2));
+}

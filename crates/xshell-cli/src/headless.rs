@@ -53,6 +53,12 @@ pub struct RunArgs {
     #[arg(long, conflicts_with = "session")]
     pub ephemeral: bool,
 
+    /// Create the session durable: kept on disk and restored when the daemon
+    /// restarts, so a later `run --session NAME` can continue it. Applies only
+    /// to a session this run creates.
+    #[arg(long, conflicts_with = "ephemeral")]
+    pub durable: bool,
+
     /// Attach an image file (PNG, JPEG, GIF or WebP) to the prompt. May be
     /// given more than once. The model profile must have `vision = true`.
     #[arg(long, value_name = "FILE")]
@@ -294,6 +300,8 @@ fn execute(
             cwd,
             persistence: if args.ephemeral {
                 PersistenceMode::Ephemeral
+            } else if args.durable {
+                PersistenceMode::Durable
             } else {
                 PersistenceMode::Daemon
             },

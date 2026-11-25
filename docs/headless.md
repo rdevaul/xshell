@@ -20,7 +20,7 @@ running in the daemon (an `--ephemeral` session ends with its client).
 ## Usage
 
 ```text
-xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral | --detach] [--approval-channel FD]
+xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral | --durable] [--detach] [--approval-channel FD]
                             [--prompt-file FILE] [--attach FILE]... [PROMPT]
 ```
 
@@ -41,6 +41,10 @@ xshell [SHARED OPTIONS] run [--output text|jsonl] [--ephemeral | --detach] [--ap
   - `--session NAME` runs in that session instead, creating it if needed. An
     existing session keeps its own model and working directory.
   - `--ephemeral` uses a session that is removed when the run ends.
+  - `--durable` creates the session durable: it is kept in the state directory and
+    restored when the daemon restarts, so a later `run --session NAME` continues the
+    same conversation, thinking blocks included. It applies only to a session the
+    run creates; otherwise a run's session lasts as long as the daemon.
 - **Shared options:** `--config`, `--profile`, `--provider`, `--model`,
   `--base-url`, `--api-key-env`, `--system-prompt`, `--session`, `--cwd`,
   `--approval`, `--approval-policy`, and `--limits` work as they do for interactive `xshell`,
