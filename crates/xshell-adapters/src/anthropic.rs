@@ -268,9 +268,6 @@ pub struct AnthropicAdapter {
     api_key: Option<String>,
     vision: bool,
     options: AnthropicOptions,
-    /// Whether a compaction produced no summary. Later requests then send
-    /// [`NO_TOOLS_SUMMARY_PROMPT`] unless the profile set a prompt.
-    summary_failed: bool,
 }
 
 impl AnthropicAdapter {
@@ -286,7 +283,6 @@ impl AnthropicAdapter {
             api_key,
             vision: false,
             options: AnthropicOptions::default(),
-            summary_failed: false,
         }
     }
 
@@ -346,15 +342,29 @@ impl AnthropicAdapter {
         if let Some(ttl) = self.options.cache_ttl {
             place_cache_markers(&mut body, ttl);
         }
+        // The turn's context goes after the marked system prompt, so a new
+        // context costs one uncached block, not the tools and system prompt.
+        // It still precedes `messages`, so the history is written again.
+        if let Some(context) = request.context.as_deref().filter(|text| !text.is_empty()) {
+            let block = json!({"type": "text", "text": context});
+            match body["system"].as_array_mut() {
+                Some(system) => system.push(block),
+                None => body["system"] = json!([block]),
+            }
+        }
         if let Some(compaction) = &self.options.compaction {
             let mut edit = json!({
                 "type": COMPACT_EDIT,
                 "trigger": {"type": "input_tokens", "value": compaction.at_tokens},
             });
-            let instructions = compaction
-                .instructions
-                .as_deref()
-                .or(self.summary_failed.then_some(NO_TOOLS_SUMMARY_PROMPT));
+            let instructions =
+                compaction
+                    .instructions
+                    .as_deref()
+                    .or(
+                        (latest_compaction_summarized(&request.messages) == Some(false))
+                            .then_some(NO_TOOLS_SUMMARY_PROMPT),
+                    );
             if let Some(instructions) = instructions {
                 edit["instructions"] = json!(instructions);
             }
@@ -363,11 +373,15 @@ impl AnthropicAdapter {
         body
     }
 
-    /// The `anthropic-beta` values: the profile's, and those the request's
-    /// features need.
-    fn betas(&self) -> Vec<String> {
+    /// The `anthropic-beta` values: the profile's, and those the request
+    /// needs. The compaction beta is sent while compaction is on, and also
+    /// whenever `body` replays a compaction block, as it does after
+    /// compaction is turned off or the session moves to another Anthropic
+    /// profile.
+    fn betas(&self, body: &Value) -> Vec<String> {
         let mut betas = self.options.betas.clone();
-        if self.options.compaction.is_some() && !betas.iter().any(|beta| beta == COMPACT_BETA) {
+        let needs_compact = self.options.compaction.is_some() || replays_compaction(body);
+        if needs_compact && !betas.iter().any(|beta| beta == COMPACT_BETA) {
             betas.push(COMPACT_BETA.to_owned());
         }
         betas
@@ -380,7 +394,7 @@ impl AnthropicAdapter {
             .header("accept", "text/event-stream")
             .header("anthropic-version", &self.options.api_version)
             .json(body);
-        let betas = self.betas();
+        let betas = self.betas(body);
         if self.options.send_betas && !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
@@ -397,13 +411,16 @@ impl AnthropicAdapter {
 
 /// Mark where the prompt cache should end, at the request's stability
 /// boundaries. Caching is a prefix match over tools, system, then messages,
-/// and the API allows four markers; three are used:
+/// and the API allows four markers:
 ///
-/// 1. The last system block, which caches the tools with it. With no system
-///    prompt, the last tool instead.
-/// 2. The last block of the newest user message: the next request reads
+/// 1. The last tool, so the tools stay cached when the system prompt
+///    changes (an execution record folded into it after a failed turn).
+/// 2. The last block of the system prompt. The turn's context is added
+///    after this marker (see [`AnthropicAdapter::body`]), so it is not part
+///    of the cached prefix.
+/// 3. The last block of the newest user message: the next request reads
 ///    everything up to here.
-/// 3. The last block of the user message before it, so that a request whose
+/// 4. The last block of the user message before it, so that a request whose
 ///    newest message added many blocks still finds the previous entry within
 ///    the API's 20-position lookback.
 ///
@@ -416,11 +433,8 @@ fn place_cache_markers(body: &mut Value, ttl: CacheTtl) {
             last["cache_control"] = marker.clone();
         }
     };
-    if body["system"].is_array() {
-        mark_last(&mut body["system"]);
-    } else if body["tools"].is_array() {
-        mark_last(&mut body["tools"]);
-    }
+    mark_last(&mut body["tools"]);
+    mark_last(&mut body["system"]);
     let Some(messages) = body["messages"].as_array_mut() else {
         return;
     };
@@ -466,9 +480,17 @@ fn wire_messages(laid: &[Laid<'_>]) -> (Vec<Value>, Vec<Value>) {
         let (wire_role, blocks) = match (&role, message.source) {
             (MessageRole::Assistant, Some(source)) => {
                 close_calls(&mut messages, &mut open_calls);
-                if let Some(stored) = replayable(source) {
+                // A compaction block with no summary is held back: it gives
+                // the model nothing, and whether the API accepts one on input
+                // is not documented.
+                let stored: Vec<&Value> = replayable(source)
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block["type"] != "compaction" || has_summary(block))
+                    .collect();
+                if !stored.is_empty() {
                     let blocks = stored
-                        .iter()
+                        .into_iter()
                         .map(|block| {
                             let mut block = block.clone();
                             if block["type"] == "tool_use" {
@@ -564,6 +586,7 @@ fn wire_messages(laid: &[Laid<'_>]) -> (Vec<Value>, Vec<Value>) {
         }
     }
     close_calls(&mut messages, &mut open_calls);
+    start_at_latest_compaction(&mut messages);
     let messages = messages
         .into_iter()
         .map(|(role, content)| json!({"role": role, "content": content}))
@@ -579,6 +602,64 @@ fn replayable(message: &ChatMessage) -> Option<&Vec<Value>> {
     let stored = message.provider_blocks.as_ref()?;
     (stored.provider == PROVIDER).then_some(())?;
     stored.blocks.as_array().filter(|blocks| !blocks.is_empty())
+}
+
+/// Whether a stored compaction block carries a summary. A compaction that
+/// failed to summarize yields `content: null`.
+fn has_summary(block: &Value) -> bool {
+    block["type"] == "compaction"
+        && block["content"]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty())
+}
+
+/// The latest compaction in the history: whether it produced a summary, or
+/// `None` when there has been none. Read from the history, not kept in the
+/// adapter, because the daemon builds a new adapter for each turn.
+fn latest_compaction_summarized(messages: &[ChatMessage]) -> Option<bool> {
+    messages
+        .iter()
+        .rev()
+        .filter_map(replayable)
+        .flat_map(|blocks| blocks.iter().rev())
+        .find(|block| block["type"] == "compaction")
+        .map(has_summary)
+}
+
+/// Whether a request body sends a compaction block.
+fn replays_compaction(body: &Value) -> bool {
+    body["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "compaction"))
+        })
+    })
+}
+
+/// Stands in for the history a compaction summarized, since a request must
+/// open with a user message.
+const COMPACTED_HISTORY: &str =
+    "(The conversation before this point was compacted. Its summary follows.)";
+
+/// Start the messages at the latest summarized compaction. The API ignores
+/// everything before that block, so sending it would only grow every
+/// request until the body exceeds the API's size limit.
+fn start_at_latest_compaction(messages: &mut Vec<(&'static str, Vec<Value>)>) {
+    let Some(at) = messages
+        .iter()
+        .rposition(|(role, blocks)| *role == "assistant" && blocks.iter().any(has_summary))
+    else {
+        return;
+    };
+    messages.drain(..at);
+    messages.insert(
+        0,
+        (
+            "user",
+            vec![json!({"type": "text", "text": COMPACTED_HISTORY})],
+        ),
+    );
 }
 
 /// Supply an interrupted-call result for every call still open, at the head
@@ -747,9 +828,11 @@ struct Collected {
     /// Compaction blocks received, and those of them with no summary. A
     /// compaction block must be replayed too.
     compactions: usize,
-    empty_summaries: usize,
     /// Usage as last reported: `message_start`'s, updated by `message_delta`.
     usage: Option<TokenUsage>,
+    /// The compaction steps of the latest `usage.iterations`, which the
+    /// top-level counts leave out.
+    compaction_usage: TokenUsage,
 }
 
 impl Collected {
@@ -922,12 +1005,9 @@ impl Collected {
                     }
                     Block::Compaction { content } => {
                         self.compactions += 1;
-                        let summarized = content.as_str().is_some_and(|text| !text.is_empty());
-                        if !summarized {
-                            self.empty_summaries += 1;
-                        }
-                        // Replayed as received, null included: the API ignores
-                        // a block with no summary.
+                        // Stored as received, null included, so the next
+                        // request can see that the summary failed; a null
+                        // block is never sent back (see `wire_messages`).
                         json!({"type": "compaction", "content": content})
                     }
                     Block::Text { text } => json!({"type": "text", "text": text}),
@@ -972,18 +1052,20 @@ impl Collected {
     /// cumulative, so each one present replaces the earlier value.
     ///
     /// With compaction on, `usage.iterations` lists each sampling step of
-    /// the request. The top-level counts leave out the compaction step, so
-    /// the total billed is the sum over `iterations`, which is what is kept.
+    /// the request, and the top-level counts leave out the compaction step.
+    /// The compaction steps are kept apart and added in [`Self::finish`], so
+    /// the result does not depend on which event carries `iterations`, or on
+    /// whether its entries carry the cache fields.
     fn update_usage(&mut self, usage: &Value) {
         if !usage.is_object() {
             return;
         }
-        if let Some(iterations) = usage["iterations"]
-            .as_array()
-            .filter(|list| !list.is_empty())
-        {
+        if let Some(iterations) = usage["iterations"].as_array() {
             let mut total = TokenUsage::default();
-            for step in iterations {
+            for step in iterations
+                .iter()
+                .filter(|step| step["type"] == "compaction")
+            {
                 let count = |field: &str| step[field].as_u64().unwrap_or(0);
                 total = total
                     + TokenUsage {
@@ -997,16 +1079,7 @@ impl Collected {
                         compactions: 0,
                     };
             }
-            // Steps may not break cache writes down by lifetime; the top level
-            // does.
-            if total.cache_write_1h == 0 {
-                total.cache_write_1h = usage["cache_creation"]["ephemeral_1h_input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .min(total.cache_write);
-            }
-            self.usage = Some(total);
-            return;
+            self.compaction_usage = total;
         }
         let mut current = self.usage.unwrap_or_default();
         let count = |field: &Value| field.as_u64();
@@ -1091,7 +1164,7 @@ call; raise max_output_tokens. Its {calls} tool call(s) were not run"
             provider_blocks,
             usage: self.usage.map(|usage| TokenUsage {
                 compactions: self.compactions as u64,
-                ..usage
+                ..usage + self.compaction_usage
             }),
         })
     }
@@ -1208,12 +1281,7 @@ impl AgentAdapter for AnthropicAdapter {
                 available_tokens: None,
             }),
             Err(error) => Err(error),
-            Ok(()) => {
-                if collected.empty_summaries > 0 {
-                    self.summary_failed = true;
-                }
-                collected.finish(&self.model)
-            }
+            Ok(()) => collected.finish(&self.model),
         }
     }
 }
@@ -1801,7 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_markers_sit_on_system_and_the_two_newest_user_messages() {
+    fn cache_markers_sit_on_tools_system_and_the_two_newest_user_messages() {
         let body = cached_body(
             tool_loop(3),
             vec![tool("b"), tool("a")],
@@ -1812,30 +1880,124 @@ mod tests {
             [
                 "/messages/4/content/0",
                 "/messages/6/content/0",
-                "/system/0"
+                "/system/0",
+                "/tools/1"
             ]
         );
         assert_eq!(
             body["system"][0]["cache_control"],
             json!({"type": "ephemeral"})
         );
-        // At most four markers are allowed; three are used.
-        assert!(markers(&body).len() <= 4);
+        assert_eq!(body["tools"][1]["name"], "b", "the last tool after sorting");
     }
 
     #[test]
-    fn without_a_system_prompt_the_last_tool_is_marked() {
+    fn without_a_system_prompt_the_last_tool_is_still_marked() {
         let body = cached_body(
             vec![ChatMessage::user("go")],
             vec![tool("b"), tool("a")],
             CacheTtl::OneHour,
         );
         assert_eq!(markers(&body), ["/messages/0/content/0", "/tools/1"]);
-        assert_eq!(body["tools"][1]["name"], "b", "the last tool after sorting");
         assert_eq!(
             body["tools"][1]["cache_control"],
             json!({"type": "ephemeral", "ttl": "1h"})
         );
+    }
+
+    /// The body for `messages` with `context` as the turn's context.
+    fn body_with_context(messages: Vec<ChatMessage>, context: &str) -> Value {
+        let mut request = ChatRequest::new(messages, vec![tool("a")]);
+        request.context = Some(context.into());
+        AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_options(AnthropicOptions {
+                cache_ttl: Some(CacheTtl::FiveMinutes),
+                ..AnthropicOptions::default()
+            })
+            .body(&request)
+    }
+
+    #[test]
+    fn the_turn_context_follows_the_marked_system_prompt() {
+        let body = body_with_context(tool_loop(1), "It is Tuesday.");
+        assert_eq!(
+            body["system"],
+            json!([
+                {"type": "text", "text": "You are xshell.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "It is Tuesday."},
+            ])
+        );
+        // At most four markers are allowed.
+        assert!(markers(&body).len() <= 4);
+
+        // A new turn with a different context keeps the marked prefix (tools
+        // and the system prompt) byte for byte.
+        let next = body_with_context(tool_loop(2), "It is Wednesday.");
+        assert_eq!(next["tools"], body["tools"]);
+        assert_eq!(next["system"][0], body["system"][0]);
+        assert_ne!(next["system"][1], body["system"][1]);
+
+        // With no system prompt, the context is the only system block and
+        // carries no marker; the last tool still does.
+        let bare = body_with_context(vec![ChatMessage::user("go")], "It is Tuesday.");
+        assert_eq!(
+            bare["system"],
+            json!([{"type": "text", "text": "It is Tuesday."}])
+        );
+        assert_eq!(markers(&bare), ["/messages/0/content/0", "/tools/0"]);
+    }
+
+    #[test]
+    fn markers_go_after_images_and_never_on_thinking() {
+        let (image, bytes) = crate::images::tests::image(7, "plot.png");
+        let a = call("toolu_a", "a");
+        let assistant = ChatMessage::assistant_with_tools("", vec![a.clone()])
+            .with_provider_blocks(Some(ProviderBlocks {
+                provider: "anthropic".into(),
+                model: "m".into(),
+                blocks: json!([
+                    {"type": "thinking", "thinking": "", "signature": "c2lnLTE="},
+                    {"type": "tool_use", "id": "toolu_a", "name": "read_file", "input": {"path": "a"}},
+                ]),
+            }));
+        let mut request = ChatRequest::new(
+            vec![
+                ChatMessage::user("go"),
+                assistant,
+                ChatMessage::tool_result(&a, "rendered").with_images([image.clone()]),
+            ],
+            Vec::new(),
+        );
+        request.images = [(image.sha256().to_owned(), std::sync::Arc::new(bytes))].into();
+        let body = AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_vision(true)
+            .with_options(AnthropicOptions {
+                cache_ttl: Some(CacheTtl::FiveMinutes),
+                ..AnthropicOptions::default()
+            })
+            .body(&request);
+        let found = markers(&body);
+        assert_eq!(
+            found,
+            [
+                "/messages/0/content/0",
+                format!(
+                    "/messages/2/content/{}",
+                    body["messages"][2]["content"].as_array().unwrap().len() - 1
+                )
+                .as_str()
+            ]
+        );
+        let last = body["messages"][2]["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(
+            last["type"], "image",
+            "the marker is on the last block, the image"
+        );
+        assert!(!body["messages"][1].to_string().contains("cache_control"));
     }
 
     #[test]
@@ -2125,7 +2287,7 @@ mod tests {
             json!({"edits": [{"type": "compact_20260112",
                 "trigger": {"type": "input_tokens", "value": 400_000}}]})
         );
-        assert_eq!(adapter.betas(), vec![COMPACT_BETA.to_owned()]);
+        assert_eq!(adapter.betas(&body), vec![COMPACT_BETA.to_owned()]);
         // A profile that already lists the beta does not get it twice.
         let listed = AnthropicAdapter::new("https://api.anthropic.com", "m", None).with_options(
             AnthropicOptions {
@@ -2134,14 +2296,84 @@ mod tests {
             },
         );
         assert_eq!(
-            listed.betas(),
+            listed.betas(&body),
             vec!["beta-a".to_owned(), COMPACT_BETA.to_owned()]
         );
         // Without compaction, neither is sent.
         let plain = AnthropicAdapter::new("https://api.anthropic.com", "m", None);
         let body = plain.body(&ChatRequest::new(vec![ChatMessage::user("hi")], Vec::new()));
         assert!(body.get("context_management").is_none());
-        assert!(plain.betas().is_empty());
+        assert!(plain.betas(&body).is_empty());
+    }
+
+    fn compacted_assistant(content: Value) -> ChatMessage {
+        ChatMessage::assistant("continuing").with_provider_blocks(Some(ProviderBlocks {
+            provider: "anthropic".into(),
+            model: "m".into(),
+            blocks: json!([
+                {"type": "compaction", "content": content},
+                {"type": "text", "text": "continuing"},
+            ]),
+        }))
+    }
+
+    #[test]
+    fn a_replayed_compaction_block_brings_its_beta_when_compaction_is_off() {
+        let plain = AnthropicAdapter::new("https://api.anthropic.com", "m", None);
+        let body = plain.body(&ChatRequest::new(
+            vec![
+                ChatMessage::user("task"),
+                compacted_assistant(json!("<summary>s</summary>")),
+                ChatMessage::user("next"),
+            ],
+            Vec::new(),
+        ));
+        assert!(body.get("context_management").is_none());
+        assert_eq!(plain.betas(&body), vec![COMPACT_BETA.to_owned()]);
+    }
+
+    #[test]
+    fn requests_start_at_the_latest_summarized_compaction() {
+        let history = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user("first task"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("second task"),
+            compacted_assistant(json!("<summary>one</summary>")),
+            ChatMessage::user("third task"),
+            compacted_assistant(json!("<summary>two</summary>")),
+            ChatMessage::user("fourth task"),
+        ];
+        let body = body_for(history, Vec::new());
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "{messages:#?}");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], COMPACTED_HISTORY);
+        assert_eq!(
+            messages[1]["content"][0]["content"],
+            "<summary>two</summary>"
+        );
+        assert_eq!(messages[2]["content"][0]["text"], "fourth task");
+        assert!(!body.to_string().contains("first task"));
+        assert_eq!(body["system"][0]["text"], "s", "the system prompt is kept");
+    }
+
+    #[test]
+    fn a_compaction_with_no_summary_is_held_back_and_cuts_nothing() {
+        let history = vec![
+            ChatMessage::user("task"),
+            compacted_assistant(Value::Null),
+            ChatMessage::user("next"),
+        ];
+        let body = body_for(history, Vec::new());
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"][0]["text"], "task");
+        assert_eq!(
+            messages[1]["content"],
+            json!([{"type": "text", "text": "continuing"}])
+        );
+        assert!(!replays_compaction(&body));
     }
 
     fn compaction_block(index: usize, content: Value) -> [Value; 3] {
@@ -2229,17 +2461,40 @@ mod tests {
             .await
             .unwrap();
         server.join().unwrap();
-        // Replayed, though the API ignores it.
+        // Stored, so later requests know the summary failed.
+        let stored = response.provider_blocks.unwrap();
         assert_eq!(
-            response.provider_blocks.unwrap().blocks[0],
+            stored.blocks[0],
             json!({"type": "compaction", "content": null})
         );
+        // The next request, from a new adapter as the daemon builds one each
+        // turn, reads the failure from the history.
+        let failed = ChatRequest::new(
+            vec![
+                ChatMessage::user("hello"),
+                ChatMessage::assistant("x").with_provider_blocks(Some(stored)),
+                ChatMessage::user("again"),
+            ],
+            Vec::new(),
+        );
+        let fresh = AnthropicAdapter::new("https://api.anthropic.com", "m", None)
+            .with_options(compacting(100_000));
         assert_eq!(
-            adapter.body(&request)["context_management"]["edits"][0]["instructions"],
+            fresh.body(&failed)["context_management"]["edits"][0]["instructions"],
             NO_TOOLS_SUMMARY_PROMPT
         );
+        // A later compaction that summarized clears it.
+        let mut recovered = failed.clone();
+        recovered
+            .messages
+            .push(compacted_assistant(json!("<summary>s</summary>")));
+        assert!(
+            fresh.body(&recovered)["context_management"]["edits"][0]
+                .get("instructions")
+                .is_none()
+        );
         // A prompt the profile set is kept.
-        let mut own = AnthropicAdapter::new("https://api.anthropic.com", "m", None).with_options(
+        let own = AnthropicAdapter::new("https://api.anthropic.com", "m", None).with_options(
             AnthropicOptions {
                 compaction: Some(Compaction {
                     at_tokens: 100_000,
@@ -2248,10 +2503,42 @@ mod tests {
                 ..AnthropicOptions::default()
             },
         );
-        own.summary_failed = true;
         assert_eq!(
-            own.body(&request)["context_management"]["edits"][0]["instructions"],
+            own.body(&failed)["context_management"]["edits"][0]["instructions"],
             "mine"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_usage_does_not_depend_on_event_order_or_cache_fields() {
+        // `iterations` arrives on an early delta whose entries carry no cache
+        // fields; a later delta without it updates the message step's counts.
+        let mut events = vec![start()];
+        events.extend(compaction_block(0, json!("<summary>s</summary>")));
+        events.extend(text_block(1, "done"));
+        events.push(json!({"type": "message_delta", "delta": {},
+        "usage": {"input_tokens": 30, "output_tokens": 10,
+            "cache_read_input_tokens": 500, "cache_creation_input_tokens": 0,
+            "iterations": [
+                {"type": "compaction", "input_tokens": 1000, "output_tokens": 200},
+                {"type": "message", "input_tokens": 30, "output_tokens": 10},
+            ]}}));
+        events.push(
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 40}}),
+        );
+        events.push(json!({"type": "message_stop"}));
+        let response = stream(sse(&events)).await.unwrap();
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                input: 1030,
+                output: 240,
+                cache_read: 500,
+                cache_write: 0,
+                cache_write_1h: 0,
+                compactions: 1,
+            })
         );
     }
 }

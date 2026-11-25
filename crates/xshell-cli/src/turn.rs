@@ -684,13 +684,15 @@ pub(crate) fn turn_policy_for(
     active: &ActiveModel,
     limits: xshell_execution::TurnLimits,
 ) -> TurnPolicy {
-    base.clone()
-        .with_limits(limits)
-        .with_compaction(&session_default.for_model(xshell_execution::ModelBudget {
-            max_history_bytes: active.max_history_bytes,
-            context_tokens: active.context_tokens,
-            reserve_output_tokens: active.reserve_output_tokens,
-        }))
+    base.clone().with_limits(limits).with_compaction(
+        &session_default
+            .for_model(xshell_execution::ModelBudget {
+                max_history_bytes: active.max_history_bytes,
+                context_tokens: active.context_tokens,
+                reserve_output_tokens: active.reserve_output_tokens,
+            })
+            .unless_server_compacts(active.anthropic.compacts_on_server()),
+    )
 }
 
 /// The model's output hit the provider's token limit; the turn ends there.

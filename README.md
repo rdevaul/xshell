@@ -187,8 +187,8 @@ and sent back unchanged, as the API requires during tool use. Prompts are
 cached for five minutes by default (`cache_ttl = "1h"` or `"off"` to change
 it); a run's `usage.tokens` shows the cache reads. For long runs,
 `context_management = "compact"` has the API summarize the conversation once the
-prompt reaches `compact_at_tokens` (150000 by default). Set `max_history_bytes = 0`
-with it, so that xshell's own compaction does not edit the history as well.
+prompt reaches `compact_at_tokens` (150000 by default); xshell's own compaction is
+then off for that profile.
 
 ```toml
 [models.opus]
@@ -558,6 +558,7 @@ rollback guarantees.
 - [Tool providers, per-session tool selections, turn context, and the embeddable daemon](docs/tool-providers.md)
 - [MCP bridge (design)](docs/mcp-bridge.md)
 - [Contained shell commands (design)](docs/shell-sandbox.md)
+- [Signed skills (design)](docs/signed-skills.md)
 - [Agentic CAD plan](docs/agentic-cad-plan.md)
 - [XSHELL.md durable handoff and goals (proposal)](docs/xshell-md-continuity.md)
 - [Home-lab service runner](docs/runall.md)
