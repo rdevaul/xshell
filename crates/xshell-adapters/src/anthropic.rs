@@ -1056,6 +1056,12 @@ impl Collected {
     /// The compaction steps are kept apart and added in [`Self::finish`], so
     /// the result does not depend on which event carries `iterations`, or on
     /// whether its entries carry the cache fields.
+    ///
+    /// When a request compacts, `message_start` reports the compaction step
+    /// and `message_delta` replaces it with the message step, without a
+    /// `cache_creation` breakdown. The one-hour figure is therefore taken
+    /// from the message steps of `iterations` when they carry it, and is
+    /// never left over from an object whose total it does not belong to.
     fn update_usage(&mut self, usage: &Value) {
         if !usage.is_object() {
             return;
@@ -1093,10 +1099,27 @@ impl Collected {
             current.cache_read = tokens;
         }
         if let Some(tokens) = count(&usage["cache_creation_input_tokens"]) {
+            if tokens != current.cache_write {
+                // A new total: an earlier one-hour figure belongs to another step.
+                current.cache_write_1h = current.cache_write_1h.min(tokens);
+            }
             current.cache_write = tokens;
         }
         if let Some(tokens) = count(&usage["cache_creation"]["ephemeral_1h_input_tokens"]) {
             current.cache_write_1h = tokens;
+        }
+        if let Some(iterations) = usage["iterations"].as_array() {
+            let steps: Vec<&Value> = iterations
+                .iter()
+                .filter(|step| step["type"] == "message")
+                .collect();
+            let one_hour: Option<u64> = steps
+                .iter()
+                .map(|step| step["cache_creation"]["ephemeral_1h_input_tokens"].as_u64())
+                .sum();
+            if let (false, Some(tokens)) = (steps.is_empty(), one_hour) {
+                current.cache_write_1h = tokens;
+            }
         }
         self.usage = Some(current);
     }
@@ -2506,6 +2529,49 @@ mod tests {
         assert_eq!(
             own.body(&failed)["context_management"]["edits"][0]["instructions"],
             "mine"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_usage_takes_the_one_hour_writes_from_the_right_step() {
+        // The usage a live compacting response reported: `message_start`
+        // carries the compaction step, all one-hour writes; `message_delta`
+        // carries the message step, 5-minute writes, with no breakdown at
+        // the top level.
+        let step =
+            |kind: &str, input: u64, output: u64, read: u64, write: u64, five: u64, hour: u64| {
+                json!({"type": kind, "input_tokens": input, "output_tokens": output,
+                "cache_read_input_tokens": read, "cache_creation_input_tokens": write,
+                "cache_creation": {"ephemeral_5m_input_tokens": five,
+                    "ephemeral_1h_input_tokens": hour}})
+            };
+        let mut events = vec![json!({"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m", "content": [],
+            "usage": {"input_tokens": 46, "output_tokens": 322,
+                "cache_read_input_tokens": 47828, "cache_creation_input_tokens": 22919,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 22919}}}})];
+        events.extend(compaction_block(0, json!("<summary>s</summary>")));
+        events.extend(text_block(1, "done"));
+        events.push(
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": 2, "output_tokens": 69,
+                "cache_read_input_tokens": 1813, "cache_creation_input_tokens": 455,
+                "iterations": [step("compaction", 46, 322, 47828, 22919, 0, 22919),
+                    step("message", 2, 69, 1813, 455, 455, 0)]}}),
+        );
+        events.push(json!({"type": "message_stop"}));
+        let response = stream(sse(&events)).await.unwrap();
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                input: 48,
+                output: 391,
+                cache_read: 49641,
+                cache_write: 23374,
+                cache_write_1h: 22919,
+                compactions: 1,
+            })
         );
     }
 
