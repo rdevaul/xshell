@@ -1,0 +1,30 @@
+{
+  "manifest_version": 2,
+  "name": "fixture-skill",
+  "version": "1.2.0",
+  "description": "A fixture signed by skill-signer — with a non-ASCII dash.",
+  "files": {
+    ".settings": {
+      "sha256": "a582b4e80acfa3f397c5798fd0c675a9ba8e494d3be6712eca13be4fe576dfe5",
+      "size": 24
+    },
+    "SKILL.md": {
+      "sha256": "f257fe8967491b723f9cb787e90003142f8c9a68712fdd98e4b6f646637a1d01",
+      "size": 142
+    },
+    "scripts/hello.sh": {
+      "sha256": "bfdeaeb08cffb6a36438bcd12dda25417e3cdd36f1e7e482a2849d539225288b",
+      "size": 21
+    }
+  },
+  "scripts": [
+    "scripts/hello.sh"
+  ],
+  "requires": {
+    "network": "loopback",
+    "secrets": [
+      "EXAMPLE_TOKEN"
+    ],
+    "read_only": []
+  }
+}
