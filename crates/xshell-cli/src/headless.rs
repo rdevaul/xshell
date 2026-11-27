@@ -53,6 +53,12 @@ pub struct RunArgs {
     #[arg(long, conflicts_with = "session")]
     pub ephemeral: bool,
 
+    /// Create the session durable: kept on disk and restored when the daemon
+    /// restarts, so a later `run --session NAME` can continue it. Applies only
+    /// to a session this run creates.
+    #[arg(long, conflicts_with = "ephemeral")]
+    pub durable: bool,
+
     /// Attach an image file (PNG, JPEG, GIF or WebP) to the prompt. May be
     /// given more than once. The model profile must have `vision = true`.
     #[arg(long, value_name = "FILE")]
@@ -294,6 +300,8 @@ fn execute(
             cwd,
             persistence: if args.ephemeral {
                 PersistenceMode::Ephemeral
+            } else if args.durable {
+                PersistenceMode::Durable
             } else {
                 PersistenceMode::Daemon
             },
@@ -307,6 +315,13 @@ fn execute(
         outcome: refusal_outcome(&error),
         error,
     })?;
+    if existing && args.durable && snapshot.descriptor.persistence != PersistenceMode::Durable {
+        output.warning(&format!(
+            "--durable applies only to a session the run creates; {session_name} already exists \
+and keeps its persistence ({:?})",
+            snapshot.descriptor.persistence
+        ));
+    }
     let session_id = snapshot.descriptor.id.clone();
     // A session this run created for a turn that never started is closed
     // again, so refused runs do not use up the daemon's session budget. An
