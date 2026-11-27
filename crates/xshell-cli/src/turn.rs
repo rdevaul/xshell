@@ -125,6 +125,9 @@ requested \"{requested}\" was not applied"
                             print_auto_continue(&reason);
                             audit.append_execution(AuditEvent::AutoContinued { reason, prompt })?;
                         }
+                        ExecutionEvent::WaitingForJobs { jobs } => {
+                            eprintln!("{}", format_waiting_for_jobs(&jobs));
+                        }
                         ExecutionEvent::ToolRequested { call } => {
                             println!(
                                 "{tag}agent requests: {}",
@@ -136,7 +139,12 @@ requested \"{requested}\" was not applied"
                                 arguments: call.arguments,
                             })?;
                         }
-                        ExecutionEvent::ApprovalRequested { call, reason } => {
+                        ExecutionEvent::ApprovalRequested {
+                            call,
+                            reason,
+                            target,
+                        } => {
+                            print_approval_preview(&call, target.as_deref());
                             print!("{tag}");
                             match confirm_daemon_tool(
                                 &call,
@@ -316,7 +324,7 @@ fn confirm_daemon_tool(
         return confirm_tool(call, reason).map(ApprovalPromptOutcome::Decision);
     };
     let why = match reason {
-        GateReason::ShellExecution => String::new(),
+        GateReason::ShellExecution | GateReason::FileWrite => String::new(),
         GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
         GateReason::Policy => " (the approval policy requires approval)".to_owned(),
         GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),
@@ -537,6 +545,10 @@ impl TurnObserver for LocalObserver<'_> {
                 self.audit
                     .append(AuditEvent::AutoContinued { reason, prompt })
             }
+            ExecutionEvent::WaitingForJobs { jobs } => {
+                eprintln!("{}", format_waiting_for_jobs(&jobs));
+                Ok(())
+            }
             ExecutionEvent::ToolRequested { call } => {
                 self.last_prompted = false;
                 println!(
@@ -550,9 +562,10 @@ impl TurnObserver for LocalObserver<'_> {
                 })
             }
             // The prompt itself is issued from `approve`; nothing to echo.
-            ExecutionEvent::ApprovalRequested { .. } => {
+            ExecutionEvent::ApprovalRequested { call, target, .. } => {
                 self.last_prompted = true;
                 self.approval_agent = agent;
+                print_approval_preview(&call, target.as_deref());
                 Ok(())
             }
             ExecutionEvent::ToolDecision {
@@ -753,6 +766,20 @@ pub(crate) fn print_auto_continue(reason: &str) {
     eprintln!("{}", format_auto_continue(reason));
 }
 
+/// The notice that the turn is waiting on background jobs. The job lines
+/// quote model-written commands, so they are escaped.
+pub(crate) fn format_waiting_for_jobs(jobs: &str) -> String {
+    let mut text = String::from(
+        "xshell: the agent answered while background jobs run; waiting for the next to end \
+(Ctrl-C to stop the turn)",
+    );
+    for line in jobs.lines() {
+        text.push_str("\n  ");
+        text.push_str(&escape_for_prompt(line));
+    }
+    text
+}
+
 pub(crate) fn format_auto_continue(reason: &str) -> String {
     format!("xshell: model stopped mid-task ({reason}); asking it to continue")
 }
@@ -798,13 +825,21 @@ pub(crate) fn approval_decision_name(decision: ApprovalDecision) -> &'static str
     }
 }
 
+/// Print what a file write will do above its approval prompt. Every line is
+/// model output, escaped so it cannot redraw the terminal.
+pub(crate) fn print_approval_preview(call: &ToolCall, target: Option<&str>) {
+    for line in tools::approval_preview(call, target) {
+        println!("{}", escape_for_prompt(&line));
+    }
+}
+
 pub(crate) fn confirm_tool(call: &ToolCall, reason: GateReason) -> Result<ApprovalDecision> {
     loop {
         // Tool arguments are model-controlled. Escape them so the command the
         // user approves is exactly the command that will run: no control
         // sequences can redraw the line, and embedded newlines are visible.
         let why = match reason {
-            GateReason::ShellExecution => String::new(),
+            GateReason::ShellExecution | GateReason::FileWrite => String::new(),
             GateReason::SensitivePath => " (matches sensitive-path policy)".to_owned(),
             GateReason::Policy => " (the approval policy requires approval)".to_owned(),
             GateReason::ToolDeclared => " (the tool requires approval)".to_owned(),

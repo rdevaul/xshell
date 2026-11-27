@@ -1140,7 +1140,9 @@ impl DaemonObserver {
     /// `SubagentFinished` records.
     fn audit_execution(&mut self, event: &ExecutionEvent) {
         match event {
-            ExecutionEvent::TextDelta { .. } | ExecutionEvent::ApprovalRequested { .. } => {}
+            ExecutionEvent::TextDelta { .. }
+            | ExecutionEvent::ApprovalRequested { .. }
+            | ExecutionEvent::WaitingForJobs { .. } => {}
             ExecutionEvent::AgentResponse {
                 content,
                 tool_call_count,

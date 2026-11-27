@@ -91,9 +91,20 @@ struct Args {
         env = "XSHELL_APPROVAL",
         value_enum,
         default_value = "ask",
-        help = "Approval policy: ask (prompt, default), auto (run all), off (deny shell)"
+        help = "Approval policy: ask (prompt, default), auto (run all but writes to sensitive \
+paths), auto-sensitive (run all), off (deny shell)"
     )]
     approval: ApprovalPolicy,
+
+    #[arg(
+        long,
+        global = true,
+        env = "XSHELL_APPROVE_SENSITIVE_WRITES",
+        help = "With --approval auto, also run writes to sensitive paths (credentials, shell \
+start-up files, git hooks) instead of prompting: the same as --approval auto-sensitive. A \
+session daemon applies it only if its max_approval allows auto-sensitive"
+    )]
+    approve_sensitive_writes: bool,
 
     #[arg(
         long,
@@ -133,6 +144,21 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
+    if args.approve_sensitive_writes {
+        match args.approval {
+            ApprovalPolicy::Auto | ApprovalPolicy::AutoSensitive => {
+                args.approval = ApprovalPolicy::AutoSensitive;
+            }
+            other => {
+                eprintln!(
+                    "xshell: --approve-sensitive-writes needs --approval auto (the approval is {})",
+                    clap::ValueEnum::to_possible_value(&other)
+                        .map_or_else(String::new, |value| value.get_name().to_owned())
+                );
+                std::process::exit(2);
+            }
+        }
+    }
     if let Some(command) = args.command.take() {
         let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         headless::watch_signals(std::sync::Arc::clone(&interrupted));
@@ -996,6 +1022,10 @@ mod tests {
         assert_eq!(
             ApprovalPolicy::from_str("off", false).unwrap(),
             ApprovalPolicy::Off
+        );
+        assert_eq!(
+            ApprovalPolicy::from_str("auto-sensitive", false).unwrap(),
+            ApprovalPolicy::AutoSensitive
         );
         assert!(ApprovalPolicy::from_str("yolo", false).is_err());
     }

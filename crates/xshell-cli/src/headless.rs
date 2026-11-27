@@ -956,6 +956,10 @@ fn handle_execution(
         ExecutionEvent::AutoContinued { reason, .. } => {
             output.event(tagged(json!({"event": "auto_continued", "reason": reason})));
         }
+        ExecutionEvent::WaitingForJobs { jobs } => {
+            output.progress("waiting for background jobs");
+            output.event(tagged(json!({"event": "waiting_for_jobs", "jobs": jobs})));
+        }
         ExecutionEvent::ToolRequested { call } => {
             summary.tool_calls += 1;
             output.progress(&format!("tool: {}", call.name));
@@ -966,13 +970,18 @@ fn handle_execution(
                 "arguments": call.arguments,
             })));
         }
-        ExecutionEvent::ApprovalRequested { call, reason } => {
+        ExecutionEvent::ApprovalRequested {
+            call,
+            reason,
+            target,
+        } => {
             output.event(tagged(json!({
                 "event": "approval_needed",
                 "call_id": call.id,
                 "name": call.name,
                 "arguments": call.arguments,
                 "reason": reason,
+                "target": target,
             })));
             // Without a channel nobody can answer, so a prompt is denied and
             // the model is told. A prompt replayed from the journal may

@@ -53,17 +53,24 @@ pub enum ApprovalPolicy {
     #[default]
     Ask,
     Auto,
+    /// `auto`, and writes to sensitive paths run too instead of being put
+    /// to a person. For batch work and testing where nobody answers and the
+    /// task needs such a write.
+    #[serde(alias = "auto-sensitive")]
+    AutoSensitive,
     Off,
 }
 
 impl ApprovalPolicy {
     /// How much a policy lets an agent do without a human decision.
-    /// `Off` (deny shell) < `Ask` (prompt) < `Auto` (run everything).
+    /// `Off` (deny shell) < `Ask` (prompt) < `Auto` (run all but sensitive
+    /// writes) < `AutoSensitive` (run everything).
     fn permissiveness(self) -> u8 {
         match self {
             Self::Off => 0,
             Self::Ask => 1,
             Self::Auto => 2,
+            Self::AutoSensitive => 3,
         }
     }
 
@@ -82,7 +89,8 @@ impl std::fmt::Display for ApprovalPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Ask => "ask before shell execution",
-            Self::Auto => "auto-run all tools",
+            Self::Auto => "auto-run all tools except writes to sensitive paths",
+            Self::AutoSensitive => "auto-run all tools, writes to sensitive paths included",
             Self::Off => "deny shell execution",
         })
     }
@@ -213,12 +221,24 @@ pub enum ExecutionEvent {
     ToolRequested {
         call: ToolCall,
     },
+    /// The root agent gave its answer while background jobs still run; the
+    /// turn waits for the next to end (or for the wall time), then continues.
+    /// `jobs` lists them, one per line.
+    WaitingForJobs {
+        jobs: String,
+    },
     ApprovalRequested {
         call: ToolCall,
         /// Why this call is gated. Absent in journals written before the
         /// field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<GateReason>,
+        /// For a file write, what the session host resolved it to: the
+        /// canonical path, and whether the file is created or replaced. The
+        /// agent's spelling of the path can hide where a symlinked directory
+        /// leads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     ToolDecision {
         call_id: String,
@@ -930,6 +950,40 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 .with_provider_blocks(response.provider_blocks),
         );
         if response.tool_calls.is_empty() {
+            // The root agent ended its response while a background job it
+            // started is still running: wait for the next job to end, then
+            // continue with what happened, as if it had been notified. A
+            // wall-time expiry while waiting ends the turn with this answer.
+            if policy.agent_scope.is_none()
+                && (budget.jobs().background_running() || budget.jobs().has_notices())
+            {
+                let cancellation = observer.cancellation();
+                if budget.jobs().background_running() {
+                    observer.emit(ExecutionEvent::WaitingForJobs {
+                        jobs: budget.jobs().running_summary(),
+                    });
+                }
+                budget
+                    .jobs()
+                    .wait_for_background(
+                        &cancellation,
+                        tokio::time::Instant::from_std(budget.deadline()),
+                    )
+                    .await;
+                let notices = budget.jobs().take_notices();
+                if !notices.is_empty() && !cancellation.is_cancelled() {
+                    let prompt = format!(
+                        "[xshell] A background job ended after your last response:{notices}\n\
+Continue the task. If it is complete, say so."
+                    );
+                    observer.emit(ExecutionEvent::AutoContinued {
+                        reason: "background_job_ended".into(),
+                        prompt: prompt.clone(),
+                    });
+                    history.push(ChatMessage::user(prompt));
+                    continue;
+                }
+            }
             if let Some((reason, prompt)) = continue_reason
                 && auto_continues < budget.limits().auto_continues
             {
@@ -1058,7 +1112,9 @@ Start a new session with //new or lower max_history_bytes to continue.",
                 sensitive: gate_reason == Some(GateReason::SensitivePath),
                 writes: match tool {
                     ToolRef::Provided(provided) => provided.access() == ToolAccess::ReadWrite,
-                    ToolRef::Builtin(builtin) => builtin == Tool::RunShell,
+                    ToolRef::Builtin(builtin) => {
+                        builtin == Tool::RunShell || builtin.writes_files()
+                    }
                 },
                 cwd: Some(cwd),
                 search_path: None,
@@ -1076,6 +1132,7 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     observer.emit(ExecutionEvent::ApprovalRequested {
                         call: scoped.clone(),
                         reason: Some(reason),
+                        target: preparation.write_description(),
                     });
                     let answer = observer.approve(scoped, reason).await;
                     (answer.decision, Some(answer.source))
@@ -1192,8 +1249,17 @@ Start a new session with //new or lower max_history_bytes to continue.",
                     observer.cancellation(),
                     budget.limits().shell_timeout,
                     policy.shell.as_ref(),
+                    budget.jobs(),
                 )
                 .await
+            };
+            // Jobs that ended since the root agent was last told, once. Only
+            // the root agent is told: it started them, and a subagent that
+            // took the once-only notice would leave it never knowing.
+            let result = if policy.agent_scope.is_none() {
+                result + &budget.jobs().take_notices()
+            } else {
+                result
             };
             observer.emit(ExecutionEvent::ToolResult {
                 call_id: scoped.id.clone(),
@@ -1967,6 +2033,7 @@ mod tests {
                 ExecutionEvent::TurnAborted => "aborted",
                 ExecutionEvent::HistoryCompacted { .. } => "compacted",
                 ExecutionEvent::AutoContinued { .. } => "continued",
+                ExecutionEvent::WaitingForJobs { .. } => "waiting",
                 ExecutionEvent::SubagentStarted { .. } => "subagent_started",
                 ExecutionEvent::Subagent { .. } => "subagent",
                 ExecutionEvent::SubagentFinished { .. } => "subagent_finished",
@@ -2176,6 +2243,114 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn the_turn_waits_for_a_background_job_and_continues_with_its_end() {
+        let temporary = TempDir::new().unwrap();
+        let background = ToolCall {
+            id: "a".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "sleep 0.3; echo built > out.txt", "background": true}),
+        };
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![background],
+                    ..Default::default()
+                },
+                // Ends while the job runs: the engine waits, then continues.
+                AssistantResponse {
+                    content: "Waiting for the build.".into(),
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "build it".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(adapter.requests.len(), 3);
+        assert!(temporary.path().join("out.txt").exists());
+        let continued: Vec<_> = observer
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::AutoContinued { reason, prompt } => {
+                    Some((reason.clone(), prompt.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].0, "background_job_ended");
+        assert!(
+            continued[0].1.contains("exited with status 0"),
+            "{}",
+            continued[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn background_jobs_are_killed_when_the_turn_ends() {
+        let temporary = TempDir::new().unwrap();
+        let background = ToolCall {
+            id: "a".into(),
+            name: "run_shell".into(),
+            arguments: json!({"command": "sleep 30; touch late", "background": true}),
+        };
+        let kill = ToolCall {
+            id: "b".into(),
+            name: "job_kill".into(),
+            arguments: json!({"job_id": 1}),
+        };
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([
+                AssistantResponse {
+                    tool_calls: vec![background],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    tool_calls: vec![kill],
+                    ..Default::default()
+                },
+                AssistantResponse {
+                    content: "stopped".into(),
+                    ..Default::default()
+                },
+            ]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer([]);
+        let mut history = Vec::new();
+        run_agent_turn(
+            &mut adapter,
+            &mut history,
+            "go".into(),
+            temporary.path(),
+            &TurnPolicy::new(ApprovalPolicy::Auto),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        let results = tool_results(&observer.events);
+        assert!(results[1].1.contains("killed"), "{}", results[1].1);
+        // Killed, so it never got to the touch; and no wait at the end.
+        assert_eq!(adapter.requests.len(), 3);
+        assert!(!temporary.path().join("late").exists());
     }
 
     #[tokio::test]
@@ -2693,6 +2868,115 @@ mod tests {
             name: "delegate_task".into(),
             arguments,
         }
+    }
+
+    /// Run one turn that asks for `call` under `approval`, answering any
+    /// prompt with `decisions`; return the events.
+    async fn one_call_turn(
+        root: &std::path::Path,
+        call: ToolCall,
+        approval: ApprovalPolicy,
+        decisions: Vec<ApprovalDecision>,
+    ) -> Vec<ExecutionEvent> {
+        let mut adapter = ScriptedAdapter {
+            responses: VecDeque::from([calls(vec![call]), answer("done")]),
+            requests: Vec::new(),
+        };
+        let mut observer = recording_observer(decisions);
+        run_agent_turn(
+            &mut adapter,
+            &mut Vec::new(),
+            "go".into(),
+            root,
+            &TurnPolicy::new(approval),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        observer.events
+    }
+
+    fn write_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: "w".into(),
+            name: "write_file".into(),
+            arguments: json!({"path": path, "content": "echo hi\n"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_follows_the_approval_mode() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        // off: denied, nothing written.
+        one_call_turn(root, write_call("a.txt"), ApprovalPolicy::Off, vec![]).await;
+        assert!(!root.join("a.txt").exists());
+        // ask: prompted, with the canonical target; a denial writes nothing.
+        let events = one_call_turn(
+            root,
+            write_call("a.txt"),
+            ApprovalPolicy::Ask,
+            vec![ApprovalDecision::Deny],
+        )
+        .await;
+        let target = events.iter().find_map(|event| match event {
+            ExecutionEvent::ApprovalRequested { target, .. } => target.clone(),
+            _ => None,
+        });
+        let canonical = root.canonicalize().unwrap().join("a.txt");
+        assert_eq!(
+            target,
+            Some(format!("{} (creates a new file)", canonical.display()))
+        );
+        assert!(!root.join("a.txt").exists());
+        // auto: written without a prompt.
+        let events = one_call_turn(root, write_call("a.txt"), ApprovalPolicy::Auto, vec![]).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "echo hi\n"
+        );
+        // auto, but a shell start-up file: prompted, and a denial holds.
+        let events = one_call_turn(
+            root,
+            write_call(".zshenv"),
+            ApprovalPolicy::Auto,
+            vec![ApprovalDecision::Deny],
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
+        );
+        assert!(!root.join(".zshenv").exists());
+        // auto-sensitive: written without a prompt.
+        let events = one_call_turn(
+            root,
+            write_call(".zshenv"),
+            ApprovalPolicy::AutoSensitive,
+            vec![],
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::ApprovalRequested { .. }))
+        );
+        assert!(root.join(".zshenv").exists());
+        // A daemon whose ceiling is `auto` lowers it to `auto`.
+        assert_eq!(
+            ApprovalPolicy::AutoSensitive.clamp_to(ApprovalPolicy::Auto),
+            ApprovalPolicy::Auto
+        );
+        assert_eq!(
+            ApprovalPolicy::Auto.clamp_to(ApprovalPolicy::AutoSensitive),
+            ApprovalPolicy::Auto
+        );
     }
 
     fn calls(tool_calls: Vec<ToolCall>) -> AssistantResponse {
@@ -5215,6 +5499,10 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
                 "list_directory",
                 "run_shell",
                 "delegate_task",
+                "write_file",
+                "edit_file",
+                "job_output",
+                "job_kill",
                 "memory_get",
                 "memory_put",
                 "memory_purge"
@@ -5434,6 +5722,10 @@ the agent returned an invalid response: invalid arguments for tool {F16_INJECTIO
                 "read_file",
                 "list_directory",
                 "run_shell",
+                "write_file",
+                "edit_file",
+                "job_output",
+                "job_kill",
                 "memory_get",
                 "memory_put",
                 "memory_purge"

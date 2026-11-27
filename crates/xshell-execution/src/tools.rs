@@ -1,7 +1,8 @@
 use crate::SensitivePaths;
 use crate::engine::CancellationFlag;
 use crate::environment::apply_agent_environment;
-use crate::prepared::{self, ObjectKind, PreparedObject};
+use crate::jobs::{ShellJobs, group_alive, status_text};
+use crate::prepared::{self, ObjectKind, PreparedObject, WriteTarget};
 use crate::process::{
     LINGER_GRACE, ShellEnd, Stream, configure_process_group, restrict_inherited_descriptors,
     supervise_shell,
@@ -37,15 +38,27 @@ pub enum Tool {
     /// Shows the model an image file. Dispatched by the engine, which holds
     /// the session's image store; offered only to models that take images.
     ViewImage,
+    /// Creates or replaces a text file beneath the root.
+    WriteFile,
+    /// Replaces exact text in an existing file beneath the root.
+    EditFile,
+    /// Reads a background job's status and new output, optionally waiting.
+    JobOutput,
+    /// Kills a background job's process group.
+    JobKill,
 }
 
 impl Tool {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 9] = [
         Self::ReadFile,
         Self::ListDirectory,
         Self::RunShell,
         Self::DelegateTask,
         Self::ViewImage,
+        Self::WriteFile,
+        Self::EditFile,
+        Self::JobOutput,
+        Self::JobKill,
     ];
 
     pub fn name(self) -> &'static str {
@@ -55,6 +68,10 @@ impl Tool {
             Self::RunShell => "run_shell",
             Self::DelegateTask => "delegate_task",
             Self::ViewImage => "view_image",
+            Self::WriteFile => "write_file",
+            Self::EditFile => "edit_file",
+            Self::JobOutput => "job_output",
+            Self::JobKill => "job_kill",
         }
     }
 
@@ -67,12 +84,24 @@ impl Tool {
     pub fn is_read_only(self) -> bool {
         match self {
             Self::ReadFile | Self::ListDirectory | Self::ViewImage => true,
-            Self::RunShell | Self::DelegateTask => false,
+            // The job tools belong with run_shell, which starts the jobs.
+            Self::RunShell
+            | Self::DelegateTask
+            | Self::WriteFile
+            | Self::EditFile
+            | Self::JobOutput
+            | Self::JobKill => false,
         }
     }
 
-    fn bit(self) -> u8 {
-        1 << self as u8
+    /// Whether the tool changes files: gated like a shell command, and
+    /// refused when the approval mode is `off`.
+    pub fn writes_files(self) -> bool {
+        matches!(self, Self::WriteFile | Self::EditFile)
+    }
+
+    fn bit(self) -> u16 {
+        1 << self as u16
     }
 }
 
@@ -84,7 +113,7 @@ impl Tool {
 /// [`ToolRegistry`]. Sets built without a registry hold built-in tools only.
 #[derive(Clone)]
 pub struct ToolSet {
-    builtins: u8,
+    builtins: u16,
     registry: Arc<ToolRegistry>,
     /// Bit `i` is the registry's tool `i`; the registry holds at most
     /// [`MAX_PROVIDED_TOOLS`](crate::MAX_PROVIDED_TOOLS) tools.
@@ -313,7 +342,8 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "read_file".into(),
             description: "Read a UTF-8 text file inside the current xshell working directory. \
-Files that look like credentials or keys require user approval."
+Binary files are refused; use view_image for images. Files that look like credentials or keys \
+require user approval."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -339,12 +369,19 @@ Files that look like credentials or keys require user approval."
         },
         ToolDefinition {
             name: "run_shell".into(),
-            description: "Run a shell command in the current xshell working directory. This always requires user approval."
-                .into(),
+            description:
+                "Run a shell command in the current xshell working directory. This always \
+requires user approval. A command that runs longer than the shell time limit is killed; run long \
+builds, servers or watchers with background: true instead, which returns a job id at once. Read \
+a job's output with job_output (which can wait for it to finish) and stop it with job_kill; you \
+are told when a job ends. Prefer background: true to `&` or nohup, which leave processes you may \
+not be able to stop."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Command passed to the user's configured shell"}
+                    "command": {"type": "string", "description": "Command passed to the user's configured shell"},
+                    "background": {"type": "boolean", "description": "Start the command as a background job and return its id without waiting (default false)"}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -374,17 +411,83 @@ need to keep in your own context."
         },
         ToolDefinition {
             name: "view_image".into(),
-            description: "Look at an image file (PNG, JPEG, GIF or WebP) inside the current xshell \
+            description:
+                "Look at an image file (PNG, JPEG, GIF or WebP) inside the current xshell \
 working directory, such as a render or plot a command produced. The image is shown to you \
 with the result, scaled to at most 1568 pixels on its longest edge. Files that look like \
 credentials or keys require user approval."
-                .into(),
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path relative to the working directory"}
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "write_file".into(),
+            description: "Create a text file, or replace one, inside the current xshell working \
+directory, creating missing parent directories. Requires user approval. Prefer edit_file to \
+change part of an existing file."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the working directory"},
+                    "content": {"type": "string", "description": "The file's complete new content"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "edit_file".into(),
+            description: "Replace exact text in an existing text file inside the current xshell \
+working directory. old_string must match the file exactly, including whitespace, and must occur \
+once unless replace_all is true; include enough surrounding lines to make it unique. Requires \
+user approval."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the working directory"},
+                    "old_string": {"type": "string", "description": "The exact text to replace"},
+                    "new_string": {"type": "string", "description": "The text to put in its place"},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
+                },
+                "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "job_output".into(),
+            description: "Show a background job's status and the output it produced since you \
+last read it. With wait_seconds, wait up to that long for the job to finish first: use it to wait \
+for a build instead of sleeping in run_shell."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "integer", "minimum": 1},
+                    "wait_seconds": {"type": "integer", "minimum": 0, "maximum": crate::jobs::MAX_JOB_WAIT.as_secs()}
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "job_kill".into(),
+            description: "Stop a background job, or processes a command left running, by killing \
+its whole process group."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "integer", "minimum": 1}
+                },
+                "required": ["job_id"],
                 "additionalProperties": false
             }),
         },
@@ -403,6 +506,8 @@ pub enum GateReason {
     Policy,
     /// A provided tool declares that its calls need approval.
     ToolDeclared,
+    /// The tool creates or changes a file.
+    FileWrite,
 }
 
 impl std::fmt::Display for GateReason {
@@ -412,6 +517,7 @@ impl std::fmt::Display for GateReason {
             Self::SensitivePath => "sensitive path",
             Self::Policy => "approval policy",
             Self::ToolDeclared => "tool requires approval",
+            Self::FileWrite => "file write",
         })
     }
 }
@@ -431,13 +537,21 @@ pub fn requires_approval(
     root: &Path,
     sensitive: &SensitivePaths,
 ) -> Option<GateReason> {
-    let preparation = match read_request(call) {
-        Some(Ok((path, kind))) => match prepared::prepare(root, &path, kind, sensitive) {
+    let preparation = match (read_request(call), write_request(call)) {
+        (Some(Ok((path, kind))), _) => match prepared::prepare(root, &path, kind, sensitive) {
             Ok(object) => Preparation::Read(object),
             Err(error) => Preparation::Failed(format!("tool error: {error:#}")),
         },
-        Some(Err(error)) => Preparation::Failed(format!("tool error: {error:#}")),
-        None => Preparation::Other,
+        (_, Some(Ok((path, must_exist)))) => {
+            match prepared::prepare_write(root, &path, sensitive, must_exist) {
+                Ok(target) => Preparation::Write(target),
+                Err(error) => Preparation::Failed(format!("tool error: {error:#}")),
+            }
+        }
+        (Some(Err(error)), _) | (_, Some(Err(error))) => {
+            Preparation::Failed(format!("tool error: {error:#}"))
+        }
+        (None, None) => Preparation::Other,
     };
     gate(call, &preparation)
 }
@@ -447,6 +561,8 @@ pub fn requires_approval(
 #[derive(Debug)]
 pub(crate) enum Preparation {
     Read(PreparedObject),
+    /// Where a write tool will write, resolved but not yet created.
+    Write(WriteTarget),
     /// The read could not be prepared; this is the tool's result.
     Failed(String),
     /// The read would open a path the session host blocks. Refused before
@@ -464,6 +580,26 @@ pub(crate) async fn prepare_call(
     sensitive: &SensitivePaths,
     blocked: &SensitivePaths,
 ) -> Preparation {
+    if let Some(request) = write_request(call) {
+        let (path, must_exist) = match request {
+            Ok(request) => request,
+            Err(error) => return Preparation::Failed(format!("tool error: {error:#}")),
+        };
+        let root = root.to_owned();
+        let sensitive = sensitive.clone();
+        return match run_blocking(move || {
+            prepared::prepare_write(&root, &path, &sensitive, must_exist)
+        })
+        .await
+        {
+            Ok(target) if blocked.matches(target.path()) => Preparation::Blocked(format!(
+                "tool error: {} is blocked by the session host's policy",
+                target.path().display()
+            )),
+            Ok(target) => Preparation::Write(target),
+            Err(error) => Preparation::Failed(format!("tool error: {error:#}")),
+        };
+    }
     let (path, kind) = match read_request(call) {
         Some(Ok(request)) => request,
         Some(Err(error)) => return Preparation::Failed(format!("tool error: {error:#}")),
@@ -487,18 +623,40 @@ impl Preparation {
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
             Self::Read(object) => Some(object.path()),
+            Self::Write(target) => Some(target.path()),
             _ => None,
         }
     }
 }
 
+impl Preparation {
+    /// For a write, the canonical path and what the write does to it, as
+    /// shown when the write is put to a person for approval.
+    pub(crate) fn write_description(&self) -> Option<String> {
+        let Self::Write(target) = self else {
+            return None;
+        };
+        let effect = match (target.must_exist(), target.exists()) {
+            (true, _) => "changes the existing file",
+            (false, true) => "replaces the existing file",
+            (false, false) => "creates a new file",
+        };
+        Some(format!("{} ({effect})", target.path().display()))
+    }
+}
+
 /// Why `call` needs a human decision, judged from its preparation.
 pub(crate) fn gate(call: &ToolCall, preparation: &Preparation) -> Option<GateReason> {
-    if requires_approval_by_name(&call.name) {
-        return Some(GateReason::ShellExecution);
-    }
     match preparation {
-        Preparation::Read(object) if object.sensitive() => Some(GateReason::SensitivePath),
+        Preparation::Read(object) if object.sensitive() => return Some(GateReason::SensitivePath),
+        Preparation::Write(target) if target.sensitive() => {
+            return Some(GateReason::SensitivePath);
+        }
+        _ => {}
+    }
+    match Tool::from_name(&call.name) {
+        Some(Tool::RunShell) => Some(GateReason::ShellExecution),
+        Some(tool) if tool.writes_files() => Some(GateReason::FileWrite),
         _ => None,
     }
 }
@@ -519,13 +677,82 @@ fn read_request(call: &ToolCall) -> Option<Result<(String, ObjectKind)>> {
                 .to_owned(),
             ObjectKind::Directory,
         ))),
-        Tool::RunShell | Tool::DelegateTask => None,
+        Tool::RunShell
+        | Tool::DelegateTask
+        | Tool::WriteFile
+        | Tool::EditFile
+        | Tool::JobOutput
+        | Tool::JobKill => None,
     }
+}
+
+/// The path a write tool asks for, and whether the file must already exist
+/// (`edit_file`), or `None` for any other tool.
+fn write_request(call: &ToolCall) -> Option<Result<(String, bool)>> {
+    let must_exist = match Tool::from_name(&call.name)? {
+        Tool::WriteFile => false,
+        Tool::EditFile => true,
+        _ => return None,
+    };
+    Some(required_string(&call.arguments, "path").map(|path| (path.to_owned(), must_exist)))
 }
 
 /// Whether a tool is gated regardless of its arguments.
 pub fn requires_approval_by_name(name: &str) -> bool {
-    Tool::from_name(name) == Some(Tool::RunShell)
+    Tool::from_name(name).is_some_and(|tool| tool == Tool::RunShell || tool.writes_files())
+}
+
+/// Lines shown above an approval prompt for a file write: where it goes,
+/// its size, and a bounded preview of the content or of the change. Each
+/// line is raw model output; the caller escapes it for the terminal.
+pub fn approval_preview(call: &ToolCall, target: Option<&str>) -> Vec<String> {
+    const LINES: usize = 12;
+    const BYTES: usize = 1200;
+    fn excerpt(text: &str, mark: &str, lines: &mut Vec<String>) {
+        let mut shown = 0;
+        let total = text.lines().count().max(1);
+        for (index, line) in text.lines().enumerate() {
+            if index == LINES || shown + line.len() > BYTES {
+                lines.push(format!("    … {} more lines", total - index));
+                return;
+            }
+            shown += line.len();
+            lines.push(format!("  {mark} {line}"));
+        }
+        if text.is_empty() {
+            lines.push(format!("  {mark} (empty)"));
+        }
+    }
+    let text = |key: &str| call.arguments.get(key).and_then(Value::as_str);
+    let mut lines = Vec::new();
+    match call.name.as_str() {
+        "write_file" => {
+            let content = text("content").unwrap_or_default();
+            lines.push(format!(
+                "  to: {}",
+                target.unwrap_or(text("path").unwrap_or("?"))
+            ));
+            lines.push(format!(
+                "  content: {} bytes, {} lines",
+                content.len(),
+                content.lines().count()
+            ));
+            excerpt(content, "|", &mut lines);
+        }
+        "edit_file" => {
+            lines.push(format!(
+                "  in: {}",
+                target.unwrap_or(text("path").unwrap_or("?"))
+            ));
+            if call.arguments.get("replace_all").and_then(Value::as_bool) == Some(true) {
+                lines.push("  every occurrence of:".to_owned());
+            }
+            excerpt(text("old_string").unwrap_or_default(), "-", &mut lines);
+            excerpt(text("new_string").unwrap_or_default(), "+", &mut lines);
+        }
+        _ => {}
+    }
+    lines
 }
 
 pub fn tool_summary(call: &ToolCall) -> String {
@@ -549,8 +776,27 @@ pub fn tool_summary(call: &ToolCall) -> String {
             .and_then(Value::as_str)
             .map_or_else(
                 || call.arguments.to_string(),
-                |command| format!("$ {command}"),
+                |command| {
+                    if call.arguments.get("background").and_then(Value::as_bool) == Some(true) {
+                        format!("$ {command} &  (background job)")
+                    } else {
+                        format!("$ {command}")
+                    }
+                },
             ),
+        "write_file" | "edit_file" => {
+            let path = call
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let verb = if call.name == "write_file" {
+                "write"
+            } else {
+                "edit"
+            };
+            format!("{verb} {path}")
+        }
         _ => format!("{} {}", call.name, call.arguments),
     }
 }
@@ -568,15 +814,19 @@ pub(crate) async fn execute_tool_cancellable(
 ) -> String {
     let preparation =
         prepare_call(call, root, &SensitivePaths::none(), &SensitivePaths::none()).await;
-    execute_prepared(
+    let jobs = ShellJobs::new();
+    let output = execute_prepared(
         call,
         preparation,
         root,
         cancellation,
         crate::TurnLimits::default().shell_timeout,
         &AmbientRunner,
+        &jobs,
     )
-    .await
+    .await;
+    jobs.shut_down();
+    output
 }
 
 /// Run a prepared call. A read-only tool reads from the object prepared for
@@ -588,9 +838,15 @@ pub(crate) async fn execute_prepared(
     cancellation: CancellationFlag,
     shell_timeout: Duration,
     runner: &dyn ShellRunner,
+    jobs: &Arc<ShellJobs>,
 ) -> String {
     let output = match preparation {
         Preparation::Failed(message) | Preparation::Blocked(message) => return message,
+        Preparation::Write(target) => match Tool::from_name(&call.name) {
+            Some(Tool::WriteFile) => write_file(target, &call.arguments).await,
+            Some(Tool::EditFile) => edit_file(target, &call.arguments).await,
+            _ => Err(anyhow::anyhow!("{} does not write files", call.name)),
+        },
         Preparation::Read(object) => match Tool::from_name(&call.name) {
             Some(Tool::ReadFile) => {
                 let max_bytes = call
@@ -605,7 +861,36 @@ pub(crate) async fn execute_prepared(
         },
         Preparation::Other => match Tool::from_name(&call.name) {
             Some(Tool::RunShell) => {
-                run_shell_under(runner, &call.arguments, root, cancellation, shell_timeout).await
+                run_shell_under(
+                    runner,
+                    &call.arguments,
+                    root,
+                    cancellation,
+                    shell_timeout,
+                    jobs,
+                )
+                .await
+            }
+            Some(Tool::JobOutput) => {
+                let wait = call
+                    .arguments
+                    .get("wait_seconds")
+                    .and_then(Value::as_u64)
+                    .map_or(Duration::ZERO, Duration::from_secs);
+                match job_id(&call.arguments) {
+                    Ok(id) => jobs
+                        .output(id, wait, &cancellation)
+                        .await
+                        .map_err(anyhow::Error::msg),
+                    Err(error) => Err(error),
+                }
+            }
+            Some(Tool::JobKill) => match job_id(&call.arguments) {
+                Ok(id) => jobs.kill(id).await.map_err(anyhow::Error::msg),
+                Err(error) => Err(error),
+            },
+            Some(Tool::WriteFile | Tool::EditFile) => {
+                Err(anyhow::anyhow!("{} was not prepared", call.name))
             }
             Some(Tool::DelegateTask) => Err(anyhow::anyhow!(
                 "delegate_task is dispatched by the agent engine"
@@ -635,7 +920,7 @@ pub(crate) async fn execute_view_image(
         Preparation::Failed(message) | Preparation::Blocked(message) => {
             return (message, Vec::new());
         }
-        Preparation::Other => {
+        Preparation::Other | Preparation::Write(_) => {
             return ("tool error: view_image was not prepared".into(), Vec::new());
         }
     };
@@ -685,20 +970,133 @@ async fn run_blocking_within<T: Send + 'static>(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(anyhow::anyhow!("filesystem worker failed: {error}")),
         Err(_) => bail!(
-            "the filesystem did not respond within {} ms",
+            "the filesystem did not respond within {} ms; the operation may still finish",
             deadline.as_millis()
         ),
     }
 }
 
 fn read_file(object: PreparedObject, max_bytes: usize) -> Result<String> {
+    let path = object.path().to_owned();
     let (bytes, truncated) = object.read(max_bytes)?;
+    if looks_binary(&bytes) {
+        let hint = if image_kind(&bytes).is_some() {
+            "; it is an image: use view_image to look at it"
+        } else {
+            ""
+        };
+        bail!("{} is a binary file, not text{hint}", path.display());
+    }
     let content = String::from_utf8_lossy(&bytes);
     Ok(if truncated {
         format!("{content}\n[output truncated at {max_bytes} bytes]")
     } else {
         content.into_owned()
     })
+}
+
+/// Whether `bytes` (the start of a file) look like binary data rather than
+/// text: a NUL byte, or invalid UTF-8 away from the end, where a multi-byte
+/// character may have been cut.
+fn looks_binary(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(8192)];
+    if head.contains(&0) {
+        return true;
+    }
+    match std::str::from_utf8(head) {
+        Ok(_) => false,
+        Err(error) => error.error_len().is_some() || error.valid_up_to() + 4 < head.len(),
+    }
+}
+
+fn image_kind(bytes: &[u8]) -> Option<&'static str> {
+    [
+        (&b"\x89PNG"[..], "PNG"),
+        (&b"\xff\xd8\xff"[..], "JPEG"),
+        (&b"GIF8"[..], "GIF"),
+        (&b"RIFF"[..], "WebP"),
+    ]
+    .into_iter()
+    .find(|(magic, _)| bytes.starts_with(magic))
+    .map(|(_, kind)| kind)
+}
+
+async fn write_file(target: WriteTarget, arguments: &Value) -> Result<String> {
+    let content = required_string(arguments, "content")?.to_owned();
+    if content.len() > prepared::MAX_EDIT_BYTES {
+        bail!(
+            "content is larger than the {}-byte limit",
+            prepared::MAX_EDIT_BYTES
+        );
+    }
+    // The path as the agent gave it: shorter than the canonical one, and it
+    // does not spell out where the session's directory is.
+    let path = required_string(arguments, "path")?.to_owned();
+    let bytes = content.len();
+    let created = run_blocking(move || target.write(content.as_bytes())).await?;
+    let verb = if created { "created" } else { "replaced" };
+    Ok(format!("{verb} {path} ({bytes} bytes)"))
+}
+
+async fn edit_file(target: WriteTarget, arguments: &Value) -> Result<String> {
+    let old = required_string(arguments, "old_string")?.to_owned();
+    let new = required_string(arguments, "new_string")?.to_owned();
+    let replace_all = arguments
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if old.is_empty() {
+        bail!("old_string is empty; use write_file to write a whole file");
+    }
+    if old == new {
+        bail!("old_string and new_string are the same");
+    }
+    let path = required_string(arguments, "path")?.to_owned();
+    let shown = path.clone();
+    let count = run_blocking(move || {
+        target.edit(|text| {
+            let count = text.matches(old.as_str()).count();
+            if count == 0 {
+                bail!(
+                    "old_string was not found in {shown}; it must match exactly, including \
+whitespace and indentation"
+                );
+            }
+            if count > 1 && !replace_all {
+                bail!(
+                    "old_string occurs {count} times in {shown}; include more surrounding text to \
+make it unique, or set replace_all"
+                );
+            }
+            // Bound the result before building it: a short old_string with
+            // many matches and a long new_string could otherwise ask for more
+            // memory than the host has.
+            let size = (text.len() as u128 + count as u128 * new.len() as u128)
+                - count as u128 * old.len() as u128;
+            if size > prepared::MAX_EDIT_BYTES as u128 {
+                bail!(
+                    "the edit would make {shown} {size} bytes, over the {}-byte limit",
+                    prepared::MAX_EDIT_BYTES
+                );
+            }
+            Ok((text.replace(old.as_str(), &new), count))
+        })
+    })
+    .await?;
+    let noun = if count == 1 {
+        "occurrence"
+    } else {
+        "occurrences"
+    };
+    Ok(format!("edited {path}: replaced {count} {noun}"))
+}
+
+fn job_id(arguments: &Value) -> Result<u32> {
+    arguments
+        .get("job_id")
+        .and_then(Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+        .context("job_id must be a positive integer")
 }
 
 fn list_directory(object: PreparedObject) -> Result<String> {
@@ -737,8 +1135,18 @@ async fn run_shell_under(
     root: &Path,
     cancellation: CancellationFlag,
     timeout: Duration,
+    jobs: &Arc<ShellJobs>,
 ) -> Result<String> {
-    run_shell_started_by(runner, arguments, root, cancellation, timeout, LINGER_GRACE).await
+    run_shell_started_by(
+        runner,
+        arguments,
+        root,
+        cancellation,
+        timeout,
+        LINGER_GRACE,
+        Some(jobs),
+    )
+    .await
 }
 
 /// [`run_shell`] with an explicit linger grace, so tests can make
@@ -758,6 +1166,7 @@ async fn run_shell_with_grace(
         cancellation,
         timeout,
         linger_grace,
+        None,
     )
     .await
 }
@@ -769,8 +1178,90 @@ async fn run_shell_started_by(
     cancellation: CancellationFlag,
     timeout: Duration,
     linger_grace: Duration,
+    jobs: Option<&Arc<ShellJobs>>,
 ) -> Result<String> {
     let command = required_string(arguments, "command")?;
+    let background = arguments
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if background {
+        let Some(jobs) = jobs else {
+            bail!("background jobs are not available here");
+        };
+        jobs.can_start().map_err(anyhow::Error::msg)?;
+        let child = spawn_shell(runner, command, root)?;
+        let id = jobs.start(command, child);
+        return Ok(format!(
+            "started background job {id}. job_output {id} shows its output (with wait_seconds, \
+waits for it to finish); job_kill {id} stops it. You will be told when it ends."
+        ));
+    }
+    let child = spawn_shell(runner, command, root)?;
+    let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+    let mut stdout = BoundedOutput::default();
+    let mut stderr = BoundedOutput::default();
+    let end = supervise_shell(
+        child,
+        &cancellation,
+        timeout,
+        linger_grace,
+        |stream, bytes| match stream {
+            Stream::Stdout => stdout.push(bytes),
+            Stream::Stderr => stderr.push(bytes),
+        },
+    )
+    .await?;
+    let (status, mut note) = match end {
+        ShellEnd::Exited(status) => (status, String::new()),
+        ShellEnd::ExitedLingering(status) => (
+            status,
+            "\nnote: the shell exited, but background processes still held its output; \
+they were killed and the output collected until then is shown"
+                .to_owned(),
+        ),
+        ShellEnd::Cancelled => {
+            bail!("shell tool cancelled; the process group was killed and reaped")
+        }
+        ShellEnd::TimedOut => bail!(
+            "shell tool timed out after {} seconds; the process group was killed and reaped. \
+Run long commands with background: true",
+            timeout.as_secs()
+        ),
+    };
+    // Processes the command left running in its group (started with `&` and
+    // their output redirected) become a job the agent can see and stop.
+    if let (Some(jobs), Some(group)) = (jobs, group)
+        && group_alive(group)
+        && {
+            // A member just exiting can still count for a moment.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            group_alive(group)
+        }
+        && let Some(id) = jobs.adopt(command, group)
+    {
+        note.push_str(&format!(
+            "\nnote: processes this command started are still running, as job {id}. \
+job_output {id} shows whether they are; job_kill {id} stops them. They are killed when the turn \
+ends."
+        ));
+    }
+    Ok(format!(
+        "exit status: {}{note}\nstdout:\n{}\nstderr:\n{}",
+        status_text(status),
+        stdout.render(),
+        stderr.render()
+    ))
+}
+
+/// Start `command` with the user's shell under `runner`, as `run_shell`
+/// runs every command: its own process group, piped output, no stdin, and
+/// the agent environment only.
+fn spawn_shell(
+    runner: &dyn ShellRunner,
+    command: &str,
+    root: &Path,
+) -> Result<tokio::process::Child> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     // The runner decides how the shell is started: directly, or inside
     // whatever contains this session's commands. Everything below applies
@@ -796,45 +1287,10 @@ async fn run_shell_started_by(
     apply_agent_environment(&mut process);
     configure_process_group(&mut process);
     restrict_inherited_descriptors(&mut process);
-    // The child is waited on here, so the daemon's orphan reaper leaves it
-    // alone.
-    let child =
-        xshell_platform::children::spawn_waited(|| process.spawn(), tokio::process::Child::id)
-            .with_context(|| format!("could not launch shell {shell}"))?;
-    let mut stdout = BoundedOutput::default();
-    let mut stderr = BoundedOutput::default();
-    let end = supervise_shell(
-        child,
-        &cancellation,
-        timeout,
-        linger_grace,
-        |stream, bytes| match stream {
-            Stream::Stdout => stdout.push(bytes),
-            Stream::Stderr => stderr.push(bytes),
-        },
-    )
-    .await?;
-    let (status, note) = match end {
-        ShellEnd::Exited(status) => (status, ""),
-        ShellEnd::ExitedLingering(status) => (
-            status,
-            "\nnote: the shell exited, but background processes still held its output; \
-they were killed and the output collected until then is shown",
-        ),
-        ShellEnd::Cancelled => {
-            bail!("shell tool cancelled; the process group was killed and reaped")
-        }
-        ShellEnd::TimedOut => bail!(
-            "shell tool timed out after {} seconds; the process group was killed and reaped",
-            timeout.as_secs()
-        ),
-    };
-    Ok(format!(
-        "exit status: {}{note}\nstdout:\n{}\nstderr:\n{}",
-        status,
-        stdout.render(),
-        stderr.render()
-    ))
+    // The child is waited on by its supervisor, so the daemon's orphan
+    // reaper leaves it alone.
+    xshell_platform::children::spawn_waited(|| process.spawn(), tokio::process::Child::id)
+        .with_context(|| format!("could not launch shell {shell}"))
 }
 
 /// One stream of shell output, of which only a bounded prefix is kept.
@@ -941,7 +1397,11 @@ mod tests {
         assert_eq!(
             ToolSet::all()
                 .without(Tool::RunShell)
-                .without(Tool::DelegateTask),
+                .without(Tool::DelegateTask)
+                .without(Tool::WriteFile)
+                .without(Tool::EditFile)
+                .without(Tool::JobOutput)
+                .without(Tool::JobKill),
             read_only
         );
         assert_eq!(
@@ -998,6 +1458,10 @@ mod tests {
                 "run_shell",
                 "delegate_task",
                 "view_image",
+                "write_file",
+                "edit_file",
+                "job_output",
+                "job_kill",
                 "memory_get",
                 "memory_put",
                 "memory_purge"
@@ -1196,9 +1660,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // `ExitStatus` displays as "exit status: 3", so the tool result line
-        // reads "exit status: exit status: 3".
-        assert!(output.starts_with("exit status: exit status: 3\n"));
+        // The exit code alone, not `ExitStatus`'s own "exit status: 3".
+        assert!(output.starts_with("exit status: 3\n"));
         assert!(output.contains("stdout:\nout"));
         assert!(output.contains("stderr:\nerr"));
     }
@@ -1302,10 +1765,7 @@ mod tests {
         .unwrap();
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
-        assert!(
-            output.starts_with("exit status: exit status: 0\n"),
-            "{output}"
-        );
+        assert!(output.starts_with("exit status: 0\n"), "{output}");
         assert!(output.contains("background processes still held its output"));
         assert!(output.contains("stdout:\nstarted"), "{output}");
         let pid = recorded_pid(&pid_file).await;
@@ -1612,12 +2072,13 @@ print $f $$; close $f; sleep 1000000' & sleep 1000000",
     async fn f8_reads_and_listings_report_their_bounds() {
         let temporary = tempfile::TempDir::new().unwrap();
         let root = temporary.path();
-        std::fs::File::create(root.join("large.bin"))
-            .unwrap()
-            .set_len(1 << 30)
-            .unwrap();
+        // Text at the start, then a gigabyte of (sparse) zeros: only the
+        // start may be read.
+        let mut large = std::fs::File::create(root.join("large.txt")).unwrap();
+        std::io::Write::write_all(&mut large, b"text").unwrap();
+        large.set_len(1 << 30).unwrap();
         let output = execute_tool(
-            &tool("read_file", json!({"path": "large.bin", "max_bytes": 4})),
+            &tool("read_file", json!({"path": "large.txt", "max_bytes": 4})),
             root,
         )
         .await;
@@ -1633,5 +2094,369 @@ print $f $$; close $f; sleep 1000000' & sleep 1000000",
         let output = execute_tool(&tool("list_directory", json!({"path": "big"})), root).await;
         assert_eq!(output.lines().count(), MAX_DIRECTORY_ENTRIES + 1);
         assert!(output.ends_with("the rest were not read]"), "{output}");
+    }
+
+    /// Run `call` the way the engine does, with `jobs` shared across calls.
+    async fn run_with(call: &ToolCall, root: &Path, jobs: &Arc<ShellJobs>) -> String {
+        let preparation =
+            prepare_call(call, root, &SensitivePaths::none(), &SensitivePaths::none()).await;
+        execute_prepared(
+            call,
+            preparation,
+            root,
+            CancellationFlag::default(),
+            Duration::from_secs(60),
+            &AmbientRunner,
+            jobs,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_files_through_dispatch() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let output = execute_tool(
+            &tool(
+                "write_file",
+                json!({"path": "src/a.py", "content": "x = 1\ny = 1\n"}),
+            ),
+            root,
+        )
+        .await;
+        assert!(output.starts_with("created "), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.py")).unwrap(),
+            "x = 1\ny = 1\n"
+        );
+
+        let edit = |old: &str, new: &str, all: bool| {
+            tool(
+                "edit_file",
+                json!({"path": "src/a.py", "old_string": old, "new_string": new, "replace_all": all}),
+            )
+        };
+        let output = execute_tool(&edit("= 1", "= 2", false), root).await;
+        assert!(output.contains("occurs 2 times"), "{output}");
+        let output = execute_tool(&edit("= 1", "= 2", true), root).await;
+        assert!(output.contains("replaced 2 occurrences"), "{output}");
+        let output = execute_tool(&edit("x = 2", "x = 3", false), root).await;
+        assert!(output.contains("replaced 1 occurrence"), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.py")).unwrap(),
+            "x = 3\ny = 2\n"
+        );
+        let output = execute_tool(&edit("nope", "x", false), root).await;
+        assert!(output.contains("was not found"), "{output}");
+        let output = execute_tool(
+            &tool(
+                "edit_file",
+                json!({"path": "missing.py", "old_string": "a", "new_string": "b"}),
+            ),
+            root,
+        )
+        .await;
+        assert!(output.contains("does not exist"), "{output}");
+        let output = execute_tool(
+            &tool(
+                "write_file",
+                json!({"path": "../escape.txt", "content": "x"}),
+            ),
+            root,
+        )
+        .await;
+        assert!(output.contains("outside"), "{output}");
+        assert!(
+            !temporary
+                .path()
+                .parent()
+                .unwrap()
+                .join("escape.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn writes_are_gated_and_refused_when_approval_is_off() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        let sensitive = SensitivePaths::new([".env".to_owned()]);
+        let write = |path: &str| tool("write_file", json!({"path": path, "content": "x"}));
+        assert_eq!(
+            requires_approval(&write("notes.txt"), root, &sensitive),
+            Some(GateReason::FileWrite)
+        );
+        assert_eq!(
+            requires_approval(&write(".env"), root, &sensitive),
+            Some(GateReason::SensitivePath)
+        );
+        assert!(requires_approval_by_name("edit_file"));
+        assert!(!requires_approval_by_name("job_kill"));
+        assert!(Tool::WriteFile.writes_files() && !Tool::WriteFile.is_read_only());
+        assert!(!Tool::JobOutput.is_read_only() && !Tool::JobOutput.writes_files());
+        let facts = crate::CallFacts {
+            tool: "write_file",
+            command: None,
+            path: None,
+            gated: true,
+            sensitive: false,
+            writes: true,
+            cwd: Some(root),
+            search_path: None,
+        };
+        assert_eq!(
+            crate::default_decision(&facts, crate::ApprovalPolicy::Off),
+            crate::PolicyDecision::Deny
+        );
+        assert_eq!(
+            crate::default_decision(&facts, crate::ApprovalPolicy::Auto),
+            crate::PolicyDecision::Run
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_files_are_refused_with_a_hint_for_images() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        std::fs::write(root.join("render.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        std::fs::write(root.join("blob.bin"), b"\x01\x02\0\x03").unwrap();
+        std::fs::write(root.join("text.txt"), "caf\u{e9} au lait").unwrap();
+        let read = |path: &str| tool("read_file", json!({"path": path}));
+        let output = execute_tool(&read("render.png"), root).await;
+        assert!(
+            output.contains("binary file") && output.contains("view_image"),
+            "{output}"
+        );
+        let output = execute_tool(&read("blob.bin"), root).await;
+        assert!(
+            output.contains("binary file") && !output.contains("view_image"),
+            "{output}"
+        );
+        assert_eq!(
+            execute_tool(&read("text.txt"), root).await,
+            "caf\u{e9} au lait"
+        );
+        // A multi-byte character cut by max_bytes is still text.
+        let output = execute_tool(
+            &tool("read_file", json!({"path": "text.txt", "max_bytes": 4})),
+            root,
+        )
+        .await;
+        assert!(output.contains("[output truncated at 4 bytes]"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn background_jobs_run_report_and_can_be_waited_for() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let jobs = ShellJobs::new();
+        let output = run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "echo started; sleep 0.3; echo done; exit 4", "background": true}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        assert!(output.starts_with("started background job 1."), "{output}");
+        assert!(jobs.background_running());
+        let output = run_with(
+            &tool("job_output", json!({"job_id": 1, "wait_seconds": 30})),
+            root,
+            &jobs,
+        )
+        .await;
+        assert!(output.contains("exited with status 4"), "{output}");
+        assert!(output.contains("started\ndone"), "{output}");
+        assert!(!jobs.background_running());
+        // Read once, it is not shown again, and the agent was told by reading.
+        let output = run_with(&tool("job_output", json!({"job_id": 1})), root, &jobs).await;
+        assert!(output.contains("no new output"), "{output}");
+        assert_eq!(jobs.take_notices(), "");
+        let output = run_with(&tool("job_output", json!({"job_id": 9})), root, &jobs).await;
+        assert!(output.contains("there is no job 9"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn an_edit_whose_result_would_exceed_the_limit_is_refused() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        std::fs::write(root.join("a.txt"), "a".repeat(1 << 20)).unwrap();
+        let output = execute_tool(
+            &tool(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "a", "new_string": "b".repeat(500_000),
+                    "replace_all": true}),
+            ),
+            root,
+        )
+        .await;
+        assert!(output.contains("over the"), "{output}");
+        assert_eq!(
+            std::fs::metadata(root.join("a.txt")).unwrap().len(),
+            1 << 20
+        );
+    }
+
+    #[tokio::test]
+    async fn processes_a_background_shell_leaves_running_become_a_job_killed_at_turn_end() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let jobs = ShellJobs::new();
+        run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "sleep 60 >/dev/null 2>&1 &", "background": true}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        let group = jobs_group(&jobs, 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while jobs.group_of(2).is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(jobs.group_of(2), Some(group), "the survivors are adopted");
+        let notice = jobs.take_notices();
+        assert!(
+            notice.contains("job 1") && notice.contains("status 0"),
+            "{notice}"
+        );
+        let output = run_with(&tool("job_output", json!({"job_id": 2})), root, &jobs).await;
+        assert!(output.contains("leftover processes, running"), "{output}");
+        jobs.shut_down();
+        assert!(!group_alive(group));
+    }
+
+    #[tokio::test]
+    async fn a_job_output_wait_ends_at_the_turn_deadline() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let jobs = ShellJobs::until(tokio::time::Instant::now() + Duration::from_millis(300));
+        run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "sleep 30", "background": true}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let output = run_with(
+            &tool("job_output", json!({"job_id": 1, "wait_seconds": 600})),
+            root,
+            &jobs,
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5), "{output}");
+        assert!(output.contains("running"), "{output}");
+        jobs.shut_down();
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_is_reported_once_in_a_notice() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let jobs = ShellJobs::new();
+        run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "echo hi", "background": true}),
+            ),
+            temporary.path(),
+            &jobs,
+        )
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while jobs.background_running() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let notice = jobs.take_notices();
+        assert!(
+            notice.contains("job 1 (`echo hi`)") && notice.contains("status 0"),
+            "{notice}"
+        );
+        assert!(notice.contains("job_output 1"), "{notice}");
+        assert_eq!(jobs.take_notices(), "");
+    }
+
+    #[tokio::test]
+    async fn job_kill_and_turn_end_kill_the_whole_group() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let jobs = ShellJobs::new();
+        run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "sleep 60 & sleep 60 & wait", "background": true}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let group = jobs_group(&jobs, 1);
+        assert!(group_alive(group));
+        let output = run_with(&tool("job_kill", json!({"job_id": 1})), root, &jobs).await;
+        assert!(output.contains("killed"), "{output}");
+        assert!(!group_alive(group));
+
+        run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "sleep 60", "background": true}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let group = jobs_group(&jobs, 2);
+        assert!(group_alive(group));
+        jobs.shut_down();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!group_alive(group));
+        let output = run_with(
+            &tool("run_shell", json!({"command": "true", "background": true})),
+            root,
+            &jobs,
+        )
+        .await;
+        assert!(output.contains("the turn has ended"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn processes_a_command_leaves_running_become_a_job() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path();
+        let jobs = ShellJobs::new();
+        let output = run_with(
+            &tool(
+                "run_shell",
+                json!({"command": "sleep 60 > /dev/null 2>&1 &"}),
+            ),
+            root,
+            &jobs,
+        )
+        .await;
+        assert!(output.starts_with("exit status: 0\n"), "{output}");
+        assert!(output.contains("still running, as job 1"), "{output}");
+        let group = jobs_group(&jobs, 1);
+        assert!(group_alive(group));
+        let output = run_with(&tool("job_output", json!({"job_id": 1})), root, &jobs).await;
+        assert!(output.contains("leftover processes, running"), "{output}");
+        let output = run_with(&tool("job_kill", json!({"job_id": 1})), root, &jobs).await;
+        assert!(output.contains("killed"), "{output}");
+        assert!(!group_alive(group));
+        // A command that leaves nothing behind adds no job.
+        let output = run_with(&tool("run_shell", json!({"command": "true"})), root, &jobs).await;
+        assert!(!output.contains("still running"), "{output}");
+    }
+
+    fn jobs_group(jobs: &ShellJobs, id: u32) -> i32 {
+        jobs.group_of(id).expect("the job exists")
     }
 }

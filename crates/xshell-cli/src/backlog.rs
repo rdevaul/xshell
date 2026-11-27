@@ -9,7 +9,7 @@ use crate::session::SessionRuntime;
 use crate::sessions_ui::session_label;
 use crate::turn::{
     TRUNCATED_RESPONSE_NOTICE, agent_tag, format_auto_continue, format_compaction,
-    format_subagent_finished, format_subagent_started, format_tool_result,
+    format_subagent_finished, format_subagent_started, format_tool_result, format_waiting_for_jobs,
 };
 use anyhow::Result;
 use std::collections::HashSet;
@@ -158,6 +158,9 @@ fn render_events<'a>(
                     ExecutionEvent::AutoContinued { reason, .. } => {
                         writeln!(output, "{}", format_auto_continue(reason))?;
                     }
+                    ExecutionEvent::WaitingForJobs { jobs } => {
+                        writeln!(output, "{}", format_waiting_for_jobs(jobs))?;
+                    }
                     ExecutionEvent::ToolRequested { call } => {
                         writeln!(
                             output,
@@ -165,7 +168,14 @@ fn render_events<'a>(
                             escape_for_prompt(&tool_summary(call))
                         )?;
                     }
-                    ExecutionEvent::ApprovalRequested { call, reason } => {
+                    ExecutionEvent::ApprovalRequested {
+                        call,
+                        reason,
+                        target,
+                    } => {
+                        for line in xshell_execution::approval_preview(call, target.as_deref()) {
+                            writeln!(output, "{tag}{}", escape_for_prompt(&line))?;
+                        }
                         let why = match reason {
                             Some(GateReason::SensitivePath) => " (matches sensitive-path policy)",
                             Some(GateReason::Policy) => " (the approval policy requires approval)",
@@ -393,6 +403,7 @@ mod tests {
                 ExecutionEvent::ApprovalRequested {
                     call,
                     reason: Some(GateReason::ShellExecution),
+                    target: None,
                 },
             ),
             from_subagent(
@@ -472,6 +483,7 @@ mod tests {
                     event: ExecutionEvent::ApprovalRequested {
                         call: call.clone(),
                         reason: None,
+                        target: None,
                     },
                 },
             ),

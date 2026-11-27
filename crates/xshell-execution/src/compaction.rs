@@ -36,7 +36,7 @@ pub const REQUEST_OVERHEAD_TOKENS: usize = 1024;
 /// this measures the real serialized schema once so that growing the tool
 /// surface cannot silently push an "in budget" request over the window. The
 /// constant stays as a floor for chat-template markup we cannot measure.
-fn tool_schema_overhead_tokens() -> usize {
+pub fn tool_schema_overhead_tokens() -> usize {
     static OVERHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *OVERHEAD.get_or_init(|| {
         serde_json::to_string(&crate::tools::definitions())
@@ -740,13 +740,13 @@ mod tests {
     #[test]
     fn budget_derived_from_the_context_window() {
         // 262144-token window, default reserve and overhead:
-        // (262144 - 1024 - 1024) * 0.9 * 3 bytes.
+        // (262144 - 1024 - the tool definitions' size) * 0.9 * 3 bytes.
         let config = CompactionConfig {
             max_history_bytes: None,
             context_tokens: Some(262_144),
             reserve_output_tokens: DEFAULT_RESERVE_OUTPUT_TOKENS,
         };
-        let expected = (262_144 - 2 * 1024) * 9 / 10 * BYTES_PER_TOKEN;
+        let expected = (262_144 - 1024 - tool_schema_overhead_tokens()) * 9 / 10 * BYTES_PER_TOKEN;
         assert_eq!(config.effective_max_bytes(), Some(expected));
         assert_eq!(config.build().name(), "max_history_bytes");
     }
@@ -760,7 +760,7 @@ mod tests {
             context_tokens: Some(8_192),
             reserve_output_tokens: DEFAULT_RESERVE_OUTPUT_TOKENS,
         };
-        let derived = (8_192 - 2 * 1024) * 9 / 10 * BYTES_PER_TOKEN;
+        let derived = (8_192 - 1024 - tool_schema_overhead_tokens()) * 9 / 10 * BYTES_PER_TOKEN;
         assert_eq!(config.effective_max_bytes(), Some(derived));
     }
 

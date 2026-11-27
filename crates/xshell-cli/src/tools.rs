@@ -1,1 +1,1 @@
-pub use xshell_execution::{definitions, tool_summary as summary};
+pub use xshell_execution::{approval_preview, definitions, tool_summary as summary};

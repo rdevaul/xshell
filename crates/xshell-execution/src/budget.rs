@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use xshell_core::TokenUsage;
 
+use crate::jobs::ShellJobs;
+
 /// The longest duration a limit may be configured with. Keeps deadline
 /// arithmetic far from overflow; a turn that needs longer should be split.
 pub const MAX_LIMIT_DURATION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -31,7 +33,8 @@ pub struct TurnLimits {
     /// runs; a running `run_shell` call is bounded by `shell_timeout` plus a
     /// fixed kill-and-drain allowance of a few seconds (background jobs
     /// included, see F17), so a turn overruns by at most about one shell
-    /// timeout. Other tools carry their own bounds.
+    /// timeout. A `job_output` wait ends at the deadline. Other tools carry
+    /// their own bounds.
     #[serde(with = "seconds")]
     pub wall_time: Duration,
     /// How long one `run_shell` tool call may run before its process group
@@ -299,6 +302,15 @@ struct BudgetInner {
     tool_calls: AtomicUsize,
     tool_output_bytes: AtomicUsize,
     tokens: Mutex<TokenTally>,
+    /// The turn's background jobs, shared with its subagents and killed when
+    /// the last handle on this budget is dropped.
+    jobs: Arc<ShellJobs>,
+}
+
+impl Drop for BudgetInner {
+    fn drop(&mut self) {
+        self.jobs.shut_down();
+    }
 }
 
 /// Tokens the providers reported over a turn.
@@ -326,6 +338,7 @@ impl TurnBudget {
             tool_calls: AtomicUsize::new(0),
             tool_output_bytes: AtomicUsize::new(0),
             tokens: Mutex::default(),
+            jobs: ShellJobs::until(deadline.into()),
         }))
     }
 
@@ -446,6 +459,16 @@ impl TurnBudget {
     /// Resolves when the time budget runs out.
     pub async fn expired(&self) {
         tokio::time::sleep_until(self.0.deadline.into()).await;
+    }
+
+    /// The turn's background shell jobs.
+    pub fn jobs(&self) -> &Arc<ShellJobs> {
+        &self.0.jobs
+    }
+
+    /// When the turn's wall time runs out.
+    pub fn deadline(&self) -> Instant {
+        self.0.deadline
     }
 
     pub fn provider_requests_used(&self) -> usize {

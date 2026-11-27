@@ -113,12 +113,18 @@ enum Rule {
     Tool(String),
     /// A simple `run_shell` command whose words match.
     Shell(Vec<String>),
-    /// A read-only tool on a path matching the pattern.
+    /// A file tool on a path matching the pattern.
     Path { tool: String, pattern: String },
 }
 
 /// The tools a path entry may name.
-const PATH_TOOLS: &[&str] = &["read_file", "list_directory", "view_image"];
+const PATH_TOOLS: &[&str] = &[
+    "read_file",
+    "list_directory",
+    "view_image",
+    "write_file",
+    "edit_file",
+];
 
 impl Rule {
     fn parse(entry: &str) -> Result<Self> {
@@ -147,7 +153,7 @@ impl Rule {
             }),
             Some(_) => bail!(
                 "{entry:?}: only run_shell takes a command pattern, and only {} take a path",
-                PATH_TOOLS.join(" and ")
+                PATH_TOOLS.join(", ")
             ),
         }
     }
@@ -179,7 +185,12 @@ impl Rule {
     /// Whether the rule denies this call. Shell patterns are also checked
     /// against each part of a compound command.
     fn denies(&self, call: &CallFacts) -> bool {
-        if self.tool() != call.tool {
+        // `edit_file` reads the file it changes, and its errors ("not found",
+        // "occurs N times") tell the agent what the file holds, so a path
+        // denied to `read_file` is denied to `edit_file` too.
+        let reads_through_edit = matches!(self, Self::Path { tool, .. } if tool == "read_file")
+            && call.tool == "edit_file";
+        if self.tool() != call.tool && !reads_through_edit {
             return false;
         }
         match self {
@@ -513,7 +524,14 @@ pub fn default_decision(call: &CallFacts, mode: ApprovalPolicy) -> PolicyDecisio
     match mode {
         ApprovalPolicy::Off => PolicyDecision::Deny,
         ApprovalPolicy::Ask => PolicyDecision::Prompt,
-        ApprovalPolicy::Auto => PolicyDecision::Run,
+        // A file tool writing a sensitive path (a credential, a shell
+        // start-up file, a git hook) is put to a person even in `auto`: the
+        // write could run code or plant a key the next time something starts.
+        // With nobody to answer, as in a headless run, the prompt is denied.
+        ApprovalPolicy::Auto if call.writes && call.sensitive && call.path.is_some() => {
+            PolicyDecision::Prompt
+        }
+        ApprovalPolicy::Auto | ApprovalPolicy::AutoSensitive => PolicyDecision::Run,
     }
 }
 
@@ -827,6 +845,49 @@ mod tests {
         // An overlay naming the path cannot skip the prompt.
         let overlay = by_path.decide(&read(&secret, true), Ask, false);
         assert_eq!(overlay.decision, Prompt);
+    }
+
+    fn write<'a>(tool: &'a str, path: &'a Path) -> CallFacts<'a> {
+        CallFacts {
+            tool,
+            command: None,
+            path: Some(path),
+            gated: true,
+            sensitive: false,
+            writes: true,
+            cwd: None,
+            search_path: None,
+        }
+    }
+
+    #[test]
+    fn write_tools_take_path_rules_and_a_read_denial_covers_edit_file() {
+        let deny = policy(&[], None, &["write_file: .git/**", "read_file: secrets/**"]);
+        let hook = PathBuf::from("/work/.git/hooks/pre-commit");
+        assert_eq!(base(&deny, &write("write_file", &hook)), [Deny, Deny, Deny]);
+        let source = PathBuf::from("/work/src/main.rs");
+        assert_eq!(
+            base(&deny, &write("write_file", &source)),
+            [Deny, Prompt, Run]
+        );
+        // edit_file reads what it changes, so a path closed to read_file is
+        // closed to it too; write_file, which reads nothing, is not.
+        let secret = PathBuf::from("/work/secrets/x");
+        assert_eq!(
+            base(&deny, &write("edit_file", &secret)),
+            [Deny, Deny, Deny]
+        );
+        assert_eq!(
+            base(&deny, &write("write_file", &secret)),
+            [Deny, Prompt, Run]
+        );
+        // A read_file allow grants edit_file nothing.
+        let allow = policy(&["read_file: docs/**"], None, &[]);
+        let doc = PathBuf::from("/work/docs/a.md");
+        assert_eq!(base(&allow, &write("edit_file", &doc)), [Deny, Prompt, Run]);
+        // Allows by path work for the write tools.
+        let allowed = policy(&["edit_file: docs/**"], None, &[]);
+        assert_eq!(base(&allowed, &write("edit_file", &doc)), [Deny, Run, Run]);
     }
 
     /// F13: a path denial cannot be dodged by letter case, and an allow
