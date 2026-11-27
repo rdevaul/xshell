@@ -347,9 +347,11 @@ The 1M context window of the current models leaves a large margin. Most turns ne
     record. Only `usage.tokens.compactions` reports a server compaction.
   - A fallback for a model or gateway that rejects the beta; that shows as a plain HTTP error.
   - The engine's `history = "append_only"` mode, and sending the turn's context after the history.
-- **Needs a live check:** that a request may open with the stand-in user message and the
-  compaction block, and that the signed thinking after the block still passes the prefix check
-  when what precedes the block is replaced.
+- **Checked live** (2026-11-25, `scripts/live-compaction-check.py`): requests that open with
+  the stand-in user message and the compaction block are accepted, as is the signed thinking
+  after the block, within a turn and in the next one. Each request after a compaction is the
+  size of what followed it (about 190 KB down to 68 KB in that run). Not checked live: replaying
+  a compaction block after compaction is turned off, which needs a manual `//model` rebind.
 
 ### 5.3 Token usage
 
