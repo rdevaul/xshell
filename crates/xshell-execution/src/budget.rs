@@ -437,6 +437,7 @@ impl TurnBudget {
             cache_read: Some(tally.total.cache_read),
             cache_write: Some(tally.total.cache_write),
             cache_write_1h: Some(tally.total.cache_write_1h).filter(|tokens| *tokens > 0),
+            compactions: Some(tally.total.compactions).filter(|count| *count > 0),
             unreported_responses: Some(tally.unreported).filter(|count| *count > 0),
             assurance: Assurance::Measured,
         }
@@ -486,6 +487,9 @@ pub struct TokenMeasure {
     pub cache_write: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_1h: Option<u64>,
+    /// Server-side compactions over the turn, when there were any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<u64>,
     /// Responses whose provider reported no usage, so the counts above miss
     /// them. Absent when every response reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -501,6 +505,7 @@ impl Default for TokenMeasure {
             cache_read: None,
             cache_write: None,
             cache_write_1h: None,
+            compactions: None,
             unreported_responses: None,
             assurance: Assurance::Unavailable,
         }
@@ -637,6 +642,7 @@ mod tests {
             cache_read,
             cache_write,
             cache_write_1h: 0,
+            compactions: 0,
         };
         budget.record_tokens(Some(usage(10, 5, 0, 100)));
         budget.record_tokens(Some(usage(3, 7, 100, 0)));

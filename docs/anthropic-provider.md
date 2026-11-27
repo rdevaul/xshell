@@ -311,6 +311,48 @@ descriptor reports it by default for the models above. Under it:
 
 The 1M context window of the current models leaves a large margin. Most turns never compact.
 
+**As built (server compaction, the adapter part of P6).**
+- A profile sets `context_management = "compact"` and, optionally, `compact_at_tokens` (default
+  150000, at least 50000) and `compact_instructions`. The default is `"none"`.
+  `clear_tool_uses` is not built.
+- Each request then carries a `compact_20260112` edit with an `input_tokens` trigger. The
+  adapter adds `compact-2026-01-12` to `anthropic-beta`, so compaction cannot be combined with
+  `send_betas = false`. The beta is also sent whenever a request replays a compaction block, as it
+  does after compaction is turned off or the session moves to another Anthropic profile.
+- **xshell's own compaction is off while the server compacts.** The session's byte budget and the
+  profile's `context_tokens` are ignored for such a profile (`unless_server_compacts`). Otherwise
+  the stored history, which the server never shortens, would eventually exceed the budget, and
+  xshell would drop the oldest turns, compaction block or signed thinking included.
+- The `compaction` block, which streams as one `compaction_delta`, is stored in `provider_blocks`
+  with the rest of the response. **Requests start at the latest compaction block that has a
+  summary**, after one user message that says the earlier conversation was compacted (a request
+  must open with a user message). The API ignores everything before that block, so sending it would
+  only grow each request until the body passed the API's size limit. xshell's stored history keeps
+  everything.
+- Usage is the top-level counts plus the compaction steps of `usage.iterations`, which the
+  top-level counts leave out. It does not depend on which event carries `iterations`, or on whether
+  the entries carry the cache fields. `TokenUsage.compactions` counts the compactions a response
+  carried, and appears in the per-response and per-turn usage.
+- A block with a null `content` means the API wrote no summary and compacted nothing. The
+  documented cause is that the model called a tool instead of summarizing. Such a block is stored
+  but never sent back. While the latest compaction in the history is one of these, requests carry
+  a summarization prompt that rules out tools, unless the profile set its own prompt. This is read
+  from the history, so it holds across turns, although the daemon builds a new adapter for each
+  turn. On Opus 5.5 a custom prompt summarizes without the earlier thinking, so the API's default
+  prompt is tried first.
+- `stop_reason: "compaction"` is treated as the end of the turn. It only occurs with
+  `pause_after_compaction`, which xshell does not send.
+- **Not built.**
+  - The `history_compacted` event with `kind = "provider"`, and a compaction count in the audit
+    record. Only `usage.tokens.compactions` reports a server compaction.
+  - A fallback for a model or gateway that rejects the beta; that shows as a plain HTTP error.
+  - The engine's `history = "append_only"` mode, and sending the turn's context after the history.
+- **Checked live** (2026-11-25, `scripts/live-compaction-check.py`): requests that open with
+  the stand-in user message and the compaction block are accepted, as is the signed thinking
+  after the block, within a turn and in the next one. Each request after a compaction is the
+  size of what followed it (about 190 KB down to 68 KB in that run). Not checked live: replaying
+  a compaction block after compaction is turned off, which needs a manual `//model` rebind.
+
 ### 5.3 Token usage
 
 `AssistantResponse` gains an optional `usage`:
@@ -538,7 +580,7 @@ limits = "cad"
 | P3 (done) | Usage: `TokenUsage`, sums per turn, `result.usage.tokens`, audit record | 1–2 days |
 | P4 | `api_key_command` with TTL and 401 refresh; daemon-only route; audit event | 2–3 days |
 | P5 (done) | Caching: breakpoints, stability tests, `cache_ttl`, zero-read warning | 1–2 days |
-| P6 | Append-only history: compaction mode, server compaction or tool-result clearing, per-turn context as a turn-scoped system message, live conformance test | 4–6 days |
+| P6 (adapter part done) | Append-only history: compaction mode, server compaction or tool-result clearing, per-turn context as a turn-scoped system message, live conformance test | 4–6 days |
 
 - **What each stage enables.**
   - P1–P3 are enough for a short comparison run.

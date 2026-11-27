@@ -524,6 +524,10 @@ pub struct TokenUsage {
     /// reported. It is billed at a higher rate.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_write_1h: u64,
+    /// Server-side compactions the response carried (Anthropic). Their
+    /// tokens are in the counts above.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compactions: u64,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -542,6 +546,7 @@ impl std::ops::Add for TokenUsage {
             cache_read: self.cache_read.saturating_add(other.cache_read),
             cache_write: self.cache_write.saturating_add(other.cache_write),
             cache_write_1h: self.cache_write_1h.saturating_add(other.cache_write_1h),
+            compactions: self.compactions.saturating_add(other.compactions),
         }
     }
 }
@@ -584,11 +589,27 @@ pub struct AnthropicSettings {
     /// Prompt-cache lifetime: "5m" (the default), "1h", or "off".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<String>,
+    /// Server-side context management: "compact" or "none" (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<String>,
+    /// The prompt size in input tokens at which the API compacts (150000
+    /// by default, at least 50000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at_tokens: Option<u64>,
+    /// Replaces the API's summarization prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_instructions: Option<String>,
 }
 
 impl AnthropicSettings {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Whether the provider compacts the conversation on the server, in
+    /// which case xshell's own compaction is turned off.
+    pub fn compacts_on_server(&self) -> bool {
+        self.context_management.as_deref() == Some("compact")
     }
 }
 

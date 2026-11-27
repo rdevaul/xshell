@@ -89,6 +89,15 @@ pub struct ModelProfile {
     /// "off".
     #[serde(default)]
     pub cache_ttl: Option<String>,
+    /// Anthropic only: "compact" for server-side compaction, or "none".
+    #[serde(default)]
+    pub context_management: Option<String>,
+    /// Anthropic only: the prompt size in tokens that triggers compaction.
+    #[serde(default)]
+    pub compact_at_tokens: Option<u64>,
+    /// Anthropic only: a summarization prompt to use instead of the API's.
+    #[serde(default)]
+    pub compact_instructions: Option<String>,
 }
 
 impl ModelProfile {
@@ -105,6 +114,9 @@ impl ModelProfile {
             betas: self.betas.clone(),
             send_betas: self.send_betas,
             cache_ttl: self.cache_ttl.clone(),
+            context_management: self.context_management.clone(),
+            compact_at_tokens: self.compact_at_tokens,
+            compact_instructions: self.compact_instructions.clone(),
         }
     }
 
@@ -115,7 +127,7 @@ impl ModelProfile {
         } else if !settings.is_default() {
             bail!(
                 "auth, api_version, effort, thinking, thinking_display, max_output_tokens, betas, \
-send_betas and cache_ttl apply only to provider = \"anthropic\""
+send_betas, cache_ttl, context_management, compact_at_tokens and compact_instructions apply only to provider = \"anthropic\""
             );
         }
         Ok(())

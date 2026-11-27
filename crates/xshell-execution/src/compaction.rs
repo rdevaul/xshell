@@ -433,6 +433,23 @@ impl CompactionConfig {
         }
     }
 
+    /// This budget, or no client compaction at all when the provider
+    /// compacts on the server. Both at once would fight: the server keeps
+    /// the stored history long, so it would eventually exceed the byte
+    /// budget, and dropping its oldest turns could remove the provider's
+    /// compaction block or the signed thinking after it.
+    pub fn unless_server_compacts(&self, server_compacts: bool) -> Self {
+        if server_compacts {
+            Self {
+                max_history_bytes: Some(0),
+                context_tokens: None,
+                reserve_output_tokens: self.reserve_output_tokens,
+            }
+        } else {
+            self.clone()
+        }
+    }
+
     /// Layer a per-model budget over this (session-wide) default. The right
     /// history depth depends on the model's context window, so a model profile
     /// may set its own values; when it does, those win.
@@ -452,6 +469,21 @@ mod tests {
     use super::*;
     use serde_json::json;
     use xshell_core::ToolCall;
+
+    #[test]
+    fn server_compaction_turns_the_client_compactor_off() {
+        let config = CompactionConfig {
+            max_history_bytes: Some(8192),
+            context_tokens: Some(200_000),
+            ..CompactionConfig::default()
+        };
+        assert!(config.effective_max_bytes().is_some());
+        assert_eq!(
+            config.unless_server_compacts(true).effective_max_bytes(),
+            None
+        );
+        assert_eq!(config.unless_server_compacts(false), config);
+    }
 
     fn turn(n: usize, with_tool: bool) -> Vec<ChatMessage> {
         let mut messages = vec![ChatMessage::user(format!(
