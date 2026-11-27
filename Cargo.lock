@@ -2244,6 +2244,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "xshell-skills"
+version = "0.2.0"
+dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "xshell-view"
 version = "0.2.0"
 dependencies = [

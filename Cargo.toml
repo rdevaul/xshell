@@ -11,6 +11,7 @@ members = [
     "crates/xshell-pty",
     "crates/xshell-release",
     "crates/xshell-session",
+    "crates/xshell-skills",
     "crates/xshell-view",
 ]
 resolver = "2"

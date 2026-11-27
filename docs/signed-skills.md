@@ -1,7 +1,9 @@
 # Signed skills: design
 
-**Status:** proposed; nothing here is implemented.
-**Updated:** 23 November 2026
+**Status:** stages K0 (skill-signer writes manifest version 2) and K1 (the
+`xshell-skills` verifier crate) are implemented. Nothing loads a skill yet:
+the store, sessions and the registry (K2–K5) are not built.
+**Updated:** 27 November 2026
 
 ## 1. Summary
 
@@ -165,8 +167,8 @@ and re-signed.
 enabled = false
 # OpenSSH allowed_signers format: who may sign skills, and with which key.
 allowed_signers = "/etc/xshell/skill_signers"
-# Optional: keys that are no longer trusted (OpenSSH key revocation list or
-# a file of public keys).
+# Optional: keys that are no longer trusted. One per line: a public key or
+# its SHA256 fingerprint.
 revoked_keys = "/etc/xshell/skill_revoked"
 # Whether a skill with scripts may be used in a session whose shell is not
 # contained. Off by default (§7).
@@ -191,6 +193,23 @@ The trusted-signers file is OpenSSH's `allowed_signers` format: a principal
 Certificate authorities and other key types are refused with a clear
 message, not ignored. GPG signatures are not supported.
 
+The verifier reads a subset of the format and treats anything outside it as
+an error naming the line, because a line the operator wrote and xshell
+skipped would be a restriction, or a signer, they believe in and do not
+have. Where it differs from `ssh-keygen`:
+
+| | `ssh-keygen` | xshell |
+|---|---|---|
+| Principals | A list of patterns | One plain name per line |
+| `namespaces` | A list of patterns | A list of exact names |
+| `valid-after`, `valid-before` | Local time unless the value ends in `Z` | UTC only: the `Z` is required |
+| Other options | `cert-authority`, `verify-required` | Refused |
+| Key types | All | `ssh-ed25519` |
+| A key on several lines | Each principal is tried | The first line that allows the signature names the signer |
+
+Comment lines and blank lines are skipped, so a file `skill-signer trust`
+maintains (which comments out a revoked signer's line) reads as intended.
+
 The signer of a skill is whichever principal's key verifies its signature.
 The skill does not get to say who signed it.
 
@@ -205,7 +224,10 @@ registry's rule that a name belongs to its first publisher.
 
 ### 4.4 Revocation
 
-A key in `revoked_keys` verifies nothing. The check is made at installation,
+A key in `revoked_keys` verifies nothing. The file lists one key per line,
+as a public key of any type (`ssh-ed25519 AAAA…`) or as a fingerprint
+(`SHA256:…`). OpenSSH's binary revocation lists are refused with a message
+saying so. The check is made at installation,
 when the daemon starts, and when a session that uses the skill is created,
 so revoking a key stops its skills being offered without removing them by
 hand. Installed skills signed by a revoked key are reported at startup.
@@ -404,12 +426,28 @@ packages.
 | K4 | Script skills: the store directory as a read-only grant; `requires` checked against the session; `allow_scripts_uncontained`; tests on macOS under the sandbox | 2–3 |
 | K5 | Registry fetch with safe unpacking; `refresh` for revocation; registry support for version 2 | 3–4 |
 
+**Done:** K0 (skill-signer pull request 2) and K1 (`crates/xshell-skills`).
+
+K1 parses the OpenSSH signature format itself, on `ed25519-dalek`, `sha2`
+and `base64`, which the workspace already used; it adds no dependency. Its
+tests run against a skill signed by skill-signer and one signed by stock
+`ssh-keygen` (`crates/xshell-skills/tests/fixtures`), and, where OpenSSH is
+installed, check that `ssh-keygen` accepts the signatures the tests make.
+Where the verifier and `ssh-keygen` could disagree, the verifier is the
+stricter: it refuses trailing bytes in a signature, a non-empty reserved
+field, text around the armor, weak keys and non-canonical signatures.
+
+Two details differ from skill-signer's own check and are worth knowing:
+paths are compared for case-insensitive uniqueness by lowercasing, where
+skill-signer uses Unicode case folding, and `requires: null` is refused
+where skill-signer reads it as absent. A manifest skill-signer writes
+passes both.
+
 **Risks:**
 
 - **Reimplementing signature checking.** K1 verifies OpenSSH signatures
-  itself. The alternative is to run `ssh-keygen -Y verify`, which is exact
-  by definition but adds a process and a dependency on what is installed.
-  See §11.
+  itself (decided, §11). The fixtures and the `ssh-keygen` cross-check are
+  what keep it honest.
 - **A false sense of safety.** "Signed" will be read as "safe". The
   documentation and the install prompt have to say what a signature means.
 - **Three repositories.** The format change lands in skill-signer, the
@@ -426,25 +464,27 @@ Decided on 23 November 2026:
 | The signed form | Change skill-signer to sign the manifest's bytes as stored (§3.2) |
 | Signature types | SSH only for now; no GPG (§4.2) |
 
+Decided on 27 November 2026:
+
+| Question | Decision |
+|---|---|
+| Own verifier, or `ssh-keygen`? | A Rust implementation, in the daemon's process (§10, K1) |
+| Manifest shape | As in §3.2 |
+
 Still open:
 
-1. **Own verifier, or `ssh-keygen`?** A Rust implementation (the `ssh-key`
-   crate provides the signature format) keeps verification in-process and
-   testable, at the cost of owning the `allowed_signers` parsing. Calling
-   `ssh-keygen` gives OpenSSH's exact behaviour and its revocation-list
-   support for free.
-2. **How the model meets a skill.** This design puts only names and signed
+1. **How the model meets a skill.** This design puts only names and signed
    descriptions in the prompt and has the agent read `SKILL.md` when it
    decides to. The alternative is to put each selected skill's `SKILL.md`
    in the prompt. That is simpler for the model and costs context on every
    request.
-3. **Dependencies between skills.** skill-signer's version 1 manifest has a
+2. **Dependencies between skills.** skill-signer's version 1 manifest has a
    `dependencies` field. Version 2 as written here has none, and a skill
    that needs another has to say so in its instructions. Should it return,
    with each dependency pinned by manifest hash?
-4. **Install events in the signed audit log.** The log is organised by
+3. **Install events in the signed audit log.** The log is organised by
    session. Skill management is not part of any session.
-5. **Who may sign what, beyond pins.** A pin is made at first install. A
+4. **Who may sign what, beyond pins.** A pin is made at first install. A
    stricter host might list, per signer, the names they may publish.
-6. **Skills for subagents.** A subagent inherits its parent's tools and
+5. **Skills for subagents.** A subagent inherits its parent's tools and
    containment. Should it see the skills index and have `skill_read`?
